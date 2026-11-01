@@ -134,10 +134,10 @@ target_compile_definitions(lx.text PRIVATE
     LUMEN_FONT_DIR_BUILD="${CMAKE_SOURCE_DIR}/assets/fonts"
     LUMEN_FONT_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/fonts"
     LUMEN_FONT_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/fonts")
-lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
+lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation)
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
-    DEPENDS lx.gfx lx.layout lx.scheduler lx.runtime lx.sync)
+    DEPENDS lx.gfx lx.scheduler lx.runtime lx.sync)
 lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.layout lx.a11y)
 # Compiled themes (ADR-010 §4.8) and bundled Lucide icons (§5.5): found in the build tree, an
 # install relative to the executable, or the configured install (LUMEN_THEME_DIR /
@@ -176,17 +176,18 @@ add_custom_command(
     COMMENT "Compiling the bundled themes (One Dark, One Light)"
     VERBATIM)
 add_custom_target(lumen-themes ALL DEPENDS ${LUMEN_THEME_OUTPUTS})
-lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 
 # ── Desktop ──────────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
     DEPENDS lx.foundation lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
     DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
-# lumen-shell talks libwayland-client directly (it moves onto lx.wayland.client in Phase 5): the
-# zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
+# lumen-shell's connection, registry, outputs, seat and surfaces are lx.wayland.client's and its
+# loop is lx::runtime::event_loop (ADR-010 Phase 5). The extension globals it binds itself
+# (zlm_shell_v1, ext-workspace, ext-idle-notify, wlr-output-power, ext-background-effect) and
+# the requests on them come from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
-    DEPENDS lx.shell.policy lx.text lx.trace lx.config)
+    DEPENDS lx.shell.policy lx.text lx.trace lx.config lx.wayland.client lx.runtime lx.ui.host)
 lumen_link_platform_parts(lx.shell wayland_client xkb text systemd)
 if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
@@ -221,11 +222,17 @@ if(LUMEN_BUILD_XWAYLAND)
     lumen_add_module_library(lx.compositor.xwayland modules/lx.compositor.xwayland
         DEPENDS lx.wayland.server lx.foundation)
 endif()
-# ADR-010 Phase 4: the application runtime — the Wayland connection and event loop, windows
-# drawn with lx.ui through lx.gfx's client swapchain, input routing. Application layer.
-lumen_add_module_library(lx.app modules/lx.app
+# ADR-010 Phase 5: lx.ui on Wayland surfaces — one context per UI thread (client_gpu,
+# renderer, atlas and caches, theme, worker, timer, seat routing) driving surfaces of any role
+# (xdg_toplevel, wlr layer surface, xdg_popup, wl_subsurface). Desktop layer: lx.app, lx.shell
+# and lx.portal build on it.
+lumen_add_module_library(lx.ui.host modules/lx.ui.host
     DEPENDS lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
-lumen_link_platform_parts(lx.app xkb)
+lumen_link_platform_parts(lx.ui.host xkb)
+# ADR-010 Phase 4: the application runtime — the Wayland connection and event loop, windows
+# (lx.ui.host surfaces with the toplevel role), the clipboard. Application layer.
+lumen_add_module_library(lx.app modules/lx.app
+    DEPENDS lx.ui.host lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
 # An application loads only the shared libraries it calls into: the module archives carry the
 # compositor's platform libraries (libinput and its libwacom / GLib / Lua, udev,
 # libwayland-server, libdisplay-info) as link dependencies, which an lx.app client never
@@ -1161,7 +1168,7 @@ if(LUMEN_BUILD_TESTS)
     # Compositor and lx.shell's bridge in one process: the shell side of zlm_policy_bridge_v1
     # against the real server side, with the privilege check configured to accept this binary.
     add_executable(test_shell_bridge tests/test_shell_bridge.cpp)
-    target_link_libraries(test_shell_bridge PRIVATE lx.compositor lx.shell)
+    target_link_libraries(test_shell_bridge PRIVATE lx.compositor lx.shell lx.ui.host)
     lumen_apply_module_properties(test_shell_bridge)
     lumen_link_platform(test_shell_bridge)
     target_include_directories(test_shell_bridge PRIVATE tests "${LUMEN_GENERATED_DIR}")
@@ -1221,6 +1228,25 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_wayland_client COMMAND test_wayland_client)
     set_tests_properties(test_wayland_client PROPERTIES TIMEOUT 60)
 
+    # lx.wayland.client without wlr-layer-shell's glue: the units with a layer gate compiled
+    # again with its protocol macro undefined (the linker takes them before the library's) —
+    # the not_implemented paths compile, link and run, and the rest of the wrapper is real.
+    if(TARGET lumen-protocol-glue AND WAYLAND_CLIENT_FOUND)
+        add_executable(test_wayland_client_nolayer tests/test_wayland_client_nolayer.cpp
+            modules/lx.wayland.client/display.cpp modules/lx.wayland.client/layer.cpp
+            modules/lx.wayland.client/xdg.cpp)
+        target_link_libraries(test_wayland_client_nolayer PRIVATE lx.compositor lx.wayland.client
+            lumen-protocol-glue)
+        lumen_apply_module_properties(test_wayland_client_nolayer)
+        lumen_link_platform(test_wayland_client_nolayer)
+        lumen_link_platform_parts(test_wayland_client_nolayer wayland_client xkb)
+        target_compile_definitions(test_wayland_client_nolayer PRIVATE LUMEN_HAS_PROTOCOL_GLUE=1)
+        target_compile_options(test_wayland_client_nolayer PRIVATE
+            -ULUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1)
+        add_test(NAME test_wayland_client_nolayer COMMAND test_wayland_client_nolayer)
+        set_tests_properties(test_wayland_client_nolayer PROPERTIES TIMEOUT 30)
+    endif()
+
     # ADR-010 Phase 4 stage 2: lx.gfx:swapchain's three tiers against the in-process
     # compositor — golden frames read back from the compositor's side, buffer age, release,
     # resize, explicit sync (a fake kernel timeline on GL), allocations and present cost.
@@ -1255,6 +1281,17 @@ if(LUMEN_BUILD_TESTS)
         add_test(NAME test_app_window COMMAND test_app_window)
         set_tests_properties(test_app_window PROPERTIES TIMEOUT 180)
     endif()
+
+    # ADR-010 Phase 5: lx.ui.host — one context driving two toplevels, a layer-shell panel, a
+    # popup on it and an alpha subsurface against the in-process compositor (the client in a
+    # child process): routing, sharing, idle, steady-frame allocations; cpu and gl.
+    add_executable(test_ui_host tests/test_ui_host.cpp)
+    target_link_libraries(test_ui_host PRIVATE lx.compositor lx.wayland.client lx.ui.host)
+    lumen_apply_module_properties(test_ui_host)
+    lumen_link_platform(test_ui_host)
+    target_include_directories(test_ui_host PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_ui_host COMMAND test_ui_host)
+    set_tests_properties(test_ui_host PROPERTIES TIMEOUT 180)
 
     # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
     # in-process against a real compositor with injected relative motion and gestures.
@@ -1449,6 +1486,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_ui_reconcile PRIVATE tests)
     add_test(NAME test_ui_reconcile COMMAND test_ui_reconcile)
 
+    # ADR-010 §7 Phase 5: several ui_roots on one UI thread, a ui_context each — damage,
+    # overlays, timers and reducers per root; posted and icon-landing damage reach their root.
+    add_executable(test_ui_multi_root tests/test_ui_multi_root.cpp)
+    target_link_libraries(test_ui_multi_root PRIVATE lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y)
+    lumen_apply_module_properties(test_ui_multi_root)
+    lumen_link_platform(test_ui_multi_root)
+    target_include_directories(test_ui_multi_root PRIVATE tests)
+    add_test(NAME test_ui_multi_root COMMAND test_ui_multi_root)
+
     # ADR-010 §7 Phase 3: focus over the retained tree, reducers wired into the root, pointer
     # state and motion, and §5.6's basic components against Zed's sizes and tokens.
     add_executable(test_ui_components tests/test_ui_components.cpp)
@@ -1549,7 +1595,7 @@ if(LUMEN_BUILD_TESTS)
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
+        test_ui_reconcile test_ui_multi_root test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     if(TEST test_ui_components)
         set_tests_properties(test_ui_components PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")

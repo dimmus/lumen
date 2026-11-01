@@ -13,19 +13,32 @@ module;
 // italic, underline, links), up to three action buttons (more go into a menu), a close
 // button. The pointer over the stack pauses every timer (GNOME, KDE).
 //
-// The layout is pure (`layout_notifications`, tested); drawing repaints the whole buffer
-// (a few cards) and damages only the cards that changed. Event driven: nothing runs while
-// nothing changes. Shell thread only.
+// The view is an lx.ui tree on an lx.ui.host surface (ADR-010 Phase 5 P5-7): the same
+// `layout_notifications` geometry, described into the engine's retained tree with the
+// canvas's exact palette (view_ui's literal boxes; the cards' backgrounds and buttons ride
+// the engine's hover states). Pointer events arrive through the context's seat router —
+// the cards, their close and action buttons are the tree's interactive nodes — with the
+// click semantics kept in the view (press and release on one part; the body's links
+// hit-tested against the cached wrap, as the canvas did). The body renders as a text_block
+// carrying the markup spans as attrs.
+//
+// The layout is pure (`layout_notifications`, tested); a change re-describes and the
+// surface's frame loop draws it. Event driven: nothing runs while nothing changes. Shell
+// thread only.
 
 import lx.foundation;
+import lx.gfx;
 import lx.text;
+import lx.ui;
+import lx.ui.host;
+import lx.wayland.client;
 
 export module lx.shell:notify_view;
 
 import std;
 
 import :notifications;
-import :shm_canvas;
+import :view_ui;
 
 export namespace lx::shell {
 
@@ -85,11 +98,8 @@ void layout_notifications(const notification* const* shown, unsigned n, unsigned
 unsigned notify_button_actions(const notification& n, int* out, unsigned cap);
 
 struct notify_globals {
-    void* compositor = nullptr;  // wl_compositor
-    void* shm = nullptr;         // wl_shm
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1 (v2+: set_layer)
-    void* viewporter = nullptr;  // wp_viewporter
-    void* fractional = nullptr;  // wp_fractional_scale_manager_v1
+    /// The shell's lx.ui.host context (null: the view cannot be created).
+    lx::ui::host::context* ui = nullptr;
 };
 
 /// A notification's icon at `px`² pixels (premultiplied ARGB; null: none), except
@@ -106,6 +116,19 @@ struct notify_click {
     lx::rect2i anchor{};
 };
 
+/// The stack's input, forwarded from the tree's interactive parts (the context's seat
+/// router): a completed click (press and release on one part; `serial` is the press's, for
+/// activation tokens and menu grabs) and the pointer arriving on or leaving a card (the
+/// stack's timers pause while it is over one).
+struct notify_input {
+    void (*click)(const notify_click& c, unsigned serial, void* user) = nullptr;
+    void (*hover)(bool over, void* user) = nullptr;
+    void* user = nullptr;
+};
+
+/// The notification stack's surface. It exists while cards show and is destroyed when the
+/// last goes; a size change is a live layer resize (`set_size` and the configure that
+/// answers it), and a critical one shown moves it to the overlay layer (`set_layer`).
 class notification_view {
 public:
     notification_view() = default;
@@ -114,33 +137,31 @@ public:
     notification_view& operator=(const notification_view&) = delete;
 
     void init(notify_globals g, notify_icon_fn icons, void* user);
+    /// The stack's input, as the tree forwards it (`set_input`).
+    void set_input(const notify_input& in) { input_ = in; }
     void set_position(notify_position p);
-    /// Shows `c`'s popups on `output` (wl_output*; another output moves the stack there), or
-    /// closes the surface when there are none. Cheap when nothing changed (its rev).
-    void update(const notification_center& c, void* output);
+    /// Shows `c`'s popups on output slot `output_slot` (`display::output_at`; another output
+    /// moves the stack there; ~0u: the compositor picks), or closes the surface when there
+    /// are none. Cheap when nothing changed (its rev).
+    void update(const notification_center& c, unsigned output_slot);
     void close();
-    [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
-    [[nodiscard]] void* surface() const { return surface_; }
+    [[nodiscard]] bool is_open() const { return surface_.valid(); }
+    [[nodiscard]] void* surface() const {
+        return surface_.valid() ? surface_.wl().native() : nullptr;
+    }
     /// zwlr_layer_surface_v1* (a menu's parent).
-    [[nodiscard]] void* layer() const { return layer_; }
+    [[nodiscard]] void* layer() const { return role_.valid() ? role_.layer().native() : nullptr; }
     [[nodiscard]] const notify_layout& layout() const { return layout_; }
-    /// Draws when something changed and the compositor took the last frame.
+    /// Re-describes what changed and runs the surface's frame loop.
     void after_dispatch();
     /// Frames committed since it opened.
-    [[nodiscard]] unsigned frames() const { return frames_; }
-
-    // ── Pointer, routed here by the shell ──
-    void pointer_enter(double x, double y);
-    void pointer_leave();
-    void pointer_motion(double x, double y);
-    [[nodiscard]] notify_click pointer_button(unsigned button, bool pressed);
-    /// The pointer is over a card (the stack's timers pause).
-    [[nodiscard]] bool hovered() const { return hover_card_ >= 0; }
-
-    struct events;
+    [[nodiscard]] unsigned frames() const {
+        return surface_.valid() ? static_cast<unsigned>(surface_.stats().frames) : 0u;
+    }
 
 private:
-    friend struct events;
+    /// One card's shape beyond the layout: the wrapped body (its height for the layout, its
+    /// pieces for the links' hit tests) and the image-data resampled to the drawn size.
     struct card_cache {
         unsigned id = 0;
         unsigned rev = 0;
@@ -152,45 +173,64 @@ private:
         int image_px = 0;
         std::vector<std::uint32_t> image{};
     };
-    /// What is under the pointer: a card, and its part.
-    struct hit {
+    /// A part's stable identity for the tree's callbacks (`part_refs_`): card `i`, part 0
+    /// the card itself, 1 its close button, 2+b its bth action button.
+    struct part_ref {
+        notification_view* view = nullptr;
         int card = -1;
-        /// 0 body, 1 close, 2+i button i, 10+p link piece p.
         int part = -1;
     };
-    [[nodiscard]] hit hit_at(double x, double y) const;
-    card_cache* cache_for(const notification& n);
+    /// What is under the pointer: a card, and its part (as `part_ref` spells them, plus
+    /// 10+p: the pth piece of the body's wrap — a link).
+    struct hit {
+        int card = -1;
+        int part = -1;
+    };
+
+    /// The describing function's guard pattern (the panel's).
+    friend lx::ui::child notify_describe(lx::ui::build_context& ctx);
+    [[nodiscard]] lx::ui::child build_ui();
+    [[nodiscard]] card_cache* cache_for(const notification& n);
     void relayout();
-    void draw();
-    void paint_card(int bi, const card_layout& c, const notification& n);
+    void request_repaint();
     void apply_size();
+    [[nodiscard]] hit hit_at(double x, double y) const;
+    void on_part_event(const part_ref& ref, const lx::ui::pointer_event& e);
+    void on_part_hover(const part_ref& ref, bool hovered);
+    void finish_click(int card, int hit_card, int part, int press_card, int press_part,
+                      unsigned button);
+    void on_layer_closed();
 
     notify_globals g_{};
     notify_icon_fn icons_ = nullptr;
     void* user_ = nullptr;
+    notify_input input_{};
     notify_position position_ = notify_position::top_right;
     const notification_center* center_ = nullptr;
-    shm_canvas canvas_{};
+    lx::ui::host::surface surface_{};
+    lx::ui::host::layer_role role_{};
     notify_layout layout_{};
     std::vector<std::unique_ptr<card_cache>> cache_;
-    void* output_ = nullptr;
-    void* surface_ = nullptr; // wl_surface*
-    void* layer_ = nullptr;   // zwlr_layer_surface_v1*
+    unsigned output_ = ~0u;
     unsigned center_rev_ = 0;
     bool overlay_ = false;
-    bool configured_ = false;
     bool dirty_ = false;
-    /// The size asked for (set_size) and the size configured.
+    /// The size asked for (set_size) and the size the tree last described at.
     int want_w_ = 0;
     int want_h_ = 0;
-    int conf_w_ = 0;
-    int conf_h_ = 0;
+    int drawn_w_ = 0;
+    int drawn_h_ = 0;
     double pointer_x_ = -1.0;
     double pointer_y_ = -1.0;
     int hover_card_ = -1;
     int hover_part_ = -1;
     hit pressed_{};
-    unsigned frames_ = 0;
+    /// The tree's per-card parts: card i's {card, close, button 0..2} — 5 a card.
+    static constexpr unsigned k_parts_per_card = 2 + k_card_buttons;
+    part_ref part_refs_[k_max_cards * k_parts_per_card]{};
 };
+
+/// The stack's describing function (the surface's frame loop calls it inside `run_frame`).
+[[nodiscard]] lx::ui::child notify_describe(lx::ui::build_context& ctx);
 
 } // namespace lx::shell

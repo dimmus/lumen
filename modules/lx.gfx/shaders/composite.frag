@@ -13,7 +13,7 @@ layout(push_constant) uniform quad_push {
     vec4 dst;
     vec2 target;
     float opacity;
-    float use_solid; // 1: a solid draw, `solid` replaces the sample
+    float use_solid; // 1: a solid draw, `solid` replaces the sample; 2: `solid` × the sample's red (a glyph's coverage)
     vec4 src_uv;
     vec4 tint;
     vec4 src_bounds;  // u_lo, v_lo, u_hi, v_hi — half-texel inset sampling bounds
@@ -21,9 +21,15 @@ layout(push_constant) uniform quad_push {
     int downsample;   // 1: the area filter (downsample.glsl)
     vec2 uv_dy;
     vec4 solid;      // premultiplied, encoded colour of a solid draw
+    float radius;     // a rounded solid: the corner radius of `dst` (0: square)
 } push;
 
 layout(set = 0, binding = 0) uniform sampler2D surface_texture;
+
+// The lowered-primitive variant (a coverage or rounded solid blit, `lower_to_blits`): a
+// pipeline of its own, made on the first such draw. Every other pipeline is made with it false,
+// so the code below folds away and their shader is the plain composite.
+layout(constant_id = 0) const bool k_lowered = false;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
@@ -68,12 +74,27 @@ void main() {
     // Clamped to the source rectangle (in sample_source). Linear filtering samples between
     // texel centers, so a magnified crop would otherwise read texels from outside its own
     // source rect. A solid draw (wp_single_pixel_buffer_v1) takes the colour a 1x1 texture
-    // would hold and goes through the same decode, tint and opacity.
-    vec4 texel = push.use_solid > 0.5
-                     ? push.solid
-                     : sample_source(surface_texture, v_uv, push.src_bounds,
-                                     push.src_uv.zw / push.dst.z, push.uv_dy / push.dst.w,
-                                     push.downsample);
+    // would hold and goes through the same decode, tint and opacity. A lowered glyph
+    // (`use_solid` 2) is that colour times the coverage its R8 atlas page holds.
+    vec4 texel = k_lowered && push.use_solid > 1.5
+                     ? push.solid *
+                           sample_source(surface_texture, v_uv, push.src_bounds,
+                                         push.src_uv.zw / push.dst.z, push.uv_dy / push.dst.w,
+                                         push.downsample)
+                               .r
+                     : push.use_solid > 0.5
+                           ? push.solid
+                           : sample_source(surface_texture, v_uv, push.src_bounds,
+                                           push.src_uv.zw / push.dst.z, push.uv_dy / push.dst.w,
+                                           push.downsample);
+    // A lowered rounded solid: `:ui_cpu`'s quad coverage, saturate(1/2 - d) of the
+    // rounded-box distance at the pixel centre.
+    if (k_lowered && push.radius > 0.0) {
+        vec2 h = 0.5 * push.dst.zw;
+        vec2 q = abs(gl_FragCoord.xy - push.dst.xy - h) - h + push.radius;
+        float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - push.radius;
+        texel *= clamp(0.5 - d, 0.0, 1.0);
+    }
 
     // Client buffers are premultiplied, but a transfer function is defined on the
     // unpremultiplied signal — decoding premultiplied values would bend partially

@@ -13,7 +13,6 @@ import :invalidate;
 import :node;
 import :style;
 import :theme;
-import :widgets_decl;
 
 // ── Styled boxes (ADR-010 §4.8) ────────────────────────────────────────────────────────
 //
@@ -316,8 +315,7 @@ lx::ui::child lx::ui::styled(const style& s, child content) {
     if (!content)
         return nullptr;
     const element_type_id t = content->type;
-    if (t == flex_node::static_type() || t == styled_node::static_type() ||
-        t == box_node::static_type()) {
+    if (t == flex_node::static_type() || t == styled_node::static_type()) {
         // A container: the styled box takes its place over the same children.
         const child c = describe<styled_node, styled_props>({s}, content->key);
         return with_children(c, {content->children, content->child_count});

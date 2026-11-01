@@ -256,11 +256,6 @@ private:
     bool set_ = false;
 };
 
-/// Recording handle threaded through widget paint. The real composite pass lives in
-/// `vulkan_compositor`; widget-level painting is not wired yet, so this deliberately
-/// exposes no operations rather than no-op ones that would look implemented.
-class render_pass {};
-
 class device_recovery {
 public:
     explicit device_recovery(device& dev);

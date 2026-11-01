@@ -1,0 +1,28 @@
+flowchart TB
+    %% A client surface's pixel path (ADR-010 §4.10; lx.gfx:swapchain, lx.ui.host:context / :surface).
+    %% One client_gpu per lx.ui.host context; one client_swapchain per surface on it.
+    subgraph Tier["the tier — once per context, on the first surface's show()"]
+        FB["linux-dmabuf default feedback<br/>(main device, tranches)"] --> VK{"hardware Vulkan on<br/>the render node?"}
+        VK -->|yes| TVK["vulkan: VK_EXT_image_drm_format_modifier images,<br/>timeline semaphore per image → syncobj"]
+        VK -->|no| GL{"hardware GL_RENDERER<br/>(GLES 3.1 on GBM)?"}
+        GL -->|yes| TGL["gl: gbm_bo → EGLImage → renderbuffer + FBO,<br/>native fence → DRM syncobj"]
+        GL -->|no| TCPU["cpu: one sealed memfd per size → wl_shm,<br/>ui_cpu draws into the mapping"]
+        TVK & TGL -->|"no dma-buf format<br/>for the surface"| TCPU
+    end
+
+    subgraph Life["an image's life — per surface (3 dma-buf images, 2 shm)"]
+        FREE["free<br/>(age = frames since drawn; 0 undefined)"] -->|"acquire()<br/>never blocks: none free → wait for a release"| DRAW["drawing<br/>repaint = damage ∪ its age"]
+        DRAW -->|"present(image, damage)<br/>sync exported"| SENT["with the compositor<br/>attach · damage_buffer · commit"]
+        DRAW -->|"cancel (empty tick, a failure)"| FREE
+        SENT -->|"wl_buffer.release<br/>(implicit sync)"| FREE
+        SENT -->|"release point signalled<br/>→ eventfd → collect_releases"| FREE
+        SENT -->|"resize: kept until released (≤ 6 retired,<br/>then warn_and_drop)"| RET["retired"]
+        RET -->|released| GONE["destroyed: its wl_buffer and<br/>syncobj timeline with it"]
+    end
+
+    subgraph Sync["explicit sync (wp_linux_drm_syncobj_v1)"]
+        SO["settled with the first image; never downgraded"] --> PTS["every commit with a buffer:<br/>set_acquire_point(timeline, n)<br/>set_release_point(timeline, n + 1)"]
+    end
+
+    TCPU & TGL & TVK --> FREE
+    SENT -.-> PTS

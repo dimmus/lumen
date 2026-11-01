@@ -51,7 +51,7 @@ struct flex_props {
 /// A box laid out as a CSS flex container, and laid out as a flex item by its parent.
 /// `overflow: hidden | scroll` clips the children to the bounds; scrolling is the
 /// owner's (`content_size` minus the padding box is the range).
-class flex_node final : public ui_node {
+class flex_node : public ui_node {
 public:
     [[nodiscard]] static element_type_id static_type();
     [[nodiscard]] element_type_id type() const override;

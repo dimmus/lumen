@@ -23,12 +23,6 @@ module;
 #include <unistd.h>
 
 #include <wayland-client.h>
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
 #if defined(LUMEN_PROTOCOL_VIEWPORTER)
 #include "viewporter-client-protocol.h"
 #define LUMEN_BELL_VIEWPORT 1
@@ -37,6 +31,7 @@ module;
 
 import lx.foundation;
 import lx.trace;
+import lx.wayland.client;
 
 export module lx.shell:visual_bell;
 
@@ -45,9 +40,10 @@ import std;
 export namespace lx::shell {
 
 struct visual_bell_globals {
+    /// The connection its wl_surfaces and layer surfaces come from.
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr;  // wl_compositor*
     void* shm = nullptr;         // wl_shm*
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1*
     void* viewporter = nullptr;  // wp_viewporter* (without it there is no flash)
 };
 
@@ -62,9 +58,10 @@ public:
     visual_bell& operator=(const visual_bell&) = delete;
 
     void init(visual_bell_globals g) { g_ = g; }
-    /// Flashes `rect` (logical, relative to `output`'s origin) on `output` (wl_output*) until
-    /// `now_ns` + 120 ms. False when it cannot (no viewporter, no layer shell, empty rect).
-    bool flash(void* output, lx::rect2i rect, long long now_ns);
+    /// Flashes `rect` (logical, relative to the output's origin) on output slot `output_slot`
+    /// (`display::output_at`) until `now_ns` + 120 ms. False when it cannot (no viewporter,
+    /// no layer shell, empty rect).
+    bool flash(unsigned output_slot, lx::rect2i rect, long long now_ns);
     /// When the next flash ends (0: none showing).
     [[nodiscard]] long long deadline() const;
     /// Removes the flashes that are over.
@@ -77,13 +74,16 @@ public:
 
 private:
     friend struct events;
-    struct flash_surface {
+    struct flash_surface final : lx::wayland::layer_handler {
         visual_bell* owner = nullptr;
-        void* surface = nullptr;  // wl_surface*
-        void* layer = nullptr;    // zwlr_layer_surface_v1*
+        lx::wayland::surface wl{};
+        lx::wayland::layer_surface layer{};
+        void* surface = nullptr;  // wl_surface* (wl.native() while showing)
         void* viewport = nullptr; // wp_viewport*
         lx::rect2i rect{};
         long long until_ns = 0;
+        void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
+        void on_closed(lx::wayland::layer_surface& l) override;
     };
     void destroy(flash_surface& f);
     [[nodiscard]] bool ensure_buffer();
@@ -98,32 +98,23 @@ private:
 
 #if defined(LUMEN_SHELL_WAYLAND) && defined(LUMEN_BELL_VIEWPORT)
 
-struct lx::shell::visual_bell::events {
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial, uint32_t,
-                          uint32_t) {
-        auto* f = static_cast<flash_surface*>(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        if (!f->surface || !f->owner->buffer_)
-            return;
-        auto* s = static_cast<wl_surface*>(f->surface);
-        wl_surface_attach(s, static_cast<wl_buffer*>(f->owner->buffer_), 0, 0);
-        wp_viewport_set_destination(static_cast<wp_viewport*>(f->viewport), f->rect.width,
-                                    f->rect.height);
-        wl_surface_damage_buffer(s, 0, 0, 1, 1);
-        wl_surface_commit(s);
-    }
-    static void closed(void* data, zwlr_layer_surface_v1*) {
-        auto* f = static_cast<flash_surface*>(data);
-        f->owner->destroy(*f);
-    }
-};
+struct lx::shell::visual_bell::events {};
 
-namespace {
-const zwlr_layer_surface_v1_listener k_bell_layer_listener = {
-    .configure = lx::shell::visual_bell::events::configure,
-    .closed = lx::shell::visual_bell::events::closed,
-};
-} // namespace
+void lx::shell::visual_bell::flash_surface::on_configure(lx::wayland::layer_surface& l,
+                                                         const lx::wayland::layer_configure& c) {
+    l.ack_configure(c.serial);
+    if (!surface || !owner->buffer_)
+        return;
+    auto* s = static_cast<wl_surface*>(surface);
+    wl_surface_attach(s, static_cast<wl_buffer*>(owner->buffer_), 0, 0);
+    wp_viewport_set_destination(static_cast<wp_viewport*>(viewport), rect.width, rect.height);
+    wl_surface_damage_buffer(s, 0, 0, 1, 1);
+    wl_surface_commit(s);
+}
+
+void lx::shell::visual_bell::flash_surface::on_closed(lx::wayland::layer_surface&) {
+    owner->destroy(*this);
+}
 
 bool lx::shell::visual_bell::ensure_buffer() {
     if (buffer_)
@@ -146,9 +137,10 @@ bool lx::shell::visual_bell::ensure_buffer() {
     return buffer_ != nullptr;
 }
 
-bool lx::shell::visual_bell::flash(void* output, lx::rect2i rect, long long now_ns) {
-    if (!g_.compositor || !g_.shm || !g_.layer_shell || !g_.viewporter || rect.width <= 0 ||
-        rect.height <= 0 || !ensure_buffer())
+bool lx::shell::visual_bell::flash(unsigned output_slot, lx::rect2i rect, long long now_ns) {
+    if (!g_.display || !g_.compositor || !g_.shm || !g_.viewporter || rect.width <= 0 ||
+        rect.height <= 0 || !g_.display->has(lx::wayland::global_kind::layer_shell) ||
+        !ensure_buffer())
         return false;
     flash_surface* slot = nullptr;
     for (auto& f : flashes_) {
@@ -161,28 +153,29 @@ bool lx::shell::visual_bell::flash(void* output, lx::rect2i rect, long long now_
     }
     if (slot->surface)
         destroy(*slot);
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
+    if (!slot->wl.create(*g_.display))
         return false;
-    auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface, static_cast<wl_output*>(output),
-        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lumen-bell");
+    if (auto made = slot->layer.create(*g_.display, slot->wl,
+                                       {.output_slot = output_slot,
+                                        .level = lx::wayland::layer::overlay,
+                                        .name_space = "lumen-bell"});
+        !made) {
+        slot->wl.destroy();
+        return false;
+    }
+    auto* surface = static_cast<wl_surface*>(slot->wl.native());
     auto* viewport = wp_viewporter_get_viewport(static_cast<wp_viewporter*>(g_.viewporter), surface);
     slot->owner = this;
     slot->surface = surface;
-    slot->layer = layer;
     slot->viewport = viewport;
     slot->rect = rect;
     slot->until_ns = now_ns + k_duration_ns;
-    zwlr_layer_surface_v1_add_listener(layer, &k_bell_layer_listener, slot);
-    zwlr_layer_surface_v1_set_anchor(layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
-    zwlr_layer_surface_v1_set_margin(layer, rect.y, 0, 0, rect.x);
-    zwlr_layer_surface_v1_set_size(layer, static_cast<uint32_t>(rect.width),
-                                   static_cast<uint32_t>(rect.height));
-    zwlr_layer_surface_v1_set_exclusive_zone(layer, -1);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(
-        layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    slot->layer.set_handler(slot);
+    slot->layer.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_left);
+    slot->layer.set_margin(rect.y, 0, 0, rect.x);
+    slot->layer.set_size({rect.width, rect.height});
+    slot->layer.set_exclusive_zone(-1);
+    (void)slot->layer.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::none);
     // An empty input region: the flash never takes a click.
     if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
         wl_surface_set_input_region(surface, region);
@@ -196,11 +189,13 @@ bool lx::shell::visual_bell::flash(void* output, lx::rect2i rect, long long now_
 void lx::shell::visual_bell::destroy(flash_surface& f) {
     if (f.viewport)
         wp_viewport_destroy(static_cast<wp_viewport*>(f.viewport));
-    if (f.layer)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(f.layer));
-    if (f.surface)
-        wl_surface_destroy(static_cast<wl_surface*>(f.surface));
-    f = {};
+    f.layer.destroy();
+    f.wl.destroy();
+    f.owner = nullptr;
+    f.surface = nullptr;
+    f.viewport = nullptr;
+    f.rect = {};
+    f.until_ns = 0;
 }
 
 void lx::shell::visual_bell::destroy_all() {
@@ -217,8 +212,14 @@ void lx::shell::visual_bell::destroy_all() {
 
 struct lx::shell::visual_bell::events {};
 bool lx::shell::visual_bell::ensure_buffer() { return false; }
-bool lx::shell::visual_bell::flash(void*, lx::rect2i, long long) { return false; }
-void lx::shell::visual_bell::destroy(flash_surface& f) { f = {}; }
+void lx::shell::visual_bell::flash_surface::on_configure(lx::wayland::layer_surface&,
+                                                         const lx::wayland::layer_configure&) {}
+void lx::shell::visual_bell::flash_surface::on_closed(lx::wayland::layer_surface&) {}
+bool lx::shell::visual_bell::flash(unsigned, lx::rect2i, long long) { return false; }
+void lx::shell::visual_bell::destroy(flash_surface& f) {
+    f.surface = nullptr;
+    f.until_ns = 0;
+}
 void lx::shell::visual_bell::destroy_all() {}
 
 #endif

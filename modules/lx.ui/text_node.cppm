@@ -177,6 +177,10 @@ public:
     [[nodiscard]] int to_layout_px(int device_px) const;
     [[nodiscard]] text_emit_stats last_emit() const { return stats_; }
     [[nodiscard]] text_async_stats async_stats() const;
+    /// The index (into the props' `attrs`) of the span under `local` (layout px from the
+    /// block's top-left, as its bounds lay out), or -1: no line or run there, or a run with no
+    /// span. A link's hit test (a notification body's links).
+    [[nodiscard]] int attr_at(lx::point2i local) const;
 
 private:
     struct shape_job;
@@ -571,6 +575,24 @@ void lx::ui::text_block_node::arrange(lx::rect2i bounds) {
     bounds_ = bounds;
     layout_.set_max_width(logical_width(bounds.width));
     layout_dirty_ = false;
+}
+
+int lx::ui::text_block_node::attr_at(lx::point2i local) const {
+    if (!layout_.update())
+        return -1;
+    // The layout's units: 26.6 device px (laid out at the UI device scale).
+    const double scale = static_cast<double>(ui_scale_) * 64.0;
+    const std::int64_t x = static_cast<std::int64_t>(std::floor(local.x * scale));
+    const std::int64_t y = static_cast<std::int64_t>(std::floor(local.y * scale));
+    for (const lx::text::layout_line& line : layout_.lines()) {
+        if (y < line.top || y >= static_cast<std::int64_t>(line.top) + line.height)
+            continue;
+        for (const lx::text::layout_run& run : layout_.runs(line))
+            if (x >= run.x && x < static_cast<std::int64_t>(run.x) + run.width)
+                return run.attr == lx::text::k_no_attr || run.ellipsis ? -1 : static_cast<int>(run.attr);
+        return -1;
+    }
+    return -1;
 }
 
 void lx::ui::text_block_node::emit(draw_scope& out) const {

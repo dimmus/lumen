@@ -2,12 +2,12 @@ flowchart TB
     subgraph Apps["Application Layer"]
         APP["lx::app"]
         UI["lx::ui"]
-        UIB["lx::ui.builder"]
     end
 
     subgraph Desktop["Desktop Layer"]
         SHELL["lx::shell"]
         POLICY["lx::shell.policy"]
+        UIHOST["lx::ui.host"]
     end
 
     subgraph Compositing["Compositor Layer"]
@@ -46,6 +46,11 @@ flowchart TB
         FOUND["lx::foundation"]
     end
 
+    APP --> UIHOST
+    UIHOST --> UI
+    UIHOST --> GFX
+    UIHOST --> WLC
+    UIHOST --> RT
     APP --> UI
     APP --> GFX
     APP --> SCENE
@@ -53,7 +58,7 @@ flowchart TB
     APP --> RT
     UI --> SCENE
     UI --> TEXT
-    UIB --> UI
+    UI --> LAYOUT
     SHELL --> POLICY
     SHELL --> TEXT
     POLICY --> WLPROT
@@ -66,7 +71,6 @@ flowchart TB
     COMP --> CONFIG
     SHELL --> CONFIG
     SCENE --> GFX
-    SCENE --> LAYOUT
     SCENE --> SCHED
     WLS --> WLPROT
     WLC --> RT

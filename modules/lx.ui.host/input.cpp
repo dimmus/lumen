@@ -1,12 +1,12 @@
 module;
 
-// Bodies of lx.app:input.
+// Bodies of lx.ui.host:input.
 
 #if defined(LUMEN_HAS_XKBCOMMON)
 #include <xkbcommon/xkbcommon.h>
 #endif
 
-module lx.app;
+module lx.ui.host;
 
 import std;
 
@@ -16,11 +16,11 @@ import lx.trace;
 import lx.ui;
 import lx.wayland.client;
 
-namespace lx::app {
+namespace lx::ui::host {
 
 namespace {
 
-constexpr lx::trace::category log_input{"app.input"};
+constexpr lx::trace::category log_input{"ui.host.input"};
 
 // evdev buttons (linux/input-event-codes.h).
 constexpr std::uint32_t k_btn_left = 0x110;
@@ -173,7 +173,7 @@ std::uint64_t input_router::now_ns() const {
 }
 
 void input_router::bind(lx::wayland::display& display, lx::wayland::surface& surface,
-                        lx::ui::ui_root& root) {
+                        lx::ui::ui_root& root, lx::wayland::text_input* text_input) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     display_ = &display;
     surface_ = &surface;
@@ -183,18 +183,28 @@ void input_router::bind(lx::wayland::display& display, lx::wayland::surface& sur
         repeat_rate_ = seat_->repeat_rate();
         repeat_delay_ms_ = seat_->repeat_delay_ms();
     }
-    if (seat_ && display.has(lx::wayland::global_kind::text_input)) {
-        if (auto made = text_input_.create(display, *seat_); made)
-            text_input_.set_handler(this);
-        else
-            log_input.warn("zwp_text_input_v3 unavailable: {}", lx::format_error(made.get_error()));
-    }
+    text_input_ = text_input && text_input->valid() ? text_input : nullptr;
+}
+
+lx::wayland::text_input& input_router::text_input() {
+    if (text_input_)
+        return *text_input_;
+    // No seat proxy: an invalid one (valid() false). Made on first need and never destroyed:
+    // a static object would put its 8 KiB of initialised state in every binary's .data.
+    static lx::wayland::text_input* const none = new lx::wayland::text_input{};
+    return *none;
 }
 
 void input_router::unbind() {
     if (saved_focus_)
         saved_focus_ = nullptr;
-    text_input_.destroy();
+    // The seat's proxy outlives the surface: a session this surface began ends with it.
+    if (text_input_ && ime_enabled_) {
+        text_input_->disable();
+        text_input_->commit();
+        ++stats_.ime_commits;
+    }
+    text_input_ = nullptr;
     ime_enabled_ = false;
     ime_focus_ = false;
     ime_target_ = nullptr;
@@ -464,9 +474,9 @@ void input_router::on_focus(lx::wayland::text_input& t, lx::wayland::surface* ta
     ime_focus_ = entered;
     if (!entered) {
         // The compositor took the text input away: enabled state is reset by the protocol.
-        if (ime_enabled_) {
-            text_input_.disable();
-            text_input_.commit();
+        if (ime_enabled_ && text_input_) {
+            text_input_->disable();
+            text_input_->commit();
             ++stats_.ime_commits;
         }
         ime_enabled_ = false;
@@ -524,14 +534,14 @@ void input_router::after_frame() {
 }
 
 void input_router::sync_text_input(bool force) {
-    if (!text_input_.valid() || !root_)
+    if (!text_input_ || !text_input_->valid() || !root_)
         return;
     lx::ui::ime_target* target = ime_focus_ ? root_->ime() : nullptr;
     if (target != ime_target_) {
         // The focused field changed: the old one's session ends, a new one starts.
         if (ime_enabled_) {
-            text_input_.disable();
-            text_input_.commit();
+            text_input_->disable();
+            text_input_->commit();
             ++stats_.ime_commits;
             ime_enabled_ = false;
         }
@@ -550,15 +560,15 @@ void input_router::sync_text_input(bool force) {
     if (!changed)
         return;
     if (!ime_enabled_) {
-        text_input_.enable();
-        text_input_.set_content_type(0, 0); // hint none, purpose normal
+        text_input_->enable();
+        text_input_->set_content_type(0, 0); // hint none, purpose normal
         ime_enabled_ = true;
     }
-    text_input_.set_surrounding_text(q.surrounding, static_cast<std::int32_t>(q.cursor),
+    text_input_->set_surrounding_text(q.surrounding, static_cast<std::int32_t>(q.cursor),
                                      static_cast<std::int32_t>(q.anchor));
-    text_input_.set_text_change_cause(change_cause_);
-    text_input_.set_cursor_rectangle(q.cursor_rect);
-    text_input_.commit();
+    text_input_->set_text_change_cause(change_cause_);
+    text_input_->set_cursor_rectangle(q.cursor_rect);
+    text_input_->commit();
     ++stats_.ime_commits;
     std::memcpy(sent_text_, q.surrounding.data(), n);
     sent_size_ = static_cast<std::uint32_t>(n);
@@ -567,4 +577,4 @@ void input_router::sync_text_input(bool force) {
     sent_rect_ = q.cursor_rect;
 }
 
-} // namespace lx::app
+} // namespace lx::ui::host

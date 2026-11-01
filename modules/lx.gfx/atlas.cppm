@@ -63,6 +63,16 @@ inline constexpr unsigned k_atlas_stale_frames = 120;
 /// Above this share of a page claimed by shelves, reclaiming stale tiles rebuilds it.
 inline constexpr float k_atlas_rebuild_occupancy = 0.85f;
 
+/// Texture ids of an atlas's R8 pages as a composite backend without a primitive renderer
+/// holds them (`gl_compositor::sync_atlas`, `vulkan_compositor::sync_atlas`), for the
+/// coverage blits `lower_to_blits` makes of mono sprites: page `p` is
+/// `k_atlas_page_texture_base + p`. Outside the shm range (0x4000'0000 upward) and apart
+/// from the compositor's own ids (0x7FFF'FD00 upward).
+inline constexpr unsigned k_atlas_page_texture_base = 0x7FFF'FC00u;
+[[nodiscard]] constexpr unsigned atlas_page_texture(unsigned page) {
+    return k_atlas_page_texture_base + page;
+}
+
 /// Where a tile is: a page and a texel box. `uv()` is what a sprite instance carries.
 struct atlas_tile {
     std::uint8_t page = 0;

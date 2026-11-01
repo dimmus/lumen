@@ -106,7 +106,7 @@ private:
     unsigned configures_ = 0;
 };
 
-/// An xdg_popup on a surface, parented to a toplevel or another popup.
+/// An xdg_popup on a surface, parented to a toplevel, another popup or a layer surface.
 class popup {
 public:
     popup() = default;
@@ -117,6 +117,11 @@ public:
     [[nodiscard]] lx::result<void> create(display& d, surface& s, toplevel& parent,
                                           const positioner_desc& where);
     [[nodiscard]] lx::result<void> create(display& d, surface& s, popup& parent,
+                                          const positioner_desc& where);
+    /// On a layer surface (a panel's menu): xdg_surface.get_popup without a parent, then
+    /// zwlr_layer_surface_v1.get_popup before the initial commit. `where` is relative to the
+    /// layer surface. not_implemented without wlr-layer-shell's glue.
+    [[nodiscard]] lx::result<void> create(display& d, surface& s, layer_surface& parent,
                                           const positioner_desc& where);
     void destroy();
     [[nodiscard]] bool valid() const { return popup_ != nullptr; }
@@ -140,6 +145,7 @@ public:
     void on_done();
 
 private:
+    /// `parent_xdg` null: a parent assigned by another protocol (layer-shell) next.
     [[nodiscard]] lx::result<void> create_on(display& d, surface& s, void* parent_xdg,
                                              const positioner_desc& where);
 

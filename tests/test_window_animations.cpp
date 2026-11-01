@@ -358,7 +358,7 @@ namespace {
 class quad_node final : public lx::scene::scene_node {
 public:
     explicit quad_node(lx::rect2i r) : rect_{r} {}
-    [[nodiscard]] lx::scene::node_kind kind() const override { return lx::scene::node_kind::widget; }
+    [[nodiscard]] lx::scene::node_kind kind() const override { return lx::scene::node_kind::surface; }
     using lx::scene::scene_node::emit_draws;
     void emit_draws(lx::scene::draw_list& out, const lx::scene::emit_context&) const override {
         lx::gfx::quad_instance q{};

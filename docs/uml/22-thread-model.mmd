@@ -4,9 +4,9 @@ flowchart TB
             EL["event_loop"]
             STRAND_UI["strand ui"]
             SCENE_MUT["scene_graph mutate"]
-            WIDGETS["widget tree"]
+            UITREE["ui_node tree (ui_root)"]
             EL --> STRAND_UI
-            STRAND_UI --> SCENE_MUT --> WIDGETS
+            STRAND_UI --> SCENE_MUT --> UITREE
         end
 
         subgraph RenderThread["Render affinity thread"]

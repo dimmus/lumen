@@ -21,6 +21,7 @@ import std;
 import lx.foundation;
 import lx.text;
 import lx.trace;
+import lx.wayland.client;
 import :menu_popup;
 import :shm_canvas;
 
@@ -180,7 +181,8 @@ bool lx::shell::menu_popup::open(void* layer, lx::rect2i anchor, std::vector<men
     if (is_open())
         close();
     ++generation_;
-    if (!g_.compositor || !g_.wm_base || !g_.seat || !g_.shm || !layer || items.empty())
+    if (!g_.display || !g_.compositor || !g_.wm_base || !g_.seat || !g_.shm || !layer ||
+        items.empty())
         return false;
     root_ = std::move(items);
     on_activate_ = on_activate;
@@ -215,9 +217,9 @@ bool lx::shell::menu_popup::open_level(unsigned index, void* parent_xdg, void* p
             return w > 0 ? w : 0;
         },
         &l, l.rows);
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
+    if (!l.wl.create(*g_.display))
         return false;
+    auto* surface = static_cast<wl_surface*>(l.wl.native());
     l.surface = surface;
     auto* xdg = xdg_wm_base_get_xdg_surface(static_cast<xdg_wm_base*>(g_.wm_base), surface);
     l.xdg = xdg;
@@ -272,8 +274,7 @@ void lx::shell::menu_popup::close_from(unsigned index) {
             xdg_popup_destroy(static_cast<xdg_popup*>(l.popup));
         if (l.xdg)
             xdg_surface_destroy(static_cast<xdg_surface*>(l.xdg));
-        if (l.surface)
-            wl_surface_destroy(static_cast<wl_surface*>(l.surface));
+        l.wl.destroy();
         l.popup = l.xdg = l.surface = nullptr;
         l.items = nullptr;
         l.configured = false;
@@ -583,7 +584,8 @@ lx::shell::menu_popup::~menu_popup() {
 bool lx::shell::tooltip_popup::open(void* layer, lx::rect2i anchor, std::string_view title,
                                     std::string_view text) {
     close();
-    if (!g_.compositor || !g_.wm_base || !g_.shm || !layer || (title.empty() && text.empty()))
+    if (!g_.display || !g_.compositor || !g_.wm_base || !g_.shm || !layer ||
+        (title.empty() && text.empty()))
         return false;
     canvas_.set_alpha(true);
     title_ = std::string{title};
@@ -598,9 +600,9 @@ bool lx::shell::tooltip_popup::open(void* layer, lx::rect2i anchor, std::string_
     w = w > k_tip_w ? k_tip_w : (w < 40 ? 40 : w);
     width_ = w;
     height_ = k_tip_pad * 2 + (title_.empty() ? 0 : 18) + (bh > 0 ? bh + (title_.empty() ? 0 : 2) : 0);
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
+    if (!wl_.create(*g_.display))
         return false;
+    auto* surface = static_cast<wl_surface*>(wl_.native());
     surface_ = surface;
     auto* xdg = xdg_wm_base_get_xdg_surface(static_cast<xdg_wm_base*>(g_.wm_base), surface);
     xdg_ = xdg;
@@ -676,7 +678,7 @@ void lx::shell::tooltip_popup::close() {
         xdg_popup_destroy(static_cast<xdg_popup*>(popup_));
     if (xdg_)
         xdg_surface_destroy(static_cast<xdg_surface*>(xdg_));
-    wl_surface_destroy(static_cast<wl_surface*>(surface_));
+    wl_.destroy();
     popup_ = xdg_ = surface_ = nullptr;
     configured_ = false;
 }

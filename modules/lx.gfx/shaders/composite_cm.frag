@@ -27,6 +27,7 @@ layout(push_constant) uniform quad_push {
     int downsample;
     vec2 uv_dy;
     vec4 solid;
+    float radius;    // quad_push's corner radius (unused: lowered draws are not colour-managed)
     vec4 m0;
     vec4 m1;
     vec4 m2;

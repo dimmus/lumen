@@ -1,37 +1,14 @@
 module;
 
-// lx.app:window — a toplevel window drawn with the ADR-010 engine: xdg_toplevel (with a
-// server-side decoration request), an lx.ui `ui_root`, the client pixel path of §4.10 (the
-// `lx::gfx::client_gpu` tier and its `client_swapchain`, whose images become wl_buffers here)
-// and the frame loop of §4.9.
+// lx.app:window — a toplevel window drawn with the ADR-010 engine: an lx.ui.host surface with
+// the xdg_toplevel role (and a server-side decoration request). The surface does the rest —
+// the ui_root, the client pixel path of §4.10 on the application's shared client_gpu, the
+// frame loop of §4.9, configure, scale and idle (lx.ui.host:surface describes them); the
+// window adds the toplevel's options and its close request.
 //
-// Frame loop. Input, a reducer, a timer or a configure leaves work in lx.ui's ledger; the
-// window's frame source sees it in the same loop iteration. With no frame callback
-// outstanding the frame is drawn at once (no round trip to the compositor first: input that
-// arrives while the window is idle is on screen at the next refresh); with one outstanding it
-// waits for it, so a window never draws faster than the compositor presents. A frame:
-// acquire a free image (none free: wait for a release, then draw once — never a busy loop),
-// take its age as repaint (`ui_root::add_repaint`), tick the root with `emit_scope::damage`,
-// render inside the repaint region (each rect scissored), present it (sync exported), ack the
-// configure it answers, attach, damage_buffer × what changed (≤ 16 rects), set the syncobj
-// points, request the next frame callback and presentation feedback, commit. The ledger is
-// cleared only by that commit: a frame that fails puts its damage back. A configure that finds
-// no frame callback outstanding (and a preferred-scale change, always) is answered at once;
-// one that arrives while a callback is outstanding waits for it, the newest replacing the
-// older, so a compositor configuring per pointer motion gets one resize per refresh (GTK 4's
-// frozen frame clock). The commit right after an ack has its size (frame-perfect resize).
-// A maximized or tiled configure's size is the window's; a fullscreen or resizing one's is
-// its maximum; `min_size` holds only where the compositor leaves the size to the client.
-//
-// Idle (G1): an empty ledger, nothing animating, no timer due, no key held → no frame callback
-// is requested after the last frame's, nothing is submitted, no timer is armed, and the loop
-// blocks in epoll with no timeout.
-//
-// Scale. With wp_fractional_scale_v1 and wp_viewporter the buffer is ceil(logical × scale)
-// device px and the viewport's destination the logical size (buffer_scale 1); without them the
-// integer wl_surface.preferred_buffer_scale (v6), else the outputs' scale, else 1, as
-// buffer_scale. The UI always lays out in logical px; `ui_root::set_scale` projects at
-// emission and rasterises text and icons at device resolution.
+// An application may open several windows: each has its own ui_root and ui_context (damage,
+// overlays, timers, reducers), its own swapchain and frame loop; they share the application's
+// client_gpu, renderer, atlas, glyph and icon caches (lx.ui.host:context).
 //
 // UI affinity. A steady frame allocates nothing (G5); allocation happens at open, at a
 // swapchain (re)creation and when the tree's shape changes.
@@ -47,6 +24,7 @@ import lx.scene;
 import lx.text;
 import lx.ui;
 import lx.wayland.client;
+import lx.ui.host;
 
 import :input;
 
@@ -87,8 +65,10 @@ public:
     [[nodiscard]] virtual lx::runtime::executor* host_worker() = 0;
     /// The window asks to be closed (xdg_toplevel.close): the application decides.
     virtual void host_close_requested(window& w) = 0;
+    /// The context the window's surface joins (the application's: one per UI thread).
+    [[nodiscard]] virtual lx::ui::host::context& host_context() = 0;
     /// The window opens (refused: the open fails with the error) / is closing (a no-op for a
-    /// window never admitted): seat events and deadlines are routed to it.
+    /// window never admitted).
     [[nodiscard]] virtual lx::result<void> host_attach(window& w) = 0;
     virtual void host_detach(window& w) = 0;
 
@@ -117,260 +97,92 @@ struct window_options {
     bool presentation_feedback = false;
 };
 
-/// One committed frame's wp_presentation feedback, for the bench (§8.3 S9). CLOCK_MONOTONIC
-/// ns (the compositor's presentation clock when it is that, which Lumen's is).
-struct frame_record {
-    std::uint64_t commit_id = 0;
-    std::uint64_t commit_ns = 0;
-    /// When the frame started (its event or callback seen): commit − start is the UI
-    /// thread's frame time.
-    std::uint64_t start_ns = 0;
-    std::uint64_t presented_ns = 0;
-    std::uint64_t sequence = 0;
-    std::uint32_t refresh_ns = 0;
-    std::uint32_t flags = 0;
-    std::uint16_t damage_rects = 0;
-    bool presented = false;
-    bool discarded = false;
-    /// The buffer's size in device px.
-    std::uint16_t width = 0;
-    std::uint16_t height = 0;
-    /// Where the UI thread's time went (ns, §8.1's stages): geometry (a configure's size,
-    /// the scale, a swapchain resize and its new images and wl_buffers); acquire; the root's
-    /// tick and, inside it, describe / reconcile / layout / emit; `batch_for_render`
-    /// (order); the renderer's draw into the image (render: CPU raster, or GL / Vulkan
-    /// record and submit); the swapchain's present (sync export, flush). Commit − start
-    /// minus these is the input flush, the age and the wire requests.
-    /// The pointer motion this frame consumed: its hit test and the hover / leave events
-    /// (`input_router::flush_motion`), before anything else.
-    std::uint32_t input_ns = 0;
-    /// Device px reported as damage (the area of the damage_buffer rects).
-    std::uint32_t damage_px = 0;
-    std::uint32_t geometry_ns = 0;
-    /// The UI thread's CPU time from the frame's start to its commit
-    /// (CLOCK_THREAD_CPUTIME_ID): commit − start much above it is time the thread was not
-    /// running (preempted, or its vCPU descheduled by the host).
-    std::uint32_t cpu_ns = 0;
-    std::uint32_t acquire_ns = 0;
-    std::uint32_t tick_ns = 0;
-    std::uint32_t describe_ns = 0;
-    std::uint32_t reconcile_ns = 0;
-    std::uint32_t layout_ns = 0;
-    std::uint32_t emit_ns = 0;
-    std::uint32_t order_ns = 0;
-    std::uint32_t render_ns = 0;
-    std::uint32_t present_ns = 0;
-    /// Layout work in the tick: measure and arrange calls (`ui_layout_counters`).
-    std::uint32_t measures = 0;
-    std::uint32_t arranges = 0;
-};
-inline constexpr unsigned k_frame_ring = 256;
+/// One committed frame's record, the window's statistics and timeline: the surface's
+/// (lx.ui.host:surface).
+using frame_record = lx::ui::host::frame_record;
+using lx::ui::host::k_frame_ring;
+using window_stats = lx::ui::host::surface_stats;
+using window_timeline = lx::ui::host::surface_timeline;
 
-struct window_stats {
-    std::uint64_t frame_requests = 0;  ///< wl_surface.frame requested
-    std::uint64_t frame_callbacks = 0; ///< wl_callback.done received
-    std::uint64_t frames = 0;          ///< frames drawn and committed
-    std::uint64_t commits = 0;         ///< wl_surface.commit (frames, and acks without a frame)
-    std::uint64_t empty_ticks = 0;     ///< ticks that produced nothing (the image went back)
-    std::uint64_t no_image = 0;        ///< frames that waited for a release
-    std::uint64_t configures = 0;
-    std::uint64_t acks = 0;
-    std::uint64_t reallocations = 0;   ///< swapchain allocations (creation and new sizes)
-    std::uint64_t scale_changes = 0;
-    std::uint64_t failures = 0;        ///< frames that failed (their damage put back)
-    std::uint64_t presented = 0;
-    std::uint64_t discarded = 0;
-    /// The last frame: what changed (device rects sent as damage_buffer), what it repainted.
-    unsigned last_damage_rects = 0;
-    unsigned last_repaint_rects = 0;
-    std::uint64_t last_damage_px = 0;
-    lx::rect2i last_damage_bounds{};
-};
-
-/// When the window got where (CLOCK_MONOTONIC ns; 0: not yet).
-struct window_timeline {
-    std::uint64_t opened_ns = 0;
-    std::uint64_t first_configure_ns = 0;
-    std::uint64_t first_commit_ns = 0;
-    std::uint64_t first_presented_ns = 0;
-};
-
-class window final : public lx::wayland::toplevel_handler,
-                     public lx::wayland::surface_handler,
-                     public lx::wayland::buffer_handler,
-                     public lx::gfx::swapchain_listener {
+class window final {
 public:
     window();
-    ~window() override;
+    ~window();
     window(const window&) = delete;
     window& operator=(const window&) = delete;
 
-    /// Creates the surface and the toplevel, picks the pixel tier and adds the frame source
-    /// to the host's loop. The first frame is drawn when the first configure arrives. Fails
-    /// (invalid_argument) while another window of the host is open: one window per UI
-    /// thread, since lx.ui's ledger, overlays, timers and scale are the thread's.
+    /// Creates the surface and the toplevel on the host's context, and the first commit;
+    /// the context's pixel tier is picked with the first window. The first frame is drawn
+    /// when the first configure arrives. Fails (invalid_argument) when the host refuses it
+    /// (its window table is full) or without a describe function.
     [[nodiscard]] lx::result<void> open(window_host& host, const window_options& options);
     void close();
     [[nodiscard]] bool is_open() const { return open_; }
 
-    [[nodiscard]] lx::ui::ui_root& root() { return *root_; }
-    [[nodiscard]] input_router& input() { return input_; }
-    [[nodiscard]] lx::wayland::surface& surface() { return surface_; }
-    [[nodiscard]] lx::wayland::toplevel& toplevel() { return toplevel_; }
-    [[nodiscard]] lx::gfx::client_tier tier() const { return gpu_.tier(); }
-    [[nodiscard]] const lx::gfx::client_gpu& gpu() const { return gpu_; }
-    [[nodiscard]] const lx::gfx::client_swapchain& swapchain() const { return swapchain_; }
-    [[nodiscard]] lx::size2i logical_size() const { return logical_; }
-    [[nodiscard]] lx::size2i buffer_size() const { return buffer_; }
-    [[nodiscard]] float scale() const { return scale_; }
+    [[nodiscard]] lx::ui::ui_root& root() { return surface_.root(); }
+    [[nodiscard]] input_router& input() { return surface_.input(); }
+    [[nodiscard]] lx::wayland::surface& surface() { return surface_.wl(); }
+    [[nodiscard]] lx::wayland::toplevel& toplevel() { return role_.toplevel(); }
+    /// The lx.ui.host surface the window is.
+    [[nodiscard]] lx::ui::host::surface& host_surface() { return surface_; }
+    [[nodiscard]] lx::gfx::client_tier tier() const { return surface_.tier(); }
+    [[nodiscard]] const lx::gfx::client_gpu& gpu() const { return surface_.gpu(); }
+    [[nodiscard]] const lx::gfx::client_swapchain& swapchain() const { return surface_.swapchain(); }
+    [[nodiscard]] lx::size2i logical_size() const { return surface_.logical_size(); }
+    [[nodiscard]] lx::size2i buffer_size() const { return surface_.buffer_size(); }
+    [[nodiscard]] float scale() const { return surface_.scale(); }
     /// wl_surface.buffer_scale in use (1 with a viewport).
-    [[nodiscard]] int buffer_scale() const { return buffer_scale_; }
+    [[nodiscard]] int buffer_scale() const { return surface_.buffer_scale(); }
     /// The viewport's destination (0 × 0: no viewport).
-    [[nodiscard]] lx::size2i viewport_destination() const { return viewport_dst_; }
-    [[nodiscard]] const window_stats& stats() const { return stats_; }
+    [[nodiscard]] lx::size2i viewport_destination() const { return surface_.viewport_destination(); }
+    [[nodiscard]] const window_stats& stats() const { return surface_.stats(); }
     /// The last frame's damage_buffer rects (device px).
-    [[nodiscard]] const lx::gfx::damage_region& last_damage() const { return last_damage_; }
-    [[nodiscard]] const window_timeline& timeline() const { return timeline_; }
+    [[nodiscard]] const lx::gfx::damage_region& last_damage() const { return surface_.last_damage(); }
+    [[nodiscard]] const window_timeline& timeline() const { return surface_.timeline(); }
     /// The frame ring, oldest first through `frame_count()` entries (at most `k_frame_ring`).
-    [[nodiscard]] const frame_record& frame_at(unsigned i) const;
-    [[nodiscard]] unsigned frame_count() const;
+    [[nodiscard]] const frame_record& frame_at(unsigned i) const { return surface_.frame_at(i); }
+    [[nodiscard]] unsigned frame_count() const { return surface_.frame_count(); }
     /// The last frame's draw list (device px).
-    [[nodiscard]] const lx::scene::draw_list& last_draws() const { return *draws_; }
+    [[nodiscard]] const lx::scene::draw_list& last_draws() const { return surface_.last_draws(); }
     /// The last presented image's pixels on the CPU tier (XRGB8888, `stride` bytes), else null.
-    [[nodiscard]] const lx::gfx::pixel_surface* cpu_pixels() const;
-    [[nodiscard]] lx::gfx::atlas& atlas() { return *atlas_; }
+    [[nodiscard]] const lx::gfx::pixel_surface* cpu_pixels() const { return surface_.cpu_pixels(); }
+    /// The application's atlas (shared by its windows).
+    [[nodiscard]] lx::gfx::atlas& atlas() { return surface_.atlas(); }
 
     /// Draw every frame (whole window damaged) while true — `lumen-hello --frames`.
-    void set_continuous(bool on) { continuous_ = on; }
+    void set_continuous(bool on) { surface_.set_continuous(on); }
     /// `window_options::presentation_feedback`, from the next frame.
-    void set_presentation_feedback(bool on) { presentation_feedback_ = on; }
+    void set_presentation_feedback(bool on) { surface_.set_presentation_feedback(on); }
     /// The earliest deadline the application must wake for (a held key's repeat, a UI timer
     /// still ahead of `now_ns`); 0: none.
-    [[nodiscard]] std::uint64_t next_deadline_ns(std::uint64_t now_ns) const;
+    [[nodiscard]] std::uint64_t next_deadline_ns(std::uint64_t now_ns) const {
+        return surface_.next_deadline_ns(now_ns);
+    }
     /// The application's timer fired.
-    void on_deadline(std::uint64_t now_ns);
+    void on_deadline(std::uint64_t now_ns) { surface_.on_deadline(now_ns); }
 
-    // ── seat events for this window (the application routes them) ──
-    void route_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) { input_.on_pointer(s, f); }
-    void route_keyboard_focus(lx::wayland::seat& s, bool entered) { input_.on_keyboard_focus(s, entered); }
-    void route_key(lx::wayland::seat& s, const lx::wayland::key_event& e) { input_.on_key(s, e); }
-    void route_modifiers(lx::wayland::seat& s, std::uint32_t m) { input_.on_modifiers(s, m); }
-    void route_repeat_info(lx::wayland::seat& s, std::int32_t r, std::int32_t d) { input_.on_repeat_info(s, r, d); }
-    void route_touch(lx::wayland::seat& s, const lx::wayland::touch_event& e) { input_.on_touch(s, e); }
+    // ── seat events for this window (the application's context routes them) ──
+    void route_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) { surface_.route_pointer(s, f); }
+    void route_keyboard_focus(lx::wayland::seat& s, bool entered) { surface_.route_keyboard_focus(s, entered); }
+    void route_key(lx::wayland::seat& s, const lx::wayland::key_event& e) { surface_.route_key(s, e); }
+    void route_modifiers(lx::wayland::seat& s, std::uint32_t m) { surface_.route_modifiers(s, m); }
+    void route_repeat_info(lx::wayland::seat& s, std::int32_t r, std::int32_t d) { surface_.route_repeat_info(s, r, d); }
+    void route_touch(lx::wayland::seat& s, const lx::wayland::touch_event& e) { surface_.route_touch(s, e); }
 
-    // ── the frame source (lx::runtime::event_source over the window) ──
-    [[nodiscard]] bool frame_due() const;
-    void run_frame();
-
-    // toplevel_handler
-    void on_configure(lx::wayland::toplevel& t, const lx::wayland::toplevel_configure& c) override;
-    void on_close(lx::wayland::toplevel& t) override;
-    // surface_handler
-    void on_frame(lx::wayland::surface& s, std::uint32_t time_ms) override;
-    void on_preferred_scale(lx::wayland::surface& s, std::uint32_t scale120) override;
-    void on_presentation(lx::wayland::surface& s, const lx::wayland::presentation_event& e) override;
-    // buffer_handler
-    void on_release(lx::wayland::buffer& b) override;
-    void on_failed(lx::wayland::buffer& b) override;
-    // swapchain_listener
-    void on_image_created(const lx::gfx::swapchain_image& image) override;
-    void on_image_destroyed(std::uint32_t id) override;
+    // ── the frame source ──
+    [[nodiscard]] bool frame_due() const { return surface_.frame_due(); }
+    void run_frame() { surface_.run_frame(); }
 
 private:
-    struct frame_source;
-    struct buffer_slot {
-        std::uint32_t id = 0;
-        /// The wl_shm_pool (`pools_`) the buffer was made from; 0: a dma-buf.
-        std::uint32_t pool_id = 0;
-        lx::wayland::buffer buffer{};
-        lx::wayland::syncobj_timeline timeline{};
-    };
-    /// One wl_shm_pool per swapchain shm block (`swapchain_image::pool_id`), alive while
-    /// the block has images.
-    struct shm_pool_slot {
-        std::uint32_t id = 0;
-        unsigned refs = 0;
-        lx::wayland::shm_pool pool{};
-    };
-    static constexpr unsigned k_buffer_slots =
-        lx::gfx::k_swapchain_images + lx::gfx::k_swapchain_retired;
-    static constexpr unsigned k_shm_pools = 1 + lx::gfx::k_swapchain_retired;
-    /// The longest a configure waits for an outstanding frame callback.
-    static constexpr std::uint64_t k_configure_wait_ns = 100'000'000;
-
-    [[nodiscard]] lx::result<void> make_pixel_path();
-    /// Applies a pending configure and scale: bounds, scale, viewport, swapchain size.
-    [[nodiscard]] lx::result<void> apply_geometry();
-    [[nodiscard]] bool draw();
-    void ack_pending();
-    void restore_damage();
-    [[nodiscard]] lx::result<void> render(lx::gfx::swapchain_image& image,
-                                          const lx::gfx::damage_region& repaint);
-    [[nodiscard]] buffer_slot* slot_of(std::uint32_t id);
-    void release_pool(std::uint32_t pool_id);
-    void collect_releases();
-    [[nodiscard]] static std::uint64_t now_ns();
-    /// CLOCK_THREAD_CPUTIME_ID: what a frame cost the UI thread, preemption excluded.
-    [[nodiscard]] static std::uint64_t thread_cpu_ns();
+    static void close_requested(void* self);
 
     window_host* host_ = nullptr;
-    window_options options_{};
     bool open_ = false;
-    bool broken_ = false;
-
-    lx::wayland::surface surface_{};
-    lx::wayland::toplevel toplevel_{};
-    input_router input_{};
-
-    std::unique_ptr<lx::runtime::memory_arena> arena_{};
-    std::unique_ptr<lx::ui::ui_root> root_{};
-    std::unique_ptr<lx::scene::draw_list> draws_{};
-    std::unique_ptr<lx::gfx::atlas> atlas_{};
-    std::unique_ptr<lx::text::glyph_cache> glyphs_{};
-    std::unique_ptr<lx::ui::icon_cache> icons_{};
-    std::uint64_t atlas_frame_ = 0;
-
-    lx::gfx::client_gpu gpu_{};
-    lx::gfx::format_choice format_{};
-    lx::gfx::client_swapchain swapchain_{};
-    lx::gfx::ui_cpu_renderer cpu_{};
-    std::unique_ptr<lx::gfx::ui_gl_renderer> gl_{};
-    std::unique_ptr<lx::gfx::ui_vk_renderer> vk_{};
-    std::unique_ptr<frame_source> source_{};
-    std::unique_ptr<lx::runtime::fd_source> release_source_{};
-    buffer_slot buffers_[k_buffer_slots]{};
-    shm_pool_slot pools_[k_shm_pools]{};
-    const lx::gfx::swapchain_image* last_image_ = nullptr;
-
-    // configure and scale
-    lx::wayland::toplevel_configure pending_cfg_{};
-    bool configure_pending_ = false;
-    bool configured_ = false;
-    bool scale_pending_ = false;
-    bool fractional_ = false;
-    bool viewport_ = false;
-    lx::size2i logical_{};
-    lx::size2i buffer_{};
-    lx::size2i viewport_dst_{};
-    float scale_ = 1.f;
-    int buffer_scale_ = 1;
-
-    bool waiting_release_ = false;
-    bool continuous_ = false;
-    bool presentation_feedback_ = false;
-    /// When the outstanding frame callback was requested (a held configure's limit).
-    std::uint64_t frame_requested_ns_ = 0;
-    /// The wp_linux_drm_syncobj_surface_v1 exists (explicit sync settled on).
-    bool syncobj_ = false;
-    std::uint64_t frame_start_ns_ = 0;
-    std::uint64_t frame_start_cpu_ns_ = 0;
-    std::uint64_t frame_input_ns_ = 0;
-
+    bool attached_ = false;
+    lx::ui::host::surface surface_{};
+    lx::ui::host::toplevel_role role_{};
+    /// The surface's frame ring, kept in the window (where it always was).
     frame_record ring_[k_frame_ring]{};
-    std::uint64_t ring_next_ = 0;
-    window_stats stats_{};
-    lx::gfx::damage_region last_damage_{};
-    window_timeline timeline_{};
 };
 
 } // namespace lx::app

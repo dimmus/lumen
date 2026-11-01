@@ -10,6 +10,7 @@ export module lx.ui:root;
 
 import std;
 
+import :context;
 import :element;
 import :events;
 import :focus;
@@ -41,9 +42,17 @@ enum class emit_scope : std::uint8_t {
 };
 
 /// Owns the retained tree and drives one UI frame: rebuild, reconcile, layout, emit.
+///
+/// Its damage ledger, overlays, timers and reducer queue are its `ui_context`'s (lx.ui:context),
+/// so several roots on one UI thread each wake, draw and hit-test only for their own tree.
+/// Every entry point below names that context for what it runs (`context_scope`).
 class ui_root {
 public:
+    /// A root on the thread-default context (`thread_default_context`): one tree per thread,
+    /// as before contexts existed.
     explicit ui_root(lx::runtime::memory_arena& arena);
+    /// A root on its own `context`, which must outlive it.
+    ui_root(lx::runtime::memory_arena& arena, ui_context& context);
     /// Destroys the retained tree: its timers, overlays, focus and hover go with it.
     ~ui_root();
     ui_root(const ui_root&) = delete;
@@ -90,7 +99,9 @@ public:
     void add_repaint(lx::rect2i region);
 
     [[nodiscard]] ui_node* tree() const;
+    /// This root's context's ledger: what its next tick repaints.
     [[nodiscard]] damage_ledger& damage();
+    [[nodiscard]] ui_context& context() const { return *context_; }
 
     // ── Input (ADR-010 §4.9; Phase 4's window routes wl_pointer / wl_keyboard here) ──
 
@@ -155,6 +166,7 @@ public:
 
 private:
     lx::runtime::memory_arena* arena_ = nullptr;
+    ui_context* context_ = nullptr;
     describe_fn describe_ = nullptr;
     ui_node* root_ = nullptr;
     reconciler reconciler_{};
@@ -179,12 +191,13 @@ private:
 
 namespace {
 
-/// The pointer's hit test: the overlays first (topmost down; an occluding one, a modal,
-/// blocks the tree), then the tree.
-lx::ui::ui_node* lx_ui_root_resolve(void*, lx::ui::ui_node* root, lx::point2i at,
+/// The pointer's hit test: the root's overlays first (topmost down; an occluding one, a
+/// modal, blocks the tree), then the tree. `context` is the root's `ui_context`.
+lx::ui::ui_node* lx_ui_root_resolve(void* context, lx::ui::ui_node* root, lx::point2i at,
                                     bool interactive) {
     bool blocked = false;
-    lx::ui::ui_node* hit = lx::ui::ui_overlays().hit(at, interactive, blocked);
+    lx::ui::ui_node* hit =
+        static_cast<lx::ui::ui_context*>(context)->overlays().hit(at, interactive, blocked);
     if (hit || blocked || !root)
         return hit;
     return interactive ? lx::ui::hit_interactive(*root, at) : lx::ui::hit_node(*root, at);
@@ -192,18 +205,25 @@ lx::ui::ui_node* lx_ui_root_resolve(void*, lx::ui::ui_node* root, lx::point2i at
 
 } // namespace
 
-lx::ui::ui_root::ui_root(lx::runtime::memory_arena& arena) : arena_{&arena} {
-    pointer_.set_resolver(lx_ui_root_resolve, this);
+lx::ui::ui_root::ui_root(lx::runtime::memory_arena& arena)
+    : ui_root(arena, thread_default_context()) {}
+
+lx::ui::ui_root::ui_root(lx::runtime::memory_arena& arena, ui_context& context)
+    : arena_{&arena}, context_{&context} {
+    pointer_.set_resolver(lx_ui_root_resolve, context_);
+    (void)detail::register_root(this, context);
 }
 
 lx::ui::ui_root::~ui_root() {
-    overlay_layer& overlays = ui_overlays();
+    const context_scope scope{*context_};
+    overlay_layer& overlays = context_->overlays();
     if (root_) {
         overlays.set_focus(nullptr);
         delete root_;
         root_ = nullptr;
     }
     overlays.set_root(nullptr);
+    detail::unregister_root(this, *context_);
 }
 
 void lx::ui::ui_root::set_describer(describe_fn fn) {
@@ -230,9 +250,10 @@ bool lx::ui::ui_root::wants_frame() const {
         return false;
     if (dirty_ || !root_ || theme_generation() != theme_generation_ || scale_ != laid_out_scale_)
         return true;
-    if (!ui_damage().empty() || root_->layout_dirty() || reducers_pending())
+    const context_scope scope{*context_};
+    if (!context_->damage().empty() || root_->layout_dirty() || reducers_pending())
         return true;
-    const std::uint64_t deadline = ui_timers().next_deadline();
+    const std::uint64_t deadline = context_->timers().next_deadline();
     if (deadline == 0)
         return false;
     const auto now = static_cast<std::uint64_t>(
@@ -242,7 +263,7 @@ bool lx::ui::ui_root::wants_frame() const {
     return deadline <= now;
 }
 
-lx::ui::damage_ledger& lx::ui::ui_root::damage() { return ui_damage(); }
+lx::ui::damage_ledger& lx::ui::ui_root::damage() { return context_->damage(); }
 
 lx::ui::ui_root::stage_times lx::ui::ui_root::last_stage_times() const { return stage_times_; }
 
@@ -304,14 +325,16 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         return false;
     }
 
+    // Everything this frame runs invalidates, times and opens overlays in this root's context.
+    const context_scope in_context{*context_};
     // Text and icons measure and rasterise at the root's device scale.
     if (scale_ != 1.f || ui_device_scale() != 1.f)
         set_ui_device_scale(scale_);
     const lx_ui_frame_scope frame_clock{};
     // Timers due by this frame's time run first: what they invalidate is this frame's.
-    (void)ui_timers().fire_due(ui_now_ns());
+    (void)context_->timers().fire_due(ui_now_ns());
 
-    damage_ledger& ledger = ui_damage();
+    damage_ledger& ledger = context_->damage();
     // A new theme or density changes what every styled node resolves to: describe again
     // (each node re-resolves in `apply`), and lay out and repaint everything.
     if (const std::uint64_t generation = theme_generation(); generation != theme_generation_) {
@@ -361,8 +384,12 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
             stage_times_.describe = lx_ui_ns_between(stage_start, described_at);
             stage_times_.described = true;
             if (!ctx.overflowed()) {
+                ui_node* const before = root_;
                 root_ = reconciler_.apply(root_, described);
                 dirty_ = false;
+                // Out-of-scope invalidations find this root by its tree (lx.ui:context).
+                if (root_ != before)
+                    detail::set_root_tree(this, root_);
             }
             stage_start = clock::now();
             stage_times_.reconcile = lx_ui_ns_between(described_at, stage_start);
@@ -380,7 +407,7 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         stage_times_.reconcile += lx_ui_ns_between(rebuild_start, stage_start);
     }
     focus_.set_root(root_);
-    overlay_layer& overlays = ui_overlays();
+    overlay_layer& overlays = context_->overlays();
     overlays.set_root(root_);
     overlays.set_focus(&focus_);
 
@@ -456,12 +483,14 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
 lx::ui::ui_node* lx::ui::ui_root::tree() const { return root_; }
 
 bool lx::ui::ui_root::pointer_move(lx::point2i at) {
-    ui_overlays().set_pointer(at);
+    const context_scope scope{*context_};
+    context_->overlays().set_pointer(at);
     return pointer_.move(root_, at);
 }
 
 bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
-    overlay_layer& overlays = ui_overlays();
+    const context_scope scope{*context_};
+    overlay_layer& overlays = context_->overlays();
     const lx::point2i at = pointer_.position();
     // A press outside an overlay dismisses it before anything else sees the press; an
     // occluding overlay (a modal) takes it.
@@ -496,9 +525,15 @@ bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
     return root_->on_mouse(e);
 }
 
-void lx::ui::ui_root::pointer_leave() { pointer_.leave(); }
+void lx::ui::ui_root::pointer_leave() {
+    const context_scope scope{*context_};
+    pointer_.leave();
+}
 
-void lx::ui::ui_root::pointer_cancel() { pointer_.cancel_press(); }
+void lx::ui::ui_root::pointer_cancel() {
+    const context_scope scope{*context_};
+    pointer_.cancel_press();
+}
 
 namespace {
 /// The drop target at `at`: the node there, then its ancestors, up to a layer.
@@ -516,6 +551,7 @@ lx::ui::drop_target* lx_ui_drop_target_at(lx::ui::pointer_state& pointer, lx::ui
 
 bool lx::ui::ui_root::drop_motion(lx::point2i at) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    const context_scope scope{*context_};
     drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
     drop_target* was = current_drop_target();
     if (was && was != t)
@@ -528,6 +564,7 @@ bool lx::ui::ui_root::drop_motion(lx::point2i at) {
 }
 
 void lx::ui::ui_root::drop_leave() {
+    const context_scope scope{*context_};
     if (drop_target* was = current_drop_target())
         was->drop_leave();
     set_current_drop_target(nullptr);
@@ -535,6 +572,7 @@ void lx::ui::ui_root::drop_leave() {
 
 bool lx::ui::ui_root::drop_text(lx::point2i at, std::string_view utf8) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    const context_scope scope{*context_};
     drop_leave();
     drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
     return t && t->drop_text(at, utf8);
@@ -542,6 +580,7 @@ bool lx::ui::ui_root::drop_text(lx::point2i at, std::string_view utf8) {
 
 bool lx::ui::ui_root::pointer_axis(float dx, float dy) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    const context_scope scope{*context_};
     pointer_event e{};
     e.kind = pointer_kind::wheel;
     e.at = pointer_.position();
@@ -564,9 +603,10 @@ bool lx::ui::ui_root::pointer_axis(float dx, float dy) {
 }
 
 bool lx::ui::ui_root::key(key_event event) {
+    const context_scope scope{*context_};
     focus_.set_root(root_);
     pointer_.set_modifiers(event.modifiers);
-    overlay_layer& overlays = ui_overlays();
+    overlay_layer& overlays = context_->overlays();
     if (event.pressed && event.key == key::escape && overlays.escape())
         return true;
     const bool taken = focus_.handle_key(event);
@@ -576,4 +616,6 @@ bool lx::ui::ui_root::key(key_event event) {
     return root_ && root_->on_key(event);
 }
 
-std::uint64_t lx::ui::ui_root::next_deadline_ns() const { return ui_timers().next_deadline(); }
+std::uint64_t lx::ui::ui_root::next_deadline_ns() const {
+    return context_->timers().next_deadline();
+}

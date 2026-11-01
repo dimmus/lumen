@@ -145,7 +145,7 @@ struct control_props {
     bool nav_wrap = true;
 };
 
-class control_node final : public ui_node {
+class control_node : public ui_node {
 public:
     [[nodiscard]] static element_type_id static_type();
     [[nodiscard]] element_type_id type() const override;
@@ -229,6 +229,9 @@ struct image_props {
     lx::gfx::atlas* atlas = nullptr;
     lx::gfx::atlas_tile_id tile{};
     float corner_radius = 0.f;
+    /// Drawn 1:1 instead: the tile's texels on whole device pixels from the bounds' projected
+    /// origin, square corners (`image`; an icon or a notification's picture).
+    bool pixel_exact = false;
 };
 
 class image_node final : public ui_node {
@@ -558,7 +561,7 @@ bool lx::ui::control_node::activate() {
     if (!has_flag(node_flag::interactive) || has_flag(node_flag::disabled))
         return false;
     ++activations_;
-    ui_overlays().note_activation(*this);
+    detail::overlays_of(*this).note_activation(*this);
     if (overlay_node* sub = child_overlay(*this, overlay_kind::menu)) {
         (void)sub->open();
         return true;
@@ -572,7 +575,7 @@ void lx::ui::control_node::on_timer(std::uint32_t tag) {
     if (tag != k_timer_hover_intent || !has_flag(node_flag::hovered))
         return;
     if (overlay_node* tip = child_overlay(*this, overlay_kind::tooltip))
-        (void)tip->open_at(ui_overlays().pointer());
+        (void)tip->open_at(detail::overlays_of(*this).pointer());
 }
 
 void lx::ui::control_node::on_interaction_changed() {
@@ -613,7 +616,7 @@ const char* lx::ui::image_node::type_name() const { return "image"; }
 
 bool lx::ui::image_node::apply(const image_props& props) {
     if (props.atlas != props_.atlas || props.tile.value != props_.tile.value ||
-        props.corner_radius != props_.corner_radius)
+        props.corner_radius != props_.corner_radius || props.pixel_exact != props_.pixel_exact)
         invalidate_paint(*this);
     props_ = props;
     return false;
@@ -625,6 +628,13 @@ void lx::ui::image_node::emit(draw_scope& out) const {
     lx::gfx::atlas_tile tile{};
     if (!props_.atlas->use(props_.tile, tile))
         return;
+    if (props_.pixel_exact) {
+        const lx::rect2i d = out.device_rect(bounds_);
+        out.device_sprite(lx::gfx::primitive_kind::poly_sprite, tile.page,
+                          {d.x, d.y, static_cast<int>(tile.w), static_cast<int>(tile.h)}, tile.uv(),
+                          lx::color::rgb(1.f, 1.f, 1.f, 1.f));
+        return;
+    }
     const float r = props_.corner_radius;
     out.sprite(lx::gfx::primitive_kind::poly_sprite, tile.page, bounds_, tile.uv(),
                lx::color::rgb(1.f, 1.f, 1.f, 1.f), {r, r, r, r});

@@ -45,12 +45,6 @@ module;
 #define LUMEN_BG_SINGLE_PIXEL 1
 #endif
 #endif
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
 #endif
 
 #if defined(LUMEN_HAS_PNG)
@@ -64,6 +58,7 @@ module;
 #endif
 import lx.foundation;
 import lx.trace;
+import lx.wayland.client;
 
 export module lx.shell:background;
 
@@ -121,26 +116,28 @@ struct background_decoders {
 bool render_background(const background_spec& spec, std::uint32_t* px, int w, int h, int stride);
 
 struct background_globals {
+    /// The connection its wl_surface and layer surface come from.
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr;   // wl_compositor*
     void* shm = nullptr;          // wl_shm*
-    void* layer_shell = nullptr;  // zwlr_layer_shell_v1*
     void* viewporter = nullptr;   // wp_viewporter*
     void* fractional = nullptr;   // wp_fractional_scale_manager_v1*
     void* single_pixel = nullptr; // wp_single_pixel_buffer_manager_v1*
 };
 
 /// One output's background surface. Shell thread only, except the render job it starts.
-class background {
+class background : private lx::wayland::layer_handler {
 public:
     background() = default;
-    ~background();
+    ~background() override;
     background(const background&) = delete;
     background& operator=(const background&) = delete;
 
     /// `spec` must outlive this. `notify_fd` is an eventfd the shell polls: a finished
     /// render writes to it, and the shell then calls `after_dispatch`.
+    /// On output slot `output_slot` (`display::output_at`).
     [[nodiscard]] lx::result<void> create(background_globals globals, const background_spec* spec,
-                                          void* output, int notify_fd);
+                                          unsigned output_slot, int notify_fd);
     void destroy();
     /// After every dispatch: starts a render when the size or scale changed, and shows a
     /// finished one.
@@ -164,6 +161,8 @@ private:
         int pw = 0;
         int ph = 0;
     };
+    void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
+    void on_closed(lx::wayland::layer_surface& l) override;
     void start_render();
     void finish_render();
     void show_color();
@@ -172,8 +171,9 @@ private:
     background_globals g_{};
     const background_spec* spec_ = nullptr;
     int notify_fd_ = -1;
-    void* surface_ = nullptr;    // wl_surface*
-    void* layer_ = nullptr;      // zwlr_layer_surface_v1*
+    lx::wayland::surface wl_surface_{};
+    lx::wayland::layer_surface wl_layer_{};
+    void* surface_ = nullptr;    // wl_surface* (wl_surface_.native() while created)
     void* viewport_ = nullptr;   // wp_viewport*
     void* fractional_ = nullptr; // wp_fractional_scale_v1*
     unsigned scale120_ = 120;
@@ -790,17 +790,6 @@ bool lx::shell::render_background(const background_spec& spec, std::uint32_t* px
 struct lx::shell::background::events {
     static background& self(void* data) { return *static_cast<background*>(data); }
 
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial, uint32_t w,
-                          uint32_t h) {
-        auto& b = self(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        b.width_ = static_cast<int>(w);
-        b.height_ = static_cast<int>(h);
-        b.configured_ = true;
-        b.must_commit_ = true; // the ack takes effect with the next commit
-    }
-    static void closed(void* data, zwlr_layer_surface_v1*) { self(data).closed_ = true; }
-
     static void buffer_release(void*, wl_buffer* buffer) {
         // On screen in the compositor's copy: the shell keeps none.
         wl_buffer_destroy(buffer);
@@ -819,10 +808,6 @@ struct lx::shell::background::events {
 
 namespace {
 
-const zwlr_layer_surface_v1_listener k_bg_layer_listener = {
-    .configure = lx::shell::background::events::configure,
-    .closed = lx::shell::background::events::closed,
-};
 const wl_buffer_listener k_bg_buffer_listener = {
     .release = lx::shell::background::events::buffer_release,
 };
@@ -836,24 +821,38 @@ const wp_fractional_scale_v1_listener k_bg_fractional_listener = {
 
 lx::shell::background::~background() { destroy(); }
 
+void lx::shell::background::on_configure(lx::wayland::layer_surface& l,
+                                         const lx::wayland::layer_configure& c) {
+    l.ack_configure(c.serial);
+    width_ = c.size.width;
+    height_ = c.size.height;
+    configured_ = true;
+    must_commit_ = true; // the ack takes effect with the next commit
+}
+
+void lx::shell::background::on_closed(lx::wayland::layer_surface&) { closed_ = true; }
+
 lx::result<void> lx::shell::background::create(background_globals globals, const background_spec* spec,
-                                               void* output, int notify_fd) {
-    if (!globals.compositor || !globals.shm || !globals.layer_shell || !spec)
-        return lx::invalid_argument("background needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
+                                               unsigned output_slot, int notify_fd) {
+    if (!globals.display || !globals.compositor || !globals.shm || !spec)
+        return lx::invalid_argument("background needs the display, wl_compositor and wl_shm");
     g_ = globals;
     spec_ = spec;
     notify_fd_ = notify_fd;
     auto* compositor = static_cast<wl_compositor*>(g_.compositor);
-    auto* surface = wl_compositor_create_surface(compositor);
-    if (!surface)
-        return lx::make_error(lx::wayland_err::bind_failed, "wl_compositor.create_surface failed");
-    surface_ = surface;
-    auto* layer = zwlr_layer_shell_v1_get_layer_surface(static_cast<zwlr_layer_shell_v1*>(g_.layer_shell),
-                                                        surface, static_cast<wl_output*>(output),
-                                                        ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
-                                                        "lumen-background");
-    layer_ = layer;
-    zwlr_layer_surface_v1_add_listener(layer, &k_bg_layer_listener, this);
+    if (auto made = wl_surface_.create(*g_.display); !made)
+        return made.get_error();
+    if (auto made = wl_layer_.create(*g_.display, wl_surface_,
+                                     {.output_slot = output_slot,
+                                      .level = lx::wayland::layer::background,
+                                      .name_space = "lumen-background"});
+        !made) {
+        wl_surface_.destroy();
+        return made.get_error();
+    }
+    wl_layer_.set_handler(this);
+    surface_ = wl_surface_.native();
+    auto* surface = static_cast<wl_surface*>(surface_);
 #if defined(LUMEN_BG_FRACTIONAL)
     if (g_.viewporter) {
         viewport_ = wp_viewporter_get_viewport(static_cast<wp_viewporter*>(g_.viewporter), surface);
@@ -866,14 +865,11 @@ lx::result<void> lx::shell::background::create(background_globals globals, const
     }
 #endif
     // The whole output, under the panel too (no exclusive zone of its own, others' ignored).
-    zwlr_layer_surface_v1_set_anchor(layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_size(layer, 0, 0);
-    zwlr_layer_surface_v1_set_exclusive_zone(layer, -1);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(layer,
-                                                     ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    wl_layer_.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_bottom |
+                         lx::wayland::anchor_left | lx::wayland::anchor_right);
+    wl_layer_.set_size({0, 0});
+    wl_layer_.set_exclusive_zone(-1);
+    (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::none);
     // Opaque everywhere (no blending; covered parts are skipped), and no input: the pointer
     // over the bare desktop belongs to no client.
     if (auto* region = wl_compositor_create_region(compositor)) {
@@ -911,11 +907,8 @@ void lx::shell::background::destroy() {
 #endif
     fractional_ = nullptr;
     viewport_ = nullptr;
-    if (layer_)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
-    layer_ = nullptr;
-    if (surface_)
-        wl_surface_destroy(static_cast<wl_surface*>(surface_));
+    wl_layer_.destroy();
+    wl_surface_.destroy();
     surface_ = nullptr;
 }
 
@@ -1050,7 +1043,9 @@ void lx::shell::background::after_dispatch() {
 #else
 
 lx::shell::background::~background() = default;
-lx::result<void> lx::shell::background::create(background_globals, const background_spec*, void*, int) {
+void lx::shell::background::on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure&) {}
+void lx::shell::background::on_closed(lx::wayland::layer_surface&) {}
+lx::result<void> lx::shell::background::create(background_globals, const background_spec*, unsigned, int) {
     return lx::not_implemented("lx::shell::background::create");
 }
 void lx::shell::background::destroy() {}

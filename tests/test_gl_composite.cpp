@@ -525,9 +525,10 @@ LUMEN_TEST(gl_composite_exports_a_completion_fence) {
     close_fence(stats);
 }
 
-// Server-side frames fill rects by stretching the centre 2x2 of a 4x4 swatch in an atlas
-// (lx.compositor:decoration). The half-texel inset must keep linear filtering inside the
-// swatch: no bleed from the neighbouring swatch at any edge of a large stretch.
+// A rect filled by stretching the centre 2x2 of a 4x4 swatch in an atlas (what server-side
+// frames did until their fills became primitives): the half-texel inset must keep linear
+// filtering inside the swatch — no bleed from the neighbouring swatch at any edge of a large
+// stretch. Swatch colours: the frame palette's title fill and hover red.
 LUMEN_TEST(gl_composite_stretches_a_swatch_centre_without_bleed) {
     auto* device = shared_device();
     if (!device)

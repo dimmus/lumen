@@ -527,6 +527,33 @@ compositor, Vulkan (lavapipe) within 1/255 outside the text and 9/255 on glyph e
 stem weight +1.5 %; render-thread cost on CPU +3–5 % for a full repaint, GL unchanged within
 noise; no frame allocates.
 
+As built in Phase 5 (rendering-performance.md "Server-side frames: primitives only", §6 "UI
+primitives in the compositor"): `frame_node` draws quads and `mono_sprite`s only — the hover /
+pressed circle is a quad of radius half its side, the × always the atlas glyph, rasterised as
+soon as `decoration_manager::set_window_scales` (or the first framing) sees a scale. The 64x64
+decoration atlas, its staging and the `atlas_ready` gate that kept a shown frame blank until
+then are deleted: a frame draws from its first snapshot. The snap preview and the fullscreen
+backdrop are `draw_command::solid` (their 1×1 textures deleted), pixel-identical on CPU and GL.
+The lowering path keeps the frame whole instead of keeping the decoration atlas for it (the
+owner's choice over the default the plan proposed): `lower_to_blits` turns a quad with four
+equal radii into a solid blit with `blit_command::corner_radius` and an unturned mono sprite
+into a coverage blit (`blit_command::coverage`) from the atlas's R8 page, which the GL
+(GL_LUMINANCE, a `#version 100` program built on the first such draw) and Vulkan (R8_UNORM,
+the composite shader's `use_solid` 2 and `radius`) backends keep as textures
+(`sync_atlas`); against GLES 3.1's primitive path GLES 2 is 0/255 everywhere and lavapipe
+Vulkan 0/255 away from anti-aliased edges (`test_deco_titles`). Capture re-composites lower the
+stream only when the backend has no UI renderer; `report_unregistered_draw` reads the frame's
+converted draws (`frame_painter::last_surfaces`) instead of converting them again.
+
+Deviation — the per-frame `draw_command` → `blit_command` conversion stays. The sentence above
+asks `compositor_impl` to stop it; Phase 5 measured it first (`bench_ui_composite`, interleaved
+A/B, 6 runs each, `setarch -R`, pinned): `frame_painter::surfaces` costs 0.74 µs p50 for 16
+surface draws, 2.1 µs for 64 and 7.8 µs for 256 on the render thread — 0.03 % of the CPU
+composite of the same 256-draw frame (28.7 ms) and 0.74 % of the GL composite's submit
+(1.25 ms), under the 2 % that would justify a shared `draw_command` / `blit_command` struct
+(which needs `scene::draw_command` to embed `gfx::blit_command` and every reader of either to
+change). Measured, not taken.
+
 ### 4.12 Threads and allocation
 
 | Work | Affinity | Allocation |
@@ -555,7 +582,9 @@ ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 | `lx.scene` (`draw_list` of primitives, one overlap grid per list) | Compositor | `lx.gfx` |
 | `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
 | `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
-| `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
+| `lx.ui.host` (`:context`, `:surface`, `:input`, `:roles`; Phase 5) — lx.ui on Wayland surfaces: one context per UI thread, surfaces of any role | Desktop | `lx.ui`, `lx.scene`, `lx.text`, `lx.gfx`, `lx.wayland.client`, `lx.runtime`, `lx.trace` |
+| `lx.app` (Phase 5: on `lx.ui.host`; `:input` re-exports its router) | Application | `lx.ui.host`, `lx.ui` |
+| `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui`, `lx.ui.host` (from Phase 5's shell stages) |
 | `tools/lumen-theme` | tool | the `lx.ui` facade (its `:theme`, `:theme_compile` and `:theme_defaults` partitions; see Phase 3's deviations) |
 
 The overlap grid (`order_grid`) is a geometry utility with no scene dependency, so it lives
@@ -1610,13 +1639,123 @@ in-process compositor, cold went from 131–135 to 133–139 ms p50 and warm fro
 start is the driver's: EGL on GBM ≈ 27 ms, the two compiles ≈ 60 ms, and fontconfig ≈ 16 ms on
 a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
 
-### Phase 5 — Adoption and deletion (≈2 weeks) — not started
+### Phase 5 — Adoption and deletion (≈2 weeks) — in progress
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
   the background keeps its single-pixel-buffer and worker-rendered image paths.
 - Delete `lx.ui:widgets`, `:widget_node`, `lx.ui.builder` and `gfx::render_pass`
-  (ADR-005 F7, step 13); `lx.app` no longer imports the builder.
+  (ADR-005 F7, step 13); `lx.app` no longer imports the builder. **Done**, with
+  `:widgets_decl` (its `box` / placeholder `text` / `button`; S1 and the tests that used them
+  now build from `flex` / `div` / `label` / `button`, so S1's node and primitive counts
+  changed deliberately), the string-keyed `style_ref` (`sizeof(ui_node)` 80 → 64 B), the
+  `scene::node_kind::widget` kind, and lx.layout's old `flex_node` / `grid_node` /
+  `layout_engine` with `container_node::layout()` and `scene_graph::update` (an empty
+  1920 × 1080 solve every compositor tick; `sizeof(container_node)` 1744 → 1176 B). No pixel
+  changed (`test_ui_golden`); lumen-ui-bench S2–S4 p50 equal or lower on cpu and gl.
 - Compositor decorations fully on primitives; `compositor_impl` passes the stream through.
+  **Done** (§4.11 "As built in Phase 5"): frames draw quads and mono sprites only, from their
+  first frame, on every path — the paths without a primitive renderer through an extended
+  `lower_to_blits` (rounded solid and coverage blits) rather than a decoration atlas, which is
+  deleted; the snap preview and fullscreen backdrop are solid draws; captures lower only where
+  nothing draws the stream. Deviations: the per-frame draw → blit conversion stays (measured
+  at < 1 % of the composite, §4.11); no frame shadow and no rounded window corner on
+  server-side frames — a visual change with no gate, rounded corners already reverted once
+  (PR #63) — left out of Phase 5; the compositor's memory with four decorated windows was
+  measured with `foot` (which asks for server-side decorations; `lumen-square` asks for none).
+  Measured against the stage's base (interleaved, 6 runs each, `setarch -R`, pinned, load
+  0.8–1.4): `bench_ui_composite` render p50 at parity on CPU and GL in every row (decorated
+  full 2169 → 1971 µs CPU, 830 → 820 µs GL; hover repaint 4.8 → 4.8 µs CPU, 621 → 614 µs GL),
+  no frame allocates (`steady_titled_frame_allocates_nothing`), chrome `draw_command`s per
+  frame 0 on a primitive path (a hovered button was 1). The headless lavapipe compositor with
+  four idle `foot` windows settles in one of two RssAnon states, ≈50 MB or ≈61 MB, on both
+  builds: which one is set by start-up timing (with info logging on, the base build lands in
+  the higher one 3 runs in 4 and this one 1 in 4; without, the reverse), its heap allocations
+  are the same (heaptrack peak 75.31 vs 75.29 MB, in-use heap equal per state), and it is
+  pages of buffers both builds allocate being touched.
+- `lx.ui` multi-root: a `ui_context` per `ui_root`. **Done** (`lx.ui:context`; ui-architecture.md
+  "Several roots on one thread"): the damage ledger, overlay layer, timers and reducer queue
+  that were thread globals are one root's (≈1.4 KiB, no heap); a root's entry points scope its
+  context, and an invalidation from outside every scope finds its root by walking `parent()` to
+  the tree's root and a 32-entry thread table (no node field: `sizeof(ui_node)` stays 64 B;
+  `sizeof(ui_root)` 1232 → 1240 B). Async icon rasters damage each asking root still alive.
+  `ui_root(arena)` uses the thread-default context, so lx.app, the bench and the goldens are
+  unchanged; lx.app keeps its one-window refusal until `lx.ui.host`. Thread-wide by design:
+  the caches, the device scale, the frame clock, the percent base, the layout counters, the
+  text input's statics and the drop target. Deviations: the table's overflow uses
+  `overflow_action::warn_and_drop` (the enum has no `log_and_drop`); a node in no registered
+  tree keeps the thread default while a root uses it or none lives (a bare tree in a test),
+  and is dropped and counted (`layout_counters::damage_dropped`) only when every live root
+  has its own context; a destroyed root's icon waiters are skipped at the landing by the
+  context's serial rather than cancelled by `~ui_root`. `test_ui_multi_root` covers press,
+  tooltip timer, reducer, overlay hit test, posted damage, a late icon and G1 per root.
+  Measured against the stage's base (interleaved, 6 runs each, `setarch -R`, pinned, load
+  0.56–1.2): lumen-ui-bench tick p50 S2 95.2 → 93.3 µs cpu, 95.4 → 94.7 µs GL; S3 406 → 403 µs
+  cpu, 523 → 512 µs GL; S4 91.1 → 89.5 µs cpu, 134 → 132 µs GL — parity, inside each A/B's
+  spread; counters identical, 0 allocations per steady frame (G5's GL `mallinfo2` delta of
+  112–288 B is the driver's, on both builds).
+- `lx.wayland.client` for the shell and the host: layer surfaces, popups on layer parents,
+  subsurfaces. **Done**: `:layer` (`layer_surface` with `layer_handler`, gated on
+  wlr-layer-shell's glue alone — `not_implemented` without it, `test_wayland_client_nolayer`
+  builds that way and runs against the compositor), `popup::create` on a `layer_surface`
+  (`xdg_surface.get_popup` without a parent, then `zwlr_layer_surface_v1.get_popup`), and
+  `subsurface` in `:surface`. The layer shell (cap 5) is bound by the first layer surface, not
+  at connect, so an application window binds nothing new; a setter the bound version lacks
+  (`set_layer` < 2, `on_demand` < 4, `set_exclusive_edge` < 5) is not sent and returns false.
+  `test_wayland_client` covers the panel's configure (output width × 32) and zone (usable area
+  from y = 32), `set_layer` top → overlay, on_demand focus on map and on click, a grabbing
+  popup on the panel dismissed by a click on another client's window, `closed` on unplug, and
+  a subsurface composited above, then below, its parent (read back with wlr-screencopy).
+  Deviations: the objects follow the module's existing form (default-constructed, member
+  `create` returning `result<void>`, `set_handler`) rather than a static factory returning
+  `unique_ptr`; the output is a slot (`~0u`: the compositor's choice). Measured against the
+  stage's base (lumen-hello against one headless compositor, interleaved, 8 runs each,
+  `setarch -R`, pinned, load 0.29–0.66): RssAnon 4504 → 4508 kB on cpu, 27006 → 27012 kB on
+  gl — `sizeof(display)` grows by 40 B (one global slot) on `main`'s stack, which crosses a
+  stack page in one environment size of eight (equal in the other seven); start-up to connect
+  and to the first configure at parity inside each A/B's spread.
+- `lx.ui.host`: one context per UI thread, role-agnostic surfaces; lx.app rebased onto it.
+  **Done** (§4.13; api/README.md "lx.ui.host"): a layer-5 module — `:context` (ONE
+  `client_gpu`, renderer, atlas, glyph and icon cache per UI thread, the theme, the worker, one
+  timerfd at the earliest deadline over its surfaces, the seat router with one
+  `zwp_text_input_v3` per seat, the last press serial for popup grabs), `:surface` (moved from
+  lx.app's window: its own `ui_root` on its own `ui_context`, swapchain, frame loop, scale,
+  opaque / input regions; the frame ring opt-in), `:input` (moved from lx.app) and `:roles`
+  (toplevel, layer surface with keyboard interactivity and layer switchable live, popup on a
+  toplevel / popup / layer parent with a grab, desynchronized subsurface). lx.app's window is a
+  surface with the toplevel role; its public API is unchanged and an application may open up
+  to 32 windows (the one-window refusal is gone). lx.ui gains `image(atlas, tile, size_px)`
+  (one `poly_sprite` 1:1 on whole device pixels) and `text_block_node::attr_at` (the span
+  under a point). `lumen-hello --windows N` measures a surface's marginal cost. As GDK
+  (GdkSurface + GdkToplevel / GdkPopup) and QtWaylandClient (QWaylandWindow + a pluggable
+  shell integration, what layer-shell-qt plugs into) do, one connection-wide context drives
+  every surface; the roles are Qt's pluggable seam, not GTK 4's closed pair that
+  gtk4-layer-shell must interpose on; GPUI shares its renderer and atlas per window kind the
+  same way. `test_ui_host` (cpu and gl) covers two toplevels on one context (pointer by
+  target, keys to the focused one, modifiers on a focus change, own pixels on cpu, both idle),
+  a panel configured 1280 × 32 with zone 32 and keyboard interactivity switched live, a
+  grabbing popup on it dismissed by a click on another client, an alpha subsurface above a
+  toplevel, a surface destroyed mid-frame (its fds closed, unmapped, the others drawing),
+  pointer identity of the shared gpu, atlas and glyph cache, and 0 `operator new` over 300
+  frames of two surfaces drawn together (GL: the shared ring's slot waits recorded,
+  ≈ 13 ms and 2 ms over 300 frames). Measured against the stage's base (lumen-hello against
+  one headless compositor, interleaved, 5 runs each, `setarch -R`, pinned, load 0.04–0.6):
+  RssAnon 4508 → 4504 kB cpu, 27016–27020 → 27008–27016 kB gl, idle context switches 0;
+  `lumen-ui-bench --client` S1 G1 / G5 equal (1 switch in 10 s), S5 frame p50 78.2 → 80.6 µs
+  cpu and 408.5 → 407.5 µs gl (8 extra GL rounds: the tier is bimodal on both builds), S7
+  frame p50 1876 → 1896 µs cpu and 918 → 896 µs gl, 0 storm allocations, 30 reallocations;
+  S10 exec → first presented p50 40.95 → 40.9 ms cold and 25.65 → 25.2 ms warm (cpu, 6 × 20
+  start-ups). A surface's marginal RssAnon: ≈ 290–300 kB on cpu (2nd 284, 3rd 296, 4th
+  300 kB; 13 surfaces 297 kB each) and ≈ 200–210 kB on gl (2nd 196, 3rd 208, 4th 208 kB;
+  13 surfaces 207 kB each). Found on the way: with transparent huge pages `always`, the
+  surfaces' 512 KiB arenas, mapped side by side, merged into a region whose 2 MiB-aligned
+  stretch faulted in whole (+2 MiB at the 6th surface, +4 MiB at 13), so `memory_arena` maps
+  with `MADV_NOHUGEPAGE` as `page_mapping` already did (the compositor's RssAnon equal or
+  lower). Deviations: `image` takes the atlas and a tile id (a stable handle) rather than an
+  `atlas_tile` (a position that moves on a rebuild), and lays out at the tile's size over the
+  device scale; the context makes its caches with the first surface; lx.app's window keeps
+  its frame ring in itself (`surface_options::frame_ring`), as before; the gl tier's "no
+  corruption" check is the absence of failures over 300 frames, since the headless compositor
+  cannot read GL buffers back on this host (the cpu tier's pixels are compared).
 - Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
   rewritten, rendering-performance.md gains a UI section with the measured tables,
   api/README.md and architecture.md §3 for the new partitions, UML for the client frame

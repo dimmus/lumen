@@ -121,8 +121,9 @@ struct cursor_image_set {
 using cursor_frame_mailbox = latest_value<cursor_frame>;
 using cursor_image_mailbox = latest_value<cursor_image_set>;
 
-/// Compositor-owned textures (the software cursor, server-side frames), staged through the
-/// same queue as client shm content. Installed by the protocol layer, which owns the staging
+/// Compositor-owned textures (the software cursor; server-side frames, the snap preview and
+/// the fullscreen backdrop stage none since ADR-010 Phase 5), staged through the same queue
+/// as client shm content. Installed by the protocol layer, which owns the staging
 /// and the texture queue; no Wayland or backend type crosses it.
 struct compositor_texture_ops {
     /// Stages a premultiplied ARGB image (`width` x `height`, `stride_px` words per row) as

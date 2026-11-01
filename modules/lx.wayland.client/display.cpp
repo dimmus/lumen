@@ -23,6 +23,8 @@ struct global_desc {
     const char* interface;
     unsigned cap;
     bool required;
+    /// Bound by its first user (`display::bind_on_demand`), not at connect.
+    bool on_demand = false;
 };
 
 // Index = global_kind. Caps are the versions this wrapper implements (types.cppm).
@@ -44,6 +46,8 @@ constexpr global_desc k_globals[k_global_kinds] = {
     {"zxdg_output_manager_v1", 3, false},
     {"wl_data_device_manager", 3, false},
     {"zwp_primary_selection_device_manager_v1", 1, false},
+    // Only panels, docks and launchers make layer surfaces: an application never binds it.
+    {"zwlr_layer_shell_v1", 5, false, true},
 };
 
 constexpr unsigned k_seat_cap = 10;
@@ -84,6 +88,11 @@ const wl_interface* interface_of(global_kind k) {
     case global_kind::xdg_output: return &zxdg_output_manager_v1_interface;
     case global_kind::data_device_manager: return &wl_data_device_manager_interface;
     case global_kind::primary_selection: return &zwp_primary_selection_device_manager_v1_interface;
+#if LX_WLC_LAYER
+    case global_kind::layer_shell: return &zwlr_layer_shell_v1_interface;
+#else
+    case global_kind::layer_shell: return nullptr; // no glue: an extension global
+#endif
     case global_kind::count: break;
     }
     return nullptr;
@@ -138,6 +147,15 @@ void destroy_global(global_kind k, void* p, std::uint32_t version) {
     case global_kind::primary_selection:
         zwp_primary_selection_device_manager_v1_destroy(
             static_cast<zwp_primary_selection_device_manager_v1*>(p));
+        break;
+    case global_kind::layer_shell:
+#if LX_WLC_LAYER
+        // The destroy request exists since v3; before it the proxy just goes.
+        if (version >= ZWLR_LAYER_SHELL_V1_DESTROY_SINCE_VERSION)
+            zwlr_layer_shell_v1_destroy(static_cast<zwlr_layer_shell_v1*>(p));
+        else
+            wl_proxy_destroy(static_cast<wl_proxy*>(p));
+#endif
         break;
     case global_kind::count: break;
     }
@@ -304,11 +322,13 @@ lx::result<void> display::connect(const connect_options& options) {
     want_feedback_ = options.default_dmabuf_feedback;
     error_ = {};
     error_logged_ = false;
+    expect_hangup_ = false;
     for (unsigned i = 0; i < k_global_kinds; ++i) {
         globals_[i] = {};
         globals_[i].interface = k_globals[i].interface;
         globals_[i].cap = k_globals[i].cap;
         globals_[i].required = k_globals[i].required;
+        globals_[i].on_demand = k_globals[i].on_demand;
         proxies_[i] = nullptr;
     }
     display_ = options.fd >= 0 ? wl_display_connect_to_fd(options.fd)
@@ -346,7 +366,7 @@ lx::result<void> display::connect(const connect_options& options) {
     char missing[320]{};
     std::size_t used = 0;
     for (unsigned i = 0; i < k_global_kinds; ++i) {
-        if (globals_[i].bound)
+        if (globals_[i].bound || (globals_[i].on_demand && globals_[i].name))
             continue;
         const auto r = std::format_to_n(missing + used, sizeof(missing) - 1 - used, "{}{}",
                                         used ? " " : "", globals_[i].interface);
@@ -441,7 +461,7 @@ void display::note_error() {
         if (e == EPROTO)
             log_wl.error("protocol error: {}@{} code {}", error_.interface, error_.object_id,
                          error_.code);
-        else
+        else if (!expect_hangup_)
             log_wl.error("connection lost: {}", std::strerror(e));
     }
 }
@@ -557,13 +577,18 @@ void display::on_global(std::uint32_t name, const char* interface, std::uint32_t
     for (unsigned i = 0; i < k_global_kinds; ++i) {
         if (std::strcmp(interface, k_globals[i].interface) != 0)
             continue;
+        const wl_interface* iface = interface_of(static_cast<global_kind>(i));
+        if (!iface)
+            break; // its glue was not built: the caller may bind it (global_handler)
         global_info& g = globals_[i];
-        if (g.bound)
+        if (g.bound || (g.on_demand && g.name))
             return; // a second instance of a singleton: the first stays
         g.name = name;
         g.advertised = version;
+        if (g.on_demand)
+            return; // bound by its first user
         const std::uint32_t v = std::min<std::uint32_t>(version, g.cap);
-        void* p = wl_registry_bind(registry_, name, interface_of(static_cast<global_kind>(i)), v);
+        void* p = wl_registry_bind(registry_, name, iface, v);
         if (!p)
             return;
         g.bound = v;
@@ -632,6 +657,27 @@ void display::on_global(std::uint32_t name, const char* interface, std::uint32_t
         global_handler_->on_global(*this, name, interface, version);
 }
 
+void* display::bind_on_demand(global_kind k) {
+    check_affinity();
+    const auto i = static_cast<unsigned>(k);
+    if (i >= k_global_kinds)
+        return nullptr;
+    global_info& g = globals_[i];
+    if (proxies_[i] || !g.on_demand || !g.name || !registry_)
+        return proxies_[i];
+    const wl_interface* iface = interface_of(k);
+    if (!iface)
+        return nullptr;
+    const std::uint32_t v = std::min<std::uint32_t>(g.advertised, g.cap);
+    void* p = wl_registry_bind(registry_, g.name, iface, v);
+    if (!p)
+        return nullptr;
+    wl_proxy_set_tag(static_cast<wl_proxy*>(p), &lx_wlc_tag);
+    g.bound = v;
+    proxies_[i] = p;
+    return p;
+}
+
 void display::on_global_remove(std::uint32_t name) {
     for (auto& s : seats_)
         if (s.bound() && s.global_name() == name) {
@@ -653,9 +699,10 @@ void display::on_global_remove(std::uint32_t name) {
             return;
         }
     for (auto& g : globals_)
-        if (g.bound && g.name == name) {
+        if ((g.bound || g.on_demand) && g.name && g.name == name) {
             // A singleton going away: its proxy stays valid until disconnect (requests on
-            // it are ignored by the server); new objects are not made from it.
+            // it are ignored by the server); new objects are not made from it. One bound on
+            // demand and not used yet is simply no longer available.
             log_wl.warn("global {} removed", g.interface);
             g.name = 0;
             return;
@@ -762,6 +809,7 @@ lx::result<display::flush_status> display::flush() {
 lx::result<int> display::dispatch(int) { return lx::not_implemented("lx::wayland::display::dispatch"); }
 lx::result<void> display::roundtrip() { return lx::not_implemented("lx::wayland::display::roundtrip"); }
 void display::on_global(std::uint32_t, const char*, std::uint32_t) {}
+void* display::bind_on_demand(global_kind) { return nullptr; }
 void display::on_global_remove(std::uint32_t) {}
 void display::on_shm_format(std::uint32_t) {}
 void display::on_ping(std::uint32_t) {}

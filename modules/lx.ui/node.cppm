@@ -45,6 +45,9 @@ struct layout_counters {
     std::uint64_t measure_uncached = 0;
     std::uint64_t arranges = 0;
     std::uint64_t arrange_skips = 0;
+    /// Invalidations outside any root's scope whose node is in no registered tree, while
+    /// every live root has its own context (lx.ui:context): no root draws them.
+    std::uint64_t damage_dropped = 0;
     void (*on_measure)(const ui_node& node) = nullptr;
     void (*on_arrange)(const ui_node& node) = nullptr;
 };
@@ -575,9 +578,6 @@ public:
     void set_visible(bool visible);
     [[nodiscard]] bool visible() const;
 
-    void set_style(style_ref style);
-    [[nodiscard]] style_ref style() const;
-
     [[nodiscard]] lx::rect2i bounds() const;
 
     /// Layout must run again before the next emit: clears this node's measure cache and
@@ -600,7 +600,6 @@ protected:
     unsigned child_capacity_ = 0;
     element_key key_ = 0;
     lx::rect2i bounds_{};
-    style_ref style_{};
     bool visible_ = true;
     bool layout_dirty_ = true;
     /// `node_flag` bits, in what was padding.
@@ -657,9 +656,12 @@ template<typename NodeT, typename PropsT>
 } // namespace lx::ui
 
 namespace lx::ui::detail {
-/// Adds `region` to the UI thread's damage ledger (`ui_damage`, defined in :invalidate,
+/// Adds `region` to the current context's damage ledger (`ui_damage`; defined in :context,
 /// which this partition cannot import).
 void damage_rect(lx::rect2i region);
+/// Adds `region` (surface coordinates) to the ledger of `node`'s context (`context_of`):
+/// the current scope's, else its tree's root's (defined in :context).
+void damage_rect_of(const ui_node& node, lx::rect2i region);
 /// Adds `region` of `node`'s layout space, mapped to the surface (`surface_rect`).
 void damage_node(const ui_node& node, lx::rect2i region);
 /// Live nodes that override `child_viewport` with an offset (scroll containers) register
@@ -1674,7 +1676,7 @@ lx::point2i lx::ui::local_point(const ui_node& node, lx::point2i surface) {
 }
 
 void lx::ui::detail::damage_node(const ui_node& node, lx::rect2i region) {
-    damage_rect(surface_rect(node, region));
+    damage_rect_of(node, surface_rect(node, region));
 }
 
 int lx::ui::ui_node::ink_outset() const { return 0; }
@@ -1876,8 +1878,6 @@ void lx::ui::ui_node::set_key(element_key key) { key_ = key; }
 lx::ui::element_key lx::ui::ui_node::key() const { return key_; }
 void lx::ui::ui_node::set_visible(bool visible) { visible_ = visible; }
 bool lx::ui::ui_node::visible() const { return visible_; }
-void lx::ui::ui_node::set_style(style_ref style) { style_ = style; }
-lx::ui::style_ref lx::ui::ui_node::style() const { return style_; }
 lx::rect2i lx::ui::ui_node::bounds() const { return bounds_; }
 
 void lx::ui::ui_node::mark_layout_dirty() {

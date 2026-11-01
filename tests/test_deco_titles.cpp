@@ -9,6 +9,13 @@
 //     the `text.contrast` exponent — their mean stem weight is held to the CPU's within
 //     3 % and every pixel within 16/255 (measured below; see `vk_titles_in_the_linear_pass`);
 //   - a dimmed (not-responding) frame's fill and glyph colours agree on every backend;
+//   - the close button's circle is a primitive (Phase 5): against the 64x64 decoration
+//     atlas's circle it replaced, identical inside on CPU and GL, its anti-aliased edge now
+//     blended in the encoded space on the CPU (measured and reported);
+//   - the paths without a primitive renderer (a GLES 2 context, Vulkan without `:ui_vk`)
+//     draw the titles, the × and the circle through `lower_to_blits` — coverage blits from
+//     the atlas's pages and a rounded solid blit — against GLES 3.1's primitive path within
+//     2/255 away from anti-aliased edges (edges measured and reported);
 //   - a Vulkan frame without primitives is the blit composite byte for byte; the
 //     compositor waits for a UI renderer's frames before it drops a texture they sampled;
 //   - screen capture's re-composite and the headless dump draw the titles too;
@@ -60,8 +67,6 @@ using lx::compositor::deco_button;
 constexpr int k_w = 320;
 constexpr int k_h = 176;
 constexpr lx::color k_black = lx::color::rgb(0.f, 0.f, 0.f);
-/// The decoration atlas (circles, the fallback close glyph) counts as staged.
-bool g_atlas_ready = true;
 
 /// `cpu_compositor`'s dim of an encoded byte (0.65 as 166/256), per channel of `rgb`.
 [[nodiscard]] constexpr std::uint32_t dimmed(std::uint32_t rgb) {
@@ -71,11 +76,36 @@ bool g_atlas_ready = true;
     return out;
 }
 
-/// The decoration atlas (button circles, the close glyph's fallback), premultiplied ARGB.
-const std::vector<std::uint32_t>& deco_atlas() {
+/// The circles of the 64x64 decoration atlas Phase 4 drew the close button's hover / pressed
+/// circle from (deleted in Phase 5), premultiplied ARGB, rebuilt to measure the primitive
+/// circle against: coverage c + ½ − |p − centre| at each texel centre, c = 10.
+constexpr unsigned k_old_atlas_size = 64;
+constexpr unsigned k_old_atlas_texture = 0x7FFF'FE00u;
+constexpr lx::rect2i k_old_circle_hover{0, 24, 20, 20};
+constexpr lx::rect2i k_old_circle_pressed{24, 24, 20, 20};
+const std::vector<std::uint32_t>& old_deco_atlas() {
     static const std::vector<std::uint32_t> a = [] {
-        std::vector<std::uint32_t> px(lx::compositor::k_deco_atlas_size * lx::compositor::k_deco_atlas_size);
-        lx::compositor::build_deco_atlas(px.data());
+        std::vector<std::uint32_t> px(k_old_atlas_size * k_old_atlas_size, 0u);
+        const auto circle = [&](lx::rect2i r, std::uint32_t rgb) {
+            const double c = r.width / 2.0;
+            for (int y = 0; y < r.height; ++y)
+                for (int x = 0; x < r.width; ++x) {
+                    const double dx = x + 0.5 - c, dy = y + 0.5 - c;
+                    double cov = c + 0.5 - std::sqrt(dx * dx + dy * dy);
+                    if (cov <= 0.0)
+                        continue;
+                    cov = cov > 1.0 ? 1.0 : cov;
+                    const auto ch = [&](unsigned sh) {
+                        return static_cast<std::uint32_t>(((rgb >> sh) & 0xFFu) * cov + 0.5);
+                    };
+                    px[static_cast<std::size_t>(r.y + y) * k_old_atlas_size +
+                       static_cast<std::size_t>(r.x + x)] =
+                        (static_cast<std::uint32_t>(255.0 * cov + 0.5) << 24) | (ch(16) << 16) |
+                        (ch(8) << 8) | ch(0);
+                }
+        };
+        circle(k_old_circle_hover, lx::compositor::k_deco_button_hover);
+        circle(k_old_circle_pressed, lx::compositor::k_deco_button_pressed);
         return px;
     }();
     return a;
@@ -186,7 +216,6 @@ struct desktop {
                 f->active = w.active;
                 f->button = w.button;
                 f->dimmed = w.not_responding;
-                f->atlas_ready = &g_atlas_ready;
                 f->title = tt.get();
                 f->text = &e.text;
                 (void)scene->root().add(f.get());
@@ -237,13 +266,14 @@ lx::gfx::cpu_compositor& cpu_comp() {
     static lx::gfx::cpu_compositor comp;
     static bool registered = false;
     if (!registered) {
+        // Only the Phase 4 circle measurement samples it.
         registered = true;
         lx::gfx::pixel_surface a{};
-        a.pixels = reinterpret_cast<unsigned char*>(const_cast<std::uint32_t*>(deco_atlas().data()));
-        a.width = a.height = lx::compositor::k_deco_atlas_size;
-        a.stride = lx::compositor::k_deco_atlas_size * 4u;
+        a.pixels = reinterpret_cast<unsigned char*>(const_cast<std::uint32_t*>(old_deco_atlas().data()));
+        a.width = a.height = k_old_atlas_size;
+        a.stride = k_old_atlas_size * 4u;
         a.format = static_cast<lx::fourcc>(lx::pixel_format::argb8888);
-        LUMEN_CHECK(static_cast<bool>(comp.register_texture(lx::compositor::k_deco_atlas_texture_id, a)));
+        LUMEN_CHECK(static_cast<bool>(comp.register_texture(k_old_atlas_texture, a)));
     }
     return comp;
 }
@@ -291,9 +321,8 @@ int max_diff(const std::vector<std::uint32_t>& a, const std::vector<std::uint32_
     return max_diff(a, b, [](int, int) { return true; });
 }
 
-/// The close buttons of `ws` whose circle shows (hovered, pressed): a blit of the decoration
-/// atlas, whose anti-aliased edge the CPU compositor blends in linear light and GL in the
-/// encoded space, as every blit always was — not what these tests compare.
+/// The close buttons of `ws` whose circle shows (hovered, pressed): a quad primitive whose
+/// anti-aliased edge Vulkan blends in linear light and CPU and GL in the encoded space.
 bool in_circle(std::span<const titled_window> ws, double scale, int x, int y) {
     for (const titled_window& w : ws) {
         if (w.button == deco_button::normal)
@@ -449,9 +478,8 @@ gl_env* shared_gl() {
         std::printf("    (gl skip: initialisation failed)\n");
         return nullptr;
     }
-    const std::vector<unsigned char> atlas = rgba_of(deco_atlas());
-    if (!e->comp.upload_rgba(lx::compositor::k_deco_atlas_texture_id, lx::compositor::k_deco_atlas_size,
-                             lx::compositor::k_deco_atlas_size, atlas.data()))
+    const std::vector<unsigned char> atlas = rgba_of(old_deco_atlas());
+    if (!e->comp.upload_rgba(k_old_atlas_texture, k_old_atlas_size, k_old_atlas_size, atlas.data()))
         return nullptr;
     auto t = lx::gfx::ui_gl_target::create(k_w, k_h);
     if (!t)
@@ -509,12 +537,6 @@ vk_env* shared_vk() {
     }
     if (auto ok = e->ui.initialize(e->device.context()); !ok) {
         std::printf("    (vk skip: %s)\n", ok.get_error().message);
-        return nullptr;
-    }
-    const std::vector<unsigned char> atlas = rgba_of(deco_atlas());
-    if (!e->comp.upload_rgba(lx::compositor::k_deco_atlas_texture_id, lx::compositor::k_deco_atlas_size,
-                             lx::compositor::k_deco_atlas_size, atlas.data())) {
-        std::printf("    (vk skip: atlas upload failed)\n");
         return nullptr;
     }
     auto t = lx::gfx::render_target::create(e->device.context(), k_w, k_h);
@@ -922,11 +944,10 @@ LUMEN_TEST(gl_titles_match_cpu) {
         dump(scale == 1.0 ? "gl" : "gl-125", gl);
         const std::span<const titled_window> ws = scale == 1.0 ? std::span<const titled_window>{k_windows}
                                                                : std::span<const titled_window>{k_windows_125};
+        // The button circles included: both blend them, as every primitive, in the encoded space.
         int x = 0, y = 0;
-        const int worst = max_diff(cpu, gl, [&](int px, int py) { return !in_circle(ws, scale, px, py); },
-                                   &x, &y);
-        std::printf("    scale %.2f: max channel error %d/255 vs CPU at (%d, %d) (button circles aside)\n",
-                    scale, worst, x, y);
+        const int worst = max_diff(cpu, gl, [](int, int) { return true; }, &x, &y);
+        std::printf("    scale %.2f: max channel error %d/255 vs CPU at (%d, %d)\n", scale, worst, x, y);
         LUMEN_CHECK(worst <= 3);
         if (scale == 1.0) {
             // The dimmed frame: its fill and its glyphs' full-coverage pixels carry the CPU's
@@ -934,6 +955,154 @@ LUMEN_TEST(gl_titles_match_cpu) {
             const lx::rect2i tc = lx::compositor::title_rect(k_windows[2].geometry);
             LUMEN_CHECK((gl[static_cast<std::size_t>((tc.y + 2) * k_w + tc.x + 2)] & 0xFFFFFFu) ==
                         dimmed(0x48484Cu));
+        }
+    }
+}
+
+// ── The close button's circle: a primitive since Phase 5 ─────────────────────────────
+
+namespace {
+
+/// `snap`'s stream as Phase 4 drew it: every rounded quad (a close button's circle) replaced
+/// by the `surface` ref of the blit it was — the decoration atlas's circle over the quad's
+/// rect (the projected 20 px square), clipped to the projected title bar, tinted by the dim of
+/// a not-responding frame. One batch per ref (some changed kind).
+struct phase4_stream {
+    std::vector<lx::gfx::primitive_ref> refs;
+    std::vector<lx::gfx::batch> batches;
+    std::vector<lx::gfx::blit_command> surfaces;
+    lx::gfx::ui_stream stream{};
+    unsigned circles = 0;
+};
+
+void phase4_of(lx::compositor::frame_painter& painter, const lx::scene::immutable_frame_snapshot& snap,
+               phase4_stream& p) {
+    const auto blits = painter.surfaces(snap);
+    p.surfaces.assign(blits.begin(), blits.end());
+    const lx::gfx::ui_stream s = painter.stream(snap);
+    p.refs.assign(s.refs.begin(), s.refs.end());
+    const auto dim = [](unsigned v) { return (v * 166u) >> 8u; };
+    for (lx::gfx::primitive_ref& r : p.refs) {
+        if (r.kind != lx::gfx::primitive_kind::quad || r.index >= s.quads.size())
+            continue;
+        const lx::gfx::quad_instance& q = s.quads[r.index];
+        if ((q.radii[0] & 0x7FFFu) == 0)
+            continue;
+        const auto red = static_cast<unsigned>(std::lround(lx::gfx::from_half(q.background[0]) * 255.f));
+        const bool pressed = red == 0xB8u || red == dim(0xB8u);
+        const bool dimmed = red == dim(0xE0u) || red == dim(0xB8u);
+        lx::gfx::blit_command b{};
+        b.texture_id = k_old_atlas_texture;
+        const lx::rect2i c = pressed ? k_old_circle_pressed : k_old_circle_hover;
+        b.src = {static_cast<float>(c.x), static_cast<float>(c.y), static_cast<float>(c.width),
+                 static_cast<float>(c.height)};
+        b.dst = {static_cast<int>(q.bounds[0]), static_cast<int>(q.bounds[1]),
+                 static_cast<int>(q.bounds[2]), static_cast<int>(q.bounds[3])};
+        b.clip = {static_cast<int>(q.clip[0]), static_cast<int>(q.clip[1]),
+                  static_cast<int>(q.clip[2]), static_cast<int>(q.clip[3])};
+        b.blend = lx::blend_mode::premultiplied;
+        b.tint = dimmed ? lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f) : lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+        r.kind = lx::gfx::primitive_kind::surface;
+        r.index = static_cast<std::uint32_t>(p.surfaces.size());
+        p.surfaces.push_back(b);
+        ++p.circles;
+    }
+    p.batches.clear();
+    for (unsigned i = 0; i < p.refs.size(); ++i)
+        p.batches.push_back({p.refs[i].kind, p.refs[i].page, i, 1, {0, 0, k_w, k_h}});
+    p.stream = s;
+    p.stream.refs = p.refs;
+    p.stream.batches = p.batches;
+    p.stream.surfaces = p.surfaces;
+}
+
+/// Where the circles of `ws` are at `scale`: 0 outside every one, 1 on an anti-aliased edge,
+/// 2 inside. The edge is the old circle's ramp: its texels ramp over one texel at the radius,
+/// and away from scale 1 bilinear resampling spreads that by another texel — ½ + `scale`
+/// output pixels each side of the radius, with the pixel's own half.
+int circle_zone(std::span<const titled_window> ws, double scale, int x, int y) {
+    const lx::scene::output_projection proj{{0, 0}, scale, {k_w, k_h}};
+    int zone = 0;
+    for (const titled_window& w : ws) {
+        if (w.button == deco_button::normal)
+            continue;
+        const lx::rect2i c = lx::compositor::close_rect(w.geometry);
+        const int d = lx::compositor::k_deco_close_circle;
+        const lx::rect2i r = lx::scene::project_node(proj, {w.geometry.x, w.geometry.y},
+                                                     {c.x + (c.width - d) / 2, c.y + (c.height - d) / 2},
+                                                     {d, d});
+        const double cx = r.x + r.width / 2.0, cy = r.y + r.height / 2.0;
+        const double rad = std::min(r.width, r.height) / 2.0;
+        const double dist = std::hypot(x + 0.5 - cx, y + 0.5 - cy);
+        const double band = 0.5 + scale;
+        if (dist <= rad - band)
+            return 2;
+        if (dist < rad + band)
+            zone = 1;
+    }
+    return zone;
+}
+
+} // namespace
+
+// The hover / pressed circle is one quad (radius half its side) where Phase 4 blitted the
+// decoration atlas's circle: the same coverage function at scale 1 (½ − (|p − c| − r)). On
+// CPU and GL the pixels inside the circle and everywhere off it are the old ones; only the
+// anti-aliased edge moves, on the CPU, from the blit's linear-light blend to the primitives'
+// encoded-space one (the measured difference is printed). At 1.25 the old circle was the
+// 20 px texture resampled to 25 px; the quad is drawn at 25 px.
+LUMEN_TEST(close_circle_matches_the_atlas_circle_inside) {
+    gl_env* g = shared_gl();
+    for (const double scale : {1.0, 1.25}) {
+        const std::span<const titled_window> ws =
+            scale == 1.0 ? std::span<const titled_window>{k_windows} : std::span<const titled_window>{k_windows_125};
+        desktop d{ws, scale};
+        for (const bool gl : {false, true}) {
+            if (gl && !g)
+                continue;
+            const std::vector<std::uint32_t> now = gl ? paint_gl(*g, d) : paint_cpu(d);
+            std::vector<std::uint32_t> before(static_cast<std::size_t>(k_w * k_h), 0u);
+            {
+                lx::compositor::frame_painter painter;
+                const auto& snap = d.publish();
+                phase4_stream p{};
+                phase4_of(painter, snap, p);
+                LUMEN_CHECK(p.circles == 1);
+                const std::lock_guard<std::mutex> lock{env().atlas.mutex()};
+                if (gl) {
+                    g->ui.set_surface_compositor(&g->comp);
+                    LUMEN_CHECK(static_cast<bool>(g->ui.draw(g->target->framebuffer(), k_w, k_h, p.stream,
+                                                             &env().atlas.atlas(), full_region(),
+                                                             snap.clear_color())));
+                    auto fence = g->comp.fence_frame();
+                    if (fence && fence.value() >= 0)
+                        ::close(fence.value());
+                    LUMEN_CHECK(static_cast<bool>(g->target->read_back(before)));
+                } else {
+                    lx::gfx::ui_cpu_renderer ui;
+                    ui.set_surface_compositor(&cpu_comp());
+                    LUMEN_CHECK(static_cast<bool>(ui.draw(surface_of(before, k_w, k_h), p.stream,
+                                                          &env().atlas.atlas(), full_region(),
+                                                          snap.clear_color())));
+                }
+                d.release(snap);
+            }
+            int worst[3] = {0, 0, 0};
+            unsigned count[3] = {0, 0, 0};
+            for (int y = 0; y < k_h; ++y)
+                for (int x = 0; x < k_w; ++x) {
+                    const int z = circle_zone(ws, scale, x, y);
+                    const std::size_t i = static_cast<std::size_t>(y * k_w + x);
+                    ++count[z];
+                    for (unsigned sh = 0; sh < 24; sh += 8)
+                        worst[z] = std::max(worst[z], std::abs(channel(now[i], sh) - channel(before[i], sh)));
+                }
+            std::printf("    %s scale %.2f: vs the atlas circle — inside %d/255 (%u px), edge %d/255 "
+                        "(%u px), elsewhere %d/255\n",
+                        gl ? "gl " : "cpu", scale, worst[2], count[2], worst[1], count[1], worst[0]);
+            LUMEN_CHECK(count[2] > 100);
+            LUMEN_CHECK(worst[2] <= 2);
+            LUMEN_CHECK(worst[0] == 0);
         }
     }
 }
@@ -1097,10 +1266,6 @@ LUMEN_TEST(vk_damage_limited_titles_match_a_full_repaint) {
         std::printf("    SKIP: no second compositor\n");
         return;
     }
-    const std::vector<unsigned char> atlas = rgba_of(deco_atlas());
-    LUMEN_CHECK(static_cast<bool>(ref.upload_rgba(lx::compositor::k_deco_atlas_texture_id,
-                                                  lx::compositor::k_deco_atlas_size,
-                                                  lx::compositor::k_deco_atlas_size, atlas.data())));
     lx::gfx::render_target slots[3]{};
     lx::gfx::render_target ref_target{};
     for (auto* t : {&slots[0], &slots[1], &slots[2], &ref_target}) {
@@ -1228,6 +1393,157 @@ LUMEN_TEST(vk_gpu_timing_times_the_linear_pass) {
     (void)paint_vk(*v, d, &res);
     LUMEN_CHECK(res.composite.gpu_serial == 0);
     LUMEN_CHECK(v->comp.take_gpu_times(t, lx::gfx::vulkan_compositor::k_gpu_times) == 0);
+}
+
+// ── Paths without a primitive renderer ───────────────────────────────────────────────
+
+namespace {
+
+/// Pixels of `ref` whose 3×3 neighbourhood is one colour: away from every anti-aliased edge.
+std::vector<bool> flat_mask(const std::vector<std::uint32_t>& ref) {
+    std::vector<bool> flat(ref.size(), false);
+    for (int y = 1; y + 1 < k_h; ++y)
+        for (int x = 1; x + 1 < k_w; ++x) {
+            const std::uint32_t c = ref[static_cast<std::size_t>(y * k_w + x)] & 0xFFFFFFu;
+            bool same = true;
+            for (int dy = -1; dy <= 1 && same; ++dy)
+                for (int dx = -1; dx <= 1 && same; ++dx)
+                    same = (ref[static_cast<std::size_t>((y + dy) * k_w + x + dx)] & 0xFFFFFFu) == c;
+            flat[static_cast<std::size_t>(y * k_w + x)] = same;
+        }
+    return flat;
+}
+
+} // namespace
+
+// GLES 2 (a context asked for as GLES 2: no `:ui_gl`) and Vulkan without `:ui_vk` lower the
+// stream (`lower_to_blits`): the fills and the circle as solid blits (the circle with its
+// radius), the title and the × as coverage blits from the atlas's R8 pages the backend
+// uploaded (`sync_atlas`). Nothing is dropped, the titles, the × and the circle are there,
+// and against GLES 3.1's primitive path every pixel away from an anti-aliased edge is within
+// 2/255; the edges (GLES 2: the same encoded-space blend, so nearly equal; Vulkan: linear
+// light, no `text.contrast`) are measured and printed. Lavapipe: correctness only.
+LUMEN_TEST(lowered_paths_draw_titles_close_and_circle) {
+    gl_env* g = shared_gl();
+    if (!g) {
+        std::printf("    SKIP: no GLES 3.1 reference\n");
+        return;
+    }
+    vk_env* v = shared_vk();
+    // Every title and close glyph rasterised before any paint: each backend then uploads the
+    // atlas whole on its first lowered frame (a second consumer of one atlas is a test's).
+    desktop d1{k_windows};
+    desktop d125{k_windows_125, 1.25};
+
+    const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    LUMEN_CHECK(fd >= 0);
+    if (fd < 0)
+        return;
+    {
+        auto device = lx::gfx::egl_device::create(fd, true);
+        LUMEN_CHECK(static_cast<bool>(device));
+        if (!device) {
+            ::close(fd);
+            return;
+        }
+        std::printf("    gles2: %s, context GLES %d.%d\n", device->renderer(), device->gles_major(),
+                    device->gles_minor());
+        lx::gfx::gl_compositor comp;
+        LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+        auto target = lx::gfx::gl_scanout_target::create(
+            *device, k_w, k_h, static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));
+        LUMEN_CHECK(static_cast<bool>(target));
+        lx::compositor::frame_painter es2_painter;
+        lx::compositor::frame_painter vk_painter;
+        for (desktop* d : {&d1, &d125}) {
+            const double scale = d == &d1 ? 1.0 : 1.25;
+            const std::span<const titled_window> ws =
+                d == &d1 ? std::span<const titled_window>{k_windows} : std::span<const titled_window>{k_windows_125};
+            LUMEN_CHECK(static_cast<bool>(g->device.make_current()));
+            const std::vector<std::uint32_t> ref = paint_gl(*g, *d);
+            const std::vector<bool> flat = flat_mask(ref);
+            const auto report = [&](const char* name, const std::vector<std::uint32_t>& px,
+                                    const lx::compositor::frame_paint_stats& st) {
+                int inside = 0, edge = 0, ix = 0, iy = 0;
+                for (int y = 0; y < k_h; ++y)
+                    for (int x = 0; x < k_w; ++x) {
+                        const std::size_t i = static_cast<std::size_t>(y * k_w + x);
+                        for (unsigned sh = 0; sh < 24; sh += 8) {
+                            const int e = std::abs(channel(px[i], sh) - channel(ref[i], sh));
+                            if (flat[i] && e > inside) {
+                                inside = e;
+                                ix = x;
+                                iy = y;
+                            }
+                            if (!flat[i])
+                                edge = std::max(edge, e);
+                        }
+                    }
+                std::printf("    %s scale %.2f: lowered %u, dropped %u; vs GLES 3.1 away from edges "
+                            "%d/255 (at %d, %d), anti-aliased edges %d/255\n",
+                            name, scale, st.lowered, st.dropped, inside, ix, iy, edge);
+                LUMEN_CHECK(st.dropped == 0 && st.lowered > 0);
+                LUMEN_CHECK(inside <= 2);
+                // The titles, the × and the circle are there: ink in every bar, the hover /
+                // pressed colour around the circle's centre, light × strokes on it.
+                for (const titled_window& w : ws) {
+                    const std::uint32_t bar_rgb =
+                        w.active ? lx::compositor::k_deco_title_active : lx::compositor::k_deco_title_inactive;
+                    const std::uint32_t bar = w.not_responding ? dimmed(bar_rgb) : bar_rgb;
+                    if (scale == 1.0)
+                        LUMEN_CHECK(ink_in_title(px, w.geometry, bar) > (w.not_responding ? 10u : 30u));
+                    const lx::rect2i c = lx::compositor::close_rect(w.geometry);
+                    const int cx = static_cast<int>(std::floor((c.x + c.width / 2.0) * scale));
+                    const int cy = static_cast<int>(std::floor((c.y + c.height / 2.0) * scale));
+                    const std::uint32_t mid = px[static_cast<std::size_t>(cy * k_w + cx)];
+                    LUMEN_CHECK(channel(mid, 8) > channel(bar, 8) + 0x20); // the × crosses the centre
+                    if (w.button != deco_button::normal) {
+                        const int ox = cx - static_cast<int>(std::lround(7 * scale));
+                        const std::uint32_t red = px[static_cast<std::size_t>(cy * k_w + ox)];
+                        LUMEN_CHECK(channel(red, 16) > channel(red, 8) + 0x40); // inside the circle
+                    }
+                }
+            };
+            {
+                LUMEN_CHECK(static_cast<bool>(device->make_current()));
+                const auto& snap = d->publish();
+                auto p = es2_painter.paint_gl(comp, nullptr, target->framebuffer(), k_w, k_h, snap,
+                                              full_region(), &env().atlas);
+                LUMEN_CHECK(p && !p->paint.stream);
+                if (p && p->composite.out_fence_fd >= 0)
+                    ::close(p->composite.out_fence_fd);
+                d->release(snap);
+                std::vector<unsigned char> rgba(static_cast<std::size_t>(k_w * k_h) * 4u);
+                LUMEN_CHECK(static_cast<bool>(
+                    comp.read_back(*target, rgba.data(), static_cast<unsigned>(rgba.size()))));
+                std::vector<std::uint32_t> px(static_cast<std::size_t>(k_w * k_h));
+                for (std::size_t i = 0; i < px.size(); ++i)
+                    px[i] = 0xFF000000u | (static_cast<std::uint32_t>(rgba[i * 4]) << 16u) |
+                            (static_cast<std::uint32_t>(rgba[i * 4 + 1]) << 8u) | rgba[i * 4 + 2];
+                dump(scale == 1.0 ? "gles2" : "gles2-125", px);
+                if (p)
+                    report("gles2 ", px, p->paint);
+            }
+            if (v) {
+                const auto& snap = d->publish();
+                auto p = vk_painter.paint_vk(v->comp, nullptr, v->target, snap, &env().atlas);
+                LUMEN_CHECK(p && !p->paint.stream);
+                if (p && p->composite.out_fence_fd >= 0)
+                    ::close(p->composite.out_fence_fd);
+                d->release(snap);
+                const std::vector<std::uint32_t> px = read_vk(*v);
+                dump(scale == 1.0 ? "vk-lowered" : "vk-lowered-125", px);
+                if (p)
+                    report("vulkan", px, p->paint);
+            } else {
+                std::printf("    (vk skip: no Vulkan device)\n");
+            }
+        }
+        // The GL objects go with this context current (destroyed in reverse order here).
+        LUMEN_CHECK(static_cast<bool>(device->make_current()));
+    }
+    ::close(fd);
+    LUMEN_CHECK(static_cast<bool>(g->device.make_current()));
 }
 
 // Last: with LUMEN_VULKAN_VALIDATION=1, the validation layer's log holds no error.

@@ -1,12 +1,15 @@
 sequenceDiagram
     participant C as lumen-compositor
     participant D as lx.wayland.client (display_source)
-    participant W as lx.app::window (frame source)
-    participant R as lx.ui::ui_root
+    participant X as lx.ui.host::context (seat router, timerfd)
+    participant W as lx.ui.host::surface (frame source; any role)
+    participant R as lx.ui::ui_root (its own ui_context)
     participant S as lx.gfx client_swapchain (cpu / gl / vulkan)
-    Note over D,S: one UI thread, one lx::runtime::event_loop (ADR-010 §4.9, §4.12; Phase 4)
+    Note over D,S: one UI thread, one lx::runtime::event_loop, N surfaces on one context (ADR-010 §4.9, §4.12; Phase 4, Phase 5)
     C->>D: wl_pointer motion + frame (or a key, a text-input done, a configure)
-    D->>W: input_router keeps the latest position (no hit test yet)
+    D->>X: seat event (pointer / touch: its target surface; keys: the keyboard focus)
+    X->>W: input_router keeps the latest position (no hit test yet)
+    Note over X,W: a configure goes to the role (toplevel / layer / popup), which hands the surface its size and serial
     Note over W: due now: work in the ledger and no frame callback outstanding<br/>(from idle the frame is drawn in this iteration, no round trip)
     W->>R: flush_motion: one hit test, pointer_move → hover → ledger
     W->>W: geometry: a pending configure's size, the preferred scale, swapchain resize
@@ -14,13 +17,14 @@ sequenceDiagram
     S-->>W: image + its age → ui_root::add_repaint (repaint, not damage)
     W->>R: tick (emit_scope::damage): describe · reconcile · layout · emit
     W->>W: draw_list::batch_for_render (order)
-    W->>S: ui_cpu / ui_gl / ui_vk draw, scissored per repaint rect
+    W->>S: the context's ui_cpu / ui_gl / ui_vk draw (shared atlas), scissored per repaint rect
     W->>S: present(image, damage): native fence / sync_file, or none on shm
-    W->>C: ack_configure (if this frame answers one), attach, damage_buffer × ≤ 16
+    W->>C: the role's ack_configure (if this frame answers one), attach, damage_buffer × ≤ 16
     W->>C: syncobj acquire/release points (explicit sync), frame callback, wp_presentation
     W->>C: wl_surface.commit — the ledger is cleared only now
-    W->>W: frame_record: start, commit, per-stage ns, thread CPU ns, damage
+    W->>W: frame_record (with frame_records on): start, commit, per-stage ns, thread CPU ns, damage
     C-->>D: wl_callback.done — work left: draw again; none: request nothing more
     C-->>D: wp_presentation.presented (time, refresh, sequence) → frame_record
     C-->>D: wl_buffer.release (or the release point signals the swapchain's eventfd)
-    Note over W: idle (G1): no ledger entry, no animation, no timer, no key held →<br/>no callback requested, nothing submitted, timerfd disarmed, epoll blocks with no timeout
+    X->>X: after the dispatch: the timerfd armed at the earliest deadline of all surfaces (none: disarmed)
+    Note over X,W: idle (G1), per surface: no ledger entry, no animation, no timer, no key held →<br/>no callback requested, nothing submitted; with every surface idle the timerfd is disarmed and epoll blocks with no timeout

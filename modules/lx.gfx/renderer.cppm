@@ -8,6 +8,7 @@ import std;
 import :headless;
 import :damage;
 import :color;
+import :primitives;
 
 export namespace lx::gfx {
 
@@ -56,6 +57,15 @@ struct blit_command {
     bool scaled = false;
     /// Covered by an opaque draw above it: skipped (identical pixels).
     bool occluded = false;
+    /// A rounded solid (a quad primitive `lower_to_blits` lowered): with `solid`, the radius of
+    /// every corner of `dst` in target pixels, at most half its shorter side, as f16 bits (the
+    /// quad's own encoding; `corner_radius_px`). The draw covers the rounded box with
+    /// `:ui_cpu`'s quad coverage — saturate(½ − d) of the rounded-box distance at each pixel
+    /// centre — times `solid_color`, blended as a solid draw. 0: the square `dst`. Drawn by GL
+    /// (a program built on the first such draw) and Vulkan; the CPU compositor reports it
+    /// unsupported (its frames with primitives go through `:ui_cpu`). It sits in what was the
+    /// padding after the flags above: the struct did not grow.
+    std::uint16_t corner_radius = 0;
     /// The part the opaque draws above leave visible, when they cover some of it: up to
     /// `k_max_visible_rects` disjoint rects in target pixels, inside the clipped `dst`
     /// (`scene::draw_command::visible`). Zero: the whole draw. A backend draws only inside
@@ -68,6 +78,13 @@ struct blit_command {
     /// nothing is uploaded; an opaque, untinted one is a scissored clear where the backend
     /// has one.
     bool solid = false;
+    /// A coverage draw (a `mono_sprite` `lower_to_blits` lowered): `texture_id` is an R8
+    /// page of a glyph atlas (`atlas_page_texture`, uploaded by the backend's `sync_atlas`),
+    /// `src` the tile's texels, and each pixel is `solid_color` (premultiplied, encoded) ×
+    /// the sampled coverage, blended as a solid draw. `solid` stays false. Drawn by GL and
+    /// Vulkan; the CPU compositor reports it unsupported, as `corner_radius`. (In the padding
+    /// after `solid`.)
+    bool coverage = false;
     lx::color solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
     /// A backdrop blur (ext-background-effect-v1): no texture; `dst` (inside `clip` and
     /// `visible`, as any draw) shows what the draws before it put in the target, blurred
@@ -79,6 +96,9 @@ struct blit_command {
     bool blur = false;
     unsigned blur_source = 0;
     lx::rect2i blur_box{};
+
+    /// `corner_radius` in target pixels.
+    [[nodiscard]] float corner_radius_px() const { return from_half(corner_radius); }
 };
 
 /// A draw whose effective alpha (opacity × tint alpha) is zero changes no pixel: every

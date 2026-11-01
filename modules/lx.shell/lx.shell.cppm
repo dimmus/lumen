@@ -13,6 +13,11 @@ module;
 #include <sys/timerfd.h>
 #include <unistd.h>
 
+#if defined(LUMEN_HAS_XKBCOMMON)
+#include <sys/mman.h>
+#include <xkbcommon/xkbcommon.h>
+#endif
+
 #include <wayland-client.h>
 #include "cursor-shape-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -53,7 +58,10 @@ import lx.foundation;
 import lx.shell.policy;
 import lx.trace;
 import lx.config;
+import lx.runtime;
 import lx.text;
+import lx.wayland.client;
+import lx.ui.host;
 
 export module lx.shell;
 
@@ -134,6 +142,32 @@ struct shell_config {
 /// notice expiry, catalog debounce, activation-token timeout — only armed while one of them
 /// is due) and, once a launch opened it, the user bus. Exit status: 0 on SIGINT/SIGTERM, 1
 /// when the compositor refuses or goes away (the systemd unit restarts it).
+/// The shell's wl_keyboard state: the compositor's keymap and modifier state. Without
+/// LUMEN_HAS_XKBCOMMON every key is ignored (the launcher is then pointer-only).
+class xkb_keyboard {
+public:
+    xkb_keyboard() = default;
+    ~xkb_keyboard();
+    xkb_keyboard(const xkb_keyboard&) = delete;
+    xkb_keyboard& operator=(const xkb_keyboard&) = delete;
+
+    /// wl_keyboard.keymap (XKB_V1). Takes ownership of `fd`.
+    bool set_keymap(int fd, std::uint32_t size);
+    void update_mods(std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked,
+                     std::uint32_t group);
+    /// A key press (`code` is the evdev code, as wl_keyboard.key sends it).
+    [[nodiscard]] bool press(std::uint32_t code, key_press& out) const;
+    [[nodiscard]] bool ctrl() const;
+    [[nodiscard]] bool shift() const;
+    [[nodiscard]] bool alt() const;
+    [[nodiscard]] bool ready() const { return state_ != nullptr; }
+
+private:
+    void* ctx_ = nullptr;    // xkb_context*
+    void* keymap_ = nullptr; // xkb_keymap*
+    void* state_ = nullptr;  // xkb_state*
+};
+
 class shell_app {
 public:
     explicit shell_app(shell_config config = {});
@@ -148,11 +182,24 @@ public:
 
     /// Registry, seat and activation bookkeeping (defined with the listeners).
     struct events;
+    /// Seat input for the views the ui host does not host (the launcher, the notification
+    /// stack, the switcher and the menus are canvas views on the views' connection): the
+    /// context hands the shell every frame whose target is not one of its surfaces, the
+    /// keyboard focus entering or leaving one, and the keys pressed while one has the
+    /// focus (P5-6 — the raw connection's wl_seat no longer hears any of it).
+    struct view_input final : lx::ui::host::unrouted_input_handler {
+        shell_app* app = nullptr;
+        void on_unrouted_pointer(lx::wayland::seat& s,
+                                 const lx::wayland::pointer_frame& f) override;
+        void on_unrouted_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target,
+                                        std::uint32_t serial, bool entered) override;
+        void on_unrouted_key(lx::wayland::seat& s, const lx::wayland::key_event& e) override;
+    };
 
 private:
     friend struct events;
+    friend struct view_input;
     enum timer_slot : unsigned {
-        t_repeat,
         t_notice,
         t_debounce,
         t_token,
@@ -265,6 +312,9 @@ private:
     /// Where the launcher opens (M13): the active window's output, else the one whose panel
     /// was last pointed at, else the first.
     [[nodiscard]] output_record* launcher_output();
+    /// `client_`'s output slot for `o` (connector-name match); ~0u when not there yet (the
+    /// layer surface then lets the compositor pick the output).
+    [[nodiscard]] unsigned client_slot(const output_record& o) const;
     /// Every panel's task filter after the outputs' rects changed.
     void outputs_moved();
     /// The indicator cells of `o`'s panel: its workspaces in order, active, occupied (a
@@ -316,9 +366,13 @@ private:
     // ── The window switcher (zlm v7 held actions, design-session-and-wm K.1, K.2) ──
     /// zlm_shell_v1.held_action: a switcher.* binding was pressed; the hold lasts while its
     /// modifier is down.
-    void on_hold_begin(const char* action);
+    void on_hold_begin(const char* action, unsigned input_time_ms);
     /// A key press during the hold (the compositor diverted it from the focused window).
     void on_hold_key(unsigned keysym, unsigned mods, const char* binding);
+    /// The switcher's cells, as the view's tree forwards them: hover (from the second cell
+    /// on) selects, a press and its release on one cell pick it and end the switch.
+    void on_switcher_cell_hover(unsigned entry);
+    void on_switcher_cell_pick(unsigned entry, bool pressed);
     /// Ends the switch: the selection activated when `commit`, the hold and the view gone.
     /// `why` is logged.
     void finish_switch(bool commit, const char* why);
@@ -400,11 +454,12 @@ private:
     /// The window switcher: the hold's list and selection, and its view.
     switcher_model switcher_{};
     switcher_view switcher_view_{};
-    /// Where the pointer entered the switcher: it selects only once it has moved (a pointer
-    /// that happens to be where the view appears selects nothing).
-    double switcher_ptr_x_ = 0.0;
-    double switcher_ptr_y_ = 0.0;
-    bool switcher_ptr_moved_ = false;
+    /// The switcher's cells (the tree's interactive nodes forward them): the pointer's first
+    /// landing selects nothing — hovering selects only from the second cell on (GNOME's rule,
+    /// a pointer that happens to be where the view appears stays put) — and a press and its
+    /// release on one cell pick it.
+    bool switcher_hover_seen_ = false;
+    int switcher_pressed_ = -1;
     std::vector<std::unique_ptr<output_record>> outputs_{};
     /// The panels exist (after the setup): an output bound later gets its panel at its done.
     bool panels_enabled_ = false;
@@ -415,6 +470,14 @@ private:
     launcher launcher_{};
     app_launcher apps_{};
     xkb_keyboard xkb_{};
+    /// The views' connection (lx.wayland.client): its own socket, dispatched alongside the
+    /// raw one — the launcher, panels, background, switcher and bell draw through it.
+    lx::wayland::display client_{};
+    /// The UI host context on it (ADR-010 Phase 5 P5-6): one per UI thread, the panel's
+    /// surface joins it. Its loop is never run: the shell's own loop drives the panels'
+    /// frames through `panel::after_dispatch`.
+    lx::runtime::event_loop ui_loop_{};
+    lx::ui::host::context ui_host_{};
     void* display_ = nullptr;      // wl_display*
     void* registry_ = nullptr;     // wl_registry*
     void* compositor_ = nullptr;   // wl_compositor*
@@ -463,12 +526,10 @@ private:
     pointer_target pointer_target_ = pointer_target::none;
     bool axis_discrete_seen_ = false;
     double axis_accum_ = 0.0;
-    // Key repeat (wl_keyboard.repeat_info; rate 0 = none).
-    int repeat_rate_ = 25;
-    int repeat_delay_ = 600;
-    unsigned repeat_code_ = 0;
-    unsigned repeat_serial_ = 0;
     unsigned last_key_serial_ = 0;
+    view_input view_input_{};
+    /// When the switcher's hold began (its open delay is measured from here).
+    long long switcher_hold_ns_ = 0;
     pending_token tokens_[k_max_tokens]{};
     /// (desktop ID, reason) pairs already warned about in this catalog generation.
     std::vector<std::pair<std::string, launch_failure>> warned_{};
@@ -506,9 +567,6 @@ private:
     /// The launcher menu's entry and the catalog generation it belongs to.
     unsigned launcher_menu_entry_ = 0;
     unsigned launcher_menu_gen_ = 0;
-    /// Whether the launcher has the keyboard (a menu over it takes it for a while), and the
-    /// wl_callback* of the round trip after its menu closed that tells whether it came back.
-    bool launcher_kb_ = false;
     void* launcher_refocus_ = nullptr;
     unsigned menu_key_ = 0;
     unsigned menu_output_ = 0;
@@ -553,6 +611,106 @@ constexpr lx::trace::category log_shell{"shell"};
 
 lx::shell::shell_app::shell_app(shell_config config) : config_{config}, idle_{config.idle} {}
 lx::shell::shell_app::~shell_app() { teardown(); }
+
+unsigned lx::shell::shell_app::client_slot(const output_record& o) const {
+    for (unsigned i = 0; i < client_.output_count(); ++i) {
+        const lx::wayland::output* out = client_.output_at(i);
+        if (out && std::strcmp(out->info().name, o.connector) == 0)
+            return i;
+    }
+    return ~0u;
+}
+
+// ── Keyboard (xkbcommon) ─────────────────────────────────────────────────────
+
+#if defined(LUMEN_HAS_XKBCOMMON)
+
+bool lx::shell::xkb_keyboard::set_keymap(int fd, std::uint32_t size) {
+    void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED)
+        return false;
+    if (!ctx_)
+        ctx_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    xkb_keymap* km = ctx_ ? xkb_keymap_new_from_string(static_cast<xkb_context*>(ctx_),
+                                                       static_cast<const char*>(map),
+                                                       XKB_KEYMAP_FORMAT_TEXT_V1,
+                                                       XKB_KEYMAP_COMPILE_NO_FLAGS)
+                          : nullptr;
+    munmap(map, size);
+    if (!km)
+        return false;
+    xkb_state* st = xkb_state_new(km);
+    if (!st) {
+        xkb_keymap_unref(km);
+        return false;
+    }
+    if (state_)
+        xkb_state_unref(static_cast<xkb_state*>(state_));
+    if (keymap_)
+        xkb_keymap_unref(static_cast<xkb_keymap*>(keymap_));
+    keymap_ = km;
+    state_ = st;
+    return true;
+}
+
+void lx::shell::xkb_keyboard::update_mods(std::uint32_t depressed, std::uint32_t latched,
+                                          std::uint32_t locked, std::uint32_t group) {
+    if (state_)
+        xkb_state_update_mask(static_cast<xkb_state*>(state_), depressed, latched, locked, 0, 0,
+                              group);
+}
+
+bool lx::shell::xkb_keyboard::press(std::uint32_t code, key_press& out) const {
+    if (!state_)
+        return false;
+    auto* st = static_cast<xkb_state*>(state_);
+    const xkb_keycode_t kc = code + 8;
+    out.keysym = xkb_state_key_get_one_sym(st, kc);
+    out.utf8[0] = '\0';
+    (void)xkb_state_key_get_utf8(st, kc, out.utf8, sizeof(out.utf8));
+    out.repeats = xkb_keymap_key_repeats(static_cast<xkb_keymap*>(keymap_), kc) != 0;
+    return out.keysym != XKB_KEY_NoSymbol;
+}
+
+bool lx::shell::xkb_keyboard::ctrl() const {
+    return state_ && xkb_state_mod_name_is_active(static_cast<xkb_state*>(state_),
+                                                  XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+bool lx::shell::xkb_keyboard::shift() const {
+    return state_ && xkb_state_mod_name_is_active(static_cast<xkb_state*>(state_),
+                                                  XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+bool lx::shell::xkb_keyboard::alt() const {
+    return state_ && xkb_state_mod_name_is_active(static_cast<xkb_state*>(state_),
+                                                  XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+lx::shell::xkb_keyboard::~xkb_keyboard() {
+    if (state_)
+        xkb_state_unref(static_cast<xkb_state*>(state_));
+    if (keymap_)
+        xkb_keymap_unref(static_cast<xkb_keymap*>(keymap_));
+    if (ctx_)
+        xkb_context_unref(static_cast<xkb_context*>(ctx_));
+}
+
+#else
+
+bool lx::shell::xkb_keyboard::set_keymap(int fd, std::uint32_t) {
+    if (fd >= 0)
+        ::close(fd);
+    return false;
+}
+void lx::shell::xkb_keyboard::update_mods(std::uint32_t, std::uint32_t, std::uint32_t,
+                                          std::uint32_t) {}
+bool lx::shell::xkb_keyboard::press(std::uint32_t, key_press&) const { return false; }
+bool lx::shell::xkb_keyboard::ctrl() const { return false; }
+bool lx::shell::xkb_keyboard::shift() const { return false; }
+bool lx::shell::xkb_keyboard::alt() const { return false; }
+lx::shell::xkb_keyboard::~xkb_keyboard() = default;
+
+#endif
 lx::shell::policy_registry& lx::shell::shell_app::policies() {
     return policy_registry::instance();
 }
@@ -670,23 +828,11 @@ struct lx::shell::shell_app::events {
         if (s && a.menu_.owns(s)) {
             a.pointer_target_ = pointer_target::menu;
             a.menu_.pointer_enter(s, px, py);
-        } else if (s && s == a.note_view_.surface()) {
-            a.pointer_target_ = pointer_target::notify;
-            a.note_view_.pointer_enter(px, py);
-            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
         } else if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
             a.pointer_target_ = pointer_target::panel;
             a.pointer_panel_ = o->bar.get();
             a.last_panel_output_ = o->name;
             a.pointer_panel_->pointer_enter(px, py);
-        } else if (s && s == a.launcher_.surface()) {
-            a.pointer_target_ = pointer_target::launcher;
-            a.launcher_.pointer_enter(px, py);
-        } else if (s && s == a.switcher_view_.surface()) {
-            a.pointer_target_ = pointer_target::switcher;
-            a.switcher_ptr_x_ = px;
-            a.switcher_ptr_y_ = py;
-            a.switcher_ptr_moved_ = false;
         } else {
             a.pointer_target_ = pointer_target::none;
         }
@@ -695,14 +841,8 @@ struct lx::shell::shell_app::events {
         auto& a = self(data);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_leave();
-        else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_leave();
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_leave(s);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            a.note_view_.pointer_leave();
-            a.notes_.set_hover(false, now_ns());
-        }
         a.pointer_surface_ = nullptr;
         a.pointer_panel_ = nullptr;
         a.pointer_target_ = pointer_target::none;
@@ -712,20 +852,8 @@ struct lx::shell::shell_app::events {
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_motion(px, py);
-        else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_motion(px, py);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_motion(a.pointer_surface_, px, py);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            a.note_view_.pointer_motion(px, py);
-            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
-        } else if (a.pointer_target_ == pointer_target::switcher && a.switcher_.active()) {
-            // Hovering selects (GNOME), once the pointer has really moved.
-            const double dx = px - a.switcher_ptr_x_, dy = py - a.switcher_ptr_y_;
-            a.switcher_ptr_moved_ = a.switcher_ptr_moved_ || dx * dx + dy * dy > 9.0;
-            if (const int i = a.switcher_view_.entry_at(px, py); i >= 0 && a.switcher_ptr_moved_)
-                a.switcher_.select(static_cast<unsigned>(i));
-        }
     }
     static void ptr_button(void* data, wl_pointer*, uint32_t serial, uint32_t, uint32_t button,
                            uint32_t state) {
@@ -737,32 +865,10 @@ struct lx::shell::shell_app::events {
             a.pointer_panel_->pointer_button(button, down, serial);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_button(a.pointer_surface_, button, down, serial);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            const notify_click c = a.note_view_.pointer_button(button, down);
-            if (c.what != notify_click::kind::none)
-                a.on_notify_click(c, a.last_press_serial_);
-        } else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_button(serial, button, down);
-        else if (a.pointer_target_ == pointer_target::switcher && down && a.switcher_.active()) {
-            // A click picks the window under it (or the selection) and ends the switch.
-            if (const int i = a.switcher_view_.entry_at(a.switcher_ptr_x_, a.switcher_ptr_y_);
-                i >= 0 && !a.switcher_ptr_moved_)
-                a.switcher_.select(static_cast<unsigned>(i));
-            a.finish_switch(true, "click");
-        }
     }
-    static void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
-        auto& a = self(data);
-        if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || a.axis_discrete_seen_ ||
-            a.pointer_target_ != pointer_target::launcher)
-            return;
-        // Continuous scrolling (touchpads): one row per row height of motion.
-        a.axis_accum_ += wl_fixed_to_double(value);
-        const int rows = static_cast<int>(a.axis_accum_ / (k_launcher_row_h * 3));
-        if (rows) {
-            a.axis_accum_ -= rows * (k_launcher_row_h * 3);
-            a.launcher_.pointer_scroll_steps(rows);
-        }
+    static void ptr_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {
+        // Continuous scroll reached the launcher only (the wheel's discrete notches are the
+        // panel's); the launcher scrolls through its ui tree now (P5-7).
     }
     static void ptr_frame(void* data, wl_pointer*) { self(data).axis_discrete_seen_ = false; }
     static void ptr_axis_source(void*, wl_pointer*, uint32_t) {}
@@ -774,13 +880,12 @@ struct lx::shell::shell_app::events {
         if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
             return;
         a.axis_discrete_seen_ = true;
-        if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_scroll_steps(discrete);
-        else if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
+        if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_scroll(discrete);
     }
 
-    // ── wl_keyboard: only the launcher ever has keyboard focus ──
+    // ── wl_keyboard: the raw seat's keymap only (the menus' canvas views translate on the
+    //    views' connection; the launcher's keyboard is its ui host surface's, P5-7) ──
     static void kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size) {
         auto& a = self(data);
         if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
@@ -788,29 +893,13 @@ struct lx::shell::shell_app::events {
             return;
         }
         if (!a.xkb_.set_keymap(fd, size))
-            log_shell.warn("keymap not usable: the launcher takes no typing");
+            log_shell.warn("keymap not usable");
     }
-    static void kb_enter(void* data, wl_keyboard*, uint32_t, wl_surface* s, wl_array*) {
-        auto& a = self(data);
-        if (s && s == a.launcher_.surface()) {
-            a.launcher_kb_ = true;
-            a.launcher_.keyboard_enter();
-        }
-    }
-    static void kb_leave(void* data, wl_keyboard*, uint32_t, wl_surface* s) {
-        auto& a = self(data);
-        a.set_timer(t_repeat, 0);
-        a.repeat_code_ = 0;
-        if (s && s == a.launcher_.surface()) {
-            a.launcher_kb_ = false;
-            // Its own menu took the keyboard: the launcher stays (`launcher_menu_closed`).
-            if (a.menu_kind_ == menu_kind::launcher)
-                return;
-            a.launcher_.keyboard_leave();
-            if (!a.launcher_.is_open())
-                a.set_apps_all(false);
-        }
-    }
+    static void kb_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
+    static void kb_leave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
+    // The raw seat repeats nothing (the ui host's router repeats into the trees, P5-7); the
+    // slot must exist — libwayland aborts on a NULL listener entry.
+    static void kb_repeat(void*, wl_keyboard*, int32_t, int32_t) {}
     static void kb_key(void* data, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key,
                        uint32_t state) {
         self(data).on_key(serial, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -818,10 +907,6 @@ struct lx::shell::shell_app::events {
     static void kb_modifiers(void* data, wl_keyboard*, uint32_t, uint32_t dep, uint32_t lat,
                              uint32_t lock, uint32_t group) {
         self(data).xkb_.update_mods(dep, lat, lock, group);
-    }
-    static void kb_repeat(void* data, wl_keyboard*, int32_t rate, int32_t delay) {
-        self(data).repeat_rate_ = rate;
-        self(data).repeat_delay_ = delay;
     }
 
 #if defined(LUMEN_SHELL_ACTIVATION)
@@ -1089,7 +1174,6 @@ void lx::shell::shell_app::events::seat_caps(void* data, wl_seat* seat, uint32_t
     } else if (!has_kb && a.keyboard_) {
         release_keyboard(a.keyboard_);
         a.keyboard_ = nullptr;
-        a.set_timer(t_repeat, 0);
     }
 }
 
@@ -1305,13 +1389,17 @@ void lx::shell::shell_app::output_ready(output_record& o) {
     add_power(o);
     if (panels_enabled_ && config_.background_enabled && !o.bg) {
         o.bg = std::make_unique<background>();
-        if (auto made = o.bg->create({.compositor = compositor_,
-                                      .shm = shm_,
-                                      .layer_shell = layer_shell_,
-                                      .viewporter = viewporter_,
-                                      .fractional = fractional_,
-                                      .single_pixel = single_pixel_},
-                                     &config_.background, o.output, bg_notify_fd_);
+        if (auto made = o.bg->create({.display = client_.connected() ? &client_ : nullptr,
+                                      .compositor =
+                                          client_.native_global(lx::wayland::global_kind::compositor),
+                                      .shm = client_.native_global(lx::wayland::global_kind::shm),
+                                      .viewporter =
+                                          client_.native_global(lx::wayland::global_kind::viewporter),
+                                      .fractional = client_.native_global(
+                                          lx::wayland::global_kind::fractional_scale),
+                                      .single_pixel = client_.native_global(
+                                          lx::wayland::global_kind::single_pixel)},
+                                     &config_.background, client_slot(o), bg_notify_fd_);
             !made) {
             log_shell.error(made.get_error());
             o.bg.reset();
@@ -1374,13 +1462,9 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                           return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
                       },
                       this});
-    if (auto created = o.bar->create({.compositor = compositor_,
-                                      .shm = shm_,
-                                      .layer_shell = layer_shell_,
-                                      .viewporter = viewporter_,
-                                      .fractional = fractional_,
+    if (auto created = o.bar->create({.ui = ui_host_.started() ? &ui_host_ : nullptr,
                                       .background_effect = panel_blur_manager()},
-                                     bridge_, o.output);
+                                     bridge_, client_slot(o));
         !created) {
         log_shell.error(created.get_error());
         o.bar.reset();
@@ -1554,15 +1638,6 @@ void lx::shell::shell_app::on_timer() {
     std::uint64_t expirations = 0;
     (void)!read(timer_fd_, &expirations, sizeof(expirations));
     const long long now = now_ns();
-    if (deadline_[t_repeat] && deadline_[t_repeat] <= now) {
-        deadline_[t_repeat] = 0;
-        if (repeat_code_ && launcher_.is_open() && repeat_rate_ > 0) {
-            key_press k{};
-            if (xkb_.press(repeat_code_, k))
-                launcher_.key(repeat_serial_, k, xkb_.ctrl(), xkb_.shift());
-            deadline_[t_repeat] = now + 1000000000LL / repeat_rate_;
-        }
-    }
     if (deadline_[t_notice] && deadline_[t_notice] <= now) {
         deadline_[t_notice] = 0;
         set_notice_all(nullptr);
@@ -1696,13 +1771,13 @@ void lx::shell::shell_app::on_bell(task_handle h) {
             const int y1 = e->geometry.y + e->geometry.height < L.y + L.height
                                ? e->geometry.y + e->geometry.height
                                : L.y + L.height;
-            flashed = bell_.flash(o->output, {x0 - L.x, y0 - L.y, x1 - x0, y1 - y0}, now);
+            flashed = bell_.flash(client_slot(*o), {x0 - L.x, y0 - L.y, x1 - x0, y1 - y0}, now);
         }
     }
     if (!flashed) {
         // No window (or not on screen): the panel strip of the output the user works on.
         if (output_record* o = launcher_output(); o && o->logical.width > 0)
-            flashed = bell_.flash(o->output, {0, 0, o->logical.width, k_panel_height}, now);
+            flashed = bell_.flash(client_slot(*o), {0, 0, o->logical.width, k_panel_height}, now);
     }
     if (flashed)
         set_timer(t_bell, bell_.deadline());
@@ -1746,8 +1821,6 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
         tooltip_.close();
         set_timer(t_tooltip, 0);
         pointer_target_ = pointer_target::none;
-        repeat_code_ = 0;
-        set_timer(t_repeat, 0);
     }
     if (s == shell_lock::abandoned) {
         const long long delay = idle_.relaunch_delay(now_ns());
@@ -1786,33 +1859,69 @@ void lx::shell::shell_app::on_lock_requested(unsigned reason) {
 // ── Keyboard ──
 
 void lx::shell::shell_app::on_key(unsigned serial, unsigned code, bool pressed) {
-    if (!pressed) {
-        if (code == repeat_code_) {
-            repeat_code_ = 0;
-            set_timer(t_repeat, 0);
-        }
+    // The launcher's keys arrive through its ui tree (P5-7); the raw keyboard is the
+    // menus' only (a menu that grabbed the keyboard from its panel's surface).
+    if (!menu_.is_open())
         return;
-    }
-    last_key_serial_ = serial;
     key_press k{};
-    if (menu_.is_open()) {
-        if (xkb_.press(code, k))
-            menu_.key(k.keysym, k.utf8, serial);
-        return;
+    if (pressed && xkb_.press(code, k))
+        menu_.key(k.keysym, k.utf8, serial);
+}
+
+// ── The canvas views' seat input (the ui host's unrouted frames; P5-6) ──────────────
+
+void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
+                                                           const lx::wayland::pointer_frame& f) {
+    auto& a = *app;
+    using pf = lx::wayland::pointer_frame;
+    void* surf = f.target ? f.target->native() : nullptr;
+    if (f.mask & pf::has_enter) {
+        a.pointer_surface_ = surf;
+        if (surf && a.menu_.owns(surf)) {
+            a.pointer_target_ = pointer_target::menu;
+            a.menu_.pointer_enter(surf, f.x, f.y);
+        } else {
+            a.pointer_target_ = pointer_target::none;
+        }
+    } else if (f.mask & pf::has_leave) {
+        if (a.pointer_target_ == pointer_target::menu)
+            a.menu_.pointer_leave(surf);
+        a.pointer_surface_ = nullptr;
+        a.pointer_target_ = pointer_target::none;
     }
-    if (!launcher_.is_open() || !xkb_.press(code, k))
-        return;
-    launcher_.key(serial, k, xkb_.ctrl(), xkb_.shift());
-    if (k.repeats && repeat_rate_ > 0 && launcher_.is_open()) {
-        repeat_code_ = code;
-        repeat_serial_ = serial;
-        set_timer(t_repeat, now_ns() + static_cast<long long>(repeat_delay_) * 1000000LL);
-    } else {
-        repeat_code_ = 0;
-        set_timer(t_repeat, 0);
+    if (f.mask & pf::has_motion) {
+        if (a.pointer_target_ == pointer_target::menu)
+            a.menu_.pointer_motion(surf, f.x, f.y);
     }
-    if (!launcher_.is_open())
-        set_apps_all(false);
+    if (f.mask & pf::has_button) {
+        const bool down = f.pressed;
+        if (down)
+            a.last_press_serial_ = f.serial;
+        if (a.pointer_target_ == pointer_target::menu)
+            a.menu_.pointer_button(surf, f.button, down, f.serial);
+    }
+}
+
+void lx::shell::shell_app::view_input::on_unrouted_keyboard_focus(
+    lx::wayland::seat& s, lx::wayland::surface* target, std::uint32_t serial, bool entered) {
+    // The launcher's keyboard focus is its ui host surface's now (P5-7: the surface's own
+    // focus handler closes it when the keyboard leaves, unless its menu took it); the
+    // unrouted focus is a canvas view's — the menus'.
+    (void)s;
+    (void)target;
+    (void)serial;
+    (void)entered;
+}
+
+void lx::shell::shell_app::view_input::on_unrouted_key(lx::wayland::seat& s,
+                                                       const lx::wayland::key_event& e) {
+    (void)s;
+    auto& a = *app;
+    if (e.state != lx::wayland::key_state::pressed)
+        return;
+    a.last_key_serial_ = e.serial;
+    if (a.menu_.is_open())
+        a.menu_.key(e.keysym, e.utf8, e.serial);
 }
 
 // ── Launching ──
@@ -1832,7 +1941,7 @@ void lx::shell::shell_app::open_launcher() {
     output_record* o = launcher_output();
     const int w = o && o->logical.width > 0 ? o->logical.width : 1024;
     const int h = o && o->logical.height > 0 ? o->logical.height : 768;
-    if (!launcher_.open(w, h, k_panel_height, o ? o->output : nullptr)) {
+    if (!launcher_.open(w, h, k_panel_height, o ? client_slot(*o) : ~0u)) {
         log_shell.warn("launcher: cannot open");
         return;
     }
@@ -1851,13 +1960,11 @@ void lx::shell::shell_app::close_launcher() {
         menu_.close();
     launcher_.close();
     set_apps_all(false);
-    repeat_code_ = 0;
-    set_timer(t_repeat, 0);
     set_timer(t_debounce, 0);
 }
 
 void lx::shell::shell_app::launcher_menu_closed() {
-    if (!launcher_.is_open() || launcher_kb_ || launcher_refocus_)
+    if (!launcher_.is_open() || launcher_.keyboard_present() || launcher_refocus_)
         return;
     // The compositor gives the keyboard back to the launcher when the menu goes (Escape, a
     // click outside) unless something else took it (a window activated meanwhile). Its
@@ -1868,10 +1975,9 @@ void lx::shell::shell_app::launcher_menu_closed() {
                 auto& a = *static_cast<shell_app*>(data);
                 wl_callback_destroy(cb);
                 a.launcher_refocus_ = nullptr;
-                if (a.launcher_.is_open() && !a.launcher_kb_ && a.menu_kind_ == menu_kind::none) {
-                    a.launcher_.keyboard_leave();
-                    if (!a.launcher_.is_open())
-                        a.set_apps_all(false);
+                if (a.launcher_.is_open() && !a.launcher_.keyboard_present() &&
+                    a.menu_kind_ == menu_kind::none) {
+                    a.close_launcher();
                 }
             },
     };
@@ -1998,8 +2104,11 @@ bool lx::shell::shell_app::request_token(pending_token&& req, unsigned serial, v
                 xdg_activation_token_v1_set_serial(tok, serial, static_cast<wl_seat*>(seat_));
             if (app_id && *app_id)
                 xdg_activation_token_v1_set_app_id(tok, app_id);
-            if (surface)
-                xdg_activation_token_v1_set_surface(tok, static_cast<wl_surface*>(surface));
+            // No set_surface: the views' surfaces live on the second connection
+            // (lx.wayland.client) and this token on the raw one — the surface's object id
+            // means nothing there and the compositor rejects the request (P5-6). The
+            // surface is advisory (the compositor logs it only); the serial names the input.
+            (void)surface;
             xdg_activation_token_v1_commit(tok);
             t = std::move(req);
             t.token = tok;
@@ -2132,8 +2241,8 @@ int lx::shell::shell_app::run() {
 
     // zlm_shell_v1 v7 held actions: the window switcher (Alt+Tab).
     bridge_.set_hold_handlers(
-        {.begin = [](const char* action, const char*, unsigned, unsigned, void* user) {
-             static_cast<shell_app*>(user)->on_hold_begin(action);
+        {.begin = [](const char* action, const char*, unsigned, unsigned time_ms, void* user) {
+             static_cast<shell_app*>(user)->on_hold_begin(action, time_ms);
          },
          .key = [](unsigned keysym, unsigned mods, const char* binding, unsigned, unsigned,
                    void* user) { static_cast<shell_app*>(user)->on_hold_key(keysym, mods, binding); },
@@ -2159,6 +2268,26 @@ int lx::shell::shell_app::run() {
         return fail(line);
     }
     display_ = d;
+    // The views (launcher, panels, background, switcher, bell) draw through their own
+    // lx.wayland.client connection; the raw one keeps zlm_shell_v1 and the seat.
+    if (auto connected = client_.connect({.name = config_.display}); !connected) {
+        log_shell.error(connected.get_error());
+        close(sfd);
+        return fail("lx.wayland.client connection failed");
+    }
+    // The UI host context on it: the panel is an lx.ui tree on a layer surface there
+    // (ADR-010 Phase 5 P5-6). Its loop is never run — the shell's own loop drives the
+    // panels' frames; the theme loads at start (a panel paints with whatever is active).
+    if (auto started = ui_host_.start(client_, ui_loop_, {.watch_theme = 0, .async_icons = false});
+        !started) {
+        log_shell.error(started.get_error());
+        close(sfd);
+        return fail("lx.ui.host context failed to start");
+    }
+    // The canvas views' input: every frame the context does not route to a ui tree of its
+    // own comes here (the launcher, the notification stack, the switcher, the menus).
+    view_input_.app = this;
+    ui_host_.set_unrouted_input_handler(&view_input_);
     auto* reg = wl_display_get_registry(d);
     registry_ = reg;
     wl_registry_add_listener(reg, &k_registry_listener, this);
@@ -2203,11 +2332,7 @@ int lx::shell::shell_app::run() {
     apps_.set_outcome_handler(
         [](const launch_outcome& o, void* user) { static_cast<shell_app*>(user)->on_outcome(o); },
         this);
-    launcher_.init({.compositor = compositor_,
-                    .shm = shm_,
-                    .layer_shell = layer_shell_,
-                    .viewporter = viewporter_,
-                    .fractional = fractional_},
+    launcher_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
                    catalog_,
                    [](unsigned entry, unsigned serial, void* user) {
                        static_cast<shell_app*>(user)->launch_entry(entry, serial);
@@ -2217,29 +2342,39 @@ int lx::shell::shell_app::run() {
                        if (a.menu_kind_ == menu_kind::launcher)
                            a.menu_.close();
                        a.set_apps_all(false);
-                       a.repeat_code_ = 0;
-                       a.set_timer(t_repeat, 0);
                    },
                    this);
     launcher_.set_menu_handler([](unsigned entry, lx::rect2i anchor, unsigned serial, void* user) {
         static_cast<shell_app*>(user)->open_launcher_menu(entry, anchor, serial);
     });
+    // The keyboard's leaving the launcher must not close it while its own menu has it (the
+    // popup grabs, and returns the keyboard when it is done).
+    launcher_.set_keyboard_stay([](void* user) {
+        auto& a = *static_cast<shell_app*>(user);
+        return a.menu_kind_ == menu_kind::launcher && a.menu_.is_open();
+    });
     // The visual bell (zlm v6) flashes over windows through overlay layer surfaces.
-    bell_.init({.compositor = compositor_,
-                .shm = shm_,
-                .layer_shell = layer_shell_,
-                .viewporter = viewporter_});
+    bell_.init({.display = client_.connected() ? &client_ : nullptr,
+                .compositor = client_.native_global(lx::wayland::global_kind::compositor),
+                .shm = client_.native_global(lx::wayland::global_kind::shm),
+                .viewporter = client_.native_global(lx::wayland::global_kind::viewporter)});
     bridge_.set_bell_handler(
         [](task_handle h, void* user) { static_cast<shell_app*>(user)->on_bell(h); }, this);
-    switcher_view_.init({.compositor = compositor_,
-                         .shm = shm_,
-                         .layer_shell = layer_shell_,
-                         .viewporter = viewporter_,
-                         .fractional = fractional_},
+    switcher_view_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
                         [](task_handle h, const task_entry& e, int px, void* user) {
                             return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
                         },
                         this);
+    // The switcher's cells forward their pointer input (the ui host's seat router): hover
+    // selects from the second cell on, a press and release on one pick it.
+    switcher_view_.set_input({.hover = [](unsigned entry, void* user) {
+                                  static_cast<shell_app*>(user)->on_switcher_cell_hover(entry);
+                              },
+                              .pick = [](unsigned entry, bool pressed, void* user) {
+                                  static_cast<shell_app*>(user)->on_switcher_cell_pick(entry,
+                                                                                       pressed);
+                              },
+                              .user = this});
     // Shell keybindings. With zlm v7 the compositor matches them (config.toml [bindings]) and
     // sends actions; the shell grabs nothing — except Super+L for a lock command given on
     // the command line that the configuration does not know (the compositor binds shell.lock
@@ -2305,7 +2440,8 @@ int lx::shell::shell_app::run() {
     }
 
     int code = 0;
-    constexpr unsigned k_fixed = 6;
+    // fds[0..5] and the views' connection (the panels' input and frames travel on it).
+    constexpr unsigned k_fixed = 7;
     pollfd fds[k_fixed + app_launcher::k_max_poll];
     for (;;) {
         // The canonical libwayland client loop: dispatch what is queued, flush, then
@@ -2390,6 +2526,22 @@ int lx::shell::shell_app::run() {
         fds[4] = {bg_notify_fd_, POLLIN, 0};
         // The user bus (once open): asleep unless a message comes or a call's reply is due.
         fds[5] = {bus_.fd(), bus_.events(), 0};
+        // The views' connection: a pointer frame over a panel must wake the loop, not wait
+        // for the next event on the raw one.
+        fds[6] = {client_.connected() ? client_.fd() : -1, POLLIN, 0};
+        if (client_.connected()) {
+            // Flush what the views drew this iteration before sleeping: a surface's first
+            // commit would otherwise sit in the queue until unrelated input wakes the loop
+            // (the compositor cannot answer it, so nothing is readable) — the switcher and
+            // a notification's fresh stack took seconds to appear (P5-6).
+            if (auto flushed = client_.flush(); !flushed) {
+                log_shell.error(flushed.get_error());
+                code = fail("client connection lost");
+                break;
+            } else if (*flushed == lx::wayland::display::flush_status::again) {
+                fds[6].events |= POLLOUT;
+            }
+        }
         int timeout_ms = bus_.timeout_ms();
         const unsigned na = apps_.poll_fds(fds + k_fixed, app_launcher::k_max_poll, timeout_ms);
         timespec ts{};
@@ -2414,6 +2566,14 @@ int lx::shell::shell_app::run() {
         if (wl_display_dispatch_pending(d) < 0) {
             code = describe_connection_error(d, "dispatch failed", bridge_.logout_requested());
             break;
+        }
+        if (client_.connected()) {
+            // The views' connection: one non-blocking dispatch iteration.
+            if (auto dispatched = client_.dispatch(0); !dispatched) {
+                log_shell.error(dispatched.get_error());
+                code = fail("client connection lost");
+                break;
+            }
         }
         if (n > 0 && (fds[1].revents & POLLIN)) {
             signalfd_siginfo si{};
@@ -2528,6 +2688,8 @@ void lx::shell::shell_app::teardown() {
         wl_registry_destroy(static_cast<wl_registry*>(registry_));
     (void)wl_display_flush(d);
     wl_display_disconnect(d);
+    ui_host_.stop();
+    client_.disconnect();
     display_ = registry_ = compositor_ = shm_ = seat_ = layer_shell_ = shell_ = cursor_shape_ =
         xdg_output_manager_ = activation_ = pointer_ = keyboard_ = cursor_device_ = viewporter_ =
             fractional_ = nullptr;
@@ -2798,7 +2960,7 @@ bool switcher_shown(const lx::shell::task_entry& e, void* user) {
 
 } // namespace
 
-void lx::shell::shell_app::on_hold_begin(const char* action) {
+void lx::shell::shell_app::on_hold_begin(const char* action, unsigned input_time_ms) {
     const std::string_view a{action ? action : ""};
     const bool forward = a == "switcher.next" || a == "switcher.next-app";
     const bool same_app = a == "switcher.next-app" || a == "switcher.previous-app";
@@ -2810,20 +2972,55 @@ void lx::shell::shell_app::on_hold_begin(const char* action) {
         finish_switch(false, "a new hold");
     if (launcher_.is_open())
         close_launcher();
+    const long long hold_ns = now_ns();
     const unsigned n = switcher_.begin(bridge_.model(), forward, same_app, switcher_settings(),
-                                       &switcher_shown, &workspaces_.view(), now_ns());
+                                       &switcher_shown, &workspaces_.view(), hold_ns);
     if (n == 0) {
         (void)switcher_.finish(false);
         bridge_.end_hold();
         log_switcher.info("switcher: {}: no window to switch to", a);
         return;
     }
+    switcher_hold_ns_ = hold_ns;
+    switcher_hover_seen_ = false;
+    switcher_pressed_ = -1;
     set_timer(t_switcher, switcher_.open_at());
     if (log_switcher.enabled(lx::trace::level::debug)) {
         const task_entry* e = bridge_.model().get(switcher_.selected());
-        log_switcher.debug("switcher: hold {} windows={} selection={} \"{}\"", a, n,
-                           switcher_.selection(), e ? e->title : "");
+        // input_time_ms is the compositor's input timestamp: the dispatch latency of the
+        // shell's loop (0-ish; hundreds of ms means it was busy elsewhere) on top of the
+        // view's own open delay logged at the open.
+        log_switcher.debug(
+            "switcher: hold {} windows={} selection={} \"{}\" dispatch_latency={} ms", a, n,
+            switcher_.selection(), e ? e->title : "",
+            (now_ns() - static_cast<long long>(input_time_ms) * 1000000LL) / 1000000LL);
     }
+}
+
+void lx::shell::shell_app::on_switcher_cell_hover(unsigned entry) {
+    if (!switcher_.active())
+        return;
+    // The pointer's first landing (the cell it happened to appear over) selects nothing;
+    // a hover on a second cell means it really moved (GNOME's rule).
+    if (!switcher_hover_seen_) {
+        switcher_hover_seen_ = true;
+        return;
+    }
+    switcher_.select(entry);
+}
+
+void lx::shell::shell_app::on_switcher_cell_pick(unsigned entry, bool pressed) {
+    if (!switcher_.active())
+        return;
+    if (pressed) {
+        switcher_pressed_ = static_cast<int>(entry);
+        return;
+    }
+    if (switcher_pressed_ != static_cast<int>(entry))
+        return; // the press began elsewhere: no pick
+    switcher_pressed_ = -1;
+    switcher_.select(entry);
+    finish_switch(true, "click");
 }
 
 void lx::shell::shell_app::on_hold_key(unsigned keysym, unsigned mods, const char* binding) {
@@ -2841,9 +3038,14 @@ void lx::shell::shell_app::open_switcher() {
     switcher_.mark_opened();
     // On the active window's output (else the one pointed at last, else the first).
     output_record* o = launcher_output();
-    if (!switcher_view_.open(o ? o->output : nullptr, o ? o->logical.width : 0,
+    const long long open_ns = now_ns();
+    if (!switcher_view_.open(o ? client_slot(*o) : ~0u, o ? o->logical.width : 0,
                              o ? o->logical.height : 0, switcher_))
         return;
+    // Debug: how far past the open delay the view got (the frame the compositor maps is
+    // what a screenshot at the open delay + margin must find).
+    if (log_switcher.enabled(lx::trace::level::debug))
+        log_switcher.debug("switcher: view open delay={} ms", (open_ns - switcher_hold_ns_) / 1000000LL);
     switcher_.set_columns(switcher_view_.layout().columns);
 }
 
@@ -2855,8 +3057,6 @@ void lx::shell::shell_app::finish_switch(bool commit, const char* why) {
     set_timer(t_switcher, 0);
     bridge_.end_hold(); // nothing when the compositor already ended it
     switcher_view_.close();
-    if (pointer_target_ == pointer_target::switcher)
-        pointer_target_ = pointer_target::none;
     const task_entry* e = bridge_.model().get(h);
     if (e) {
         // Chosen explicitly: it is the most recent window however briefly it stays focused.
@@ -2907,7 +3107,7 @@ void lx::shell::shell_app::on_config(std::string_view, unsigned) {}
 void lx::shell::shell_app::on_config_done(unsigned, bool, unsigned, unsigned,
                                           std::span<const policy_bridge::config_line>) {}
 void lx::shell::shell_app::on_action(const char*, const char*, unsigned) {}
-void lx::shell::shell_app::on_hold_begin(const char*) {}
+void lx::shell::shell_app::on_hold_begin(const char*, unsigned) {}
 void lx::shell::shell_app::on_hold_key(unsigned, unsigned, const char*) {}
 void lx::shell::shell_app::finish_switch(bool, const char*) {}
 void lx::shell::shell_app::open_switcher() {}

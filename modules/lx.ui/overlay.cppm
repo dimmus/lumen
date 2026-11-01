@@ -19,7 +19,7 @@ import :theme;
 //
 // Popovers, menus, tooltips, modals and toasts are `overlay_node`s anywhere in the tree. In
 // the flow an overlay node takes no space (`position: absolute`, measured 0 × 0) and draws
-// nothing; while it is open it is registered with the UI thread's `overlay_layer`, which —
+// nothing; while it is open it is registered with its root's `overlay_layer`, which —
 // after the main tree's layout and emit, in `ui_root::tick` — lays its content (its one child)
 // out against the window, places it beside an anchor (the overlay node's parent, a surface
 // point, or the window itself) with GPUI's anchored rules: flip to the other side when it
@@ -165,7 +165,7 @@ private:
     bool at_point_ = false;
 };
 
-/// The UI thread's open overlays, bottom to top (open order).
+/// A root's open overlays, bottom to top (open order): one per `ui_context`.
 class overlay_layer final : public node_observer {
 public:
     static constexpr unsigned k_capacity = 16;
@@ -235,6 +235,8 @@ private:
     lx::rect2i window_{};
 };
 
+/// The current context's overlay layer (lx.ui:context): the innermost `context_scope`'s,
+/// else the thread default's.
 [[nodiscard]] overlay_layer& ui_overlays();
 
 /// An overlay over `content` (null: nothing to show).
@@ -244,6 +246,12 @@ private:
 [[nodiscard]] overlay_node* child_overlay(const ui_node& parent, overlay_kind kind);
 
 } // namespace lx::ui
+
+namespace lx::ui::detail {
+/// The overlay layer of `node`'s context (`context_of`; the current one when no root draws
+/// it). Defined in :context.
+[[nodiscard]] overlay_layer& overlays_of(const ui_node& node);
+} // namespace lx::ui::detail
 
 // ── implementation ──────────────────────────────────────────────────────────────────
 
@@ -273,8 +281,6 @@ namespace {
 [[nodiscard]] int lx_ui_ov_overflow(int p, int len, int lo, int hi) {
     return std::max(lo - p, 0) + std::max(p + len - hi, 0);
 }
-
-lx::ui::overlay_layer* g_overlay_layer = nullptr;
 
 [[nodiscard]] lx::rect2i lx_ui_ov_union(lx::rect2i a, lx::rect2i b) {
     if (a.width <= 0 || a.height <= 0)
@@ -473,7 +479,7 @@ bool lx::ui::overlay_node::open() {
     at_point_ = props_.anchor_point;
     if (open_)
         return true;
-    if (!ui_overlays().add(*this))
+    if (!detail::overlays_of(*this).add(*this))
         return false; // overflow_action::reject: stays closed
     open_ = true;
     set_visible(true);
@@ -481,7 +487,8 @@ bool lx::ui::overlay_node::open() {
         fade_.start(0.f, 1.f, props_.fade_ms);
     else
         fade_.set(1.f);
-    ui_damage().request(invalidation::paint);
+    if (damage_ledger* d = detail::damage_of(*this))
+        d->request(invalidation::paint);
     return true;
 }
 
@@ -494,7 +501,8 @@ bool lx::ui::overlay_node::open_at(lx::point2i surface) {
         // Moved while open (a second right click): lay it out again there.
         if (ui_node* c = content())
             invalidate_paint(*c);
-        ui_damage().request(invalidation::paint);
+        if (damage_ledger* d = detail::damage_of(*this))
+            d->request(invalidation::paint);
     }
     return ok;
 }
@@ -502,13 +510,13 @@ bool lx::ui::overlay_node::open_at(lx::point2i surface) {
 void lx::ui::overlay_node::close() {
     if (!open_)
         return;
-    overlay_layer& layer = ui_overlays();
+    overlay_layer& layer = detail::overlays_of(*this);
     layer.close_inside(*this);
     open_ = false;
     if (ui_node* c = content())
-        detail::damage_rect(lx_ui_ov_painted(*c));
+        detail::damage_rect_of(*this, lx_ui_ov_painted(*c));
     if (props_.scrim)
-        detail::damage_rect(layer.window());
+        detail::damage_rect_of(*this, layer.window());
     layer.remove(*this);
     set_visible(false);
     fade_.set(0.f);
@@ -540,13 +548,6 @@ lx::ui::overlay_node* lx::ui::child_overlay(const ui_node& parent, overlay_kind 
 }
 
 // ── overlay_layer ──
-
-lx::ui::overlay_layer& lx::ui::ui_overlays() {
-    // Never destroyed: nodes may outlive any static they could be torn down with.
-    if (!g_overlay_layer)
-        g_overlay_layer = new overlay_layer{};
-    return *g_overlay_layer;
-}
 
 bool lx::ui::overlay_layer::live(const overlay_node& n) const {
     if (!n.open_ || !n.visible())

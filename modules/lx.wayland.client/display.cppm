@@ -132,18 +132,29 @@ public:
     /// its interface, object and code, when it is first seen.
     [[nodiscard]] const protocol_error_info& protocol_error() const { return error_; }
     [[nodiscard]] bool failed() const { return error_.display_errno != 0; }
+    /// The owner expects the compositor to hang up (it asked to end the session): a lost
+    /// connection is then not logged as an error; a protocol error still is.
+    void expect_hangup() { expect_hangup_ = true; }
 
     // ── globals ──
     [[nodiscard]] const global_info& global(global_kind k) const {
         return globals_[static_cast<unsigned>(k)];
     }
-    /// Bound version, 0 when absent.
-    [[nodiscard]] std::uint32_t version(global_kind k) const { return global(k).bound; }
+    /// Bound version, 0 when absent. A global bound on demand (`global_info::on_demand`)
+    /// reports the version it is or will be bound at while it is advertised.
+    [[nodiscard]] std::uint32_t version(global_kind k) const {
+        const global_info& g = global(k);
+        return g.bound ? g.bound : g.on_demand && g.name ? std::min(g.advertised, g.cap) : 0u;
+    }
     [[nodiscard]] bool has(global_kind k) const { return version(k) != 0; }
-    /// The bound proxy (wl_compositor*, xdg_wm_base*, ...) as `void*`; null when absent.
+    /// The bound proxy (wl_compositor*, xdg_wm_base*, ...) as `void*`; null when absent or
+    /// (on demand) not bound yet.
     [[nodiscard]] void* native_global(global_kind k) const {
         return proxies_[static_cast<unsigned>(k)];
     }
+    /// Binds an on-demand global the first time it is needed (idempotent: the proxy); null
+    /// when it is not advertised or its glue was not built.
+    [[nodiscard]] void* bind_on_demand(global_kind k);
     [[nodiscard]] void* native() const { return display_; }
     [[nodiscard]] void* native_registry() const { return registry_; }
     /// Unknown globals and removals go here (extensions the caller binds itself).
@@ -219,6 +230,7 @@ private:
     bool track_outputs_ = true;
     bool want_feedback_ = true;
     bool error_logged_ = false;
+    bool expect_hangup_ = false;
 };
 
 /// The display as an lx::runtime::event_loop source, the way GTK's GSource and calloop's

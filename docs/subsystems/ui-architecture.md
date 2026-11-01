@@ -121,6 +121,32 @@ child build_counter(const counter& s, reducer_node<counter, action>& host) {
 }
 ```
 
+**Several roots on one thread** (`lx.ui:context`, ADR-010 §7 Phase 5). What a frame owes is
+per root: each `ui_root` has a `ui_context` holding its damage ledger, its overlay layer, its
+node timers and its reducer queue (≈1.4 KiB, no heap), so a shell's panel, launcher and
+switcher, or an app's windows, share one UI thread and each wakes, draws and hit-tests only for
+its own tree (G1 per root). The rule:
+
+- Inside a root's entry point (`tick`, `wants_frame`, the pointer, key and drop entries, timer
+  firing) a `context_scope` names the root's context; `ui_damage()`, `ui_overlays()` and
+  `ui_timers()` return it. Every frame-path invalidation is that one thread-local load.
+- Outside every scope (a task posted to the UI strand, app code), a node's invalidation walks
+  `ui_node::parent()` to its tree's root and finds the root's context in the thread's root
+  table (32 entries, `overflow_action::warn_and_drop`). No node field is needed.
+- An async icon raster records the asking root's context (up to 4 per raster) and damages each
+  live one when it lands; a root destroyed meanwhile is skipped by its context's serial.
+- A node in no registered tree goes to the thread-default context while a root uses it or no
+  root lives on the thread; otherwise its damage is dropped and counted
+  (`layout_counters::damage_dropped`).
+- `ui_root(arena)` uses the thread-default context, so a single-root client is unchanged;
+  `ui_root(arena, ctx)` borrows its own, which must outlive it.
+
+Thread-wide by design, shared by every root: the text and icon caches (`ui_resources`), the
+device scale (set per tick), the frame clock, the percent base, the layout counters, the
+text input's statics and the drop target under a drag (one drag per seat at a time). GTK 4 and Qt keep this split too (a frame clock and damage per
+`GdkSurface` / `QWindow`, caches per display or process); GPUI keeps it per `Window` with one
+`App`.
+
 ---
 
 ## 4. Composition: decorators, not builders
@@ -240,8 +266,8 @@ reducer bindings, small trivially copyable lambdas) ride in props inline.
   else. `ui_root` routes `pointer_move`, `pointer_button`, `pointer_leave` and `key`.
 - **Time and motion**: `ui_now_ns()` is the frame clock (latched per tick). A `transition`
   (100–150 ms ease-out, §5.5) sampled through `animate` in `emit` asks for the next frame only
-  while it runs; `reduced_motion` makes it jump to its end. Delays are timers (`ui_timers`, 32
-  entries): hover intent fires 500 ms after a hover begins, and `ui_root::next_deadline_ns`
+  while it runs; `reduced_motion` makes it jump to its end. Delays are timers (`ui_timers`, the
+  root's, 32 entries): hover intent fires 500 ms after a hover begins, and `ui_root::next_deadline_ns`
   tells the event loop when to wake — a delay requests no frames, an idle tree nothing (G1).
 
 **Icons** (`lx.ui:icon`) are the bundled Lucide SVGs, rasterised per (icon, device size)
@@ -252,7 +278,7 @@ the worker with `icon_cache::set_async`, the icon then appearing on the frame af
 ### Overlays, scrolling, lists and text (ADR-010 §5.6)
 
 - **Overlays** (`lx.ui:overlay`): GPUI's deferred draw. An `overlay_node` is a zero-size,
-  absolute item anywhere in the tree; while open, the UI thread's `overlay_layer` (16 slots,
+  absolute item anywhere in the tree; while open, its root's `overlay_layer` (16 slots,
   `overflow_action::reject`) lays its one child out against the window after the tree's
   layout, beside an anchor (the overlay node's parent, a surface point, the window) with
   GPUI's anchored rules (`place_overlay`: flip, hang from the anchor's other end, shift 8 px
@@ -331,7 +357,7 @@ The flex container is **`flex_node`** (`lx.ui:flex`, `flex(style, children)`), a
 `layout::flex_style` over `lx.layout:flex`: the CSS flexbox subset Taffy gives GPUI
 (direction, wrap, justify / align content, items and self, gaps, grow / shrink / basis,
 min / max, margin with `auto`, padding, border, `position: absolute` with insets, overflow;
-lengths px, rem, percent, auto). `box()` is a flex column or row with a gap. Text wraps at
+lengths px, rem, percent, auto). Text wraps at
 the width the container gives it and shrinks to its longest word. Counts of what a pass did
 are in `ui_layout_counters()`.
 
@@ -377,9 +403,9 @@ tree's took 55 µs (`lumen-ui-bench --scenario S2`). `test_ui_components`'
 `damage_scoped_emit_repaints_the_damage_exactly` checks that the kept pixels with the damage
 repainted from the scoped list equal a full redraw.
 
-> The previous `widget::paint(lx::gfx::render_pass&)` signature is superseded. `render_pass`
-> was an empty placeholder class, so nothing painted through it could ever reach the
-> screen. See §9.
+> `ui_node::emit(draw_scope&)` is the only paint entry point. The old
+> `widget::paint(lx::gfx::render_pass&)` and its empty `render_pass` were deleted in ADR-010
+> Phase 5. See §9.
 
 ### Text emission (ADR-010 §4.6, Phase 2)
 
@@ -485,21 +511,24 @@ text input and the menus, modals, toasts and tooltips (`:overlay`, `:scroll`, `:
 `toast_stack`, `scroll_area` and `text_input` golden images. Flex layout (`:flex`)
 is covered by `tests/test_layout_flex.cpp`; styles, themes, styled boxes and icons
 (`:style`, `:theme`, `:theme.compile`, `:styled`, `:icon`) by `tests/test_ui_theme.cpp` and
-the `styled_surfaces` / `icons` golden images. The old string-keyed `style_ref` survives only
-for `:widgets` and `lx.ui.builder`, and reads nothing. Every §5.6 component in its states is
+the `styled_surfaces` / `icons` golden images. Every §5.6 component in its states is
 drawn by `lumen-ui-gallery` (§10); `lumen-ui-bench --scenario S2` is a shell panel built from
 them (ADR-010 §8.3, gate G2).
 
-The legacy retained-widget API (`:widgets`, `:widget_node`) is still exported so existing
-callers compile. It is superseded and should not gain new widgets:
+ADR-010 Phase 5 deleted the legacy retained-widget API (ADR-005 F7, step 13): one paradigm
+remains. What went, and what replaced it:
 
-| Legacy | Replacement |
-|--------|-------------|
-| `widget` base with raw `widget*` children | `ui_node` with owned children + reconciliation |
-| `widget::paint(gfx::render_pass&)` | `ui_node::emit(draw_scope&)` |
+| Deleted | Replacement |
+|---------|-------------|
+| `:widgets` (`widget` base with raw `widget*` children; `window::create` that succeeded with nothing) | `ui_node` with owned children + reconciliation; `lx::app::window` |
+| `widget::paint(gfx::render_pass&)` and `gfx::render_pass` | `ui_node::emit(draw_scope&)` |
 | `widget::invalidate()` (no-op) | `invalidate_paint` / `invalidate_layout` |
 | `widget::preferred_size(constraints)` | `measure(constraints, size_hint)` |
+| `:widget_node` (`scene::node_kind::widget`) | the client's `draw_list` from `ui_root::tick` |
+| `:widgets_decl` (`box()`, placeholder-bar `text()`, `button(label, fn, colour)`) | `flex()` / `div(style)`, `label()`, `button()` |
+| the string-keyed `style_ref` / `style_property` / `state` (16 B in every `ui_node`) | the packed `style` value |
 | `lx.ui.builder` fluent builders | `operator|` decorators |
+| lx.layout's old `flex_node` / `grid_node` / `layout_engine`, `scene::container_node::layout()` and `scene_graph::update` | `lx.layout:flex` through `lx.ui:flex` |
 
 Still to build:
 
@@ -569,8 +598,9 @@ given.
 ## 11. The client runtime (`lx.app`, ADR-010 Phase 4)
 
 What turns a `ui_root` into a window on screen. One process, one UI thread running one
-`lx::runtime::event_loop`, one worker thread; a window per UI thread (lx.ui's ledger, overlays,
-timers and device scale are the thread's). threading.md "Client process" has the thread table,
+`lx::runtime::event_loop`, one worker thread; a window per UI thread (lx.app's own rule until
+lx.ui.host lands: lx.ui keeps a ledger, overlays and timers per root, but the device scale and
+the caches are the thread's). threading.md "Client process" has the thread table,
 [UML 47](../uml/47-client-frame-loop.mmd) the frame.
 
 **Connection** (`lx.wayland.client`). A thin libwayland-client wrapper, no Wayland type

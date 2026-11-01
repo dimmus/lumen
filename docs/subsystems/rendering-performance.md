@@ -554,31 +554,56 @@ commit-timing target arms a stopped clock for exactly the tick that presents it 
 desktop with a timed update wakes once). See [architecture.md](../architecture.md) "Explicit
 sync, buffer readiness and the commit-path protocols".
 
-### Server-side frames: quad primitives and atlas glyphs
+### Server-side frames: primitives only
 
-A window frame (`lx.compositor:decoration`) emits its four border fills and its title fill
-as UI **quad primitives** (ADR-010 §4.11): radius 0, no border, one colour, on the projected
-whole-pixel rects the swatch blits used to cover — so the pixels are those of the blits (the
-CPU compositor at scale 1 and 1.25 is pixel-identical in every frame state,
-`test_decoration_geometry`). Colours are the palette's sRGB bytes as encoded values; a
-dimmed (not-responding) frame carries the dim already applied with `cpu_compositor`'s byte
-rule (`(c · 166) >> 8`), so no `tint` is involved. The title text and the close glyph are
-**`mono_sprite`s** (ADR-010 Phase 2) from the compositor's own glyph atlas (`chrome_atlas`):
-the title is shaped and fitted by `lx.text` and its glyphs rasterised into the atlas on the
-UI thread when the title, its ellipsis cut or the window's output scales change (≈80 µs for
-a 26-glyph title in a size not seen yet, ≈1–3 µs when its glyphs are cached — not a frame
-cost), one run per output scale the frame is on so it is drawn 1:1 on each; the close glyph
-is the analytic "×" rasterised per scale. Only the hover / pressed circle stays a blit of
-the 64x64 atlas. There are no per-window title textures any more (no upload, no texture id,
-no retirement per title change). Damage is unchanged: the frame's four strips (title bar plus
-borders, old and new apart), never the client area; a hover or press repaints the close
-button only. No shadow and no rounded corner yet — a visual change, left for Phase 3.
+A window frame (`lx.compositor:decoration`) is drawn with UI primitives only (ADR-010 §4.11,
+Phase 5). Its four border fills and its title fill are **quads** — radius 0, no border, one
+colour, on the projected whole-pixel rects the swatch blits used to cover, so the pixels are
+those of the blits (the CPU compositor at scale 1 and 1.25 is pixel-identical in every frame
+state, `test_decoration_geometry`). The close button's hover / pressed circle is **one quad
+whose radius is half its side**. The title text and the close glyph are **`mono_sprite`s**
+(ADR-010 Phase 2) from the compositor's own glyph atlas (`chrome_atlas`). No texture is staged
+for a frame and none is sampled but the atlas pages: the 64x64 decoration atlas (swatches, a
+fallback ×, the circles) is gone, and with it the gate that kept a shown frame blank until
+that atlas was staged — a frame draws from the first snapshot published after it is shown.
 
-Dimming. The fills and the glyph colours carry the byte rule on every backend, so a dimmed
-bar's fill and text follow one rule everywhere (Phase 1 left the title blits tinted in linear
-light on GL and Vulkan, apart from their fills): on GL the dimmed fill and the full-coverage
-glyph pixels equal the CPU's bytes, on Vulkan within 1/255 (`test_deco_titles`). The circle
-blit still carries `k_dim_tint`.
+- **Colours** are the palette's sRGB bytes as encoded values (`k_deco_*`); a dimmed
+  (not-responding) frame carries the dim already applied with `cpu_compositor`'s byte rule
+  (`(c · 166) >> 8`) in its fills, its circle and its glyph colours, so no `tint` is involved
+  anywhere and a dimmed bar follows one rule on every backend (GL equals the CPU's bytes,
+  Vulkan within 1/255, `test_deco_titles`).
+- **Titles.** The title is shaped and fitted by `lx.text` and its glyphs rasterised into the
+  atlas on the UI thread when the title, its ellipsis cut or the window's output scales change
+  (≈80 µs for a 26-glyph title in a size not seen yet, ≈1–3 µs when its glyphs are cached —
+  not a frame cost), one run per output scale the frame is on so it is drawn 1:1 on each.
+  There are no per-window title textures (no upload, no texture id, no retirement).
+- **The ×** is the analytic glyph rasterised per scale, at once when the manager first learns
+  a scale (`set_window_scales`, and the default scale when a frame is first framed): the ×
+  at a new output's scale is in the next frame published, and there is no fallback draw.
+- **The circle.** At scale 1 its coverage is the old atlas circle's (½ − (|p − c| − r) at
+  each pixel centre). Inside it and everywhere off it the pixels are the old ones on CPU and
+  GL; its anti-aliased edge now blends in the encoded space like every primitive, where the
+  CPU compositor blended the old blit in linear light — up to 28/255 on edge pixels at scale 1
+  and 41/255 at 1.25 (where the old circle was the 20 px texture resampled to 25 px; GL: 1 and
+  32/255). The committed CPU references changed on those edge pixels only (56 at scale 1, 172
+  at 1.25, `test_deco_titles`).
+- **Damage** is unchanged: the frame's four strips (title bar plus borders, old and new apart),
+  never the client area; a hover or press repaints the close button only.
+- **Paths without a primitive renderer** (a GLES 2 context, Vulkan whose `ui_vk` did not come
+  up) draw the same frame through `gfx::lower_to_blits`: the fills and the circle as solid
+  blits (the circle's carries `corner_radius`), the title and the × as coverage blits from the
+  atlas's R8 pages, which the backend holds as textures (`sync_atlas`). Against GLES 3.1's
+  primitive path: GLES 2 is 0/255 everywhere; Vulkan (lavapipe) 0/255 away from anti-aliased
+  edges, up to 41/255 on them (linear light, no `text.contrast`). Details in §6 "UI primitives
+  in the compositor".
+- **No frame shadow and no rounded window corner** — a visual change with no gate, and rounded
+  corners were reverted once (PR #63); not part of Phase 5 (ADR-010 Phase 5 deviations).
+
+The other compositor chrome is solid draws (`draw_command::solid`) too: the edge-snap preview
+(its translucent fill and four 1 px border strips, the colours the 1×1 textures it once
+stretched held) and the black under a fullscreen window. Nothing is staged for them; an opaque,
+untinted solid is a scissored clear on GL; the pixels are those of the textures on CPU and GL
+(`test_ui_composite`).
 
 ### Screen capture: copies ride the composite
 
@@ -661,7 +686,7 @@ flowchart TD
     HYBRID{hybrid?}
     PLANE[assign_plane]
     OVER[assign_overlay_stack]
-    VK[vulkan_composite — merged_render_pass]
+    VK[composite — frame_painter: vulkan / gl / cpu]
     PRESENT[present — mailbox/fifo per output]
 
     START --> CAND --> EVAL
@@ -1365,14 +1390,14 @@ skipping. One instanced draw per batch is the target for the UI backends (≤ 8 
 never touches the grid, its `refs()` / `batches()` are empty, and it reaches the
 compositor's backends as the sorted `draw_command` array converted to blits, as before. With
 primitives (server-side decorations), CPU and GLES 3.1 draw the stream through `:ui_cpu` /
-`:ui_gl` and the other paths draw it lowered to blits — see "UI primitives in the
-compositor" below.
+`:ui_gl`, Vulkan through `:ui_vk` in its linear pass, and a path without a primitive renderer
+draws it lowered to blits — see "UI primitives in the compositor" below.
 
-`pipeline_cache::acquire(pipeline_key)` returns cached pipeline handle (stub until P0 Vulkan).
-
-`merged_render_pass` batches `textured_quad` draws in a single pass when scanout is not used.
-
-**Module:** `lx.gfx.pipeline` — `pipeline_cache`, `merged_render_pass`, `textured_quad`
+Pipelines: the Vulkan compositor and `:ui_vk` make theirs per attachment format through one
+`VkPipelineCache` persisted on disk (`ui_vk_renderer::pipeline_cache`), GL's programs are
+built at start-up (the lowered-primitive and colour-managed ones on their first draw), and
+`gfx::pipeline_cache` (`lx.gfx:renderer`) is the 64-entry key table of the headless
+`frame_renderer`.
 
 See [../uml/33-gpu-resource-pools.mmd](../uml/33-gpu-resource-pools.mmd).
 
@@ -1529,10 +1554,32 @@ frame:
   walks the stream in order (`paint_headless`: blits, solid quads, glyphs blended from the
   atlas).
 - **Without a primitive renderer** — a GLES 2 context (`egl_device` asks for 3.1 and falls
-  back to 2.0) — the stream is lowered (`gfx::lower_to_blits`): a solid square quad on whole
-  pixels becomes a solid blit, anything else (the title glyphs among it) is dropped and
-  counted, with one warning per run of frames that drop. A GLES 2 host shows frames without
-  titles.
+  back to 2.0), or Vulkan whose `ui_vk` did not come up — the stream is lowered
+  (`gfx::lower_to_blits`): a solid quad on whole pixels becomes a solid blit (a rounded one
+  with equal radii carries `blit_command::corner_radius`, drawn with `:ui_cpu`'s coverage
+  saturate(½ − d) of the rounded-box distance), an unturned mono sprite with a whole-pixel clip
+  a coverage blit (`blit_command::coverage`: its colour × the texel of an R8 atlas page,
+  `atlas_page_texture(page)`; at 1:1 on whole pixels it samples texel centres exactly, else
+  the tile is resampled into its bounds grown to whole pixels), and anything else (shadows,
+  underlines, borders, gradients, unequal radii, colour glyphs) is dropped and counted, with
+  one warning per run of frames that drop. The backend holds the atlas's R8 pages as textures:
+  `gl_compositor::sync_atlas` (GL_LUMINANCE, a GLES 2 core format; dirty rects sent from the
+  page's memory, a row at a time where GLES 2 has no `GL_UNPACK_ROW_LENGTH`) and
+  `vulkan_compositor::sync_atlas` (R8_UNORM images, the dirty rects in one copy after the
+  frames in flight are done — a title change, never a steady frame), called by
+  `frame_painter` under the atlas's lock before the lowered composite. GL draws the lowered
+  primitives with a program of their own (`#version 100`, built on the first such draw, so no
+  other draw pays for the distance or the coverage sample); Vulkan in its composite shader
+  (`use_solid` 2: coverage; `radius` where the push block had padding). The CPU compositor
+  never sees them (its frames with primitives go through `:ui_cpu`) and reports them
+  unsupported. Server-side frames therefore draw their titles, × and circle on every path:
+  against GLES 3.1's primitive path, GLES 2 is 0/255 everywhere and Vulkan (lavapipe) 0/255
+  away from anti-aliased edges and up to 41/255 on them (`test_deco_titles`). Mesa hands out
+  a GLES 3.1 context when 2.0 is asked for, so the GLES 2 test runs the lowered path on it
+  with no `ui_gl`; its shaders also pass `glslangValidator` as GLSL ES 1.00.
+- **Capture without a UI renderer.** A capture's re-composite asks for the UI renderer's paint
+  first and lowers the stream only when there is none (GLES 2), syncing the atlas pages before
+  it: a CPU or GLES 3.1 capture no longer lowers a stream it never draws.
 - **The glyph atlas across threads.** `chrome_atlas` is written by the UI thread (a title
   change rasterises under its mutex) and read by the render thread: every paint whose stream
   has sprites holds the mutex while the renderer samples (CPU) or uploads (GL, Vulkan) the
@@ -1963,7 +2010,7 @@ Compositor logs **`warn`** when a tick exceeds budget (never on every frame at `
 | Content hints | `lx.compositor.surface` |
 | Present mode | `lx.compositor.output` |
 | Import cache LRU | `lx.gfx.import_cache` |
-| Pipeline cache | `lx.gfx.pipeline` |
+| Pipeline cache | `lx.gfx:renderer` (`pipeline_cache`, headless); `VkPipelineCache` via `lx.gfx:ui_vk` |
 | Semaphore pool | `lx.gfx.semaphore_pool` |
 | KMS atomic + damage | `lx.drm.atomic` |
 | Present timing | `lx.scheduler.presentation` |

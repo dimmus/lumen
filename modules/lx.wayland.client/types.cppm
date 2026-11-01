@@ -19,6 +19,7 @@ class surface;
 class buffer;
 class toplevel;
 class popup;
+class layer_surface;
 class text_input;
 class dmabuf_feedback;
 class data_device;
@@ -45,6 +46,11 @@ enum class global_kind : unsigned {
     xdg_output,       ///< zxdg_output_manager_v1, cap 3.
     data_device_manager, ///< wl_data_device_manager, cap 3 (wl_data_device.release).
     primary_selection,   ///< zwp_primary_selection_device_manager_v1, cap 1.
+    /// zwlr_layer_shell_v1, cap 5 (set_layer 2, keyboard on_demand 4, set_exclusive_edge 5).
+    /// Bound on demand, by the first `layer_surface::create` (an application window never
+    /// binds it). Only with its protocol glue (LUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1);
+    /// otherwise it reaches `global_handler::on_global` like any extension.
+    layer_shell,
     count,
 };
 inline constexpr unsigned k_global_kinds = static_cast<unsigned>(global_kind::count);
@@ -55,9 +61,12 @@ struct global_info {
     /// Registry name; 0 while not advertised.
     std::uint32_t name = 0;
     std::uint32_t advertised = 0;
-    /// 0: not bound (absent, or its protocol glue was not built).
+    /// 0: not bound (absent, its protocol glue was not built, or bound on demand and not
+    /// used yet).
     std::uint32_t bound = 0;
     bool required = false;
+    /// Bound by its first user rather than at connect (`display::bind_on_demand`).
+    bool on_demand = false;
 };
 
 /// What connect reached: a wl_display error after it ends the connection.
@@ -536,7 +545,7 @@ struct dmabuf_plane {
 };
 
 /// Unknown globals (an extension the caller binds itself: the shell's zlm_shell_v1,
-/// layer-shell) and removals, with the registry as `void*` (wl_registry*); and the outputs
+/// ext-workspace) and removals, with the registry as `void*` (wl_registry*); and the outputs
 /// and seats the display tracks coming and going (hotplug: one panel per output). Set it
 /// before `connect` to hear the ones bound there.
 class global_handler {

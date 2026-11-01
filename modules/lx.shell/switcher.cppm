@@ -17,36 +17,33 @@ module;
 // readback per window costs ~12 ms each on this hardware class; a compositor-drawn mirror is
 // the designed follow-up (ADR 011).
 //
+// The view is an lx.ui tree on an lx.ui.host surface (ADR-010 Phase 5 P5-7): the same
+// geometry `layout_switcher` always produced, described into the engine's retained tree with
+// the canvas's exact palette (view_ui's literal boxes); pointer events arrive through the
+// context's seat router (the cells are the tree's interactive nodes) and keys still come the
+// way they always did — the hold has them, not the surface.
+//
 // The model and the layout are pure (tests/test_switcher.cpp); the view is the only part
 // with Wayland in it. Shell thread only; nothing allocates while the hold lasts beyond the
-// view's buffers when it opens.
-
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
+// surface's buffers when it opens.
 
 #include <stdint.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
-#include <wayland-client.h>
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
-#endif
-
 import lx.foundation;
+import lx.gfx;
+import lx.layout;
 import lx.text;
 import lx.trace;
+import lx.ui;
+import lx.ui.host;
+import lx.wayland.client;
 
 export module lx.shell:switcher;
 
 import std;
 
 import :task_model;
-import :shm_canvas;
+import :view_ui;
 
 export namespace lx::shell {
 
@@ -181,11 +178,8 @@ struct switcher_layout {
 // ── The view ──────────────────────────────────────────────────────────────────
 
 struct switcher_globals {
-    void* compositor = nullptr;  // wl_compositor
-    void* shm = nullptr;         // wl_shm
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1
-    void* viewporter = nullptr;  // wp_viewporter (with fractional: sharp at any scale)
-    void* fractional = nullptr;  // wp_fractional_scale_manager_v1
+    /// The shell's lx.ui.host context (null: the view cannot be created).
+    lx::ui::host::context* ui = nullptr;
 };
 
 /// A window's icon at `px`² pixels (premultiplied ARGB8888), null for a letter tile: the
@@ -193,9 +187,23 @@ struct switcher_globals {
 using switcher_icon_fn = const std::uint32_t* (*)(task_handle h, const task_entry& e, int px,
                                                   void* user);
 
-/// The switcher's surface: an overlay-layer surface centred on one output, no keyboard
-/// interactivity (the hold has the keys), placed over panels (exclusive zone -1). It exists
-/// only while shown: open creates it and its buffers, close frees them.
+/// The cells' pointer input, forwarded from the tree's interactive cells (the context's seat
+/// router): `hover` when a cell's hover or press state changed (the pointer's first landing
+/// is one call — the shell decides when it has really moved), `pick` on a press and on its
+/// release on the same cell.
+struct switcher_input {
+    void (*hover)(unsigned entry, void* user) = nullptr;
+    void (*pick)(unsigned entry, bool pressed, void* user) = nullptr;
+    void* user = nullptr;
+};
+
+/// The switcher's describing function (the surface's frame loop calls it inside
+/// `run_frame`; `switcher_view::after_dispatch` holds the guard that names the view).
+[[nodiscard]] lx::ui::child switcher_describe(lx::ui::build_context& ctx);
+
+/// The switcher's surface: an overlay-layer lx.ui.host surface centred on one output, no
+/// keyboard interactivity (the hold has the keys), placed over panels (exclusive zone -1).
+/// It exists only while shown: open creates it and its buffers, close frees them.
 class switcher_view {
 public:
     switcher_view() = default;
@@ -204,25 +212,31 @@ public:
     switcher_view& operator=(const switcher_view&) = delete;
 
     void init(switcher_globals g, switcher_icon_fn icons, void* user);
-    /// Opens on `output` (wl_output*) of `output_w`×`output_h` logical px for `m`'s list.
-    bool open(void* output, int output_w, int output_h, const switcher_model& m);
+    /// The cells' input, as the tree forwards it (`set_input`).
+    void set_input(const switcher_input& in) { input_ = in; }
+    /// Opens on output slot `output_slot` (`display::output_at`; ~0u: the compositor picks)
+    /// of `output_w`×`output_h` logical px for `m`'s list.
+    bool open(unsigned output_slot, int output_w, int output_h, const switcher_model& m);
     void close();
-    [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
-    [[nodiscard]] void* surface() const { return surface_; }
+    [[nodiscard]] bool is_open() const { return surface_.valid(); }
+    [[nodiscard]] void* surface() const {
+        return surface_.valid() ? surface_.wl().native() : nullptr;
+    }
     [[nodiscard]] const switcher_layout& layout() const { return layout_; }
-    /// Draws what changed since the last frame (the selection's two cells and the title, or
-    /// everything after a list change), once the compositor took the last one.
+    /// Describes what changed since the last frame (the selection's cells and the title, or
+    /// everything after a list change) into the tree and runs the surface's frame loop.
     void after_dispatch(const switcher_model& m, const task_model& tasks);
     /// The entry under the surface-local point, or -1.
     [[nodiscard]] int entry_at(double x, double y) const { return switcher_hit(layout_, x, y); }
     /// Frames committed since it opened (tests, logs).
-    [[nodiscard]] unsigned frames() const { return frames_; }
-
-    struct events;
+    [[nodiscard]] unsigned frames() const {
+        return surface_.valid() ? static_cast<unsigned>(surface_.stats().frames) : 0u;
+    }
 
 private:
-    friend struct events;
-    /// What one buffer shows.
+    friend lx::ui::child switcher_describe(lx::ui::build_context& ctx);
+
+    /// What the described tree shows; a change re-describes.
     struct drawn_state {
         bool valid = false;
         unsigned first = 0;
@@ -230,25 +244,45 @@ private:
         unsigned selection = 0;
         unsigned title_rev = 0;
         task_handle selected{};
+        constexpr bool operator==(const drawn_state&) const = default;
     };
-    void draw(const switcher_model& m, const task_model& tasks, bool force);
-    void paint_cell(int bi, const switcher_model& m, const task_model& tasks, unsigned i,
-                    bool selected);
-    void paint_title(int bi, const switcher_model& m, const task_model& tasks);
+    /// One cell's stable identity for the tree's callbacks (`cell_refs_[i]`).
+    struct cell_ref {
+        switcher_view* view = nullptr;
+        unsigned entry = 0;
+    };
+    /// An icon's atlas slot, re-resolved when the window or its size changes.
+    struct icon_slot {
+        task_handle task{};
+        unsigned rev = 0;
+        int px = 0;
+        lx::gfx::atlas_tile_id tile{};
+    };
+
+    [[nodiscard]] lx::ui::child build_ui();
+    [[nodiscard]] lx::gfx::atlas_tile_id icon_tile(unsigned cell, task_handle task, unsigned rev,
+                                                   const std::uint32_t* pixels, int px);
+    static void cell_notify(void* user, bool hovered);
+    static void cell_event(void* user, const lx::ui::pointer_event& e);
+    void on_layer_closed();
 
     switcher_globals g_{};
     switcher_icon_fn icons_ = nullptr;
     void* user_ = nullptr;
-    shm_canvas canvas_{};
+    switcher_input input_{};
+    lx::ui::host::surface surface_{};
+    lx::ui::host::layer_role role_{};
     switcher_layout layout_{};
     int output_w_ = 0;
     int output_h_ = 0;
-    drawn_state drawn_[2]{};
-    drawn_state committed_{};
-    void* surface_ = nullptr; // wl_surface*
-    void* layer_ = nullptr;   // zwlr_layer_surface_v1*
-    bool configured_ = false;
-    unsigned frames_ = 0;
+    drawn_state drawn_{};
+    /// The models the describing frame reads (set by `after_dispatch`, read inside
+    /// `run_frame` in the same iteration).
+    const switcher_model* model_ = nullptr;
+    const task_model* tasks_ = nullptr;
+    static constexpr unsigned k_icon_slots = 16;
+    icon_slot icon_slots_[k_icon_slots]{};
+    cell_ref cell_refs_[k_switcher_max]{};
 };
 
 } // namespace lx::shell
@@ -460,13 +494,50 @@ constexpr lx::trace::category log_switcher{"shell.switcher"};
 constexpr std::uint32_t k_sw_bg = 0xFF1E1E22u; // the panel's colour
 constexpr std::uint32_t k_sw_selected = 0xFF3D6FB4u;
 constexpr std::uint32_t k_sw_tile = 0xFF5A5A66u;
+constexpr std::uint32_t k_sw_text = 0xFFF0F0F0u;
+constexpr std::uint32_t k_sw_text_dim = 0xFFA8A8ACu;
 constexpr int k_sw_radius = 12;
-constexpr lx::text::raster_color k_sw_text{0xF0, 0xF0, 0xF0, 0xFF};
-constexpr lx::text::raster_color k_sw_text_dim{0xA8, 0xA8, 0xAC, 0xFF};
+constexpr int k_sw_selected_radius = 8;
+constexpr int k_sw_tile_radius = 10;
 constexpr lx::text::font_desc k_sw_font{"Sans", 11.f, lx::text::weight::normal,
                                         lx::text::style::normal};
 constexpr lx::text::font_desc k_sw_letter_font{"Sans", 26.f, lx::text::weight::bold,
                                                lx::text::style::normal};
+
+lx::shell::switcher_view* g_describing = nullptr;
+struct describing_guard {
+    explicit describing_guard(lx::shell::switcher_view* v) : previous_{g_describing} {
+        g_describing = v;
+    }
+    ~describing_guard() { g_describing = previous_; }
+    describing_guard(const describing_guard&) = delete;
+    describing_guard& operator=(const describing_guard&) = delete;
+
+private:
+    lx::shell::switcher_view* previous_;
+};
+
+} // namespace
+
+lx::ui::child lx::shell::switcher_describe(lx::ui::build_context&) {
+    lx::shell::switcher_view* v = g_describing;
+    return v ? v->build_ui() : nullptr;
+}
+
+namespace {
+
+/// One line of text in the switcher's fonts, clipped to its box and centred in it.
+[[nodiscard]] lx::ui::child switcher_text(const char* text, std::uint32_t argb,
+                                          const lx::text::font_desc& font,
+                                          lx::ui::element_key key) {
+    lx::ui::text_block_props t{};
+    t.text = text;
+    t.font = font;
+    t.color = lx::shell::shell_color(argb);
+    t.wrap = lx::text::text_wrap::none;
+    t.context = lx::ui::active_ui_resources().text;
+    return lx::ui::text_block(t, key);
+}
 
 } // namespace
 
@@ -474,204 +545,51 @@ void lx::shell::switcher_view::init(switcher_globals g, switcher_icon_fn icons, 
     g_ = g;
     icons_ = icons;
     user_ = user;
-    canvas_.set_alpha(true);
-}
-
-void lx::shell::switcher_view::paint_cell(int bi, const switcher_model& m, const task_model& tasks,
-                                          unsigned i, bool selected) {
-    const lx::rect2i cell = switcher_cell(layout_, i);
-    const std::uint32_t bg = k_sw_bg;
-    canvas_.fill(bi, cell, bg);
-    if (selected)
-        canvas_.fill_rounded(bi, {cell.x + 4, cell.y + 4, cell.width - 8, cell.height - 8},
-                             k_sw_selected, bg, 8);
-    const task_handle h = m.entry(layout_.first + i);
-    const task_entry* e = tasks.get(h);
-    if (!e)
-        return;
-    const lx::rect2i icon_box{cell.x + (cell.width - k_switcher_icon) / 2,
-                              cell.y + (cell.height - k_switcher_icon) / 2, k_switcher_icon,
-                              k_switcher_icon};
-    const int px = canvas_.pixel_rect(icon_box).width;
-    const std::uint32_t* pixels = icons_ ? icons_(h, *e, px, user_) : nullptr;
-    if (pixels) {
-        canvas_.blit(bi, icon_box, pixels, px);
-        return;
-    }
-    // A letter tile, as the panel draws for a window with no icon.
-    canvas_.fill_rounded(bi, icon_box, k_sw_tile, selected ? k_sw_selected : bg, 10);
-    const char* src = e->app_id[0] ? e->app_id : (e->title[0] ? e->title : "?");
-    if (const char* dot = std::strrchr(src, '.'); dot && dot[1])
-        src = dot + 1;
-    char letter[2] = {src[0] >= 'a' && src[0] <= 'z' ? static_cast<char>(src[0] - 32) : src[0], 0};
-    const int lw = canvas_.text_width(letter, k_sw_letter_font);
-    const int lx0 = icon_box.x + (lw > 0 && lw < icon_box.width ? (icon_box.width - lw) / 2 : 8);
-    (void)canvas_.text(bi, {lx0, icon_box.y, icon_box.x + icon_box.width - lx0, icon_box.height},
-                       letter, k_sw_text, k_sw_letter_font);
-}
-
-void lx::shell::switcher_view::paint_title(int bi, const switcher_model& m, const task_model& tasks) {
-    const lx::rect2i box = switcher_title_rect(layout_);
-    canvas_.fill(bi, box, k_sw_bg);
-    const task_entry* e = tasks.get(m.selected());
-    if (!e)
-        return;
-    const char* title = e->title[0] ? e->title : (e->app_id[0] ? e->app_id : "untitled");
-    const int tw = canvas_.text_width(title, k_sw_font);
-    const int x = tw > 0 && tw < box.width ? box.x + (box.width - tw) / 2 : box.x;
-    (void)canvas_.text(bi, {x, box.y, box.x + box.width - x, box.height}, title,
-                       e->state == k_task_state_minimized ? k_sw_text_dim : k_sw_text, k_sw_font);
-}
-
-void lx::shell::switcher_view::draw(const switcher_model& m, const task_model& tasks, bool force) {
-    const int bi = canvas_.acquire();
-    if (bi < 0)
-        return; // a release re-runs this
-    // The size is fixed while open (a window that goes leaves its cell empty); the page
-    // follows the selection, and a page change or a list change repaints everything.
-    const unsigned page = layout_.columns * layout_.rows;
-    layout_.first = page && m.selection() < m.count() ? (m.selection() / page) * page : 0;
-    layout_.shown = layout_.first < m.count()
-                        ? (m.count() - layout_.first < page ? m.count() - layout_.first : page)
-                        : 0;
-    const task_entry* sel = tasks.get(m.selected());
-    drawn_state next{true, layout_.first, m.count(), m.selection(), sel ? sel->label_rev : 0u,
-                     m.selected()};
-    const auto same_frame = [](const drawn_state& a, const drawn_state& b) {
-        return a.valid && b.valid && a.first == b.first && a.count == b.count;
-    };
-    const auto same = [&](const drawn_state& a, const drawn_state& b) {
-        return same_frame(a, b) && a.selection == b.selection && a.title_rev == b.title_rev &&
-               a.selected == b.selected;
-    };
-    if (!force && same(committed_, next))
-        return;
-    // Repaint this buffer up to `next` from what it showed; damage what changed since the
-    // last commit.
-    const auto changed_rects = [&](const drawn_state& from, lx::rect2i* out) -> unsigned {
-        if (!same_frame(from, next)) {
-            out[0] = {0, 0, layout_.width, layout_.height};
-            return 1;
-        }
-        unsigned n = 0;
-        if (from.selection != next.selection) {
-            if (from.selection >= next.first && from.selection - next.first < layout_.shown)
-                out[n++] = switcher_cell(layout_, from.selection - next.first);
-            out[n++] = switcher_cell(layout_, next.selection - next.first);
-        }
-        if (from.selection != next.selection || from.title_rev != next.title_rev ||
-            !(from.selected == next.selected))
-            out[n++] = switcher_title_rect(layout_);
-        return n;
-    };
-    lx::rect2i repaint[3];
-    const unsigned nr = force ? 0u : changed_rects(drawn_[bi], repaint);
-    if (force || (nr == 1 && repaint[0].width == layout_.width && repaint[0].height == layout_.height)) {
-        canvas_.clear(bi);
-        canvas_.fill_rounded(bi, {0, 0, layout_.width, layout_.height}, k_sw_bg, 0u,
-                             k_sw_radius);
-        for (unsigned i = 0; i < layout_.shown; ++i)
-            paint_cell(bi, m, tasks, i, layout_.first + i == m.selection());
-        paint_title(bi, m, tasks);
-    } else {
-        for (unsigned r = 0; r < nr; ++r) {
-            if (repaint[r].y >= switcher_title_rect(layout_).y) {
-                paint_title(bi, m, tasks);
-                continue;
-            }
-            for (unsigned i = 0; i < layout_.shown; ++i) {
-                const lx::rect2i c = switcher_cell(layout_, i);
-                if (c.x == repaint[r].x && c.y == repaint[r].y)
-                    paint_cell(bi, m, tasks, i, layout_.first + i == m.selection());
-            }
-        }
-    }
-    drawn_[bi] = next;
-    lx::rect2i damage[3];
-    const unsigned nd = force ? 1u : changed_rects(committed_, damage);
-    if (force)
-        damage[0] = {0, 0, layout_.width, layout_.height};
-    canvas_.commit(surface_, bi, damage, nd);
-    committed_ = next;
-    ++frames_;
-    if (log_switcher.enabled(lx::trace::level::debug)) {
-        log_switcher.debug("switcher: draw selection={} first={} damage={}", m.selection(),
-                           layout_.first, nd);
-    }
 }
 
 #if defined(LUMEN_SHELL_WAYLAND)
 
-struct lx::shell::switcher_view::events {
-    static switcher_view& self(void* data) { return *static_cast<switcher_view*>(data); }
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial, uint32_t w,
-                          uint32_t h) {
-        auto& v = self(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        const int nw = w ? static_cast<int>(w) : v.layout_.width;
-        const int nh = h ? static_cast<int>(h) : v.layout_.height;
-        if (nw != v.canvas_.width() || nh != v.canvas_.height() || !v.canvas_.allocated()) {
-            if (!v.canvas_.allocate(v.g_.shm, nw, nh, "lumen-switcher")) {
-                log_switcher.error("cannot allocate switcher buffers");
-                v.close();
-                return;
-            }
-            (void)v.canvas_.take_rescale();
-            v.drawn_[0] = v.drawn_[1] = v.committed_ = {};
-        }
-        v.configured_ = true;
-    }
-    static void closed(void* data, zwlr_layer_surface_v1*) {
-        // Its output went: the switch goes on without the view.
-        self(data).close();
-    }
-};
-
-namespace {
-
-const zwlr_layer_surface_v1_listener k_switcher_layer_listener = {
-    .configure = lx::shell::switcher_view::events::configure,
-    .closed = lx::shell::switcher_view::events::closed,
-};
-
-} // namespace
-
-bool lx::shell::switcher_view::open(void* output, int output_w, int output_h,
+bool lx::shell::switcher_view::open(unsigned output_slot, int output_w, int output_h,
                                     const switcher_model& m) {
     if (is_open())
         return true;
-    if (!g_.compositor || !g_.layer_shell || !g_.shm || m.count() == 0)
+    if (!g_.ui || !g_.ui->started() || m.count() == 0)
         return false;
     output_w_ = output_w > 0 ? output_w : 1024;
     output_h_ = output_h > 0 ? output_h : 768;
     layout_ = layout_switcher(m.count(), m.selection(), output_w_, output_h_);
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
+    lx::ui::host::surface_options so{};
+    so.describe = &switcher_describe;
+    so.size = {layout_.width, layout_.height};
+    // Rounded corners over whatever is beneath: an alpha surface, no opaque region.
+    so.opaque = false;
+    so.frame_records = false;
+    if (auto made = surface_.create(*g_.ui, so); !made) {
+        log_switcher.error(made.get_error());
         return false;
-    surface_ = surface;
-    auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
-        static_cast<wl_output*>(output), ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lumen-switcher");
-    layer_ = layer;
-    zwlr_layer_surface_v1_add_listener(layer, &k_switcher_layer_listener, this);
-    canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
-    // No anchor: centred on the output. Zone -1: over panels, whatever they reserve.
-    zwlr_layer_surface_v1_set_size(layer, static_cast<uint32_t>(layout_.width),
-                                   static_cast<uint32_t>(layout_.height));
-    zwlr_layer_surface_v1_set_exclusive_zone(layer, -1);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(
-        layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
-    if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
-        // Opaque inside the rounded corners: what is under it need not be drawn.
-        wl_region_add(region, k_sw_radius, 0, layout_.width - 2 * k_sw_radius, layout_.height);
-        wl_region_add(region, 0, k_sw_radius, layout_.width, layout_.height - 2 * k_sw_radius);
-        wl_surface_set_opaque_region(surface, region);
-        wl_region_destroy(region);
     }
-    wl_surface_commit(surface);
-    configured_ = false;
-    frames_ = 0;
-    drawn_[0] = drawn_[1] = committed_ = {};
+    lx::ui::host::layer_role_options lo{};
+    lo.layer.output_slot = output_slot;
+    lo.layer.level = lx::wayland::layer::overlay;
+    lo.layer.name_space = "lumen-switcher";
+    // No anchor: centred on the output. Zone -1: over panels, whatever they reserve.
+    lo.size = {layout_.width, layout_.height};
+    lo.exclusive_zone = -1;
+    lo.keyboard = lx::wayland::keyboard_interactivity::none;
+    if (auto made = role_.create(surface_, lo); !made) {
+        log_switcher.error(made.get_error());
+        surface_.destroy();
+        return false;
+    }
+    role_.set_closed_handler(
+        [](void* user) { static_cast<switcher_view*>(user)->on_layer_closed(); }, this);
+    if (auto shown = surface_.show(); !shown) {
+        log_switcher.error(shown.get_error());
+        role_.destroy();
+        surface_.destroy();
+        return false;
+    }
+    drawn_ = {};
     log_switcher.info("switcher: open ({} windows, {}x{}, {} column{})", m.count(), layout_.width,
                       layout_.height, layout_.columns, layout_.columns == 1 ? "" : "s");
     return true;
@@ -680,45 +598,245 @@ bool lx::shell::switcher_view::open(void* output, int output_w, int output_h,
 void lx::shell::switcher_view::close() {
     if (!is_open())
         return;
-    canvas_.free();
-    canvas_.release_scale(); // before the wl_surface it extends
-    (void)canvas_.take_rescale();
-    if (layer_)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
-    layer_ = nullptr;
-    if (surface_)
-        wl_surface_destroy(static_cast<wl_surface*>(surface_));
-    surface_ = nullptr;
-    configured_ = false;
-    drawn_[0] = drawn_[1] = committed_ = {};
-    log_switcher.info("switcher: close ({} frame{})", frames_, frames_ == 1 ? "" : "s");
+    const unsigned frames = static_cast<unsigned>(surface_.stats().frames);
+    role_.destroy();
+    surface_.destroy();
+    model_ = nullptr;
+    tasks_ = nullptr;
+    for (icon_slot& s : icon_slots_)
+        s = {};
+    drawn_ = {};
+    log_switcher.info("switcher: close ({} frame{})", frames, frames == 1 ? "" : "s");
+}
+
+void lx::shell::switcher_view::on_layer_closed() {
+    // Its output went: the switch goes on without the view.
+    close();
+}
+
+lx::gfx::atlas_tile_id lx::shell::switcher_view::icon_tile(unsigned cell, task_handle task,
+                                                           unsigned rev,
+                                                           const std::uint32_t* pixels, int px) {
+    if (!pixels || px <= 0 || !surface_.valid())
+        return {};
+    icon_slot& s = icon_slots_[cell % k_icon_slots];
+    lx::gfx::atlas_tile place{};
+    if (s.task == task && s.rev == rev && s.px == px && s.tile.valid() &&
+        surface_.atlas().lookup(s.tile, place))
+        return s.tile;
+    // The pixels are premultiplied ARGB (0xAARRGGBB); the atlas wants premultiplied RGBA.
+    std::uint8_t rgba[64 * 64 * 4];
+    if (static_cast<unsigned>(px) > 64)
+        return {};
+    for (int i = 0; i < px * px; ++i) {
+        const std::uint32_t v = pixels[i];
+        rgba[i * 4 + 0] = static_cast<std::uint8_t>((v >> 16) & 0xFF);
+        rgba[i * 4 + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+        rgba[i * 4 + 2] = static_cast<std::uint8_t>(v & 0xFF);
+        rgba[i * 4 + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFF);
+    }
+    auto made = surface_.atlas().insert(lx::gfx::atlas_format::rgba8, static_cast<unsigned>(px),
+                                        static_cast<unsigned>(px),
+                                        std::span<const std::uint8_t>{rgba, sizeof(rgba)},
+                                        static_cast<unsigned>(px * 4));
+    if (!made) {
+        log_switcher.warn("icon tile insert failed: {}", made.error().message);
+        return {};
+    }
+    s.task = task;
+    s.rev = rev;
+    s.px = px;
+    s.tile = made.value();
+    return s.tile;
+}
+
+lx::ui::child lx::shell::switcher_view::build_ui() {
+    const unsigned selection = drawn_.selection;
+    lx::ui::child cells[k_switcher_max];
+    unsigned n = 0;
+    // Icons are resolved at the pixels they land on, drawn 1:1 on whole device pixels.
+    const float scale = surface_.valid() ? surface_.scale() : 1.f;
+    const int icon_px = static_cast<int>(std::lround(k_switcher_icon * scale));
+
+    for (unsigned i = 0; i < layout_.shown && n < k_switcher_max; ++i) {
+        const unsigned entry = layout_.first + i;
+        const bool selected = entry == selection;
+        const lx::rect2i cell = switcher_cell(layout_, i);
+        cell_refs_[i] = {this, entry};
+
+        lx::ui::child parts[2];
+        unsigned p = 0;
+        if (selected) {
+            // The selection's rounded highlight, inset into the cell; its corners blend into
+            // the view's background beneath (the canvas rounded them the same way).
+            lx::ui::quad_style q{};
+            q.background = shell_color(k_sw_selected);
+            for (float& r : q.corner_radii)
+                r = static_cast<float>(k_sw_selected_radius);
+            shell_box_props sel{};
+            sel.control.layout = lx::ui::style{}
+                                     .absolute()
+                                     .top(lx::layout::px(4.f))
+                                     .left(lx::layout::px(4.f))
+                                     .w(lx::layout::px(static_cast<float>(cell.width - 8)))
+                                     .h(lx::layout::px(static_cast<float>(cell.height - 8)));
+            sel.rest = q;
+            parts[p++] = shell_box(sel, {}, 0x5200'0000u + i);
+        }
+        // The window's icon, or a letter tile as the panel draws for a window without one.
+        const task_handle h = model_->entry(entry);
+        const task_entry* e = tasks_ ? tasks_->get(h) : nullptr;
+        if (e) {
+            const std::uint32_t* pixels = icons_ ? icons_(h, *e, icon_px, user_) : nullptr;
+            const lx::gfx::atlas_tile_id tile =
+                pixels ? icon_tile(i, h, e->icon_rev, pixels, icon_px) : lx::gfx::atlas_tile_id{};
+            if (tile.valid()) {
+                parts[p++] = lx::ui::image(surface_.atlas(), tile, {icon_px, icon_px},
+                                           0x5201'0000u + i);
+            } else {
+                const char* src = e->app_id[0] ? e->app_id : (e->title[0] ? e->title : "?");
+                if (const char* dot = std::strrchr(src, '.'); dot && dot[1])
+                    src = dot + 1;
+                char letter[2] = {src[0] >= 'a' && src[0] <= 'z' ? static_cast<char>(src[0] - 32)
+                                                                : src[0],
+                                  0};
+                const lx::ui::child glyph[1] = {switcher_text(letter[0] ? letter : "?", k_sw_text,
+                                                              k_sw_letter_font, 0x5202'0000u + i)};
+                lx::ui::quad_style q{};
+                q.background = shell_color(k_sw_tile);
+                for (float& r : q.corner_radii)
+                    r = static_cast<float>(k_sw_tile_radius);
+                shell_box_props tile_box{};
+                tile_box.control.layout = lx::ui::style{}
+                                              .absolute()
+                                              .top(lx::layout::px(
+                                                  static_cast<float>((cell.width - k_switcher_icon) / 2)))
+                                              .left(lx::layout::px(
+                                                  static_cast<float>((cell.width - k_switcher_icon) / 2)))
+                                              .w(lx::layout::px(static_cast<float>(k_switcher_icon)))
+                                              .h(lx::layout::px(static_cast<float>(k_switcher_icon)))
+                                              .flex_row()
+                                              .items_center()
+                                              .justify_center()
+                                              .overflow_hidden();
+                tile_box.rest = q;
+                parts[p++] = shell_box(tile_box, glyph, 0x5203'0000u + i);
+            }
+        }
+        // The cell: the tree's interactive node, transparent itself.
+        shell_box_props box{};
+        box.control.layout = lx::ui::style{}
+                                 .absolute()
+                                 .top(lx::layout::px(static_cast<float>(cell.y)))
+                                 .left(lx::layout::px(static_cast<float>(cell.x)))
+                                 .w(lx::layout::px(static_cast<float>(cell.width)))
+                                 .h(lx::layout::px(static_cast<float>(cell.height)));
+        box.control.interactive = true;
+        box.notify = &switcher_view::cell_notify;
+        box.event = &switcher_view::cell_event;
+        box.user = &cell_refs_[i];
+        cells[n++] = shell_box(box, {parts, p}, 0x5100'0000u + i);
+    }
+
+    // The selected window's title, centred under the row.
+    lx::ui::child title{nullptr};
+    bool has_title = false;
+    if (const task_entry* e = tasks_ ? tasks_->get(model_->selected()) : nullptr) {
+        const char* text = e->title[0] ? e->title : (e->app_id[0] ? e->app_id : "untitled");
+        const lx::rect2i tr = switcher_title_rect(layout_);
+        const lx::ui::child line[1] = {switcher_text(
+            text, e->state == k_task_state_minimized ? k_sw_text_dim : k_sw_text, k_sw_font,
+            0x5300u)};
+        shell_box_props tb{};
+        tb.control.layout = lx::ui::style{}
+                                .absolute()
+                                .top(lx::layout::px(static_cast<float>(tr.y)))
+                                .left(lx::layout::px(static_cast<float>(tr.x)))
+                                .w(lx::layout::px(static_cast<float>(tr.width)))
+                                .h(lx::layout::px(static_cast<float>(tr.height)))
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .overflow_hidden();
+        title = shell_box(tb, line, 0x5301u);
+        has_title = true;
+    }
+
+    // The root: the view's rounded background over everything, the cells and the title on it.
+    lx::ui::quad_style bg{};
+    bg.background = shell_color(k_sw_bg);
+    for (float& r : bg.corner_radii)
+        r = static_cast<float>(k_sw_radius);
+    lx::ui::child placed[k_switcher_max + 1];
+    unsigned total = n;
+    for (unsigned i = 0; i < n; ++i)
+        placed[i] = cells[i];
+    if (has_title)
+        placed[total++] = title;
+    shell_box_props root{};
+    root.control.layout = lx::ui::style{}
+                              .w(lx::layout::percent(100.f))
+                              .h(lx::layout::percent(100.f));
+    root.rest = bg;
+    return shell_box(root, {placed, total}, 0x5000u);
+}
+
+void lx::shell::switcher_view::cell_notify(void* user, bool hovered) {
+    const cell_ref& ref = *static_cast<cell_ref*>(user);
+    if (ref.view && ref.view->input_.hover && hovered)
+        ref.view->input_.hover(ref.entry, ref.view->input_.user);
+}
+
+void lx::shell::switcher_view::cell_event(void* user, const lx::ui::pointer_event& e) {
+    const cell_ref& ref = *static_cast<cell_ref*>(user);
+    if (!ref.view || !ref.view->input_.pick)
+        return;
+    if (e.kind == lx::ui::pointer_kind::press)
+        ref.view->input_.pick(ref.entry, true, ref.view->input_.user);
+    else if (e.kind == lx::ui::pointer_kind::release)
+        ref.view->input_.pick(ref.entry, false, ref.view->input_.user);
 }
 
 void lx::shell::switcher_view::after_dispatch(const switcher_model& m, const task_model& tasks) {
-    if (!is_open() || !configured_)
+    if (!surface_.valid())
         return;
-    if (canvas_.take_rescale()) {
-        // A new preferred scale: new buffers at the same logical size, all repainted.
-        if (!canvas_.allocate(g_.shm, layout_.width, layout_.height, "lumen-switcher")) {
-            close();
-            return;
-        }
-        drawn_[0] = drawn_[1] = committed_ = {};
+    // The size is fixed while open (a window that goes leaves its cell empty); the page
+    // follows the selection.
+    const unsigned page = layout_.columns * layout_.rows;
+    layout_.first = page && m.selection() < m.count() ? (m.selection() / page) * page : 0;
+    layout_.shown = layout_.first < m.count()
+                        ? (m.count() - layout_.first < page ? m.count() - layout_.first : page)
+                        : 0;
+    const task_entry* sel = tasks.get(m.selected());
+    const drawn_state next{true, layout_.first, m.count(), m.selection(),
+                           sel ? sel->label_rev : 0u, m.selected()};
+    if (!(next == drawn_)) {
+        drawn_ = next;
+        // The whole view: the arrangement is a function of the switch's state, so a change
+        // re-describes (`set_describer` re-arms the describe) and the repaint makes the
+        // frame worth drawing.
+        surface_.root().set_describer(&switcher_describe);
+        surface_.root().add_repaint({0, 0, layout_.width, layout_.height});
     }
-    if (!committed_.valid) {
-        draw(m, tasks, true);
-        return;
+    // The surface's frame loop: a frame when its frame callback allows one and the ledger
+    // has work (our repaint, the engine's hover damage, a configure).
+    if (surface_.frame_due()) {
+        model_ = &m;
+        tasks_ = &tasks;
+        describing_guard guard{this};
+        surface_.run_frame();
+        if (log_switcher.enabled(lx::trace::level::debug) && surface_.stats().frames > 0)
+            log_switcher.debug("switcher: draw selection={} first={} damage={}", m.selection(),
+                               layout_.first, surface_.stats().last_damage_rects);
     }
-    if (!canvas_.frame_pending())
-        draw(m, tasks, false);
 }
 
 #else // !LUMEN_SHELL_WAYLAND
 
-struct lx::shell::switcher_view::events {};
-bool lx::shell::switcher_view::open(void*, int, int, const switcher_model&) { return false; }
+bool lx::shell::switcher_view::open(unsigned, int, int, const switcher_model&) { return false; }
 void lx::shell::switcher_view::close() {}
 void lx::shell::switcher_view::after_dispatch(const switcher_model&, const task_model&) {}
+lx::ui::child lx::shell::switcher_view::build_ui() { return nullptr; }
 
 #endif
 

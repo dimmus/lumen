@@ -4,7 +4,6 @@ module;
 
 import lx.foundation;
 import lx.gfx;
-import lx.layout;
 import lx.runtime;
 import lx.scheduler;
 
@@ -16,7 +15,7 @@ export import :snapshot;
 
 export namespace lx::scene {
 
-enum class node_kind { container, widget, surface, layer };
+enum class node_kind { container, surface, layer };
 
 /// Views a scene publishes to: one per output slot (ADR 008 M3), then the capture views of
 /// screen capture (design-app-compat-capture CC2: one window's tree projected into a client
@@ -207,7 +206,6 @@ public:
     /// Unlinks `child` so the caller can destroy it. Without this a freed surface node
     /// stays reachable from the graph and the next traversal walks freed memory.
     bool remove(scene_node* child);
-    [[nodiscard]] lx::layout::layout_node& layout();
 
     [[nodiscard]] unsigned child_count() const;
     [[nodiscard]] scene_node* child_at(unsigned index) const;
@@ -229,7 +227,6 @@ public:
     [[nodiscard]] const node_animation& animation() const { return animation_; }
 
 private:
-    lx::layout::flex_node layout_{};
     bool anchor_ = false;
     node_animation animation_{};
     scene_node* children_[128]{};
@@ -334,8 +331,6 @@ public:
 
     [[nodiscard]] container_node& root();
 
-    /// UI thread: mutate scene, layout, mark damage.
-    void update(double dt_seconds);
     /// Bounding box of view 0's damage noted since its last publish.
     void collect_damage(lx::rect2i& total_damage);
 
@@ -565,7 +560,6 @@ bool lx::scene::container_node::remove(scene_node* c) {
     }
     return false;
 }
-lx::layout::layout_node& lx::scene::container_node::layout() { return layout_; }
 unsigned lx::scene::container_node::child_count() const { return count_; }
 lx::scene::scene_node* lx::scene::container_node::child_at(unsigned index) const {
     return index < count_ ? children_[index] : nullptr;
@@ -834,12 +828,6 @@ lx::scene::scene_graph::view& lx::scene::scene_graph::ensure_view(unsigned slot)
 }
 
 lx::scene::container_node& lx::scene::scene_graph::root() { return root_; }
-void lx::scene::scene_graph::update(double) {
-    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    lx::layout::layout_engine engine{};
-    lx::layout::constraints c{{0, 0}, {1920, 1080}};
-    engine.solve(root_.layout(), c);
-}
 void lx::scene::scene_graph::collect_damage(lx::rect2i& d) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     d = pending_damage(0).bounds();

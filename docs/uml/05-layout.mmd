@@ -1,20 +1,47 @@
 classDiagram
     direction TB
 
-    class LayoutNode {
-        +constraints: Constraints
-        +layout(rect) void
+    %% ADR-010 §4.7: one flex container at a time; lx.layout knows no tree.
+    class solve_flex {
+        <<lx.layout:flex>>
+        +solve_flex(flex_style, flex_input, flex_children, scratch) result~flex_output~
     }
 
-    class FlexLayout
-    class GridLayout
-
-    LayoutNode <|-- FlexLayout
-    LayoutNode <|-- GridLayout
-
-    class LayoutEngine {
-        +solve(root, constraints) void
-        +incrementalDirty(node) void
+    class flex_style {
+        +direction, wrap, justify, align
+        +gaps, grow, shrink, basis
+        +min / max, margin, padding, border
+        +position, insets, overflow
     }
 
-    LayoutEngine --> LayoutNode
+    class flex_children {
+        <<callbacks>>
+        +style(context, i) flex_style*
+        +measure(context, i, child_query) flex_size
+    }
+
+    class ui_node {
+        <<lx.ui:node>>
+        +measure(constraints, size_hint) size
+        +measure_cached() size
+        +arrange(rect) void
+        +place(rect) void
+        +mark_layout_dirty() void
+    }
+
+    class flex_node {
+        <<lx.ui:flex>>
+        +flex(style, children, fill) child
+    }
+
+    class styled_node {
+        <<lx.ui:styled>>
+        +div(style, children) child
+    }
+
+    ui_node <|-- flex_node
+    ui_node <|-- styled_node
+    flex_node --> solve_flex : measure / arrange
+    styled_node --> solve_flex : resolve_layout(style)
+    flex_node --> flex_children : its children, no allocation
+    solve_flex --> flex_style

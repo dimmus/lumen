@@ -20,4 +20,5 @@ export import :seat;
 export import :display;
 export import :surface;
 export import :xdg;
+export import :layer;
 export import :data;

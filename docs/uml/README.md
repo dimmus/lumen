@@ -13,7 +13,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | Display | Wayland-only |
 | Rendering | Vulkan-first (discrete + integrated) |
 | Processes | Multi-process (compositor, shell, apps) |
-| UI | Scene graph core + fluent builder widgets + compiled themes |
+| UI | Declarative UI engine (ADR-010): components, flex layout, primitives, compiled themes |
 | WM | Stacking-first, optional master-stack tiling per workspace (compositor) |
 | Security | Unix permissions default, optional Flatpak portal |
 
@@ -25,8 +25,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [02-component-deployment.mmd](02-component-deployment.mmd) | Component | Processes and kernel interfaces |
 | [03-runtime-events.mmd](03-runtime-events.mmd) | Class | Event loop and event bus |
 | [04-scene-graph.mmd](04-scene-graph.mmd) | Class | Scene graph and Vulkan draw path |
-| [05-layout.mmd](05-layout.mmd) | Class | Incremental layout engine |
-| [06-ui-toolkit.mmd](06-ui-toolkit.mmd) | Class | Widgets and compiled themes |
+| [05-layout.mmd](05-layout.mmd) | Class | Flex layout: lx.layout:flex under lx.ui's containers, the measure cache |
 | [07-compositor-shell.mmd](07-compositor-shell.mmd) | Class | Compositor vs shell policy split |
 | [08-frame-sequence.mmd](08-frame-sequence.mmd) | Sequence | One-frame hot path |
 | [09-wayland-protocols.mmd](09-wayland-protocols.mmd) | Package | Protocol layer stack |
@@ -34,7 +33,6 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [11-lumen-private-protocols.mmd](11-lumen-private-protocols.mmd) | Class | zlm_* DE protocols |
 | [12-window-management.mmd](12-window-management.mmd) | Class | Stacking-first + master-stack tiling |
 | [13-state-machines.mmd](13-state-machines.mmd) | State | Surface, Seat, Widget, ZlmToplevel, Session pause/resume, Display power, Session lock |
-| [14-fluent-builder.mmd](14-fluent-builder.mmd) | Class | Fluent builder API |
 | [15-dual-gpu.mmd](15-dual-gpu.mmd) | Class | Discrete vs integrated render paths |
 | [16-security.mmd](16-security.mmd) | Component | Unix creds; sandboxed clients (security-context listeners, the global filter); capture for sandboxed apps only through the portals |
 | [17-systemd-deployment.mmd](17-systemd-deployment.mmd) | Deployment | The login session: lumen-session, the compositor bound to graphical-session.target, the shell supervised by systemd, XDG autostart, the control socket and lumen-ctl, each launched app a transient service, the portals with the exported session environment (ADR 011) |
@@ -67,7 +65,8 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [44-workspace-model.mmd](44-workspace-model.mmd) | Sequence | Workspaces: a binding switches, visibility and focus follow, ext-workspace's diff and done, zlm v7 toplevel_workspace, the shell's indicator activating, hotplug (ADR 011 Part 3) |
 | [45-held-action-sequence.mmd](45-held-action-sequence.mmd) | Sequence | The window switcher's held action: Alt+Tab gives the shell a hold, presses go to it while Alt is down (the application keeps the keyboard), a quick release switches without drawing, Escape / lock cancel |
 | [46-notifications-tray-sequence.mmd](46-notifications-tray-sequence.mmd) | Sequence | Notifications and the tray: names on the user bus, Notify → a popup (or the lock queue, or the history under do-not-disturb), expiry and an action with its activation token, an item registering, its icon, Activate and its dbusmenu menu |
-| [47-client-frame-loop.mmd](47-client-frame-loop.mmd) | Sequence | An lx.app window's frame (ADR-010 §4.9, Phase 4): input coalesced to one hit test, geometry and swapchain resize, acquire and the image's age as repaint, the damage-scoped tick, the tier's draw and present, ack + attach + damage_buffer + syncobj points + frame callback + wp_presentation in one commit, the frame record; the idle rule |
+| [47-client-frame-loop.mmd](47-client-frame-loop.mmd) | Sequence | A client surface's frame (ADR-010 §4.9; Phase 4, lx.ui.host in Phase 5): the context routes the seat event to its target surface, input coalesced to one hit test, the role's configure as geometry and swapchain resize, acquire and the image's age as repaint, the damage-scoped tick, the shared renderer's draw and present, the role's ack + attach + damage_buffer + syncobj points + frame callback + wp_presentation in one commit, the frame record; the timerfd at the earliest deadline over every surface; the idle rule |
+| [48-client-swapchain.mmd](48-client-swapchain.mmd) | Flowchart | A client surface's pixel path (ADR-010 §4.10): the tier chosen once per lx.ui.host context (hardware Vulkan → hardware GL → cpu; no dma-buf format → cpu), an image's life (free → drawing → with the compositor → released by wl_buffer.release or a syncobj release point; retired on resize), the explicit-sync points every commit carries |
 
 **Narrative architecture doc:** [../architecture.md](../architecture.md)
 

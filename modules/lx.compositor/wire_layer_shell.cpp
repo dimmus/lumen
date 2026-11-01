@@ -201,6 +201,13 @@ void layer_send_closed(void* layer_res) {
         zwlr_layer_surface_v1_send_closed(static_cast<wl_resource*>(layer_res));
 }
 
+int layer_client_pid(void* client) {
+    pid_t pid = 0;
+    if (client)
+        wl_client_get_credentials(static_cast<wl_client*>(client), &pid, nullptr, nullptr);
+    return static_cast<int>(pid);
+}
+
 namespace {
 
 void layer_shell_get_layer_surface(struct wl_client* client, struct wl_resource* resource,

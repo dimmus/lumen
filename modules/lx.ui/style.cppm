@@ -284,31 +284,6 @@ struct style_context {
 /// The text size in px (0 for `inherit`).
 [[nodiscard]] float text_size_px(text_size size, const theme& t, float rem_px);
 
-// ── Legacy string-keyed style (the old `lx.ui:widgets` tree; removed with it in Phase 5) ──
-
-enum class state { normal, hovered, pressed, focused, disabled };
-
-struct style_property {
-    const char* key = "";
-    lx::color value{};
-    float number = 0.f;
-};
-
-class style_ref {
-public:
-    style_ref() = default;
-    explicit style_ref(const theme* t, const char* widget_type);
-
-    style_ref& set(const char* property, lx::color value);
-    style_ref& set(const char* property, float value);
-    /// The property unset: the old widgets read nothing from a theme.
-    [[nodiscard]] style_property get(state st, const char* property) const;
-
-private:
-    const theme* theme_ = nullptr;
-    const char* widget_type_ = "widget";
-};
-
 } // namespace lx::ui
 
 // ── implementation ──────────────────────────────────────────────────────────────────
@@ -387,13 +362,4 @@ float lx::ui::text_size_px(lx::ui::text_size size, const theme& t, float rem_px)
     case text_size::editor: return t.fonts().buffer_size_px;
     default: return 0.f;
     }
-}
-
-lx::ui::style_ref::style_ref(const theme* t, const char* type) : theme_{t}, widget_type_{type} {}
-lx::ui::style_ref& lx::ui::style_ref::set(const char*, lx::color) { return *this; }
-lx::ui::style_ref& lx::ui::style_ref::set(const char*, float) { return *this; }
-lx::ui::style_property lx::ui::style_ref::get(state, const char* property) const {
-    (void)theme_;
-    (void)widget_type_;
-    return {property, {}, 0.f};
 }
