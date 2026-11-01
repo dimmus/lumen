@@ -65,9 +65,15 @@ idle after mapping (the §8.6 protocol; scripts: `/proc/PID/stat`, `status`, `sm
 | GPUI | not comparable here | — | — | — | — |
 | Slint / Qt Quick / Flutter | not installed | — | — | — | — |
 
-"Presents" is the compositor's `compositor.latency` lines: none of these engines use
-`wp_presentation`, so the commit-rate and present-latency rows of §8.6's protocol are not
-observable for them (Lumen's own clients carry the rows; drag-smoke g gates Lumen's).
+On the "Presents" column: the compositor's `compositor.latency` line — its commit→flip
+correlation — is emitted along `wp_presentation` feedback, which Lumen's own clients
+request (drag-smoke's gate g is built on it). All three compared engines produced none in
+their windows. That is a statement about this measurement, not about the engines: the
+commit rate of any client is observable from the compositor side regardless (it sees every
+`wl_surface.commit`), and GDK's Wayland backend implements presentation-time upstream —
+whether GTK4 asked and Lumen's logging did not fire for it is unverified (a wire check is
+the follow-up). Input→present for a black-box client is the one row that genuinely needs
+the client's cooperation.
 
 What is not comparable, per engine: GPUI needs a hardware Vulkan device this host lacks
 (ADR-010 §8.6 keeps it for the hardware-Vulkan host); GTK4's gallery animates by design,
