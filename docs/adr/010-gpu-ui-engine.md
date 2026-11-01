@@ -141,7 +141,7 @@ measure on similar scenes; §8.6 says how each comparison is run.
 | G5 | Heap allocations per steady frame | 0 `operator new` on the UI thread — every allocation Lumen's own code makes (`heaptrack` flat over 10 000 frames); the C libraries' `malloc` (libwayland's closure per message, the GL driver's per submit) and `mallinfo2`'s in-use delta reported beside it, not gated (amended in Phase 4: they are libwayland's and Mesa's floor, paid by every toolkit on them, not the frame path's) | memory-management.md §7; the compositor's hot path is already arena-only |
 | G6 | Input → photon, hover highlight in the shell | median ≤ 1 refresh period + 2 ms | drag-smoke gates window moves at 1.5 periods + 4 ms; UI hover has less work |
 | G7 | Cold start → first frame, `lumen-hello` | ≤ 30 ms with a warm pipeline cache, ≤ 150 ms cold | The compositor's first frame is 106 ms (rendering-performance.md §6.2) |
-| G8 | Anonymous RSS, `lumen-shell` | ≤ 25 MB | Compositor RssAnon 19.1 MB; a client with one atlas page and one swapchain has less state |
+| G8 | Anonymous RSS, `lumen-shell` | ≤ 25 MB (set for the cpu tier; the shell rides the automatic tier — Vulkan, else GL, else CPU — and on this host that is GL, accepted) | Compositor RssAnon 19.1 MB; a client with one atlas page and one swapchain has less state. Measured on the lx.ui shell (2026-11-01, GL/SVGA3D): 23.8 MB fresh, 28.4 MB with three window entries and a history |
 | G9 | Instance bytes | quad 80 B, sprite 64 B, shadow 64 B, underline 48 B | §4.2; GPUI's quad is ≈156 B |
 | G10 | Pixel parity across backends | per-primitive golden images: max channel error ≤ 2/255 Vulkan vs GL, ≤ 3/255 vs CPU | Three backends must look the same or the theme is three themes |
 | G11 | Resize storm (30 resizes, window with text) | heap flat; no frame > 2× median; swapchain reallocation ≤ 1 per size | The compositor passed the same test in PR #19 |
@@ -1640,6 +1640,14 @@ start is the driver's: EGL on GBM ≈ 27 ms, the two compiles ≈ 60 ms, and fon
 a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
 
 ### Phase 5 — Adoption and deletion (≈2 weeks) — in progress
+
+G8 measured on the migrated shell (2026-11-01, automatic tier = GL on SVGA3D; the shell
+rides `client_gpu`'s tier like any client — the 25 MB figure was set when the shell was
+expected to pin the cpu tier): RssAnon 23.8 MB fresh, 28.4 MB idle with three window
+entries and a notification history; first panel 3.7–8.0 ms of the shell's own work
+(geometry + swapchain + first tick; the submit→present leg is the host's 25–89 ms SVGA3D
+flip stall, the WARN every smoke run carries); panel redraw 213–309 µs of shell CPU per
+hover-switched frame (gate 314 µs); 0 context switches in 10 s idle.
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
   the background keeps its single-pixel-buffer and worker-rendered image paths.
