@@ -2413,3 +2413,4 @@ returning `not_implemented` until P0 lands.
 | UI architecture | [subsystems/ui-architecture.md](subsystems/ui-architecture.md) |
 | Protocol registry | [../protocols/README.md](../protocols/README.md) |
 | Login session, control socket, health export | [adr/011-session-and-window-management.md](adr/011-session-and-window-management.md) |
+| Settings application (proposed) | [adr/013-settings-app.md](adr/013-settings-app.md) |
