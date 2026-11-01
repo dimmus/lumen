@@ -147,6 +147,8 @@ struct layer_ops {
     unsigned (*next_serial)(void* user) = nullptr;
     /// False for a client being torn down: nothing may be sent to it.
     bool (*client_alive)(void* client_native) = nullptr;
+    /// The client's PID (0: unknown).
+    int (*client_pid)(void* client_native) = nullptr;
     void* user = nullptr;
 };
 
@@ -243,15 +245,17 @@ public:
     void close_surface(lx::surface_id surface);
     static constexpr unsigned k_max_outputs = 16;
 
-    /// The zone hold (ADR 011 S6): when a mapped surface of the client given here — the
+    /// The zone hold (ADR 011 S6): when a mapped surface of the process given here — the
     /// shell — is destroyed while its output still exists (the shell crashed, or was stopped
-    /// to be restarted; a logout clears the client first), the exclusive zone it reserved
+    /// to be restarted; a logout clears the PID first), the exclusive zone it reserved
     /// stays in the usable area until `release_zone_hold`, or until a surface with an
     /// exclusive zone maps on that output (the restarted shell's panel). Maximized windows
     /// then do not grow into the panel's strip and shrink back a moment later. Whether the
     /// shell destroyed its surfaces before disconnecting or the connection took them makes no
-    /// difference. Null: no hold.
-    void set_zone_hold_client(void* client_native) { hold_client_ = client_native; }
+    /// difference. The hold is by PID, not by `wl_client*`: the shell's panel surface comes
+    /// from its second Wayland connection (lx.wayland.client), whose client differs from the
+    /// privileged one that bound the shell protocol (P5-6). 0: no hold.
+    void set_zone_hold_pid(int pid) { hold_pid_ = pid; }
     /// Called when a hold begins: the owner ends it after its bound (5 s) with
     /// `release_zone_hold`.
     void set_zone_hold_started(void (*started)(void* user), void* user) {
@@ -317,7 +321,7 @@ private:
         int top = 0, bottom = 0, left = 0, right = 0;
         bool active = false;
     };
-    void* hold_client_ = nullptr;
+    int hold_pid_ = 0;
     void (*hold_started_)(void*) = nullptr;
     void* hold_started_user_ = nullptr;
     held_zone held_[k_max_outputs]{};
@@ -907,8 +911,10 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
     const bool participated = r->initial_commit_seen && !r->closed;
     const unsigned output = r->output;
     // The shell's panel going away other than at a logout (a crash, a stop for a restart),
-    // and not because its output went: its zone is held (ADR 011 S6).
-    if (r->mapped && !r->closed && hold_client_ && r->client_native == hold_client_)
+    // and not because its output went: its zone is held (ADR 011 S6). By PID: the panel may
+    // come from a second connection of the privileged shell process.
+    if (r->mapped && !r->closed && hold_pid_ && ops_.client_pid &&
+        ops_.client_pid(r->client_native) == hold_pid_)
         hold_zone_of(*r);
     if (r->mapped)
         unmap(*r, "destroyed");

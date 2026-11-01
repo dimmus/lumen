@@ -3432,7 +3432,11 @@ if want O; then
   begin O2
   O2_SH=$(shl)
   inject key KEY_LEFTALT press; sleep 0.05
-  inject key KEY_TAB tap; sleep 0.6
+  inject key KEY_TAB tap
+  # The view maps at the open delay; the shell's loop may take a moment longer to get
+  # there (a full panel present on this hardware class stalls it), so wait for the map.
+  comp_since "compositor.layer: layer map surface=[0-9]+ layer=overlay namespace=lumen-switcher" 3
+  sleep 0.2
   O2_SHOT=$(o_shot)
   inject key KEY_TAB tap; sleep 0.3
   inject key KEY_LEFTALT release; sleep 0.7
@@ -3651,8 +3655,14 @@ if want N; then
   fi
   for _ in $(seq 1 30); do kill -0 "$N3_PID" 2>/dev/null || break; sleep 0.1; done
   forget_client "$N3_PID"
+  N3B_MAPS=$(grep -c "namespace=lumen-notifications" "$COMP_LOG")
   N3B_ID=$(notify-send -p -a smoke -t 0 "n3b body click" "dismissed by a click")
-  sleep 0.6
+  # The stack's surface maps afresh for the new card; the click is only good once it has.
+  for _ in $(seq 1 80); do
+    (( $(grep -c "namespace=lumen-notifications" "$COMP_LOG") > N3B_MAPS )) && break
+    sleep 0.05
+  done
+  sleep 0.3
   N3B_CARD=$(n_card "${N3B_ID:-0}") || true
   if [[ -n "$N3B_CARD" ]]; then
     read -r LX LY BOX _ <<<"$N3B_CARD"

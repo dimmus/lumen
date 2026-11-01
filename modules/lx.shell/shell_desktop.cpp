@@ -182,12 +182,18 @@ void lx::shell::shell_app::start_desktop_services() {
                         return static_cast<shell_app*>(user)->notification_icon(n, px);
                     },
                     this);
-    const menu_globals mg{.compositor = compositor_,
-                          .shm = shm_,
-                          .wm_base = wm_base_,
-                          .seat = seat_,
-                          .viewporter = viewporter_,
-                          .fractional = fractional_};
+    // The menus and tooltips are xdg_popups of the panels: their surfaces come from the
+    // views' connection (lx.wayland.client), like every other view's (P5-6) — the raw
+    // connection's globals mean nothing to them, and a popup of a panel's layer surface
+    // must be its client.
+    lx::wayland::seat* menu_seat = client_.connected() ? client_.default_seat() : nullptr;
+    const menu_globals mg{.display = client_.connected() ? &client_ : nullptr,
+                          .compositor = client_.native_global(lx::wayland::global_kind::compositor),
+                          .shm = client_.native_global(lx::wayland::global_kind::shm),
+                          .wm_base = client_.native_global(lx::wayland::global_kind::xdg_wm_base),
+                          .seat = menu_seat ? menu_seat->native() : nullptr,
+                          .viewporter = client_.native_global(lx::wayland::global_kind::viewporter),
+                          .fractional = client_.native_global(lx::wayland::global_kind::fractional_scale)};
     menu_.init(mg,
                [](const char* name, int px, void* user) {
                    return static_cast<shell_app*>(user)->image_icon(name, px);

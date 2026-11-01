@@ -471,15 +471,19 @@ void context::on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame&
         if ((f.mask & lx::wayland::pointer_frame::has_button) && f.pressed)
             press_serial_ = f.serial;
         to->route_pointer(s, f);
+    } else if (unrouted_ && f.target) {
+        // Not one of the hosted surfaces: the caller's own canvas view owns it.
+        unrouted_->on_unrouted_pointer(s, f);
     }
 }
 
 void context::on_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target,
                                 std::uint32_t serial, bool entered) {
-    (void)serial;
     if (!entered) {
         if (surface* from = surface_of(target))
             from->route_keyboard_focus(s, false);
+        else if (unrouted_ && target)
+            unrouted_->on_unrouted_keyboard_focus(s, target, serial, false);
         if (keyboard_target_ == target)
             keyboard_target_ = nullptr;
         return;
@@ -491,6 +495,8 @@ void context::on_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* targ
         // it; a surface that joined since has them already).
         if (have_modifiers_)
             to->route_modifiers(s, modifiers_);
+    } else if (unrouted_ && target) {
+        unrouted_->on_unrouted_keyboard_focus(s, target, serial, true);
     }
 }
 
@@ -499,6 +505,9 @@ void context::on_key(lx::wayland::seat& s, const lx::wayland::key_event& e) {
         if (e.state == lx::wayland::key_state::pressed)
             press_serial_ = e.serial;
         to->route_key(s, e);
+    } else if (unrouted_ && keyboard_target_) {
+        // The keyboard is on a canvas view of the caller's.
+        unrouted_->on_unrouted_key(s, e);
     }
 }
 

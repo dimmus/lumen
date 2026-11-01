@@ -850,6 +850,7 @@ void bind_decoration_manager(wayland::client_connection& client, unsigned id, in
 
 void layer_send_configure(void* layer_res, unsigned serial, int width, int height);
 void layer_send_closed(void* layer_res);
+int layer_client_pid(void* client);
 void bind_layer_shell(wayland::client_connection& client, unsigned id, int version);
 
 void bind_linux_dmabuf(wayland::client_connection& client, unsigned id, int version);

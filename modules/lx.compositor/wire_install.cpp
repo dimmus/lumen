@@ -316,6 +316,7 @@ void install_core(p0_protocol_context& ctx) {
         ops.send_closed = &layer_send_closed;
         ops.next_serial = &wm_next_serial;
         ops.client_alive = &popup_client_alive;
+        ops.client_pid = &layer_client_pid;
         ops.user = &ctx;
         ctx.layers->set_ops(ops);
     }

@@ -3434,7 +3434,7 @@ void compositor_impl::begin_logout(const char* source) {
     // systemd shows the unit deactivating from here on; the shell's exit is an ending, not a
     // crash, so its zones are not held.
     session::service_notifier::stopping("Logging out");
-    layers_.set_zone_hold_client(nullptr);
+    layers_.set_zone_hold_pid(0);
     // The shell learns first, so it reads the disconnect that follows as a normal end.
     if (p0_.notify_session_ending)
         p0_.notify_session_ending();
@@ -4770,9 +4770,12 @@ wm_button_binding compositor_impl::on_button_binding(unsigned button, unsigned t
     return wm_button_binding::consumed;
 }
 
-void compositor_impl::on_shell_bound(void* client_native) {
-    // The new shell's zones are the ones held if it goes without a logout.
-    layers_.set_zone_hold_client(logout_active_ ? nullptr : client_native);
+void compositor_impl::on_shell_bound(void* /*client_native*/) {
+    // The new shell's zones are the ones held if it goes without a logout. The hold is by
+    // the shell process's PID: the panel surface comes from the shell's second Wayland
+    // connection (lx.wayland.client), whose wl_client differs from this one's — but the
+    // PID matches (P5-6). shell_bridge_ has resolved it for this bind already.
+    layers_.set_zone_hold_pid(logout_active_ ? 0 : shell_bridge_.bridge_pid());
 }
 
 void compositor_impl::rearm_session_timer() {

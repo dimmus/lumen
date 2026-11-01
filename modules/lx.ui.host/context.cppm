@@ -70,6 +70,22 @@ struct context_stats {
     std::uint64_t worker_wakes = 0;      ///< times the worker thread woke for posted work
 };
 
+/// Seat input for a surface the context does not host (the caller's own canvas views — the
+/// shell's launcher, notification stack, switcher and menus draw without an lx.ui root):
+/// every pointer frame whose target is such a surface, the keyboard focus entering or
+/// leaving one, and the keys pressed while one has the focus. Installed with
+/// `set_unrouted_input_handler`; the context still tracks the keyboard target so the keys
+/// keep arriving while it stays there. UI affinity.
+class unrouted_input_handler {
+public:
+    virtual ~unrouted_input_handler() = default;
+    virtual void on_unrouted_pointer(lx::wayland::seat& s,
+                                     const lx::wayland::pointer_frame& f) = 0;
+    virtual void on_unrouted_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target,
+                                            std::uint32_t serial, bool entered) = 0;
+    virtual void on_unrouted_key(lx::wayland::seat& s, const lx::wayland::key_event& e) = 0;
+};
+
 class context final : public lx::wayland::seat_handler,
                       public lx::wayland::text_input_handler {
 public:
@@ -144,6 +160,10 @@ public:
     /// surfaces: what an xdg_popup grab or an interactive move takes (0: none yet).
     [[nodiscard]] std::uint32_t last_press_serial() const { return press_serial_; }
 
+    /// Seat input for surfaces the context does not host (the caller's canvas views); see
+    /// `unrouted_input_handler`. Null (the default): such frames are dropped.
+    void set_unrouted_input_handler(unrouted_input_handler* h) { unrouted_ = h; }
+
     // seat_handler: routed to the surface the event names.
     void on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) override;
     void on_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target, std::uint32_t serial,
@@ -198,6 +218,7 @@ private:
     lx::wayland::text_input text_input_{};
     lx::wayland::surface* keyboard_target_ = nullptr;
     lx::wayland::surface* touch_target_ = nullptr;
+    unrouted_input_handler* unrouted_ = nullptr;
     std::uint32_t press_serial_ = 0;
     /// The seat's modifier and repeat state, replayed to a surface that joins later.
     std::uint32_t modifiers_ = 0;
