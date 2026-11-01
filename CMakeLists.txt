@@ -426,7 +426,8 @@ set(LUMEN_PORTAL_BUILT FALSE)
 if(LUMEN_BUILD_PORTAL)
     if(LIBSYSTEMD_FOUND AND WAYLAND_FOUND AND TARGET lumen-protocol-glue)
         lumen_add_module_library(lx.portal modules/lx.portal
-            DEPENDS lx.foundation lx.trace lx.text lx.shell)
+            DEPENDS lx.foundation lx.trace lx.text lx.ui lx.ui.host lx.wayland.client
+                lx.runtime lx.gfx lx.layout lx.shell)
         target_link_libraries(lx.portal PRIVATE lumen-protocol-glue)
         target_compile_definitions(lx.portal PRIVATE LUMEN_PORTAL_WAYLAND=1 LUMEN_PORTAL_DBUS=1)
         target_include_directories(lx.portal PRIVATE ${WAYLAND_INCLUDE_DIRS} ${LIBSYSTEMD_INCLUDE_DIRS})

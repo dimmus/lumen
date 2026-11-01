@@ -69,7 +69,6 @@ import std;
 
 export import :task_model;
 export import :bridge;
-export import :shm_canvas;
 export import :svg;
 export import :icon_theme;
 export import :visual_bell;
@@ -86,6 +85,7 @@ export import :user_bus;
 export import :notifications;
 export import :notify_view;
 export import :menu_popup;
+export import :view_ui;
 export import :tray;
 
 namespace {
