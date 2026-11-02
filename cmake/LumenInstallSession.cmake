@@ -4,8 +4,8 @@
 # the prefix being installed to — `cmake --install build --prefix DIR` gives DIR's paths,
 # and nothing is written outside DIR (plus $DESTDIR).
 #
-# Set by the install(CODE) before this script: LUMEN_SOURCE_DIR, LUMEN_STAGE_DIR,
-# LUMEN_UNIT_DIR_OVERRIDE, LUMEN_SYSTEMD_UNIT_DIR_USR, LUMEN_PORTAL_BUILT, LUMEN_BINDIR_REL,
+# Set by the install(CODE) before this script: LUMEN_SOURCE_DIR, LUMEN_BINARY_DIR,
+# LUMEN_STAGE_DIR, LUMEN_UNIT_DIR_OVERRIDE, LUMEN_SYSTEMD_UNIT_DIR_USR, LUMEN_PORTAL_BUILT, LUMEN_BINDIR_REL,
 # LUMEN_LIBEXECDIR_REL, LUMEN_DATADIR_REL.
 
 set(_prefix "${CMAKE_INSTALL_PREFIX}")
@@ -42,9 +42,11 @@ file(INSTALL DESTINATION "${_data}/wayland-sessions" TYPE FILE FILES
     "${LUMEN_STAGE_DIR}/lumen.desktop")
 
 # The settings application's launcher entry (ADR-013): the app's binary is in bindir,
-# which the launcher's PATH covers.
+# which the launcher's PATH covers. The file is configured into the build tree at
+# configure time; the install script gets that tree through LUMEN_BINARY_DIR (its
+# CMAKE_BINARY_DIR is not the build tree).
 file(INSTALL DESTINATION "${_data}/applications" TYPE FILE FILES
-    "${CMAKE_BINARY_DIR}/share/applications/org.lumen.Settings.desktop")
+    "${LUMEN_BINARY_DIR}/share/applications/org.lumen.Settings.desktop")
 
 lumen_stage(scripts/lumen-session.in lumen-session)
 file(INSTALL DESTINATION "${LUMEN_BINDIR}" TYPE PROGRAM FILES "${LUMEN_STAGE_DIR}/lumen-session")
