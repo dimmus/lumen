@@ -444,6 +444,31 @@ inline void build_text_clip(lx::ui::draw_scope& s, const tiles& t) {
     s.quad({2, 21, 160, 39}, outline);
 }
 
+/// A single line that outgrows its box ends in `…` (the panel's tab titles): fitted whole at
+/// 200, cut with an ellipsis at 120, and the ellipsis alone beside a sliver of the text at 24.
+inline void build_text_ellipsis(lx::ui::draw_scope& s, const tiles& t) {
+    lx::ui::text_block_props p{};
+    p.text = "dimmus@iritur:~/lumen/build";
+    p.font = {lx::text::k_ui_family, 12.f * 0.75f};
+    p.color = k_text;
+    p.wrap = lx::text::text_wrap::none;
+    p.ellipsize = true;
+    p.context = {text_fonts().engine(), t.glyphs.get()};
+    const lx::ui::quad_style outline =
+        bordered(with_alpha(k_text, 0.f), with_alpha(k_accent, 0.5f), 1.f, 0.f);
+    const int widths[3] = {200, 120, 24};
+    int y = 4;
+    for (int w : widths) {
+        auto node = std::make_unique<lx::ui::text_block_node>();
+        node->apply(p);
+        const lx::size2i size = node->measure({{0, 0}, {w, 99999}}, lx::ui::size_hint::preferred);
+        node->arrange({6, y, w, size.height});
+        node->emit(s);
+        s.quad({2, y - 3, w + 8, size.height + 6}, outline);
+        y += 28;
+    }
+}
+
 // ── Styled boxes and icons (ADR-010 §4.8, §5.2, §5.5): `styled_node` and `icon_node` under
 // the built-in One Dark ──
 
@@ -826,6 +851,7 @@ inline void build_text_input(lx::ui::draw_scope& s, const tiles& t) {
         {"text_underlines", 312, 64, k_editor, build_text_underlines},
         {"text_emoji", 264, 72, k_surface, build_text_emoji},
         {"text_clip", 168, 80, k_editor, build_text_clip},
+        {"text_ellipsis", 216, 88, k_editor, build_text_ellipsis},
         {"styled_surfaces", 300, 112, k_surface, build_styled_surfaces},
     };
     if (lx::ui::icons_available()) {
