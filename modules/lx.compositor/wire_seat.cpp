@@ -11,9 +11,7 @@ module;
 #include <stdint.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 module lx.compositor;
 
@@ -36,9 +34,8 @@ constexpr lx::trace::category log_seat{"compositor.seat"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -75,8 +72,8 @@ struct keymap_source {
     // configured layout is not US.
     static lx::input::keyboard_keymap fallback{};
     lx::input::keyboard_keymap* keymap =
-        (g_p0_ctx && g_p0_ctx->seat && g_p0_ctx->seat->keymap().valid())
-            ? &g_p0_ctx->seat->keymap()
+        (g_ctx && g_ctx->seat && g_ctx->seat->keymap().valid())
+            ? &g_ctx->seat->keymap()
             : &fallback;
     if (!keymap->valid()) {
         if (auto compiled = keymap->compile(); !compiled) {
@@ -119,9 +116,9 @@ bool seat_keymap(int& fd, unsigned& size) {
 /// serial it was sent for that focus (wl_pointer.set_cursor, cursor-shape-v1). Anything
 /// else — a stale request racing a focus change, another client — is ignored, not an error.
 bool cursor_request_allowed(wl_client* client, uint32_t serial) {
-    return g_p0_ctx && g_p0_ctx->input && g_p0_ctx->cursor &&
-           g_p0_ctx->input->pointer_focus_client() == client &&
-           g_p0_ctx->input->is_pointer_enter_serial(serial);
+    return g_ctx && g_ctx->input && g_ctx->cursor &&
+           g_ctx->input->pointer_focus_client() == client &&
+           g_ctx->input->is_pointer_enter_serial(serial);
 }
 
 namespace {
@@ -142,7 +139,7 @@ void pointer_set_cursor(struct wl_client* client, struct wl_resource* pointer, u
     }
     if (!cursor_request_allowed(client, serial))
         return;
-    g_p0_ctx->cursor->set_client_surface(surf ? surf->id : lx::surface_id{}, hot_x, hot_y);
+    g_ctx->cursor->set_client_surface(surf ? surf->id : lx::surface_id{}, hot_x, hot_y);
 }
 
 const struct wl_seat_interface seat_impl = {
@@ -159,14 +156,14 @@ const struct wl_seat_interface seat_impl = {
             };
             // Unregister on destroy, or the router keeps sending into freed resources.
             wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
-                if (g_p0_ctx && g_p0_ctx->input)
-                    g_p0_ctx->input->remove(r);
+                if (g_ctx && g_ctx->input)
+                    g_ctx->input->remove(r);
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
                 shape_devices_drop_pointer(r);
 #endif
             });
-            if (g_p0_ctx && g_p0_ctx->input && g_p0_ctx->seat)
-                g_p0_ctx->input->add_pointer(res, *g_p0_ctx->seat);
+            if (g_ctx && g_ctx->input && g_ctx->seat)
+                g_ctx->input->add_pointer(res, *g_ctx->seat);
         },
     .get_keyboard =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -179,8 +176,8 @@ const struct wl_seat_interface seat_impl = {
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
             wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
-                if (g_p0_ctx && g_p0_ctx->input)
-                    g_p0_ctx->input->remove(r);
+                if (g_ctx && g_ctx->input)
+                    g_ctx->input->remove(r);
             });
 
             const keymap_source& keymap = shared_keymap();
@@ -193,13 +190,13 @@ const struct wl_seat_interface seat_impl = {
             wl_keyboard_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, keymap.fd,
                                    keymap.size);
             if (wl_resource_get_version(res) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
-                wl_keyboard_send_repeat_info(res, g_p0_ctx ? g_p0_ctx->repeat_rate : 25,
-                                             g_p0_ctx ? g_p0_ctx->repeat_delay : 600);
+                wl_keyboard_send_repeat_info(res, g_ctx ? g_ctx->repeat_rate : 25,
+                                             g_ctx ? g_ctx->repeat_delay : 600);
 
             // Registered only after the keymap is sent: a client that receives `enter`
             // before it knows the layout cannot interpret the keys it is told are held.
-            if (g_p0_ctx && g_p0_ctx->input && g_p0_ctx->seat)
-                g_p0_ctx->input->add_keyboard(res, *g_p0_ctx->seat);
+            if (g_ctx && g_ctx->input && g_ctx->seat)
+                g_ctx->input->add_keyboard(res, *g_ctx->seat);
         },
     .get_touch =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -212,11 +209,11 @@ const struct wl_seat_interface seat_impl = {
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
             wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
-                if (g_p0_ctx && g_p0_ctx->input)
-                    g_p0_ctx->input->remove(r);
+                if (g_ctx && g_ctx->input)
+                    g_ctx->input->remove(r);
             });
-            if (g_p0_ctx && g_p0_ctx->input)
-                g_p0_ctx->input->add_touch(res);
+            if (g_ctx && g_ctx->input)
+                g_ctx->input->add_touch(res);
         },
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
@@ -225,12 +222,12 @@ const struct wl_seat_interface seat_impl = {
 } // namespace
 
 void bind_seat(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wl_seat_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&seat_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&seat_impl, g_ctx, nullptr);
     auto* native = static_cast<wl_resource*>(res.native());
     if (native) {
         uint32_t caps = WL_SEAT_CAPABILITY_POINTER;
@@ -243,6 +240,5 @@ void bind_seat(wayland::client_connection& client, unsigned id, int version) {
     }
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

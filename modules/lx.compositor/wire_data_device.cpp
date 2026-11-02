@@ -14,9 +14,7 @@ module;
 
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 module lx.compositor;
 
@@ -28,9 +26,8 @@ import lx.trace;
 import :data_transfer;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -153,7 +150,7 @@ const struct wl_data_device_manager_interface data_device_manager_impl = {
 
 } // namespace
 
-void install_data_device(p0_protocol_context&) {
+void install_data_device(protocol_context&) {
     auto& ops = xfer_ops[static_cast<unsigned>(xfer_family::clipboard)];
     ops.name = "clipboard";
     ops.offer_interface = &wl_data_offer_interface;
@@ -176,15 +173,14 @@ void install_data_device(p0_protocol_context&) {
 }
 
 void bind_data_device_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &wl_data_device_manager_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&data_device_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&data_device_manager_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

@@ -381,7 +381,7 @@ struct compositor_impl {
     hotplug_controller hotplug_{};
     gfx::device_recovery device_recovery_{graphics};
     session::logind_session logind_{};
-    p0_protocol_context p0_{};
+    protocol_context wire_{};
 
     // ── Session pause/resume (VT switching) — docs/architecture.md "Session pause/resume" ──
     /// UI affinity. The state machine; `apply_session_actions` executes what it returns.
@@ -948,7 +948,7 @@ struct compositor_impl {
     long long last_published_any_ = -1;
     /// UI affinity. `outputs.layout_generation()` the views and clocks were synced to.
     unsigned applied_layout_generation_ = ~0u;
-    /// UI affinity. wp_presentation feedback in flight (`p0_.presentation`).
+    /// UI affinity. wp_presentation feedback in flight (`wire_.presentation`).
     presentation_feedback_table presentation_feedback_{};
     /// Debug screenshot (`compositor::request_screenshot`, SIGUSR1 in lumen-compositor):
     /// requested from any thread or a signal handler; UI forces a full repaint, render reads
@@ -1345,7 +1345,7 @@ struct compositor_impl {
     [[nodiscard]] bool render_is_quiet() const;
     void render_loop();
     void worker_loop();
-    void register_p0_globals();
+    void register_protocol_globals();
 
     /// A flip of one output's pipeline (UI thread; `user_data` is the `output_pipeline`).
     static void presentation_flip_handler(scheduler::presentation_feedback fb, void* user_data);
@@ -1682,8 +1682,8 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
     // pointer back. Never inhibitable, like the bindings above; a surface with neither gets
     // the key.
     if (keybindings::escape_hatch(in)) {
-        const bool toggled = shortcuts_inhibit_toggle(p0_);
-        const bool released = pointer_constraints_release(p0_);
+        const bool toggled = shortcuts_inhibit_toggle(wire_);
+        const bool released = pointer_constraints_release(wire_);
         if (toggled || released) {
             keys_.reset();
             return;
@@ -1714,8 +1714,8 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
             start_key_repeat(key_repeat::hold, event, in);
             return;
         case keybindings::hold_step::released:
-            if (void* hold = keys_.end_hold(); hold && p0_.send_hold_released)
-                p0_.send_hold_released(hold, event.time_ms);
+            if (void* hold = keys_.end_hold(); hold && wire_.send_hold_released)
+                wire_.send_hold_released(hold, event.time_ms);
             if (log_bindings.enabled(lx::trace::level::debug))
                 log_bindings.debug("held action released");
             break;
@@ -1727,7 +1727,7 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
     //    `allow-when-locked` bindings; while the focused surface inhibits shortcuts, only
     //    `allow-when-inhibited` bindings and `not_inhibitable` grabs.
     const bool wm_busy = wm_.grab_active() || wm_.drag_active();
-    const bool inhibited = shortcuts_inhibited(p0_);
+    const bool inhibited = shortcuts_inhibited(wire_);
     if (!wm_busy && display_gate_.load(std::memory_order_relaxed) == 0) {
         if (const key_decision d = keys_.match_binding(in, inhibited); d.consume) {
             // A copy: the action may replace the table (session.reload-config).
@@ -1735,8 +1735,8 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
             // A held action (Alt+Tab): the shell gets a hold for as long as the binding's
             // modifier stays down (K.1). With no v7 shell it runs as an ordinary action.
             if (const auto& info = lx::config::action(b.action);
-                info.held && keys_.shell_actions() && p0_.send_held_action) {
-                if (void* hold = p0_.send_held_action(info.name, "", event.time_ms)) {
+                info.held && keys_.shell_actions() && wire_.send_held_action) {
+                if (void* hold = wire_.send_held_action(info.name, "", event.time_ms)) {
                     keys_.begin_hold(b.keys.mods, hold);
                     if (log_bindings.enabled(lx::trace::level::debug))
                         log_bindings.debug("held action {} begins (modifier 0x{:x})", info.name,
@@ -1760,8 +1760,8 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
             return;
         }
         if (const key_decision d = keys_.match_grab(in, inhibited); d.consume) {
-            if (p0_.fire_key_grab)
-                p0_.fire_key_grab(d.grab, event.time_ms);
+            if (wire_.fire_key_grab)
+                wire_.fire_key_grab(d.grab, event.time_ms);
             return;
         }
     }
@@ -1777,8 +1777,8 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
     if (const binding_entry* b = keys_.tap_binding(tap)) {
         const char* message = "";
         (void)run_action(b->action, b->argument, event.time_ms, true, "binding", message);
-    } else if (p0_.fire_key_grab) {
-        p0_.fire_key_grab(tap, event.time_ms);
+    } else if (wire_.fire_key_grab) {
+        wire_.fire_key_grab(tap, event.time_ms);
     }
 }
 
@@ -2219,7 +2219,7 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     }
     const bool relative_sent =
         (rdx != 0.0 || rdy != 0.0 || rdxu != 0.0 || rdyu != 0.0) &&
-        relative_pointer_motion(p0_,
+        relative_pointer_motion(wire_,
                                 event.time_us ? event.time_us
                                               : static_cast<unsigned long long>(event.time_ms) * 1000ull,
                                 rdx, rdy, rdxu, rdyu);
@@ -2245,7 +2245,7 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     {
         double x = seat.pointer_x();
         double y = seat.pointer_y();
-        const pointer_constraint_kind k = pointer_constraint_motion(p0_, from_x, from_y, x, y);
+        const pointer_constraint_kind k = pointer_constraint_motion(wire_, from_x, from_y, x, y);
         if (k == pointer_constraint_kind::locked) {
             seat.set_pointer_position(from_x, from_y);
             if (relative_sent)
@@ -2273,7 +2273,7 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     // the motion in the focused surface's local coordinates.
     wm_.on_pointer_motion(event.time_ms);
     // A constraint may hold now that the pointer is inside its region.
-    pointer_constraints_update(p0_);
+    pointer_constraints_update(wire_);
 }
 
 void compositor_impl::warp_pointer(double x, double y) {
@@ -2290,7 +2290,7 @@ void compositor_impl::on_input_gesture(const lx::input::gesture_event& event) {
     keys_.note_other_input();
     // pointer-gestures: to the pointer focus at begin, latched until the end (the wire
     // decides; a compositor gesture would claim it there).
-    pointer_gesture(p0_, event);
+    pointer_gesture(wire_, event);
 }
 
 void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
@@ -2324,7 +2324,7 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
     }
     // A press may have started a grab or opened a popup grab (a constraint yields), or
     // focused the window under the pointer (one may hold now).
-    pointer_constraints_update(p0_);
+    pointer_constraints_update(wire_);
 }
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
@@ -2590,7 +2590,7 @@ void compositor_impl::wayland_fd_callback() {
     // A window capture's view damaged (its window committed while covered) ticks the
     // window's output.
     const std::uint32_t output_damage = active->scene.pending_damage_mask() & 0xFFFFu;
-    const std::uint32_t damaged = output_damage | capture_wanted_outputs(active->p0_);
+    const std::uint32_t damaged = output_damage | capture_wanted_outputs(active->wire_);
     // Output damage this dispatch added answers held frame callbacks (capture views do not).
     if (const std::uint32_t fresh = output_damage & ~damaged_before; fresh != 0)
         active->note_client_response(fresh);
@@ -2602,23 +2602,23 @@ void compositor_impl::content_fd_callback() {
         return;
     // A fence a queued content update waited on signalled: it applies now and is composited
     // by the next tick of the outputs it damaged.
-    content_updates_poll(active->p0_);
+    content_updates_poll(active->wire_);
     const std::uint32_t damaged = (active->scene.pending_damage_mask() & 0xFFFFu) |
-                                  capture_wanted_outputs(active->p0_);
+                                  capture_wanted_outputs(active->wire_);
     if (damaged != 0)
         active->request_frame(damaged);
 }
 
 void compositor_impl::arm_commit_timers() {
     if (!vsync_timer || display_gate_.load(std::memory_order_relaxed) != 0 ||
-        content_updates_queued(p0_) == 0)
+        content_updates_queued(wire_) == 0)
         return;
     const auto now = now_ns();
     bool armed = false;
     for (unsigned s = 0; s < output_manager::k_max; ++s) {
         if (!clocks_.live(s) || (clocks_.running_mask() & (1u << s)))
             continue;
-        if (const unsigned long long t = content_updates_next_target(p0_, s); t != 0)
+        if (const unsigned long long t = content_updates_next_target(wire_, s); t != 0)
             armed = clocks_.request_at(s, static_cast<lx::runtime::clock_time>(t),
                                        static_cast<lx::runtime::clock_time>(k_cu_time_slack_ns),
                                        now) ||
@@ -2636,7 +2636,7 @@ void compositor_impl::evaluate_tearing(std::uint32_t published) {
         if (!(published & bit))
             continue;
         async_flip_state st{};
-        st.card_capable = p0_.async_flip_capable;
+        st.card_capable = wire_.async_flip_capable;
         // No async commit has been TEST_ONLY-verified on any pipeline: the atomic-async
         // property set is not wired yet (no hardware here exposes the cap to validate it
         // against), so this stays false and the policy answers vsync everywhere.
@@ -2647,7 +2647,7 @@ void compositor_impl::evaluate_tearing(std::uint32_t published) {
                 rec.fullscreen_output != static_cast<int>(slot))
                 return;
             st.fullscreen_top = true;
-            st.wants_async = surface_wants_async(p0_, rec.surface);
+            st.wants_async = surface_wants_async(wire_, rec.surface);
         });
         if (allow_async(st))
             async_allowed_mask_ |= bit;
@@ -2694,9 +2694,9 @@ void compositor_impl::housekeeping_callback() {
     }
     // Every frame clock is stopped: surfaces not on screen get their throttled frame
     // callbacks here, about once a second, without restarting a clock for them.
-    if (frame_callbacks_throttled(active->p0_)) {
+    if (frame_callbacks_throttled(active->wire_)) {
         const auto now = now_ns();
-        fire_visible_frame_callbacks(active->p0_, static_cast<unsigned>(now / 1'000'000ull),
+        fire_visible_frame_callbacks(active->wire_, static_cast<unsigned>(now / 1'000'000ull),
                                      now);
     }
     // One tick of every lit output for the deadlines only a tick notices; nothing woke the
@@ -2922,7 +2922,7 @@ void compositor_impl::notify_capture_completions() {
     compositor_impl* self = this;
     if (!runtime::executor::global().post(runtime::affinity::ui, [self] {
             self->capture_ui_posted_.store(false, std::memory_order_release);
-            capture_complete(self->p0_);
+            capture_complete(self->wire_);
             self->wayland.flush();
         }))
         capture_ui_posted_.store(false, std::memory_order_release); // the tick drains
@@ -2943,7 +2943,7 @@ void compositor_impl::after_dispatch_callback() {
     // Pointer constraints decided after what this iteration dispatched (a region commit, a
     // window that mapped or moved): nothing to do while no constraint exists.
     if (active)
-        pointer_constraints_update(active->p0_);
+        pointer_constraints_update(active->wire_);
     // Workspace changes not flushed by the operation that made them (a flag compare).
     if (active)
         active->wm_.flush_workspaces();
@@ -3059,22 +3059,22 @@ void compositor_impl::settle_frame_clocks(std::uint32_t served, std::uint32_t qu
 #endif
 }
 
-void compositor_impl::register_p0_globals() {
-    p0_.server = &wayland;
+void compositor_impl::register_protocol_globals() {
+    wire_.server = &wayland;
     if (drm_present_)
-        p0_.dmabuf_main_device = dmabuf_main_device(kms.card_fd());
-    p0_.surfaces = &surfaces;
-    p0_.input = &input_router_;
-    p0_.seat = &input_devices_.default_seat();
-    p0_.shell = &shell_bridge_;
-    p0_.toplevels = &toplevels;
-    p0_.tree = &tree_;
+        wire_.dmabuf_main_device = dmabuf_main_device(kms.card_fd());
+    wire_.surfaces = &surfaces;
+    wire_.input = &input_router_;
+    wire_.seat = &input_devices_.default_seat();
+    wire_.shell = &shell_bridge_;
+    wire_.toplevels = &toplevels;
+    wire_.tree = &tree_;
     wm_.bind(toplevels, surfaces, tree_, scene, windows_layer_, input_router_,
              input_devices_.default_seat(), shell_bridge_, outputs);
     // Workspaces changed (design Part W): ext-workspace follows, then the control stream.
     wm_.set_workspace_observer({[](void* u) {
                                     auto* self = static_cast<compositor_impl*>(u);
-                                    workspaces_changed(self->p0_);
+                                    workspaces_changed(self->wire_);
                                     self->publish_workspaces();
                                 },
                                 this});
@@ -3084,14 +3084,14 @@ void compositor_impl::register_p0_globals() {
                  this);
     popups_.bind(toplevels, surfaces, tree_, popup_layer_);
     wm_.set_popups(&popups_);
-    p0_.popups = &popups_;
+    wire_.popups = &popups_;
     {
         scene::container_node* const containers[k_layer_levels] = {
             &background_layer_, &bottom_layer_, &top_layer_, &overlay_shell_layer_};
         layers_.bind(surfaces, tree_, containers);
     }
     wm_.set_layers(&layers_);
-    p0_.layers = &layers_;
+    wire_.layers = &layers_;
     decorations_.bind(tree_, scene);
     // Titles and the close glyph are atlas sprites on every path: the primitive renderers
     // (CPU, GLES 3.1, a ready ui_vk) draw them, the headless dump walks mono sprites itself,
@@ -3099,42 +3099,42 @@ void compositor_impl::register_p0_globals() {
     // atlas's pages (`frame_painter::sync_atlas`).
     decorations_.bind_chrome(&chrome_atlas_);
     wm_.set_decorations(&decorations_);
-    p0_.decorations = &decorations_;
-    p0_.server_side_decorations = cfg.server_side_decorations;
-    p0_.wm = &wm_;
+    wire_.decorations = &decorations_;
+    wire_.server_side_decorations = cfg.server_side_decorations;
+    wire_.wm = &wm_;
     wm_.set_cursor(&cursor_);
-    p0_.cursor = &cursor_;
+    wire_.cursor = &cursor_;
     dnd_.bind(tree_, dnd_icon_layer_, &cursor_);
     wm_.set_dnd(&dnd_);
-    p0_.dnd = &dnd_;
+    wire_.dnd = &dnd_;
     liveness_.set_timeout_ns(static_cast<runtime::clock_time>(cfg.ping_timeout_ms) * 1'000'000);
     wm_.set_liveness(&liveness_);
-    p0_.liveness = &liveness_;
-    p0_.activation = &activation_;
-    p0_.presentation = &presentation_feedback_;
-    p0_.idle = &idle_;
-    p0_.inhibitors = &inhibitors_;
-    p0_.idle_user = this;
-    p0_.idle_changed = [](void* u) {
+    wire_.liveness = &liveness_;
+    wire_.activation = &activation_;
+    wire_.presentation = &presentation_feedback_;
+    wire_.idle = &idle_;
+    wire_.inhibitors = &inhibitors_;
+    wire_.idle_user = this;
+    wire_.idle_changed = [](void* u) {
         auto* self = static_cast<compositor_impl*>(u);
         self->rearm_idle_timer();
         self->request_frame(); // a tick evaluates inhibition with the newest frame
     };
     // Display power needs a display: without KMS (headless, nested) the objects are failed.
     if (drm_present_) {
-        p0_.set_output_power = [](void* u, unsigned slot, bool on) {
+        wire_.set_output_power = [](void* u, unsigned slot, bool on) {
             static_cast<compositor_impl*>(u)->request_output_power(slot, on);
         };
-        p0_.output_power_on = [](void* u, unsigned slot) {
+        wire_.output_power_on = [](void* u, unsigned slot) {
             auto* self = static_cast<compositor_impl*>(u);
             return slot < output_manager::k_max ? self->outs_[slot].power.reported_on() : true;
         };
     }
-    p0_.text_input = &text_input_;
-    p0_.ime_popup_layer = &ime_popup_layer_;
+    wire_.text_input = &text_input_;
+    wire_.ime_popup_layer = &ime_popup_layer_;
     // wlr-output-management: a queued apply/test runs when nothing else does.
-    p0_.output_mgmt_user = this;
-    p0_.output_mgmt_kick = [](void* u) { static_cast<compositor_impl*>(u)->run_next_mgmt_job(); };
+    wire_.output_mgmt_user = this;
+    wire_.output_mgmt_kick = [](void* u) { static_cast<compositor_impl*>(u)->run_next_mgmt_job(); };
     {
         wm_ime_ops ops{};
         ops.user = this;
@@ -3144,7 +3144,7 @@ void compositor_impl::register_p0_globals() {
             lx::surface_id surface{};
             double sx = 0.0;
             double sy = 0.0;
-            if (!input_popup_hit(self->p0_, x, y, res, surface, sx, sy))
+            if (!input_popup_hit(self->wire_, x, y, res, surface, sx, sy))
                 return false;
             out = {};
             out.surface_resource = res;
@@ -3157,10 +3157,10 @@ void compositor_impl::register_p0_globals() {
         };
         wm_.set_ime_ops(ops);
     }
-    p0_.lock = &lock_;
-    p0_.lock_layer = &lock_layer_;
-    p0_.lock_user = this;
-    p0_.lock_apply = [](void* u, const lock_actions& a) {
+    wire_.lock = &lock_;
+    wire_.lock_layer = &lock_layer_;
+    wire_.lock_user = this;
+    wire_.lock_apply = [](void* u, const lock_actions& a) {
         static_cast<compositor_impl*>(u)->apply_lock_actions(a);
     };
     {
@@ -3173,7 +3173,7 @@ void compositor_impl::register_p0_globals() {
             lx::surface_id root{};
             double sx = 0.0;
             double sy = 0.0;
-            if (!session_lock_hit(self->p0_, x, y, res, surface, root, sx, sy))
+            if (!session_lock_hit(self->wire_, x, y, res, surface, root, sx, sy))
                 return false;
             out = {};
             out.surface_resource = res;
@@ -3198,63 +3198,63 @@ void compositor_impl::register_p0_globals() {
         };
         wm_.set_lock_ops(ops);
     }
-    p0_.outputs = &outputs;
+    wire_.outputs = &outputs;
     // Only when frames are actually composited in software. The headless backend keeps a
     // full copy of every registered texture; handed it on a GPU path, the commit path
     // copied every shm buffer into a table nothing read and nothing pruned — the bulk of
     // the compositor's heap growth (measured with heaptrack: 60 MB over a 30-resize run).
-    p0_.headless = headless_present_ ? &headless_ : nullptr;
-    p0_.dmabuf = &graphics.dmabuf();
-    p0_.textures = &texture_updates_;
-    p0_.request_logout = [](void* self, const char* source) {
+    wire_.headless = headless_present_ ? &headless_ : nullptr;
+    wire_.dmabuf = &graphics.dmabuf();
+    wire_.textures = &texture_updates_;
+    wire_.request_logout = [](void* self, const char* source) {
         static_cast<compositor_impl*>(self)->begin_logout(source);
     };
-    p0_.logout_user = this;
-    p0_.keys = &keys_;
+    wire_.logout_user = this;
+    wire_.keys = &keys_;
     keys_.set_layout_query(
         [](unsigned keysym, void* u) {
             auto& km = static_cast<compositor_impl*>(u)->input_devices_.default_seat().keymap();
             return km.layout_has_keysym(keysym, km.active_layout());
         },
         this);
-    p0_.lifecycle = &buffer_lifecycle_;
+    wire_.lifecycle = &buffer_lifecycle_;
     // Exactly one staging strategy: the CPU path samples staged rows in place during the
     // composite, which a shared FIFO cannot keep alive that long (see shm_pixel_store).
     // GL and Vulkan copy the pixels out during the drain, so their staging is a transient
     // block per update (`shm_upload_pool`), mapped for it and unmapped after a second idle.
     // A global ring of window-sized vectors that never shrank held seven 1080p frames
     // (57 MiB) after the only client had gone.
-    p0_.shm_pool = nullptr;
-    p0_.shm_regions = false;
+    wire_.shm_pool = nullptr;
+    wire_.shm_regions = false;
     if (cpu_present_) {
-        p0_.shm_store = &shm_store_;
+        wire_.shm_store = &shm_store_;
         // Scanout is XR24, so keeping the client's channel order means an unscaled opaque
         // surface reaches the display with no conversion pass at all.
-        p0_.shm_native_format = true;
+        wire_.shm_native_format = true;
     } else if (gl_present_) {
         // GL reads staged pixels once, during the drain, so staging only has to outlive
         // the trip to the render thread: transient blocks sized by the damage they carry,
         // not a persistent window-sized copy per texture.
-        p0_.shm_pool = &shm_pool_;
-        p0_.shm_regions = true;
-        p0_.shm_store = nullptr;
-        p0_.shm_native_format = false;
+        wire_.shm_pool = &shm_pool_;
+        wire_.shm_regions = true;
+        wire_.shm_store = nullptr;
+        wire_.shm_native_format = false;
         // Where the driver takes BGRA rows at any stride, the client's buffer is uploaded
         // as it is: no staging copy and no swizzle on the UI thread. What is still staged
         // (a full table, compositor images) keeps the same channel order, so a texture
         // never changes format between uploads.
         if (gl_compositor_.supports_client_upload()) {
-            p0_.shm_direct = &shm_direct_;
-            p0_.shm_native_format = true;
+            wire_.shm_direct = &shm_direct_;
+            wire_.shm_native_format = true;
             log_gfx.info("shm: uploaded from client memory (no staging)");
         }
     } else {
         // Vulkan uploads RGBA regions the way GL does: the damage since the buffer was last
         // uploaded, staged at its own size, not the whole image per commit.
-        p0_.shm_pool = &shm_pool_;
-        p0_.shm_regions = true;
-        p0_.shm_store = nullptr;
-        p0_.shm_native_format = false;
+        wire_.shm_pool = &shm_pool_;
+        wire_.shm_regions = true;
+        wire_.shm_store = nullptr;
+        wire_.shm_native_format = false;
     }
     // GL imports client dma-bufs on the render thread, where its context lives (an EGLImage
     // per commit); the UI-side Vulkan import cache is only for the Vulkan path.
@@ -3265,27 +3265,27 @@ void compositor_impl::register_p0_globals() {
     // The content-update queue (fifo-v1, commit-timing-v1, fences): when content applied
     // now is predicted to present — this tick's deadline while a tick builds the output's
     // frame, else the first vblank whose tick has not started — and clocks armed for targets.
-    p0_.cu_user = this;
-    p0_.cu_predict = [](void* u, unsigned slot) -> unsigned long long {
+    wire_.cu_user = this;
+    wire_.cu_predict = [](void* u, unsigned slot) -> unsigned long long {
         auto* self = static_cast<compositor_impl*>(u);
         if (slot >= output_manager::k_max || !self->clocks_.live(slot))
             return 0;
         const scheduler::repaint_scheduler& c = self->clocks_.clock(slot);
         const auto now = now_ns();
-        if (self->p0_.cu_in_tick && (self->due_mask_ & (1u << slot)))
+        if (self->wire_.cu_in_tick && (self->due_mask_ & (1u << slot)))
             return static_cast<unsigned long long>(c.next_deadline(now));
         return static_cast<unsigned long long>(
             c.next_deadline(now + c.estimate_ns() + scheduler::repaint_scheduler::k_margin_ns));
     };
     // dma-fence deadline hints on client buffer fences: what an update committed now needs
     // its fences by is the start of the repaint that latches it, not the vblank after.
-    p0_.cu_latch = [](void* u, unsigned slot) -> unsigned long long {
+    wire_.cu_latch = [](void* u, unsigned slot) -> unsigned long long {
         auto* self = static_cast<compositor_impl*>(u);
         if (slot >= output_manager::k_max || !self->clocks_.live(slot))
             return 0;
         return static_cast<unsigned long long>(self->clocks_.clock(slot).next_start(now_ns()));
     };
-    p0_.cu_request_at = [](void* u, unsigned slot, unsigned long long target) {
+    wire_.cu_request_at = [](void* u, unsigned slot, unsigned long long target) {
         auto* self = static_cast<compositor_impl*>(u);
         if (!self->vsync_timer || self->display_gate_.load(std::memory_order_relaxed) != 0)
             return;
@@ -3297,9 +3297,9 @@ void compositor_impl::register_p0_globals() {
     // linux-drm-syncobj-v1 needs timeline syncobjs and the eventfd ioctl on the card, and a
     // composite that exports its completion as a sync_file (GL with
     // EGL_ANDROID_native_fence_sync, Vulkan); the CPU composite has no GPU fence to attach.
-    p0_.release_fences = &release_fences_;
-    p0_.icons = &icons_;
-    p0_.foreign = &foreign_;
+    wire_.release_fences = &release_fences_;
+    wire_.icons = &icons_;
+    wire_.foreign = &foreign_;
     // Screen capture (design-app-compat-capture Part D): on the composite path that runs —
     // GL copies the composited frame (one blit, or a read-back for shm) and renders windows'
     // capture views, CPU composites into the client's memory, Vulkan reads its target back
@@ -3309,7 +3309,7 @@ void compositor_impl::register_p0_globals() {
                             : vulkan_present_ ? capture_backend::vulkan
                                               : capture_backend::none;
     capture_host_.dmabuf = gl_present_ && egl_.supports_dmabuf_import();
-    capture_host_.dmabuf_device = p0_.dmabuf_main_device;
+    capture_host_.dmabuf_device = wire_.dmabuf_main_device;
     capture_host_.channel = &capture_channel_;
     capture_host_.guards = &capture_guards_;
     capture_host_.scene = &scene;
@@ -3326,7 +3326,7 @@ void compositor_impl::register_p0_globals() {
         return static_cast<unsigned long long>(self->clocks_.clock(slot).next_deadline(
             static_cast<lx::runtime::clock_time>(composited)));
     };
-    capture_guards_.bind({}); // libwayland's access calls are bound by install_p0_protocols
+    capture_guards_.bind({}); // libwayland's access calls are bound by install_protocols
     if (gl_present_)
         capture_renderer_.bind_gl(&gl_compositor_, &egl_);
     else if (cpu_present_)
@@ -3345,31 +3345,31 @@ void compositor_impl::register_p0_globals() {
             },
             [](void* u) { static_cast<compositor_impl*>(u)->notify_capture_completions(); },
             this);
-    p0_.capture = capture_host_.backend != capture_backend::none ? &capture_host_ : nullptr;
+    wire_.capture = capture_host_.backend != capture_backend::none ? &capture_host_ : nullptr;
     refresh_capture_host();
-    p0_.warp_user = this;
-    p0_.warp_pointer = [](void* u, double x, double y) {
+    wire_.warp_user = this;
+    wire_.warp_pointer = [](void* u, double x, double y) {
         static_cast<compositor_impl*>(u)->warp_pointer(x, y);
     };
     // ext-background-effect-v1: blur where the backend draws it (GL ES 3, Vulkan).
-    p0_.background_blur = (gl_present_ && gl_compositor_.supports_blur()) ||
+    wire_.background_blur = (gl_present_ && gl_compositor_.supports_blur()) ||
                           (vulkan_present_ && vk_compositor_.supports_blur());
     // wp_color_manager_v1: parametric descriptions where the backend draws them (all three
     // can; Vulkan needs room for the push block, GL highp in the fragment stage).
-    p0_.color_management = (gl_present_ && gl_compositor_.supports_color_management()) ||
+    wire_.color_management = (gl_present_ && gl_compositor_.supports_color_management()) ||
                            (vulkan_present_ && vk_compositor_.supports_color_management()) ||
                            cpu_present_;
     if (drm_present_) {
         const bool fence_out = (gl_present_ && egl_.supports_native_fence()) || vulkan_present_;
-        p0_.syncobj_drm_fd = kms.card_fd();
-        p0_.syncobj_supported = fence_out && gfx::drm_timeline_supported(kms.card_fd());
-        p0_.async_flip_capable = kms.supports_async_flip();
+        wire_.syncobj_drm_fd = kms.card_fd();
+        wire_.syncobj_supported = fence_out && gfx::drm_timeline_supported(kms.card_fd());
+        wire_.async_flip_capable = kms.supports_async_flip();
         log_gfx.info("explicit sync (linux-drm-syncobj-v1): {}; async page "
                      "flips (tearing-control-v1): {}",
-                     p0_.syncobj_supported ? "offered"
+                     wire_.syncobj_supported ? "offered"
                      : fence_out           ? "not offered (no timeline syncobjs on this card)"
                                            : "not offered (composite exports no fence)",
-                     p0_.async_flip_capable ? "available" : "unsupported by the card");
+                     wire_.async_flip_capable ? "available" : "unsupported by the card");
     }
     // GPU memory in the health report comes from DRM fdinfo, read on request; said once here
     // because a driver either prints usage stats or never does.
@@ -3379,7 +3379,7 @@ void compositor_impl::register_p0_globals() {
                         gpu.regions.size() == 1 ? "" : "s");
     else
         log_memory.info("GPU memory: not reported (no DRM file with usage stats in fdinfo)");
-    if (auto installed = install_p0_protocols(p0_); !installed) {
+    if (auto installed = install_protocols(wire_); !installed) {
         log_compositor.error(installed.get_error());
     }
     // The heads every zwlr_output_manager_v1 is told about from its first bind.
@@ -3436,8 +3436,8 @@ void compositor_impl::begin_logout(const char* source) {
     session::service_notifier::stopping("Logging out");
     layers_.set_zone_hold_pid(0);
     // The shell learns first, so it reads the disconnect that follows as a normal end.
-    if (p0_.notify_session_ending)
-        p0_.notify_session_ending();
+    if (wire_.notify_session_ending)
+        wire_.notify_session_ending();
     // Every window, mapped or not, gets xdg_toplevel.close: a client decides how to exit
     // (an editor may save), and nothing is killed. Clients still connected at the
     // deadline are disconnected by the compositor's own teardown.
@@ -4131,7 +4131,7 @@ control_action_result compositor_impl::run_action(lx::config::action_id action, 
         char arg[16] = "";
         if (argument)
             std::snprintf(arg, sizeof(arg), "%u", argument);
-        if (!p0_.send_shell_action || !p0_.send_shell_action(info.name, arg, time_ms, input)) {
+        if (!wire_.send_shell_action || !wire_.send_shell_action(info.name, arg, time_ms, input)) {
             // switcher.next with no shell: the compositor's quick switch (design C.3), so
             // Alt+Tab still works while the shell restarts.
             if (action == switcher_next && lock_.state() == lock_state::unlocked) {
@@ -4271,8 +4271,8 @@ void compositor_impl::apply_initial_config() {
             return static_cast<compositor_impl*>(u)->on_button_binding(button, time_ms);
         },
         this);
-    p0_.shell_config_user = this;
-    p0_.shell_config_on_bind = [](void* u, void* res) {
+    wire_.shell_config_user = this;
+    wire_.shell_config_on_bind = [](void* u, void* res) {
         static_cast<compositor_impl*>(u)->send_config_to_shell(res, true);
     };
     config_timer_ = std::make_unique<runtime::timer_source>(
@@ -4418,8 +4418,8 @@ void compositor_impl::finish_keymap_job() {
         // (and the focus its modifiers), the IM grab too.
         job->keymap.adopt_state(seat.keymap(), seat.pressed_keys(), seat.pressed_count());
         seat.keymap() = std::move(job->keymap);
-        if (p0_.invalidate_seat_keymap)
-            p0_.invalidate_seat_keymap();
+        if (wire_.invalidate_seat_keymap)
+            wire_.invalidate_seat_keymap();
         input_router_.seat_keymap_changed(seat);
         input_devices_.update_leds();
         stop_binding_repeat();
@@ -4532,8 +4532,8 @@ void compositor_impl::export_cursor_environment() {
 
 void compositor_impl::apply_repeat() {
     const auto& k = config_.current().keyboard;
-    p0_.repeat_rate = k.repeat_rate;
-    p0_.repeat_delay = k.repeat_delay;
+    wire_.repeat_rate = k.repeat_rate;
+    wire_.repeat_delay = k.repeat_delay;
     input_router_.send_repeat_info(k.repeat_rate, k.repeat_delay);
 }
 
@@ -4560,9 +4560,9 @@ void compositor_impl::apply_window_config() {
     const auto& a = config_.current().animations;
     // Retirements wait for the next tick while a ghost may still claim them (window
     // animations); off, they go at once as before.
-    p0_.defer_retire = a.enabled;
+    wire_.defer_retire = a.enabled;
     if (!a.enabled)
-        flush_deferred_retires(p0_);
+        flush_deferred_retires(wire_);
     wm_.set_animation_config(
         {.enabled = a.enabled, .stiffness = a.stiffness, .damping_ratio = a.damping_ratio});
 }
@@ -4596,7 +4596,7 @@ void compositor_impl::finish_config_generation() {
                         "the configuration in use stays",
                         config_.generation(), config_.describe_source(), d.errors());
     // The shell: the new bytes when they changed, and the report.
-    if (p0_.send_shell_config)
+    if (wire_.send_shell_config)
         send_config_to_shell(nullptr, config_.accepted_last() &&
                                           config_bytes_generation_ == config_.generation());
     if (config_sighup_) {
@@ -4641,7 +4641,7 @@ void compositor_impl::finish_config_generation() {
 
 void compositor_impl::send_config_to_shell(void* shell_resource, bool with_bytes) {
     namespace lxc = lx::config;
-    if (!p0_.send_shell_config)
+    if (!wire_.send_shell_config)
         return;
     const auto& d = config_.diagnostics();
     std::vector<std::array<char, 256>> texts(d.items().size());
@@ -4686,7 +4686,7 @@ void compositor_impl::send_config_to_shell(void* shell_resource, bool with_bytes
             }
         }
     }
-    p0_.send_shell_config(shell_resource, r);
+    wire_.send_shell_config(shell_resource, r);
 }
 
 void compositor_impl::stop_binding_repeat() {
@@ -4710,7 +4710,7 @@ void compositor_impl::binding_repeat_callback() {
         }
         // The rules the key press was matched under, again: a lock (or a shortcuts inhibitor)
         // that came while the key is held stops a binding not allowed under it.
-        if (!self.keys_.allows(*self.repeat_binding_, shortcuts_inhibited(self.p0_))) {
+        if (!self.keys_.allows(*self.repeat_binding_, shortcuts_inhibited(self.wire_))) {
             self.stop_binding_repeat();
             return;
         }
@@ -4764,11 +4764,11 @@ void compositor_impl::start_key_repeat(key_repeat kind, const lx::input::key_eve
 }
 
 void compositor_impl::send_hold_key(const key_input& in, unsigned time_ms) {
-    if (!p0_.send_hold_key || !keys_.hold_active())
+    if (!wire_.send_hold_key || !keys_.hold_active())
         return;
-    const binding_entry* b = keys_.peek_binding(in, shortcuts_inhibited(p0_));
+    const binding_entry* b = keys_.peek_binding(in, shortcuts_inhibited(wire_));
     const char* binding = b ? lx::config::action(b->action).name : "";
-    p0_.send_hold_key(keys_.hold_owner(), in.raw ? in.raw : in.raw0, in.mods, binding, time_ms);
+    wire_.send_hold_key(keys_.hold_owner(), in.raw ? in.raw : in.raw0, in.mods, binding, time_ms);
 }
 
 void compositor_impl::cancel_hold(const char* why) {
@@ -4777,8 +4777,8 @@ void compositor_impl::cancel_hold(const char* why) {
         return;
     if (repeat_kind_ == key_repeat::hold)
         stop_binding_repeat();
-    if (p0_.send_hold_cancelled)
-        p0_.send_hold_cancelled(hold);
+    if (wire_.send_hold_cancelled)
+        wire_.send_hold_cancelled(hold);
     if (log_bindings.enabled(lx::trace::level::debug))
         log_bindings.debug("held action cancelled ({})", why);
 }
@@ -4788,7 +4788,7 @@ wm_button_binding compositor_impl::on_button_binding(unsigned button, unsigned t
     const auto named = input_devices_.default_seat().keymap().named();
     const unsigned mods = (named.shift ? key_mod_shift : 0u) | (named.ctrl ? key_mod_ctrl : 0u) |
                           (named.alt ? key_mod_alt : 0u) | (named.super ? key_mod_super : 0u);
-    const binding_entry* b = keys_.match_button(button, mods, shortcuts_inhibited(p0_));
+    const binding_entry* b = keys_.match_button(button, mods, shortcuts_inhibited(wire_));
     if (!b)
         return wm_button_binding::none;
     if (b->action == lxc::action_id::window_move_interactive)
@@ -5792,7 +5792,7 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
             if (mhz > 0)
                 info.refresh_ns = static_cast<unsigned>((1'000'000'000'000ull + mhz / 2) / mhz);
         }
-        presentation_flipped(p0_, fb.tag, slot, info);
+        presentation_flipped(wire_, fb.tag, slot, info);
         // ext-session-lock (M14): a locked frame is on this output.
         if (lock_.state() == lock_state::locking && static_cast<int>(fb.tag - o.lock_frame) >= 0)
             note_lock_shown(slot);
@@ -5841,7 +5841,7 @@ void compositor_impl::release_flip_callbacks(unsigned slot) {
     unsigned ms = static_cast<unsigned>(static_cast<unsigned long long>(now) / 1'000'000ull);
     if (o.last_feedback.hw_clock && o.last_feedback.actual_present_ns > 0)
         ms = static_cast<unsigned>(o.last_feedback.actual_present_ns / 1'000'000ull);
-    fire_output_frame_callbacks(p0_, slot, ms, static_cast<unsigned long long>(now));
+    fire_output_frame_callbacks(wire_, slot, ms, static_cast<unsigned long long>(now));
 }
 
 lx::runtime::clock_time compositor_impl::client_lead_ns(unsigned slot) const {
@@ -6046,7 +6046,7 @@ void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
     // 3. The frame clock stops; the housekeeping timer becomes the 1 Hz paused tick. Nothing
     //    in flight will be presented: its feedback is discarded now (the flips still to
     //    drain are dropped by the paused branch of the flip handler).
-    presentation_discard(p0_, false);
+    presentation_discard(wire_, false);
     for (unsigned s = 0; s < output_manager::k_max; ++s)
         clocks_.stop(s);
     if (vsync_timer)
@@ -6062,7 +6062,7 @@ void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
 
 void compositor_impl::suspend_input_for_pause() {
     auto& seat = input_devices_.default_seat();
-    p0_.session_paused = true;
+    wire_.session_paused = true;
     // 5. libinput closes every device (back to logind with ReleaseDevice) and emits a
     //    release for every key and button still down; those were drained through the
     //    normal path just now, so clients saw them in order.
@@ -6080,7 +6080,7 @@ void compositor_impl::suspend_input_for_pause() {
     input_router_.suspend_keyboard_focus(seat);
     // 7. Pointer constraints end while the session is away (a persistent one holds again
     //    after the resume).
-    pointer_constraints_update(p0_);
+    pointer_constraints_update(wire_);
 }
 
 void compositor_impl::resume_input_after_pause() {
@@ -6098,9 +6098,9 @@ void compositor_impl::resume_input_after_pause() {
     // before the switch.
     wm_.resolve_keyboard_focus();
     // `enter` with an empty key array and the modifiers (only locks survive): a full resync.
-    p0_.session_paused = false;
+    wire_.session_paused = false;
     input_router_.resume_keyboard_focus(seat);
-    pointer_constraints_update(p0_);
+    pointer_constraints_update(wire_);
 }
 
 void compositor_impl::begin_display_resume(unsigned gen) {
@@ -6150,7 +6150,7 @@ void compositor_impl::finish_display_resume(unsigned gen) {
     display_gate_.fetch_and(~gate_vt, std::memory_order_release);
     resume_input_after_pause();
     wm_.set_suspend_reason(window_manager::suspend_vt, false);
-    if (idle_.note_activity(now_ns(), idle_events(p0_)))
+    if (idle_.note_activity(now_ns(), idle_events(wire_)))
         rearm_idle_timer();
     // Another master drew on the CRTCs: every pixel is repainted.
     scene.note_full_damage();
@@ -6171,7 +6171,7 @@ void compositor_impl::finish_display_resume(unsigned gen) {
 void compositor_impl::idle_timer_callback() {
     if (!active)
         return;
-    active->idle_.on_timer(static_cast<unsigned long long>(now_ns()), idle_events(active->p0_));
+    active->idle_.on_timer(static_cast<unsigned long long>(now_ns()), idle_events(active->wire_));
     active->rearm_idle_timer();
 }
 
@@ -6187,7 +6187,7 @@ void compositor_impl::rearm_idle_timer() {
 
 bool compositor_impl::on_user_activity() {
     // Per input event: one clock read, one store, and a branch per output on its power.
-    if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(p0_)))
+    if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(wire_)))
         rearm_idle_timer();
     if (gate_power_mask_.load(std::memory_order_relaxed) == 0) {
         bool any = false;
@@ -6229,7 +6229,7 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
         // wakes it. The other outputs go on. Keyboard focus is kept.
         power_gen_[slot].store(o.power.generation(), std::memory_order_release);
         gate_power_mask_.fetch_or(bit, std::memory_order_release);
-        presentation_discard_output(p0_, slot);
+        presentation_discard_output(wire_, slot);
         clocks_.set_dark(slot, true);
         rearm_frame_timer();
         o.awaiting_resume_flip = false;
@@ -6269,7 +6269,7 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
         !(o.pipe && o.pipe->kms && o.pipe->kms->flip_pending()))
         apply_power_actions(slot, o.power.on_flip_drained());
     if (a.has(power_actions::send_mode))
-        notify_output_power(p0_, slot, a.mode_on);
+        notify_output_power(wire_, slot, a.mode_on);
     if (a.has(power_actions::log_off))
         log_power.info("{} (output {} {})",
                        (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
@@ -6477,7 +6477,7 @@ void compositor_impl::advance_lock() {
 void compositor_impl::apply_lock_actions(const lock_actions& a) {
     // Screen capture follows the lock from the request on (CC7): jobs already with render
     // are cancelled, every session's next frame is the curtain.
-    capture_lock_check(p0_);
+    capture_lock_check(wire_);
     if (a.empty())
         return;
     const lx::color black = lx::color::rgb(0.f, 0.f, 0.f);
@@ -6503,14 +6503,14 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
         lock_layer_.set_visible(true);
         // The first snapshot built from here on is a locked frame, on every output.
         for (auto& o : outs_)
-            o.lock_frame = p0_.building_frame;
+            o.lock_frame = wire_.building_frame;
         lock_shown_.begin();
         wm_.set_suspend_reason(window_manager::suspend_lock, true);
         scene.note_full_damage();
         request_frame();
     }
     // The wire half: finished, locked, and lock surfaces dropped when the lock ended.
-    session_lock_send(p0_, a);
+    session_lock_send(wire_, a);
     if (a.has(lock_actions::scene_unlock)) {
         for (scene::container_node* layer :
              {&background_layer_, &bottom_layer_, &windows_layer_, &snap_preview_layer_,
@@ -6530,7 +6530,7 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
         wm_.lock_focus_changed();
     // A pointer constraint ends at the lock request and may hold again after the unlock.
     if (a.has(lock_actions::input_lock) || a.has(lock_actions::input_unlock))
-        pointer_constraints_update(p0_);
+        pointer_constraints_update(wire_);
     // The solid colour: dark red once the locker is gone (sway), so whoever sits down sees
     // why the screen is locked and empty; black otherwise.
     const lx::color clear = lock_.state() == lock_state::abandoned
@@ -6544,12 +6544,12 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     }
     if (a.has(lock_actions::locked_hint) && logind_.has_control())
         logind_.set_locked_hint(a.hint);
-    if (a.has(lock_actions::notify_shell) && p0_.notify_lock_state)
-        p0_.notify_lock_state(shell_lock_state(lock_.state()));
+    if (a.has(lock_actions::notify_shell) && wire_.notify_lock_state)
+        wire_.notify_lock_state(shell_lock_state(lock_.state()));
     if (a.has(lock_actions::activity)) {
         // An unlock is the user (I2) — but not a wake: unlocking while blanked stays dark
         // until input (the unlock itself was input, which already woke it).
-        if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(p0_)))
+        if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(wire_)))
             rearm_idle_timer();
     }
     if (a.has(lock_actions::rearm_timer))
@@ -6581,7 +6581,7 @@ void compositor_impl::on_logind_lock() {
         log_lock.info("logind Lock: already locked");
         return;
     }
-    const bool told = p0_.notify_lock_requested && p0_.notify_lock_requested(0);
+    const bool told = wire_.notify_lock_requested && wire_.notify_lock_requested(0);
     log_lock.info("{}", told ? "logind Lock: shell asked to lock"
                              : "logind Lock: no shell to start a locker — ignored");
 }
@@ -6610,7 +6610,7 @@ void compositor_impl::on_prepare_for_sleep(bool start) {
     }
     bool wait = lock_.state() != lock_state::unlocked; // a lock is under way: wait for it
     if (!wait)
-        wait = p0_.notify_lock_requested && p0_.notify_lock_requested(1);
+        wait = wire_.notify_lock_requested && wire_.notify_lock_requested(1);
     if (!wait || !logind_.holds_sleep_inhibitor()) {
         logind_.release_sleep_inhibitor();
         return;
@@ -7506,7 +7506,7 @@ int compositor_impl::add_output_from(const drm::connector_probe& e, const connec
     pd = pending_output{};
     pd.probe = e;
     pd.kms = drm_present_;
-    pd.head_known = output_mgmt_heads(p0_).find(e.connector_id) != nullptr;
+    pd.head_known = output_mgmt_heads(wire_).find(e.connector_id) != nullptr;
     if (choice) {
         for (unsigned i = 0; i < choice->mode_count && i < output_op::k_modes; ++i)
             pd.modes[i] = choice->modes[i];
@@ -7804,11 +7804,11 @@ void compositor_impl::remove_output(unsigned slot, bool connector_gone, const ch
     outs_[slot].pipe = nullptr;
     gate_power_mask_.fetch_and(~bit, std::memory_order_acq_rel);
     power_gen_[slot].fetch_add(1, std::memory_order_acq_rel); // a power-off task in flight is stale
-    presentation_discard_output(p0_, slot);
+    presentation_discard_output(wire_, slot);
     // Nothing is shown on it any more: a surface last shown only here is paced by the
     // fallback throttle (or the output it shows on next), never by this dead slot.
-    p0_.published_mask &= ~bit;
-    p0_.published_frame[slot] = 0;
+    wire_.published_mask &= ~bit;
+    wire_.published_frame[slot] = 0;
     lock_shown_.forget(slot);
     if (fallback_headless_slot_ == static_cast<int>(slot))
         fallback_headless_slot_ = -1;
@@ -7950,13 +7950,13 @@ void compositor_impl::outputs_changed_now() {
         output_generation_ = outputs.generation();
         log_outputs();
         lx::trace::scoped_span outputs_span{"ui", "outputs_changed"};
-        notify_outputs_changed(p0_);
+        notify_outputs_changed(wire_);
     }
     // Captures follow at once (CC9): a gone output stops its sessions, a new mode sends new
     // constraints (window captures publish at the next tick).
-    if (p0_.capture) {
+    if (wire_.capture) {
         refresh_capture_host();
-        capture_tick(p0_, p0_.building_frame, false);
+        capture_tick(wire_, wire_.building_frame, false);
     }
     reclamp_pointer();
 }
@@ -8430,12 +8430,12 @@ void compositor_impl::flush_output_heads() {
     if (!heads_dirty_)
         return;
     heads_dirty_ = false;
-    if (!p0_.output_mgmt_kick)
+    if (!wire_.output_mgmt_kick)
         return; // no zwlr_output_manager_v1 global
     if (!heads_scratch_)
         heads_scratch_ = std::make_unique<mgmt::head_set>();
     build_heads(*heads_scratch_);
-    output_heads_changed(p0_, *heads_scratch_);
+    output_heads_changed(wire_, *heads_scratch_);
 }
 
 drm::kms_mode compositor_impl::target_kms_mode(const mgmt::head_target& t,
@@ -8558,7 +8558,7 @@ bool compositor_impl::plan_config_test(const mgmt::target& t, config_test& out) 
 void compositor_impl::run_next_mgmt_job() {
     if (mgmt_ && mgmt_->active)
         return;
-    mgmt::job_queue& q = output_mgmt_jobs(p0_);
+    mgmt::job_queue& q = output_mgmt_jobs(wire_);
     while (!q.empty()) {
         // An output mid-way (being added or retired): its answer kicks this again.
         if (reserved_slots() != 0)
@@ -8572,12 +8572,12 @@ void compositor_impl::run_next_mgmt_job() {
         mgmt_run& r = *mgmt_;
         r = mgmt_run{};
         r.job = j;
-        if (j.config.serial != output_mgmt_serial(p0_)) {
+        if (j.config.serial != output_mgmt_serial(wire_)) {
             r.active = true;
             finish_mgmt_job(mgmt_result::cancelled, "the outputs changed since its serial");
             return;
         }
-        const mgmt::head_set& heads = output_mgmt_heads(p0_);
+        const mgmt::head_set& heads = output_mgmt_heads(wire_);
         mgmt::current_target(heads, r.previous);
         if (const auto f = mgmt::resolve(j.config, heads, max_enabled_heads(), r.target);
             f != mgmt::resolve_failure::none) {
@@ -8623,7 +8623,7 @@ void compositor_impl::on_config_tested(unsigned gen, bool ok, unsigned tests) {
         return;
     mgmt_run& r = *mgmt_;
     flush_output_heads();
-    if (r.job.config.serial != output_mgmt_serial(p0_)) {
+    if (r.job.config.serial != output_mgmt_serial(wire_)) {
         finish_mgmt_job(mgmt_result::cancelled, "the outputs changed during its test");
         return;
     }
@@ -8857,10 +8857,10 @@ void compositor_impl::finish_mgmt_job(mgmt_result result, const char* why) {
     // when it hears `succeeded` (wlr-randr exits then) sees what it asked for.
     mark_heads_dirty();
     flush_output_heads();
-    output_mgmt_finish(p0_, r.job.token, result);
+    output_mgmt_finish(wire_, r.job.token, result);
     {
         char what[1024];
-        describe_target(r.target, output_mgmt_heads(p0_), what, sizeof(what));
+        describe_target(r.target, output_mgmt_heads(wire_), what, sizeof(what));
         log_outputcfg.info("output configuration {} {}: {} ({})", r.job.test ? "test" : "apply",
                            result == mgmt_result::succeeded ? "succeeded"
                            : result == mgmt_result::failed  ? "failed"
@@ -9754,7 +9754,7 @@ lx::result<void> compositor::start() {
     }
 
     lx::trace::timeline_instant("startup", "cursor ready");
-    impl_->register_p0_globals();
+    impl_->register_protocol_globals();
     lx::trace::timeline_instant("startup", "globals registered");
     impl_->finish_input();
     lx::trace::timeline_instant("startup", "input started");
@@ -9839,7 +9839,7 @@ lx::result<void> compositor::start() {
     }
     // Fences queued content updates wait on (sync_files, syncobj eventfds): one epoll fd,
     // readable only while one has signalled.
-    if (const int cfd = content_updates_poll_fd(impl_->p0_); cfd >= 0) {
+    if (const int cfd = content_updates_poll_fd(impl_->wire_); cfd >= 0) {
         impl_->content_fd_source = std::make_unique<runtime::fd_source>(
             cfd, &detail::compositor_impl::content_fd_callback);
         impl_->loop.add_source(impl_->content_fd_source.get());
@@ -10169,21 +10169,21 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Protocol handlers date texture retirements against this, so it has to be current
     // before any Wayland dispatch below. What is committed from here on belongs to this
     // tick's snapshot at the earliest.
-    impl->p0_.frame_index = tick.frame_index;
-    impl->p0_.building_frame = tick.frame_index;
+    impl->wire_.frame_index = tick.frame_index;
+    impl->wire_.building_frame = tick.frame_index;
     impl->budget_.begin_frame(tick.frame_index);
-    impl->p0_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
+    impl->wire_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
     // Texture retirements window animations held back since the last tick (a closing
     // window's ghost had its chance to keep them): queued now.
-    if (impl->p0_.defer_retire)
-        flush_deferred_retires(impl->p0_);
+    if (impl->wire_.defer_retire)
+        flush_deferred_retires(impl->wire_);
     impl->advance_logout(tick.timestamp_ns);
     // Output heads changed since the last loop iteration (tests drive ticks without the loop).
     impl->flush_output_heads();
     // Staging: free retired CPU-path storage the render thread has let go of, unmap GL
     // blocks idle past the threshold, and report what is left against the budget.
     impl->shm_store_.collect();
-    impl->shm_pool_.collect(impl->p0_.now_ns, detail::compositor_impl::k_staging_idle_ns);
+    impl->shm_pool_.collect(impl->wire_.now_ns, detail::compositor_impl::k_staging_idle_ns);
     {
         const unsigned long long staged = impl->shm_store_.bytes_held() +
                                           impl->shm_pool_.bytes_mapped();
@@ -10224,14 +10224,14 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         lx::trace::scoped_span dispatch_span{"ui", "dispatch"};
         // From here to the publish, what is applied joins this tick's frame (the
         // commit-timing prediction of the served outputs is this tick's deadline).
-        impl->p0_.cu_in_tick = true;
+        impl->wire_.cu_in_tick = true;
         // Unflushed: the tick flushes once at its end, so what these requests produce (a
         // buffer release) leaves together with the frame's events in one send.
         (void)wayland().dispatch(0, false);
     }
     // Queued content updates whose target this tick's frame reaches, or that stopped being
     // shown, apply now and join it.
-    content_updates_try(impl->p0_);
+    content_updates_try(impl->wire_);
 
     // wl_surface.frame means "the content you committed has been shown". Answering it once
     // per tick instead makes clients render frames that are composited over and never reach
@@ -10247,10 +10247,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
             o.awaiting_resume_flip = false;
             o.last_callback_ns = tick.timestamp_ns;
         }
-        fire_frame_callbacks(impl->p0_, frame_ms);
+        fire_frame_callbacks(impl->wire_, frame_ms);
         // Nothing reaches the screen while stopped: queued presentation feedback is
         // discarded once a second, so a client pacing by it (mpv) falls back to its timer.
-        presentation_discard(impl->p0_, true);
+        presentation_discard(impl->wire_, true);
         // A lock under way while nothing is shown is locked now.
         impl->advance_lock();
     } else {
@@ -10281,7 +10281,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                     ms = static_cast<unsigned>(o.last_feedback.actual_present_ns / 1'000'000ull);
                 // Surfaces this output paces now; the ones on no output (covered, off every
                 // output, unmapped) at most once per 995 ms.
-                fire_output_frame_callbacks(impl->p0_, slot, ms,
+                fire_output_frame_callbacks(impl->wire_, slot, ms,
                                             static_cast<unsigned long long>(tick.timestamp_ns));
             }
         }
@@ -10345,17 +10345,17 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         published |= bit;
         o.published_once = true;
         o.last_published_frame = tick.frame_index;
-        impl->p0_.published_frame[slot] = tick.frame_index;
-        impl->p0_.published_mask |= bit;
+        impl->wire_.published_frame[slot] = tick.frame_index;
+        impl->wire_.published_mask |= bit;
         if (damaged & bit)
             o.last_damaged_frame = tick.frame_index;
     }
-    impl->p0_.lit_mask = paused ? 0u : (live & ~dark);
-    impl->p0_.cu_in_tick = false;
+    impl->wire_.lit_mask = paused ? 0u : (live & ~dark);
+    impl->wire_.cu_in_tick = false;
     if (published != 0) {
         // Published: commits dispatched between now and the next tick are the next
         // snapshot's. A dropped publish keeps this frame, whose damage carries forward.
-        impl->p0_.building_frame = tick.frame_index + 1;
+        impl->wire_.building_frame = tick.frame_index + 1;
         impl->last_published_any_ = tick.frame_index;
         impl->buffer_lifecycle_.on_frame_submitted(tick.frame_index);
         impl->render_mask_.fetch_or(published, std::memory_order_release);
@@ -10366,7 +10366,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
             // (the visibility pass just ran). Not while stopped: nothing is shown.
             if (paused)
                 continue;
-            presentation_published(impl->p0_, tick.frame_index, slot);
+            presentation_published(impl->wire_, tick.frame_index, slot);
             const detail::output_pipeline* p = impl->outs_[slot].pipe;
             if (!(p && p->kms)) {
                 // No display to flip (a virtual output): the tick is the only presentation
@@ -10377,7 +10377,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                 const unsigned mhz = impl->outputs.slot_state(slot).refresh_mhz;
                 if (mhz > 0)
                     info.refresh_ns = static_cast<unsigned>((1'000'000'000'000ull + mhz / 2) / mhz);
-                presentation_flipped(impl->p0_, tick.frame_index, slot, info);
+                presentation_flipped(impl->wire_, tick.frame_index, slot, info);
                 // Likewise a locked frame counts as shown once published.
                 if (impl->lock_.state() == lock_state::locking &&
                     static_cast<int>(tick.frame_index - impl->outs_[slot].lock_frame) >= 0)
@@ -10393,7 +10393,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     if (!paused) {
         for (unsigned slot = 0; slot < output_manager::k_max; ++slot)
             if ((served & (1u << slot)) && !(dark & (1u << slot)))
-                content_updates_latched(impl->p0_, slot, tick.frame_index);
+                content_updates_latched(impl->wire_, slot, tick.frame_index);
     }
     if (dropped != 0) {
         // The render thread still holds every other slot of that view. Visible on the
@@ -10407,7 +10407,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // its newest published frame. Only looked at while one exists, or while inhibition
     // still has to end — an empty set costs nothing.
     if (impl->inhibitors_.count() > 0 || impl->idle_.inhibited()) {
-        const bool inhibited = !paused && idle_inhibitor_visible(impl->p0_);
+        const bool inhibited = !paused && idle_inhibitor_visible(impl->wire_);
         if (impl->idle_.set_inhibited(inhibited,
                                       static_cast<unsigned long long>(tick.timestamp_ns))) {
             impl->rearm_idle_timer();
@@ -10439,7 +10439,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                              !outstanding && !flip;
         if (p && p->kms && !paused && !(dark & bit) && settled) {
             o.last_callback_ns = tick.timestamp_ns;
-            fire_output_frame_callbacks(impl->p0_, slot, frame_ms,
+            fire_output_frame_callbacks(impl->wire_, slot, frame_ms,
                                         static_cast<unsigned long long>(tick.timestamp_ns));
         }
         if (settled && !(published & bit))
@@ -10450,9 +10450,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Done here because sending wl_buffer.release requires the UI thread's ownership of
     // Wayland dispatch.
     long long low_water = impl->render_low_water_.load(std::memory_order_acquire);
-    if (impl->p0_.capture) {
+    if (impl->wire_.capture) {
         // A window capture job render has yet to composite holds back what its view samples.
-        if (const long long floor = capture_view_floor(impl->p0_); floor >= 0 && floor <= low_water)
+        if (const long long floor = capture_view_floor(impl->wire_); floor >= 0 && floor <= low_water)
             low_water = floor - 1;
     }
     (void)impl->buffer_lifecycle_.retire_completed_frames(low_water);
@@ -10462,10 +10462,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Screen capture (design-app-compat-capture Part D): completions render left, then this
     // tick's decisions — constraints, copies, curtains, window capture views published with
     // this frame — and the privacy indicator.
-    if (impl->p0_.capture) {
-        capture_complete(impl->p0_);
+    if (impl->wire_.capture) {
+        capture_complete(impl->wire_);
         impl->refresh_capture_host();
-        capture_tick(impl->p0_, tick.frame_index, true);
+        capture_tick(impl->wire_, tick.frame_index, true);
     }
 
     // Whether the next tick has anything to do. Per output: damage to composite, a frame
@@ -10476,13 +10476,13 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                              impl->logout_active_; // logout ends on a tick
     // A frame callback keeps the output that paces it ticking (its flip or its idle rule
     // answers it), not every output.
-    const std::uint32_t waiting = frame_callbacks_pending(impl->p0_)
-                                      ? frame_callbacks_pending_outputs(impl->p0_)
+    const std::uint32_t waiting = frame_callbacks_pending(impl->wire_)
+                                      ? frame_callbacks_pending_outputs(impl->wire_)
                                       : 0u;
     // A queued fifo update of a shown surface needs its pace output's next latch.
-    const std::uint32_t fifo_waiting = content_updates_waiting_outputs(impl->p0_);
+    const std::uint32_t fifo_waiting = content_updates_waiting_outputs(impl->wire_);
     // A window capture waiting for its window to change needs that window's output ticking.
-    const std::uint32_t capture_waiting = capture_wanted_outputs(impl->p0_);
+    const std::uint32_t capture_waiting = capture_wanted_outputs(impl->wire_);
     impl->tick_quiet_mask_ =
         global_busy ? 0u : (quiet & ~waiting & ~fifo_waiting & ~capture_waiting);
     // New damage on outputs this tick did not serve (a client of another output committed):

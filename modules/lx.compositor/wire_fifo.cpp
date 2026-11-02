@@ -28,7 +28,6 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_FIFO_V1)
 #include "fifo-v1-server-protocol.h"
@@ -37,7 +36,6 @@ module;
 #if defined(LUMEN_PROTOCOL_COMMIT_TIMING_V1)
 #include "commit-timing-v1-server-protocol.h"
 #define LUMEN_HAS_COMMIT_TIMING 1
-#endif
 #endif
 
 module lx.compositor;
@@ -49,9 +47,8 @@ import lx.wayland.server;
 import :surface;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 // ── add-on objects (every commit-path protocol) ─────────────────────────────
 
@@ -210,25 +207,24 @@ const struct wp_commit_timing_manager_v1_interface timing_manager_impl = {
 
 #if defined(LUMEN_HAS_FIFO)
 void bind_fifo_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_fifo_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&fifo_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&fifo_manager_impl, g_ctx, nullptr);
 }
 #endif
 
 #if defined(LUMEN_HAS_COMMIT_TIMING)
 void bind_commit_timing_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &wp_commit_timing_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&timing_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&timing_manager_impl, g_ctx, nullptr);
 }
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

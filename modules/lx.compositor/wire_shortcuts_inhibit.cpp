@@ -30,12 +30,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_KEYBOARD_SHORTCUTS_INHIBIT_UNSTABLE_V1)
 #include "keyboard-shortcuts-inhibit-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_SHORTCUTS_INHIBIT 1
-#endif
 #endif
 
 module lx.compositor;
@@ -48,9 +46,8 @@ import lx.trace;
 import :session_lock;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_SHORTCUTS_INHIBIT)
 
@@ -77,8 +74,8 @@ inhibitor_obj* inhibitors = nullptr;
 wl_resource* focus_surface = nullptr;
 
 bool locked() {
-    return g_p0_ctx && g_p0_ctx->lock &&
-           g_p0_ctx->lock->state() != lx::compositor::lock_state::unlocked;
+    return g_ctx && g_ctx->lock &&
+           g_ctx->lock->state() != lx::compositor::lock_state::unlocked;
 }
 
 void inhibit_log(lx::trace::level lvl, const inhibitor_obj* i, const char* what) {
@@ -175,12 +172,12 @@ const struct zwp_keyboard_shortcuts_inhibit_manager_v1_interface manager_impl = 
 } // namespace
 
 void bind_shortcuts_inhibit_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface,
                                          version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 void shortcuts_inhibit_focus(void* surface) {
@@ -233,24 +230,15 @@ bool shortcuts_inhibit_user_toggle() { return false; }
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-bool lx::compositor::shortcuts_inhibited(p0_protocol_context& ctx) {
+bool lx::compositor::shortcuts_inhibited(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::shortcuts_inhibit_effective();
-#else
-    return false;
-#endif
+    return wire::shortcuts_inhibit_effective();
 }
 
-bool lx::compositor::shortcuts_inhibit_toggle(p0_protocol_context& ctx) {
+bool lx::compositor::shortcuts_inhibit_toggle(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::shortcuts_inhibit_user_toggle();
-#else
-    return false;
-#endif
+    return wire::shortcuts_inhibit_user_toggle();
 }

@@ -2,9 +2,7 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 #include <stdio.h>
 
 import lx.foundation;
@@ -536,28 +534,18 @@ void lx::compositor::input_router::resource_set::remove(void* r) {
 }
 
 bool lx::compositor::input_router::resource_set::same_client(void* r, void* surface) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!r || !surface)
         return false;
     return wl_resource_get_client(static_cast<wl_resource*>(r)) ==
            wl_resource_get_client(static_cast<wl_resource*>(surface));
-#else
-    (void)r;
-    (void)surface;
-    return false;
-#endif
 }
 
 bool lx::compositor::input_router::resource_set::has_client(void* client) const {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!client)
         return false;
     for (unsigned i = 0; i < count; ++i)
         if (wl_resource_get_client(static_cast<wl_resource*>(items[i])) == client)
             return true;
-#else
-    (void)client;
-#endif
     return false;
 }
 
@@ -619,7 +607,6 @@ void lx::compositor::input_router::notify_focus_client(void* new_client) {
 
 void lx::compositor::input_router::send_enter_to(void* keyboard_resource, void* surface,
                                                  lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!keyboard_resource || !surface)
         return;
     auto* kb = static_cast<wl_resource*>(keyboard_resource);
@@ -649,16 +636,10 @@ void lx::compositor::input_router::send_enter_to(void* keyboard_resource, void* 
     wl_keyboard_send_modifiers(kb, mods_serial, mods.depressed, mods.latched, mods.locked,
                                mods.group);
     serials_.note(client, mods_serial, input_serial_kind::modifiers);
-#else
-    (void)keyboard_resource;
-    (void)surface;
-    (void)seat;
-#endif
 }
 
 void lx::compositor::input_router::add_keyboard(void* r, lx::input::seat& seat) {
     keyboards_.add(r);
-#if defined(LUMEN_HAS_WAYLAND)
     // Its client is switched to a virtual keyboard's keymap: so is this keyboard (it was
     // sent the seat's at creation).
     if (r && override_client_ && override_.fd >= 0 &&
@@ -669,14 +650,10 @@ void lx::compositor::input_router::add_keyboard(void* r, lx::input::seat& seat) 
     if (!r || !keyboard_focus_ || !resource_set::same_client(r, keyboard_focus_))
         return;
     send_enter_to(r, keyboard_focus_, seat);
-#else
-    (void)seat;
-#endif
 }
 
 void lx::compositor::input_router::add_pointer(void* r, lx::input::seat& seat) {
     pointers_.add(r);
-#if defined(LUMEN_HAS_WAYLAND)
     if (!r || !pointer_focus_ || !resource_set::same_client(r, pointer_focus_))
         return;
     auto* p = static_cast<wl_resource*>(r);
@@ -687,9 +664,6 @@ void lx::compositor::input_router::add_pointer(void* r, lx::input::seat& seat) {
     serials_.note(wl_resource_get_client(p), serial, input_serial_kind::focus);
     if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
         wl_pointer_send_frame(p);
-#else
-    (void)seat;
-#endif
 }
 
 void lx::compositor::input_router::add_touch(void* r) { touches_.add(r); }
@@ -736,7 +710,6 @@ bool lx::compositor::input_router::is_pointer_enter_serial(unsigned serial) cons
 }
 
 void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (keyboard_suspended_) {
         // Recorded for the resume; nobody is told anything while the session is away.
         suspended_focus_ = surface;
@@ -778,15 +751,10 @@ void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::
     // After the keyboard's own leave/enter: text-input focus follows (text-input-v3).
     if (surface_hook_)
         surface_hook_(surface_hook_user_, surface, keyboard_focus_client_, nullptr);
-#else
-    (void)surface;
-    (void)seat;
-#endif
 }
 
 unsigned lx::compositor::input_router::set_pointer_focus(void* surface, double sx, double sy,
                                                          lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (pointer_focus_ == surface)
         return 0;
 
@@ -835,13 +803,6 @@ unsigned lx::compositor::input_router::set_pointer_focus(void* surface, double s
     if (pointer_hook_)
         pointer_hook_(pointer_hook_user_);
     return serial;
-#else
-    (void)surface;
-    (void)sx;
-    (void)sy;
-    (void)seat;
-    return 0;
-#endif
 }
 
 void lx::compositor::input_router::send_key(const lx::input::key_event& event,
@@ -896,7 +857,6 @@ void lx::compositor::input_router::virtual_keymap_gone(unsigned id, lx::input::s
 }
 
 void lx::compositor::input_router::send_keymap_to(void* client, int fd, unsigned size) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!client || fd < 0)
         return;
     for (unsigned i = 0; i < keyboards_.count; ++i) {
@@ -904,11 +864,6 @@ void lx::compositor::input_router::send_keymap_to(void* client, int fd, unsigned
         if (wl_resource_get_client(kb) == client)
             wl_keyboard_send_keymap(kb, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
     }
-#else
-    (void)client;
-    (void)fd;
-    (void)size;
-#endif
 }
 
 void lx::compositor::input_router::use_keymap(const keymap_ref& keymap, lx::input::seat& seat) {
@@ -937,7 +892,6 @@ void lx::compositor::input_router::restore_seat_keymap(lx::input::seat& seat) {
     if (!client || !seat_keymap_ || !seat_keymap_(fd, size))
         return;
     send_keymap_to(client, fd, size);
-#if defined(LUMEN_HAS_WAYLAND)
     // A new keymap restarts the client's xkb state: it is told the seat's modifiers again.
     const auto mods = seat.keymap().modifiers();
     const unsigned serial = seat.next_serial();
@@ -947,13 +901,9 @@ void lx::compositor::input_router::restore_seat_keymap(lx::input::seat& seat) {
             wl_keyboard_send_modifiers(kb, serial, mods.depressed, mods.latched, mods.locked,
                                        mods.group);
     }
-#else
-    (void)seat;
-#endif
 }
 
 void lx::compositor::input_router::seat_keymap_changed(lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
     int fd = -1;
     unsigned size = 0;
     if (!seat_keymap_ || !seat_keymap_(fd, size))
@@ -974,13 +924,9 @@ void lx::compositor::input_router::seat_keymap_changed(lx::input::seat& seat) {
     }
     if (!override_client_)
         deliver_modifiers(mods, seat);
-#else
-    (void)seat;
-#endif
 }
 
 void lx::compositor::input_router::send_repeat_info(int rate, int delay) {
-#if defined(LUMEN_HAS_WAYLAND)
     for (unsigned i = 0; i < keyboards_.count; ++i) {
         auto* kb = static_cast<wl_resource*>(keyboards_.items[i]);
         if (wl_resource_get_version(kb) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
@@ -988,10 +934,6 @@ void lx::compositor::input_router::send_repeat_info(int rate, int delay) {
     }
     if (im_grab_.grab && im_grab_.repeat_info)
         im_grab_.repeat_info(im_grab_.grab, rate, delay);
-#else
-    (void)rate;
-    (void)delay;
-#endif
 }
 
 void lx::compositor::input_router::routing_changed(bool was, lx::input::seat& seat) {
@@ -1027,7 +969,6 @@ void lx::compositor::input_router::set_im_routing(bool on, lx::input::seat& seat
 
 void lx::compositor::input_router::deliver_key(const lx::input::key_event& event,
                                                lx::input::seat& seat, bool user_input) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (event.pressed) {
         if (!keyboard_focus_)
             return; // not forwarded: its release will not be either
@@ -1062,11 +1003,6 @@ void lx::compositor::input_router::deliver_key(const lx::input::key_event& event
         keyboards_.has_client(keyboard_focus_client_))
         input_hook_(input_hook_user_, keyboard_focus_client_, serial,
                     input_serial_kind::key_press);
-#else
-    (void)event;
-    (void)seat;
-    (void)user_input;
-#endif
 }
 
 void lx::compositor::input_router::release_forwarded_keys(unsigned time_ms,
@@ -1138,7 +1074,6 @@ void lx::compositor::input_router::send_modifiers(const lx::input::modifier_stat
 
 void lx::compositor::input_router::deliver_modifiers(const lx::input::modifier_state& mods,
                                                      lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!keyboard_focus_)
         return;
     const unsigned serial = seat.next_serial();
@@ -1149,15 +1084,10 @@ void lx::compositor::input_router::deliver_modifiers(const lx::input::modifier_s
         wl_keyboard_send_modifiers(static_cast<wl_resource*>(keyboards_.items[i]), serial,
                                    mods.depressed, mods.latched, mods.locked, mods.group);
     }
-#else
-    (void)mods;
-    (void)seat;
-#endif
 }
 
 void lx::compositor::input_router::send_pointer_motion(double sx, double sy,
                                                        unsigned time_ms) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!pointer_focus_)
         return;
     pointer_sx_ = sx;
@@ -1174,15 +1104,9 @@ void lx::compositor::input_router::send_pointer_motion(double sx, double sy,
         if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(p);
     }
-#else
-    (void)sx;
-    (void)sy;
-    (void)time_ms;
-#endif
 }
 
 void lx::compositor::input_router::send_pointer_frame() {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!pointer_focus_)
         return;
     for (unsigned i = 0; i < pointers_.count; ++i) {
@@ -1192,12 +1116,10 @@ void lx::compositor::input_router::send_pointer_frame() {
         if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(p);
     }
-#endif
 }
 
 unsigned lx::compositor::input_router::send_pointer_button(
     const lx::input::pointer_button_event& event, lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!pointer_focus_)
         return 0;
     const unsigned serial = seat.next_serial();
@@ -1218,16 +1140,10 @@ unsigned lx::compositor::input_router::send_pointer_button(
         input_hook_(input_hook_user_, pointer_focus_client_, serial,
                     input_serial_kind::button_press);
     return serial;
-#else
-    (void)event;
-    (void)seat;
-    return 0;
-#endif
 }
 
 void lx::compositor::input_router::send_pointer_axis(
     const lx::input::pointer_axis_event& event) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!pointer_focus_)
         return;
     for (unsigned i = 0; i < pointers_.count; ++i) {
@@ -1286,7 +1202,4 @@ void lx::compositor::input_router::send_pointer_axis(
         if (version >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(p);
     }
-#else
-    (void)event;
-#endif
 }

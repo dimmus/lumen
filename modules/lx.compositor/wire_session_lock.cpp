@@ -37,12 +37,10 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-server-protocol.h"
 #define LUMEN_HAS_SESSION_LOCK 1
-#endif
 #endif
 
 module lx.compositor;
@@ -67,9 +65,8 @@ constexpr lx::trace::category log_lock{"compositor.lock"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -81,26 +78,26 @@ namespace {
 }
 
 [[nodiscard]] lx::compositor::session_lock* machine() {
-    return g_p0_ctx ? g_p0_ctx->lock : nullptr;
+    return g_ctx ? g_ctx->lock : nullptr;
 }
 
 void apply(const lx::compositor::lock_actions& a) {
-    if (!a.empty() && g_p0_ctx && g_p0_ctx->lock_apply)
-        g_p0_ctx->lock_apply(g_p0_ctx->lock_user, a);
+    if (!a.empty() && g_ctx && g_ctx->lock_apply)
+        g_ctx->lock_apply(g_ctx->lock_user, a);
 }
 
 /// A configure serial from the seat's serial space (wm_next_serial's rule).
 [[nodiscard]] unsigned next_serial() {
-    if (g_p0_ctx && g_p0_ctx->seat)
-        return g_p0_ctx->seat->next_serial();
-    if (g_p0_ctx && g_p0_ctx->server && g_p0_ctx->server->native_display())
-        return wl_display_next_serial(static_cast<wl_display*>(g_p0_ctx->server->native_display()));
+    if (g_ctx && g_ctx->seat)
+        return g_ctx->seat->next_serial();
+    if (g_ctx && g_ctx->server && g_ctx->server->native_display())
+        return wl_display_next_serial(static_cast<wl_display*>(g_ctx->server->native_display()));
     return 1;
 }
 
 /// Live output slots, a bit each.
 [[nodiscard]] std::uint32_t live_outputs() {
-    auto* om = g_p0_ctx ? g_p0_ctx->outputs : nullptr;
+    auto* om = g_ctx ? g_ctx->outputs : nullptr;
     std::uint32_t mask = 0;
     if (!om)
         return mask;
@@ -112,7 +109,7 @@ void apply(const lx::compositor::lock_actions& a) {
 
 /// The output's logical rect, or empty when the slot is not live.
 [[nodiscard]] lx::rect2i output_rect(unsigned slot) {
-    auto* om = g_p0_ctx ? g_p0_ctx->outputs : nullptr;
+    auto* om = g_ctx ? g_ctx->outputs : nullptr;
     if (!om || !om->slot_live(slot))
         return {};
     return om->slot_state(slot).logical_rect();
@@ -143,7 +140,7 @@ lock_surface_obj* lock_surface_from(wl_resource* r) {
 
 void send_configure(lock_surface_obj* o, lx::size2i size) {
     auto* m = machine();
-    if (!o || !o->record || !m || !g_p0_ctx)
+    if (!o || !o->record || !m || !g_ctx)
         return;
     const unsigned serial = next_serial();
     m->note_configure(o->record, serial, size);
@@ -167,8 +164,8 @@ void make_inert(lock_surface_obj* o, bool tell_machine) {
     const unsigned record = o->record;
     o->record = 0;
     surface_obj* s = o->surface;
-    if (s && g_p0_ctx && g_p0_ctx->tree && g_p0_ctx->tree->root_mapped(s->id))
-        g_p0_ctx->tree->unmap_root(s->id);
+    if (s && g_ctx && g_ctx->tree && g_ctx->tree->root_mapped(s->id))
+        g_ctx->tree->unmap_root(s->id);
     if (tell_machine) {
         if (auto* m = machine())
             apply(m->remove_surface(record));
@@ -261,7 +258,7 @@ void lock_get_lock_surface(struct wl_client* client, struct wl_resource* lock_re
     // Inert: this lock is not in charge (finished), or the output is gone.
     if (!m || m->current() != lock_res || lo->finished_sent || !bit)
         return;
-    if (!g_p0_ctx->tree || !g_p0_ctx->tree->make_root(s->id, lx::compositor::root_kind::lock)) {
+    if (!g_ctx->tree || !g_ctx->tree->make_root(s->id, lx::compositor::root_kind::lock)) {
         wl_client_post_no_memory(client);
         return;
     }
@@ -278,7 +275,7 @@ void lock_get_lock_surface(struct wl_client* client, struct wl_resource* lock_re
     s->role = surface_role::lock;
     const lx::rect2i r = output_rect(o->output);
     o->origin = {r.x, r.y};
-    g_p0_ctx->tree->set_root_origin(s->id, o->origin);
+    g_ctx->tree->set_root_origin(s->id, o->origin);
     // "On binding this interface the compositor will immediately send the first configure."
     send_configure(o, {r.width, r.height});
     {
@@ -346,13 +343,13 @@ const struct ext_session_lock_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_session_lock_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &ext_session_lock_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 bool lock_surface_precheck(surface_obj* s) {
@@ -391,14 +388,14 @@ bool lock_surface_drawable(const surface_obj* s) {
 void lock_surface_committed(surface_obj* s) {
     lock_surface_obj* o = s->lock_surface;
     auto* m = machine();
-    if (!o || !o->record || !m || !s->has_content || !g_p0_ctx)
+    if (!o || !o->record || !m || !s->has_content || !g_ctx)
         return;
-    auto* tree = g_p0_ctx->tree;
-    if (tree && !tree->root_mapped(s->id) && g_p0_ctx->lock_layer) {
+    auto* tree = g_ctx->tree;
+    if (tree && !tree->root_mapped(s->id) && g_ctx->lock_layer) {
         // Placed first (the tree only records the origin while unmapped), so mapping creates
         // every node where it belongs; the tree sync that follows draws it.
         tree->set_root_origin(s->id, o->origin);
-        if (!tree->map_root(s->id, *g_p0_ctx->lock_layer, ~0u)) {
+        if (!tree->map_root(s->id, *g_ctx->lock_layer, ~0u)) {
             log_lock.warn("lock surface map failed: lock layer full");
             return;
         }
@@ -418,7 +415,7 @@ void lock_surface_surface_destroyed(surface_obj* s) {
 
 void session_lock_outputs_changed() {
     auto* m = machine();
-    auto* om = g_p0_ctx ? g_p0_ctx->outputs : nullptr;
+    auto* om = g_ctx ? g_ctx->outputs : nullptr;
     if (!m || !om)
         return;
     const std::uint32_t mask = live_outputs();
@@ -450,9 +447,9 @@ void session_lock_outputs_changed() {
         const lx::rect2i rect = output_rect(o->output);
         if (o->origin.x != rect.x || o->origin.y != rect.y) {
             o->origin = {rect.x, rect.y};
-            if (o->surface && g_p0_ctx->tree) {
-                g_p0_ctx->tree->set_root_origin(o->surface->id, o->origin);
-                g_p0_ctx->tree->sync_scene(o->surface->id, "output");
+            if (o->surface && g_ctx->tree) {
+                g_ctx->tree->set_root_origin(o->surface->id, o->origin);
+                g_ctx->tree->sync_scene(o->surface->id, "output");
             }
         }
         if (o->sent.width != rect.width || o->sent.height != rect.height)
@@ -464,8 +461,8 @@ void session_lock_outputs_changed() {
 bool session_lock_hit_impl(double x, double y, void*& surface_res, lx::surface_id& surface,
                            lx::surface_id& root, double& sx, double& sy) {
     auto* m = machine();
-    auto* tree = g_p0_ctx ? g_p0_ctx->tree : nullptr;
-    if (!m || !tree || !g_p0_ctx->surfaces || !m->scene_locked())
+    auto* tree = g_ctx ? g_ctx->tree : nullptr;
+    if (!m || !tree || !g_ctx->surfaces || !m->scene_locked())
         return false;
     bool found = false;
     m->for_each_surface([&](const lx::compositor::lock_surface_record& r) {
@@ -474,7 +471,7 @@ bool session_lock_hit_impl(double x, double y, void*& surface_res, lx::surface_i
         lx::compositor::tree_hit th{};
         if (!tree->hit(r.surface, x, y, th))
             return;
-        surface_res = g_p0_ctx->surfaces->resource(th.surface);
+        surface_res = g_ctx->surfaces->resource(th.surface);
         if (!surface_res)
             return;
         surface = th.surface;
@@ -532,33 +529,17 @@ void session_lock_send_impl(const lx::compositor::lock_actions&) {}
 
 #endif // LUMEN_HAS_SESSION_LOCK
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::session_lock_send(p0_protocol_context& ctx, const lock_actions& a) {
+void lx::compositor::session_lock_send(protocol_context& ctx, const lock_actions& a) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::session_lock_send_impl(a);
-#else
-    (void)a;
-#endif
+    wire::session_lock_send_impl(a);
 }
 
-bool lx::compositor::session_lock_hit(p0_protocol_context& ctx, double x, double y,
+bool lx::compositor::session_lock_hit(protocol_context& ctx, double x, double y,
                                       void*& surface_res, lx::surface_id& surface,
                                       lx::surface_id& root, double& sx, double& sy) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::session_lock_hit_impl(x, y, surface_res, surface, root, sx, sy);
-#else
-    (void)x;
-    (void)y;
-    (void)surface_res;
-    (void)surface;
-    (void)root;
-    (void)sx;
-    (void)sy;
-    return false;
-#endif
+    return wire::session_lock_hit_impl(x, y, surface_res, surface, root, sx, sy);
 }

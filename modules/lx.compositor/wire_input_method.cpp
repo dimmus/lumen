@@ -41,7 +41,6 @@ module;
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
 #include "input-method-unstable-v2-server-protocol.h"
@@ -50,7 +49,6 @@ module;
 #if defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
 #include "virtual-keyboard-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_VIRTUAL_KEYBOARD 1
-#endif
 #endif
 #include <time.h>
 
@@ -75,24 +73,23 @@ constexpr lx::trace::category log_ime{"compositor.ime"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
 [[nodiscard]] lx::compositor::text_input_relay* relay() {
-    return g_p0_ctx ? g_p0_ctx->text_input : nullptr;
+    return g_ctx ? g_ctx->text_input : nullptr;
 }
 
 /// The router and the seat, both or neither.
 [[nodiscard]] bool have_router() {
-    return g_p0_ctx && g_p0_ctx->input && g_p0_ctx->seat;
+    return g_ctx && g_ctx->input && g_ctx->seat;
 }
 
 /// The output whose logical rect holds the point, else the first live one; empty when none.
 [[nodiscard]] lx::rect2i output_bounds_at(int x, int y) {
-    auto* om = g_p0_ctx ? g_p0_ctx->outputs : nullptr;
+    auto* om = g_ctx ? g_ctx->outputs : nullptr;
     if (!om)
         return {};
     lx::rect2i first{};
@@ -164,7 +161,7 @@ void grab_detach(grab_obj* g) {
     if (im->grab == g) {
         im->grab = nullptr;
         if (have_router())
-            g_p0_ctx->input->set_im_grab({}, *g_p0_ctx->seat);
+            g_ctx->input->set_im_grab({}, *g_ctx->seat);
     }
 }
 
@@ -207,8 +204,8 @@ void im_grab_keyboard(struct wl_client* client, struct wl_resource* im_res, uint
         zwp_input_method_keyboard_grab_v2_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                                       size);
     // wl_keyboard's (wire_seat.cpp): one repeat rate for the seat.
-    zwp_input_method_keyboard_grab_v2_send_repeat_info(res, g_p0_ctx->repeat_rate,
-                                                       g_p0_ctx->repeat_delay);
+    zwp_input_method_keyboard_grab_v2_send_repeat_info(res, g_ctx->repeat_rate,
+                                                       g_ctx->repeat_delay);
     g->im = im;
     im->grab = g;
     lx::compositor::im_grab_ops ops{};
@@ -223,10 +220,10 @@ void im_grab_keyboard(struct wl_client* client, struct wl_resource* im_res, uint
         zwp_input_method_keyboard_grab_v2_send_repeat_info(static_cast<wl_resource*>(grab), rate,
                                                            delay);
     };
-    g_p0_ctx->input->set_im_grab(ops, *g_p0_ctx->seat);
+    g_ctx->input->set_im_grab(ops, *g_ctx->seat);
     if (log_ime.enabled(lx::trace::level::debug)) {
         log_ime.debug("input method grab keyboard routing={}",
-                      g_p0_ctx->input->im_routing_active() ? 1 : 0);
+                      g_ctx->input->im_routing_active() ? 1 : 0);
     }
 }
 
@@ -271,8 +268,8 @@ void im_get_input_popup_surface(struct wl_client* client, struct wl_resource* im
                                wl_resource_get_id(surface_res));
         return;
     }
-    if (!g_p0_ctx || !g_p0_ctx->tree ||
-        !g_p0_ctx->tree->make_root(s->id, lx::compositor::root_kind::input_popup)) {
+    if (!g_ctx || !g_ctx->tree ||
+        !g_ctx->tree->make_root(s->id, lx::compositor::root_kind::input_popup)) {
         wl_client_post_no_memory(client);
         return;
     }
@@ -416,14 +413,14 @@ void ev_im_done(void*, void* im) {
 
 void ev_routing(void*, bool on) {
     if (have_router())
-        g_p0_ctx->input->set_im_routing(on, *g_p0_ctx->seat);
+        g_ctx->input->set_im_routing(on, *g_ctx->seat);
 }
 
 bool ev_surface_rect(void*, void* surface, lx::rect2i& global, lx::rect2i& bounds) {
     surface_obj* s = surface_from(static_cast<wl_resource*>(surface));
-    if (!s || !g_p0_ctx || !g_p0_ctx->tree)
+    if (!s || !g_ctx || !g_ctx->tree)
         return false;
-    const lx::rect2i r = g_p0_ctx->tree->node_rect(s->id);
+    const lx::rect2i r = g_ctx->tree->node_rect(s->id);
     if (r.width <= 0 || r.height <= 0)
         return false;
     global = r;
@@ -433,12 +430,12 @@ bool ev_surface_rect(void*, void* surface, lx::rect2i& global, lx::rect2i& bound
 
 void ev_popup_show(void*, void* popup, void* surface, lx::point2i origin) {
     surface_obj* s = surface_from(static_cast<wl_resource*>(surface));
-    auto* tree = g_p0_ctx ? g_p0_ctx->tree : nullptr;
-    if (!s || !tree || !g_p0_ctx->ime_popup_layer)
+    auto* tree = g_ctx ? g_ctx->tree : nullptr;
+    if (!s || !tree || !g_ctx->ime_popup_layer)
         return;
     tree->set_root_origin(s->id, origin);
     if (!tree->root_mapped(s->id)) {
-        if (!tree->map_root(s->id, *g_p0_ctx->ime_popup_layer, ~0u)) {
+        if (!tree->map_root(s->id, *g_ctx->ime_popup_layer, ~0u)) {
             log_ime.warn("input popup map failed: layer full");
             return;
         }
@@ -454,7 +451,7 @@ void ev_popup_show(void*, void* popup, void* surface, lx::point2i origin) {
 
 void ev_popup_hide(void*, void*, void* surface) {
     surface_obj* s = surface_from(static_cast<wl_resource*>(surface));
-    auto* tree = g_p0_ctx ? g_p0_ctx->tree : nullptr;
+    auto* tree = g_ctx ? g_ctx->tree : nullptr;
     if (!s || !tree || !tree->root_mapped(s->id))
         return;
     tree->unmap_root(s->id);
@@ -477,13 +474,13 @@ void ev_popup_rect(void*, void* popup, lx::rect2i rect) {
 } // namespace
 
 void bind_input_method_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_input_method_manager_v2_interface, version,
                                          id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 #endif // LUMEN_HAS_INPUT_METHOD
@@ -540,7 +537,7 @@ vk_obj* vk_from(wl_resource* r) {
 /// The keymap stops being shown to anyone (replaced, or the keyboard goes).
 void drop_keymap(vk_obj* vk) {
     if (vk->keymap.id != 0 && have_router())
-        g_p0_ctx->input->virtual_keymap_gone(vk->keymap.id, *g_p0_ctx->seat);
+        g_ctx->input->virtual_keymap_gone(vk->keymap.id, *g_ctx->seat);
     vk->keymap = {};
     vk->fd = lx::unique_fd{};
 }
@@ -612,7 +609,7 @@ void vk_key(struct wl_client*, struct wl_resource* r, uint32_t time, uint32_t ke
         vk->held.set(key);
     else
         vk->held.clear(key);
-    g_p0_ctx->input->send_virtual_key(ev, vk->keymap, *g_p0_ctx->seat);
+    g_ctx->input->send_virtual_key(ev, vk->keymap, *g_ctx->seat);
 }
 
 void vk_modifiers(struct wl_client*, struct wl_resource* r, uint32_t depressed, uint32_t latched,
@@ -632,7 +629,7 @@ void vk_modifiers(struct wl_client*, struct wl_resource* r, uint32_t depressed, 
     m.latched = latched;
     m.locked = locked;
     m.group = group;
-    g_p0_ctx->input->send_virtual_modifiers(m, vk->keymap, *g_p0_ctx->seat);
+    g_ctx->input->send_virtual_modifiers(m, vk->keymap, *g_ctx->seat);
 }
 
 void vk_destroy_resource(wl_resource* r) {
@@ -651,7 +648,7 @@ void vk_destroy_resource(wl_resource* r) {
             lx::input::key_event ev{};
             ev.evdev_keycode = codes[i];
             ev.pressed = false;
-            g_p0_ctx->input->send_virtual_key(ev, vk->keymap, *g_p0_ctx->seat);
+            g_ctx->input->send_virtual_key(ev, vk->keymap, *g_ctx->seat);
         }
     }
     drop_keymap(vk);
@@ -687,13 +684,13 @@ const struct zwp_virtual_keyboard_manager_v1_interface vkm_impl = {
 } // namespace
 
 void bind_virtual_keyboard_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_virtual_keyboard_manager_v1_interface,
                                          version, id);
     if (!res)
         return;
-    res.set_implementation(&vkm_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&vkm_impl, g_ctx, nullptr);
 }
 
 #endif // LUMEN_HAS_VIRTUAL_KEYBOARD
@@ -710,7 +707,7 @@ void text_input_focus_hook(void*, void* surface, void* client, void* destroyed) 
         rl->keyboard_focus(surface, client);
 }
 
-void install_text_input(p0_protocol_context& ctx) {
+void install_text_input(protocol_context& ctx) {
     if (!ctx.text_input)
         return;
     lx::compositor::text_input_sink sink{};
@@ -782,8 +779,8 @@ void text_input_outputs_changed() {
 bool input_popup_hit_impl(double x, double y, void*& surface_res, lx::surface_id& surface,
                           double& sx, double& sy) {
     auto* rl = relay();
-    auto* tree = g_p0_ctx ? g_p0_ctx->tree : nullptr;
-    if (!rl || !tree || !g_p0_ctx->surfaces || rl->popup_count() == 0)
+    auto* tree = g_ctx ? g_ctx->tree : nullptr;
+    if (!rl || !tree || !g_ctx->surfaces || rl->popup_count() == 0)
         return false;
     bool found = false;
     rl->for_each_popup([&](const lx::compositor::input_popup_record& p) {
@@ -795,7 +792,7 @@ bool input_popup_hit_impl(double x, double y, void*& surface_res, lx::surface_id
         lx::compositor::tree_hit th{};
         if (!tree->hit(s->id, x, y, th))
             return;
-        surface_res = g_p0_ctx->surfaces->resource(th.surface);
+        surface_res = g_ctx->surfaces->resource(th.surface);
         if (!surface_res)
             return;
         surface = th.surface;
@@ -806,23 +803,12 @@ bool input_popup_hit_impl(double x, double y, void*& surface_res, lx::surface_id
     return found;
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-bool lx::compositor::input_popup_hit(p0_protocol_context& ctx, double x, double y,
+bool lx::compositor::input_popup_hit(protocol_context& ctx, double x, double y,
                                      void*& surface_res, lx::surface_id& surface, double& sx,
                                      double& sy) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::input_popup_hit_impl(x, y, surface_res, surface, sx, sy);
-#else
-    (void)x;
-    (void)y;
-    (void)surface_res;
-    (void)surface;
-    (void)sx;
-    (void)sy;
-    return false;
-#endif
+    return wire::input_popup_hit_impl(x, y, surface_res, surface, sx, sy);
 }

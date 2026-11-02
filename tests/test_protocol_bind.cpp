@@ -1,7 +1,6 @@
 // Verify advertised Wayland globals are real: present in the registry and bindable.
 #include <stdio.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-client-protocol.h"
@@ -15,21 +14,12 @@
 #undef namespace
 #pragma clang diagnostic pop
 #endif
-#endif
 #include <stdint.h>
 
 import std;
 import lx.foundation;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_WAYLAND)
-
-int main() {
-    std::printf("SKIP: LUMEN_HAS_WAYLAND not set\n");
-    return 0;
-}
-
-#else
 
 namespace {
 
@@ -189,4 +179,3 @@ int main() {
     return 0;
 }
 
-#endif

@@ -3,14 +3,17 @@ module;
 // Bodies of lx.app:clipboard — the selections read through pipes on the loop, this client's
 // sources written to readers without blocking, drags started and dropped.
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
-#endif
 
 module lx.app;
 
@@ -436,7 +439,6 @@ void clipboard::on_dnd_finished(lx::wayland::data_source& s) {
 }
 
 void clipboard::set_drag_icon(const std::uint32_t* argb, unsigned w, unsigned h) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!display_ || !argb || w == 0 || h == 0 || w > 512 || h > 512)
         return;
     void* compositor = display_->native_global(lx::wayland::global_kind::compositor);
@@ -444,25 +446,25 @@ void clipboard::set_drag_icon(const std::uint32_t* argb, unsigned w, unsigned h)
     if (!compositor || !shm)
         return;
     const std::size_t bytes = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4;
-    const int fds[2] = {-1, -1};
-    if (::pipe(fds) != 0)
+    // A wl_shm pool is mmap'd by the compositor, so it needs a memory-backed fd (memfd),
+    // never a pipe: the pixels are copied in once, the fd handed over, our map dropped.
+    const int fd = ::memfd_create("lumen-drag-icon", MFD_CLOEXEC);
+    if (fd < 0)
         return;
-    const auto* bytes_ptr = reinterpret_cast<const std::uint8_t*>(argb);
-    std::size_t off = 0;
-    while (off < bytes) {
-        const ssize_t n = ::write(fds[1], bytes_ptr + off, bytes - off);
-        if (n <= 0)
-            break;
-        off += static_cast<std::size_t>(n);
-    }
-    ::close(fds[1]);
-    if (off != written_total) {
-        ::close(fds[0]);
+    if (::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
+        ::close(fd);
         return;
     }
-    auto* pool = wl_shm_create_pool(static_cast<wl_shm*>(shm), fds[0],
+    void* map = ::mmap(nullptr, bytes, PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        ::close(fd);
+        return;
+    }
+    std::memcpy(map, argb, bytes);
+    ::munmap(map, bytes);
+    auto* pool = wl_shm_create_pool(static_cast<wl_shm*>(shm), fd,
                                     static_cast<std::int32_t>(bytes));
-    ::close(fds[0]);
+    ::close(fd);
     if (!pool)
         return;
     auto* buffer = wl_shm_pool_create_buffer(
@@ -483,20 +485,17 @@ void clipboard::set_drag_icon(const std::uint32_t* argb, unsigned w, unsigned h)
     wl_buffer_destroy(buffer);
     icon_w_ = w;
     icon_h_ = h;
-#endif
 }
 
 void clipboard::end_drag(bool moved) {
     drag_source_.destroy();
     drag_action_ = lx::wayland::k_dnd_none;
-#if defined(LUMEN_HAS_WAYLAND)
     if (icon_surface_ && display_) {
         // The drag is over: the icon surface detaches its buffer (the compositor drops
         // the pointer-following role with the drag) and is kept for the next drag.
         wl_surface_attach(static_cast<wl_surface*>(icon_surface_), nullptr, 0, 0);
         wl_surface_commit(static_cast<wl_surface*>(icon_surface_));
     }
-#endif
     lx::ui::drag_service::global().end(moved);
 }
 

@@ -29,7 +29,6 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1)
 #include "ext-idle-notify-v1-server-protocol.h"
@@ -38,7 +37,6 @@ module;
 #if defined(LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1)
 #include "idle-inhibit-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_INHIBIT 1
-#endif
 #endif
 
 module lx.compositor;
@@ -58,9 +56,8 @@ constexpr lx::trace::category log_idle{"compositor.idle"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -73,8 +70,8 @@ namespace {
 
 /// The tracker's next deadline may have moved, or inhibition must be looked at again.
 void changed() {
-    if (g_p0_ctx && g_p0_ctx->idle_changed)
-        g_p0_ctx->idle_changed(g_p0_ctx->idle_user);
+    if (g_ctx && g_ctx->idle_changed)
+        g_ctx->idle_changed(g_ctx->idle_user);
 }
 
 /// A client past its share is refused once per kind with a warning (never silently).
@@ -119,8 +116,8 @@ void send_resumed(void*, void* resource) {
 /// The notification's destructor: destroy request or client teardown. A removal only moves
 /// deadlines later, so the lazily armed timer needs nothing (it fires early, once, at most).
 void notification_destroy_resource(wl_resource* r) {
-    if (g_p0_ctx && g_p0_ctx->idle)
-        g_p0_ctx->idle->remove(r);
+    if (g_ctx && g_ctx->idle)
+        g_ctx->idle->remove(r);
 }
 
 const struct ext_idle_notification_v1_interface notification_impl = {
@@ -138,7 +135,7 @@ void create_notification(struct wl_client* client, struct wl_resource* notifier,
     }
     wl_resource_set_implementation(r, &notification_impl, nullptr,
                                    &notification_destroy_resource);
-    auto* t = g_p0_ctx ? g_p0_ctx->idle : nullptr;
+    auto* t = g_ctx ? g_ctx->idle : nullptr;
     if (!t)
         return; // inert
     if (!t->add(r, client, timeout_ms, obey, monotonic_ns(), sink())) {
@@ -179,13 +176,13 @@ const struct ext_idle_notifier_v1_interface notifier_impl = {
 #if defined(LUMEN_HAS_IDLE_INHIBIT)
 
 void inhibitor_destroy_resource(wl_resource* r) {
-    if (g_p0_ctx && g_p0_ctx->inhibitors) {
-        const unsigned before = g_p0_ctx->inhibitors->count();
-        g_p0_ctx->inhibitors->remove(r);
-        if (g_p0_ctx->inhibitors->count() != before) {
+    if (g_ctx && g_ctx->inhibitors) {
+        const unsigned before = g_ctx->inhibitors->count();
+        g_ctx->inhibitors->remove(r);
+        if (g_ctx->inhibitors->count() != before) {
             if (log_idle.enabled(lx::trace::level::debug)) {
                 log_idle.debug("idle inhibitor destroy id={} count={}", wl_resource_get_id(r),
-                               g_p0_ctx->inhibitors->count());
+                               g_ctx->inhibitors->count());
             }
             changed();
         }
@@ -206,7 +203,7 @@ void create_inhibitor(struct wl_client* client, struct wl_resource* manager, uin
     }
     wl_resource_set_implementation(r, &inhibitor_impl, nullptr, &inhibitor_destroy_resource);
     surface_obj* s = surface_from(surface_res);
-    auto* set = g_p0_ctx ? g_p0_ctx->inhibitors : nullptr;
+    auto* set = g_ctx ? g_ctx->inhibitors : nullptr;
     if (!s || !set)
         return; // inert
     if (!set->add(r, client, s->id)) {
@@ -237,53 +234,43 @@ const struct zwp_idle_inhibit_manager_v1_interface inhibit_manager_impl = {
 
 #if defined(LUMEN_HAS_IDLE_NOTIFY)
 void bind_idle_notifier(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &ext_idle_notifier_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&notifier_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&notifier_impl, g_ctx, nullptr);
 }
 #endif
 
 #if defined(LUMEN_HAS_IDLE_INHIBIT)
 void bind_idle_inhibit_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &zwp_idle_inhibit_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&inhibit_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&inhibit_manager_impl, g_ctx, nullptr);
 }
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-lx::compositor::idle_sink lx::compositor::idle_events(p0_protocol_context& ctx) {
+lx::compositor::idle_sink lx::compositor::idle_events(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::sink();
-#else
-    return {};
-#endif
+    return wire::sink();
 }
 
-bool lx::compositor::idle_inhibitor_visible(p0_protocol_context& ctx) {
-#if defined(LUMEN_HAS_WAYLAND)
+bool lx::compositor::idle_inhibitor_visible(protocol_context& ctx) {
     if (!ctx.inhibitors || ctx.inhibitors->count() == 0)
         return false;
     // On screen on a lit output (a blanked monitor's windows inhibit nothing).
     return ctx.inhibitors->any(
         [](void* user, lx::surface_id surface) {
-            const auto* c = static_cast<const p0_protocol_context*>(user);
-            return (p0::surface_shown_mask(surface) & c->lit_mask) != 0;
+            const auto* c = static_cast<const protocol_context*>(user);
+            return (wire::surface_shown_mask(surface) & c->lit_mask) != 0;
         },
         &ctx);
-#else
-    (void)ctx;
-    return false;
-#endif
 }

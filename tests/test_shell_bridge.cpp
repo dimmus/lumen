@@ -21,7 +21,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-client-protocol.h"
@@ -44,7 +43,6 @@
 #define LUMEN_TEST_V6 1
 #endif
 #endif
-#endif
 #include <stdint.h>
 #include <stddef.h>
 
@@ -61,7 +59,7 @@ import lx.config;
 // From wayland-server.h, which cannot share a translation unit with the client headers.
 extern "C" struct wl_client* wl_resource_get_client(struct wl_resource* resource);
 
-#if !defined(LUMEN_HAS_WAYLAND) || !defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if !defined(LUMEN_HAS_PROTOCOL_GLUE)
 
 int main() {
     std::printf("SKIP: needs libwayland and the generated protocol glue\n");

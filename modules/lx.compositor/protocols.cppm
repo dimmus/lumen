@@ -11,7 +11,7 @@ import lx.gfx;
 import lx.input;
 import lx.scene;
 
-export module lx.compositor:protocols_p0;
+export module lx.compositor:protocols;
 
 import std;
 
@@ -117,7 +117,7 @@ struct texture_update {
     /// texture an in-flight snapshot still draws. See `drain_texture_updates`.
     unsigned retire_after_frame = 0;
     /// Index of the first snapshot allowed to see this update: the one being built when it
-    /// was queued (`p0_protocol_context::building_frame`). The render thread holds back
+    /// was queued (`protocol_context::building_frame`). The render thread holds back
     /// every update, and every later one (FIFO), until it composites a snapshot at least
     /// this new — otherwise a re-committed buffer would show its new pixels under the
     /// previous snapshot's geometry, a parent/child mismatch inside one frame.
@@ -479,8 +479,8 @@ private:
     unsigned long long held_bytes_ = 0;
 };
 
-/// Context shared by all P0 protocol handlers (owned by compositor_impl).
-struct p0_protocol_context {
+/// Context shared by all protocol handlers (owned by compositor_impl).
+struct protocol_context {
     wayland::server* server = nullptr;
     /// Delivers seat events to focused clients. Null until the compositor supplies one, in
     /// which case seat objects are still created but nothing is routed.
@@ -494,26 +494,26 @@ struct p0_protocol_context {
     surface_tree* tree = nullptr;
     toplevel_manager* toplevels = nullptr;
     /// xdg_popup records, placement, grab and dismissal. Receives its wire ops from
-    /// `install_p0_protocols`.
+    /// `install_protocols`.
     popup_manager* popups = nullptr;
     /// wlr-layer-shell records, arrangement and exclusive zones. Receives its wire ops from
-    /// `install_p0_protocols`.
+    /// `install_protocols`.
     layer_shell* layers = nullptr;
     /// Window placement, configure flow and focus. Receives its wire ops from
-    /// `install_p0_protocols`.
+    /// `install_protocols`.
     window_manager* wm = nullptr;
     /// Pointer image: wl_pointer.set_cursor, wp_cursor_shape_v1 and cursor-role commits
-    /// land here. Receives its texture-staging hook from `install_p0_protocols`.
+    /// land here. Receives its texture-staging hook from `install_protocols`.
     cursor_manager* cursor = nullptr;
     /// Server-side frames: title changes and the decoration mode reach it through the window
-    /// manager; it receives its texture-staging hook from `install_p0_protocols`.
+    /// manager; it receives its texture-staging hook from `install_protocols`.
     decoration_manager* decorations = nullptr;
     /// The drag-and-drop grab: wl_data_device.start_drag begins it (after the window
     /// manager validated the serial), the icon role's commits and surface destruction reach
-    /// it. Receives its wire ops from `install_p0_protocols`.
+    /// it. Receives its wire ops from `install_protocols`.
     dnd_grab* dnd = nullptr;
     /// xdg_wm_base.ping/pong liveness: pongs land here, and it receives its wire ops (send
-    /// a ping, the not-responding change) from `install_p0_protocols`.
+    /// a ping, the not-responding change) from `install_protocols`.
     liveness_tracker* liveness = nullptr;
     /// xdg-activation tokens issued to clients (wire_activation.cpp); the window manager
     /// decides what presenting one does.
@@ -570,7 +570,7 @@ struct p0_protocol_context {
     void (*request_logout)(void* user, const char* source) = nullptr;
     void* logout_user = nullptr;
     /// Tells bound shells the session is ending (zlm_shell_v1.session_ending). Set by
-    /// `install_p0_protocols`.
+    /// `install_protocols`.
     void (*notify_session_ending)() = nullptr;
     /// The shell's key grabs (zlm_shell_v1 v4 grab_key) are recorded here; owned by the
     /// compositor, which consults it for every key.
@@ -579,23 +579,23 @@ struct p0_protocol_context {
     /// keyboard and input-method grab at creation. UI affinity.
     int repeat_rate = 25;
     int repeat_delay = 600;
-    /// Set by `install_p0_protocols`: the seat's keymap was replaced; the cached memfd every
+    /// Set by `install_protocols`: the seat's keymap was replaced; the cached memfd every
     /// wl_keyboard is sent is serialized again from it.
     void (*invalidate_seat_keymap)() = nullptr;
     /// zlm_shell_v1 v7: a shell bound; the compositor sends it the configuration in use
     /// (`send_shell_config` with that resource). Null: nothing is sent.
     void (*shell_config_on_bind)(void* user, void* shell_resource) = nullptr;
     void* shell_config_user = nullptr;
-    /// Set by `install_p0_protocols`: config (when `fd` ≥ 0), every diagnostic and
+    /// Set by `install_protocols`: config (when `fd` ≥ 0), every diagnostic and
     /// config_done to `shell_resource`, or to every bound v7 shell when it is null.
     void (*send_shell_config)(void* shell_resource, const shell_config_report& report) = nullptr;
-    /// Set by `install_p0_protocols`: zlm_shell_v1.action to every bound v7 shell, with a
+    /// Set by `install_protocols`: zlm_shell_v1.action to every bound v7 shell, with a
     /// fresh input serial noted as a key press delivered to it when `input` (else serial 0).
     /// False when no v7 shell is bound.
     bool (*send_shell_action)(const char* action, const char* argument, unsigned time_ms,
                               bool input) = nullptr;
     /// Sends zlm_key_grab_v1.activated to the grab `grab_resource` with a fresh input serial
-    /// noted as a key press delivered to the shell. Set by `install_p0_protocols`.
+    /// noted as a key press delivered to the shell. Set by `install_protocols`.
     void (*fire_key_grab)(void* grab_resource, unsigned time_ms) = nullptr;
     /// zlm_shell_v1.held_action (v7, design-session-and-wm K.1) to the first bound v7 shell:
     /// returns the new zlm_held_action_v1 resource (the hold's owner in `keybindings`), null
@@ -603,7 +603,7 @@ struct p0_protocol_context {
     /// The resource's destruction ends the hold (`keybindings::end_hold`).
     void* (*send_held_action)(const char* action, const char* argument, unsigned time_ms) = nullptr;
     /// zlm_held_action_v1.key / released / cancelled to the hold `hold` (a resource from
-    /// `send_held_action`). Set by `install_p0_protocols`.
+    /// `send_held_action`). Set by `install_protocols`.
     void (*send_hold_key)(void* hold, unsigned keysym, unsigned mods, const char* binding,
                           unsigned time_ms) = nullptr;
     void (*send_hold_released)(void* hold, unsigned time_ms) = nullptr;
@@ -635,7 +635,7 @@ struct p0_protocol_context {
     void (*lock_apply)(void* user, const lock_actions& a) = nullptr;
     void* lock_user = nullptr;
     /// zlm_shell_v1.lock_state / lock_requested (v5) to every bound shell. Set by
-    /// `install_p0_protocols`.
+    /// `install_protocols`.
     void (*notify_lock_state)(unsigned state) = nullptr;
     /// True when a shell that speaks v5 was told (it may start a locker).
     bool (*notify_lock_requested)(unsigned reason) = nullptr;
@@ -717,74 +717,74 @@ struct p0_protocol_context {
 
 /// Install wl_compositor, wl_subcompositor, xdg_wm_base, zwp_linux_dmabuf_v1,
 /// wl_seat, wl_output, wl_data_device_manager with real bind handlers.
-[[nodiscard]] lx::result<void> install_p0_protocols(p0_protocol_context& ctx);
+[[nodiscard]] lx::result<void> install_protocols(protocol_context& ctx);
 
 /// Answers every pending wl_surface.frame callback (the 1 Hz paused tick: the display is
 /// stopped, and a client blocked on its callback keeps running).
-void fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms);
+void fire_frame_callbacks(protocol_context& ctx, unsigned frame_time_ms);
 /// Answers the pending wl_surface.frame callbacks of surfaces on screen on any output (the
 /// visibility pass of each view's newest frame; cursor surfaces always count) and, for the
 /// others — occluded, off every output, unmapped, hidden — only once 995 ms have passed
 /// since their surface's last callback (niri's throttle). What is held back is throttled:
 /// it does not count for `frame_callbacks_pending`, so the frame clocks may stop with it
 /// queued. `now_ns`: CLOCK_MONOTONIC. (The housekeeping tick.)
-void fire_visible_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms,
+void fire_visible_frame_callbacks(protocol_context& ctx, unsigned frame_time_ms,
                                   unsigned long long now_ns);
 /// The same for one output's flip (ADR 008 M8): the callbacks of surfaces whose pace output
 /// is `slot` — the output showing most of them among those that showed them in their newest
 /// frame — are answered; surfaces another output paces wait for that output's flip; those
 /// shown nowhere follow the 995 ms throttle.
-void fire_output_frame_callbacks(p0_protocol_context& ctx, unsigned slot, unsigned frame_time_ms,
+void fire_output_frame_callbacks(protocol_context& ctx, unsigned slot, unsigned frame_time_ms,
                                  unsigned long long now_ns);
 /// A client is waiting on a wl_surface.frame callback that the next present answers
 /// (throttled ones excluded).
-[[nodiscard]] bool frame_callbacks_pending(const p0_protocol_context& ctx);
+[[nodiscard]] bool frame_callbacks_pending(const protocol_context& ctx);
 /// The outputs the pending callbacks wait on (bit per pace output; ~0 when one waits on any).
-[[nodiscard]] std::uint32_t frame_callbacks_pending_outputs(const p0_protocol_context& ctx);
+[[nodiscard]] std::uint32_t frame_callbacks_pending_outputs(const protocol_context& ctx);
 /// Throttled frame callbacks are queued (answered by `fire_visible_frame_callbacks` at
 /// the next site after their 995 ms, or the housekeeping tick while the clock is stopped).
-[[nodiscard]] bool frame_callbacks_throttled(const p0_protocol_context& ctx);
+[[nodiscard]] bool frame_callbacks_throttled(const protocol_context& ctx);
 
 /// wp_presentation: frame `frame` was published to output `slot`; queued feedback of the
 /// surfaces it shows and paces is sampled into it. UI affinity, once per published view
 /// (not while the display is stopped: nothing is shown then).
-void presentation_published(p0_protocol_context& ctx, unsigned frame, unsigned slot);
+void presentation_published(protocol_context& ctx, unsigned frame, unsigned slot);
 /// A content flip of the composite of frame `frame` on output `slot` completed with `info`:
 /// feedback that output paces is presented or discarded
 /// (`presentation_feedback_table::on_flip`). UI affinity.
-void presentation_flipped(p0_protocol_context& ctx, unsigned frame, unsigned slot,
+void presentation_flipped(protocol_context& ctx, unsigned frame, unsigned slot,
                           const present_info& info);
 /// The display stopped (`queued_only` false: everything in flight is discarded), or the
 /// stopped display's 1 Hz tick (`queued_only` true).
-void presentation_discard(p0_protocol_context& ctx, bool queued_only);
+void presentation_discard(protocol_context& ctx, bool queued_only);
 /// Output `slot` went dark (powered off): the feedback it paces is discarded.
-void presentation_discard_output(p0_protocol_context& ctx, unsigned slot);
+void presentation_discard_output(protocol_context& ctx, unsigned slot);
 
 /// ext_idle_notification_v1.idled / resumed, as the compositor's idle tracker emits them
 /// (wire_idle.cpp). A sink with no functions without the protocol's glue.
-[[nodiscard]] idle_sink idle_events(p0_protocol_context& ctx);
+[[nodiscard]] idle_sink idle_events(protocol_context& ctx);
 /// Whether an idle inhibitor is honoured: its surface is on screen on a lit output (the
 /// visibility pass of that view's newest frame — not covered, on the output). The caller
 /// adds what the frames cannot know: the session must be running. UI affinity.
-[[nodiscard]] bool idle_inhibitor_visible(p0_protocol_context& ctx);
+[[nodiscard]] bool idle_inhibitor_visible(protocol_context& ctx);
 /// zwlr_output_power_v1.mode to every object of output `slot` (the power state machine
 /// reports a change). UI affinity.
-void notify_output_power(p0_protocol_context& ctx, unsigned slot, bool on);
+void notify_output_power(protocol_context& ctx, unsigned slot, bool on);
 
 /// ext_session_lock_v1: the wire half of a lock decision — `finished` and `locked` to the
 /// objects named, then (`drop_surfaces`) every lock surface leaves the lock layer and goes
 /// inert. UI affinity.
-void session_lock_send(p0_protocol_context& ctx, const lock_actions& a);
+void session_lock_send(protocol_context& ctx, const lock_actions& a);
 /// Topmost lock surface under the global point (the window manager's lock hit-test). Fills
 /// `surface_res`, the surface, its root and the surface-local position.
-[[nodiscard]] bool session_lock_hit(p0_protocol_context& ctx, double x, double y,
+[[nodiscard]] bool session_lock_hit(protocol_context& ctx, double x, double y,
                                     void*& surface_res, lx::surface_id& surface,
                                     lx::surface_id& root, double& sx, double& sy);
 
 /// Topmost input-method popup shown under the global point (the window manager's hit-test:
 /// candidate windows take clicks, never the keyboard). Fills the surface, its resource and
 /// the surface-local position.
-[[nodiscard]] bool input_popup_hit(p0_protocol_context& ctx, double x, double y,
+[[nodiscard]] bool input_popup_hit(protocol_context& ctx, double x, double y,
                                    void*& surface_res, lx::surface_id& surface, double& sx,
                                    double& sy);
 
@@ -793,17 +793,17 @@ void session_lock_send(p0_protocol_context& ctx, const lock_actions& a);
 /// are decided and their jobs posted, window sessions publish their capture views, the
 /// privacy indicator follows. `publish` false (outside a tick: outputs changed): window
 /// sessions wait for the next tick to publish.
-void capture_tick(p0_protocol_context& ctx, unsigned frame, bool publish);
+void capture_tick(protocol_context& ctx, unsigned frame, bool publish);
 /// The render thread's completions: frame events, fence waits, read-back copy-outs.
-void capture_complete(p0_protocol_context& ctx);
+void capture_complete(protocol_context& ctx);
 /// The session lock may have changed state (a lock request curtains every capture at once).
-void capture_lock_check(p0_protocol_context& ctx);
+void capture_lock_check(protocol_context& ctx);
 /// Outputs whose clock must run for a window capture waiting on its window (bit per slot).
-[[nodiscard]] std::uint32_t capture_wanted_outputs(const p0_protocol_context& ctx);
+[[nodiscard]] std::uint32_t capture_wanted_outputs(const protocol_context& ctx);
 /// The oldest capture-view frame a posted window job still has to be composited from (-1:
 /// none). UI releases no client buffer tagged with it or later before then: render may not
 /// have taken the job yet, so its low-water mark cannot know of it.
-[[nodiscard]] long long capture_view_floor(const p0_protocol_context& ctx);
+[[nodiscard]] long long capture_view_floor(const protocol_context& ctx);
 
 /// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it (and
 /// signals its explicit-sync release point after the newest composite fence).
@@ -813,41 +813,41 @@ void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);
 void release_sync_point(unsigned timeline, unsigned long long point, bool signal,
                         void* user_data);
 
-/// Queues the texture retirements `p0_protocol_context::defer_retire` held back: the start
+/// Queues the texture retirements `protocol_context::defer_retire` held back: the start
 /// of each tick, and when window animations are turned off. UI affinity.
-void flush_deferred_retires(p0_protocol_context& ctx);
+void flush_deferred_retires(protocol_context& ctx);
 
 // ── content-update queue (wire_surface.cpp) ──
 /// The readiness poller's epoll fd (-1 before install): the compositor watches it as one
 /// event-loop source and calls `content_updates_poll` when it is readable.
-[[nodiscard]] int content_updates_poll_fd(p0_protocol_context& ctx);
-void content_updates_poll(p0_protocol_context& ctx);
+[[nodiscard]] int content_updates_poll_fd(protocol_context& ctx);
+void content_updates_poll(protocol_context& ctx);
 /// Tries every queued update (a tick reached the outputs' deadlines). UI affinity.
-void content_updates_try(p0_protocol_context& ctx);
+void content_updates_try(protocol_context& ctx);
 /// Output `slot` published (latched) frame `frame`: fifo barriers it paces clear and queued
 /// updates waiting on them apply (they join the next frame).
-void content_updates_latched(p0_protocol_context& ctx, unsigned slot, unsigned frame);
+void content_updates_latched(protocol_context& ctx, unsigned slot, unsigned frame);
 /// Outputs whose clock must keep ticking for a queued fifo update of a shown surface.
-[[nodiscard]] std::uint32_t content_updates_waiting_outputs(p0_protocol_context& ctx);
+[[nodiscard]] std::uint32_t content_updates_waiting_outputs(protocol_context& ctx);
 /// The earliest commit-timing target queued for output `slot` (0: none).
-[[nodiscard]] unsigned long long content_updates_next_target(p0_protocol_context& ctx,
+[[nodiscard]] unsigned long long content_updates_next_target(protocol_context& ctx,
                                                              unsigned slot);
 /// Updates queued anywhere (0 normally).
-[[nodiscard]] unsigned content_updates_queued(const p0_protocol_context& ctx);
+[[nodiscard]] unsigned content_updates_queued(const protocol_context& ctx);
 /// A surface with a tearing hint of `async` is the topmost content of output `slot`'s
 /// fullscreen window (tearing-control-v1, the policy's input).
-[[nodiscard]] bool surface_wants_async(p0_protocol_context& ctx, lx::surface_id surface);
+[[nodiscard]] bool surface_wants_async(protocol_context& ctx, lx::surface_id surface);
 /// The wp_content_type_v1 type applied to `surface` (0 none, 1 photo, 2 video, 3 game).
-[[nodiscard]] unsigned surface_content_type(p0_protocol_context& ctx, lx::surface_id surface);
+[[nodiscard]] unsigned surface_content_type(protocol_context& ctx, lx::surface_id surface);
 
 // ── keyboard-shortcuts-inhibit-unstable-v1 (wire_shortcuts_inhibit.cpp) ──
 /// The surface with the keyboard has an inhibitor in effect (the user has not toggled it
 /// off; not while locked — the lock surface has the keyboard then). The shell's key grabs
 /// and taps without `not_inhibitable` are skipped while it holds. UI affinity.
-[[nodiscard]] bool shortcuts_inhibited(p0_protocol_context& ctx);
+[[nodiscard]] bool shortcuts_inhibited(protocol_context& ctx);
 /// Super+Escape: the focused surface's inhibitor is toggled (`inactive` / `active`). False
 /// when that surface has none — the key is then not the compositor's.
-bool shortcuts_inhibit_toggle(p0_protocol_context& ctx);
+bool shortcuts_inhibit_toggle(protocol_context& ctx);
 // ── pointer-constraints, relative-pointer, pointer-gestures (wire_pointer_constraints.cpp,
 //    wire_relative_pointer.cpp, wire_gestures.cpp; design-app-compat-capture Part C) ──
 /// What an active pointer constraint did to a motion.
@@ -856,52 +856,52 @@ enum class pointer_constraint_kind : unsigned char { none, locked, confined };
 /// lock the pointer stays (`locked`; the caller restores the position and sends no
 /// `wl_pointer.motion`); with an active confinement `to` is clipped into the region
 /// (`confined`). UI affinity, O(rects) per motion, nothing without an active constraint.
-[[nodiscard]] pointer_constraint_kind pointer_constraint_motion(p0_protocol_context& ctx,
+[[nodiscard]] pointer_constraint_kind pointer_constraint_motion(protocol_context& ctx,
                                                                 double from_x, double from_y,
                                                                 double& to_x, double& to_y);
 /// Re-evaluates which constraint holds (after a motion, a button, a pause or resume, a lock
 /// change, once per tick): activations and deactivations are sent. Pointer and keyboard focus
 /// changes and region commits re-evaluate by themselves. UI affinity; nothing to do — one
 /// pointer test — while no constraint exists.
-void pointer_constraints_update(p0_protocol_context& ctx);
+void pointer_constraints_update(protocol_context& ctx);
 /// Super+Escape: the active constraint is released (`unlocked` / `unconfined`; a oneshot is
 /// spent, a persistent one re-arms only after the pointer leaves its surface or its window
 /// loses the keyboard). False when none is active — the key is then not the compositor's.
-bool pointer_constraints_release(p0_protocol_context& ctx);
+bool pointer_constraints_release(protocol_context& ctx);
 /// The active constraint's kind (`none` without one).
-[[nodiscard]] pointer_constraint_kind pointer_constraint_active(const p0_protocol_context& ctx);
+[[nodiscard]] pointer_constraint_kind pointer_constraint_active(const protocol_context& ctx);
 /// zwp_relative_pointer_v1.relative_motion to the pointer focus's client (every relative
 /// pointer it made), `time_us` CLOCK_MONOTONIC: accelerated and unaccelerated deltas. True
 /// when something was sent (the caller then owes the pointers a `frame` if no motion
 /// follows). UI affinity, no allocation.
-bool relative_pointer_motion(p0_protocol_context& ctx, unsigned long long time_us, double dx,
+bool relative_pointer_motion(protocol_context& ctx, unsigned long long time_us, double dx,
                              double dy, double dx_unaccel, double dy_unaccel);
 /// A touchpad gesture to the gesture objects of the client that had pointer focus when it
 /// began (latched until it ends). UI affinity.
-void pointer_gesture(p0_protocol_context& ctx, const lx::input::gesture_event& event);
+void pointer_gesture(protocol_context& ctx, const lx::input::gesture_event& event);
 
 /// wlr-output-management (wire_output_management.cpp, ADR 008 Part C). The heads as the
 /// compositor sees them now: every bound zwlr_output_manager_v1 is sent what changed since
 /// the last call (heads introduced or finished, modes, state), then `done` with a new serial.
 /// Nothing at all when nothing changed. UI affinity; called when outputs or connectors
 /// changed, coalesced to once per loop iteration.
-void output_heads_changed(p0_protocol_context& ctx, const mgmt::head_set& heads);
+void output_heads_changed(protocol_context& ctx, const mgmt::head_set& heads);
 /// The heads managers were last told about, and the serial of that `done`.
-[[nodiscard]] const mgmt::head_set& output_mgmt_heads(const p0_protocol_context& ctx);
-[[nodiscard]] unsigned output_mgmt_serial(const p0_protocol_context& ctx);
+[[nodiscard]] const mgmt::head_set& output_mgmt_heads(const protocol_context& ctx);
+[[nodiscard]] unsigned output_mgmt_serial(const protocol_context& ctx);
 /// Applies and tests waiting for the compositor.
-[[nodiscard]] mgmt::job_queue& output_mgmt_jobs(p0_protocol_context& ctx);
+[[nodiscard]] mgmt::job_queue& output_mgmt_jobs(protocol_context& ctx);
 enum class mgmt_result : unsigned char { succeeded, failed, cancelled };
 /// A job's answer to its configuration object, unless the client destroyed it meanwhile.
-void output_mgmt_finish(p0_protocol_context& ctx, unsigned long long token, mgmt_result result);
+void output_mgmt_finish(protocol_context& ctx, unsigned long long token, mgmt_result result);
 
 /// `output_manager::generation` moved: every bound wl_output and zxdg_output_v1 is sent
 /// the new state (then `done`), and every surface's output membership is recomputed from
 /// its node rect. UI affinity; rare (a mode change, an output added or removed).
-void notify_outputs_changed(p0_protocol_context& ctx);
+void notify_outputs_changed(protocol_context& ctx);
 /// The window manager's workspaces or memberships changed (its observer): every
 /// ext_workspace_manager_v1 is brought in line, one `done` each. UI affinity.
-void workspaces_changed(p0_protocol_context& ctx);
+void workspaces_changed(protocol_context& ctx);
 
 } // namespace lx::compositor
 

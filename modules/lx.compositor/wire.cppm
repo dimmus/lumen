@@ -8,9 +8,7 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 #include <signal.h>
 
 module lx.compositor:wire;
@@ -27,16 +25,15 @@ import :toplevel;
 import :positioner;
 import :popup;
 import :layer_shell;
-import :protocols_p0;
+import :protocols;
 import :data_transfer;
 import :viewport;
 import :text_input;
 import :content_update;
 import :capture;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 constexpr unsigned k_max_surfaces = 256;
 /// wl_surface.frame callbacks one content update may carry; beyond, the oldest is answered
@@ -173,7 +170,7 @@ struct surface_addon {
 
 struct surface_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     lx::surface_id id{};
     lx::client_id client{};
     surface_pending pending{};
@@ -359,7 +356,7 @@ struct shm_buffer_listener {
 /// (invalid_positioner, invalid_popup_parent, not_the_topmost_popup) are posted on it.
 struct xdg_wm_base_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     /// The owning client, for liveness pings (wire_xdg_shell.cpp).
     lx::client_id client{};
     /// The last liveness ping sent on this object: when the object goes before its pong,
@@ -374,7 +371,7 @@ struct decoration_obj;
 
 struct xdg_surface_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     surface_obj* surface = nullptr;
     xdg_toplevel_obj* toplevel = nullptr;
     xdg_popup_obj* popup = nullptr;
@@ -394,7 +391,7 @@ struct positioner_obj {
 /// half, inert once the record is gone.
 struct xdg_popup_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     xdg_surface_obj* xdg_surface = nullptr;
     lx::surface_id surface{};
     bool used = false;
@@ -402,7 +399,7 @@ struct xdg_popup_obj {
 
 struct xdg_toplevel_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     xdg_surface_obj* xdg_surface = nullptr;
     /// The compositor-side record; null once any of the three objects is gone.
     lx::toplevel_id id{};
@@ -417,7 +414,7 @@ struct xdg_toplevel_obj {
 /// is the wire half, inert once its wl_surface is gone.
 struct layer_surface_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     surface_obj* surface = nullptr;
     bool used = false;
 };
@@ -426,21 +423,21 @@ struct layer_surface_obj {
 /// destroying the toplevel first is `orphaned`).
 struct decoration_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     xdg_toplevel_obj* toplevel = nullptr;
     bool used = false;
 };
 
 struct dmabuf_params_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     lx::gfx::dmabuf_desc desc{};
     bool used = false;
 };
 
 struct seat_obj {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
 };
 
 // ── Data transfer: clipboard (wl_data_*) and primary selection (zwp_primary_selection_*) ──
@@ -551,21 +548,21 @@ inline surface_obj* surface_from(wl_resource* res) {
     return s && s->used && s->resource == res ? s : nullptr;
 }
 
-extern p0_protocol_context* g_p0_ctx;
+extern protocol_context* g_ctx;
 
 /// The surface record of a surface id, through the surface manager's resource registry.
 inline surface_obj* surface_by_id(lx::surface_id id) {
-    if (!g_p0_ctx || !g_p0_ctx->surfaces || !id)
+    if (!g_ctx || !g_ctx->surfaces || !id)
         return nullptr;
-    return surface_from(static_cast<wl_resource*>(g_p0_ctx->surfaces->resource(id)));
+    return surface_from(static_cast<wl_resource*>(g_ctx->surfaces->resource(id)));
 }
 
 /// X7: a client being torn down has already left the server's table (its destroy signal
 /// fires before libwayland destroys its objects, in id order). Destructors must not post
 /// protocol errors to it, nor do work on its behalf.
 inline bool client_dying(wl_client* client) {
-    return !g_p0_ctx || !g_p0_ctx->server || !client ||
-           g_p0_ctx->server->find_client_by_native(client) == nullptr;
+    return !g_ctx || !g_ctx->server || !client ||
+           g_ctx->server->find_client_by_native(client) == nullptr;
 }
 
 /// `compositor.surface`, which every wl_surface-facing unit logs to.
@@ -595,7 +592,7 @@ lx::fourcc staged_shm_format(wl_shm_buffer* shm);
                                          lx::rect2i region, const unsigned char*& pixels,
                                          unsigned& stride);
 /// Binds `ctx.shm_direct` to libwayland (access guards, release, pool unref).
-void bind_shm_direct(p0_protocol_context& ctx);
+void bind_shm_direct(protocol_context& ctx);
 /// Copies the commit's shm pixels into compositor-owned staging (see the definition).
 /// `history`/`surface`: the committing surface's damage, with which the CPU path's
 /// per-texture store rewrites only what changed in the slot it reuses.
@@ -639,7 +636,7 @@ void drop_state(surface_obj* s, surface_pending& st, bool dying);
 
 // ── the content-update queue (wire_surface.cpp) ────────────────────────────
 
-/// UI hooks into the compositor's clocks (`p0_protocol_context::cu_*`): kept here so the
+/// UI hooks into the compositor's clocks (`protocol_context::cu_*`): kept here so the
 /// queue code reads one place.
 [[nodiscard]] content_queue& cu_queue();
 /// The readiness poller's epoll fd (opened on first use; -1 when it cannot be).
@@ -801,7 +798,7 @@ void bind_input_method_manager(wayland::client_connection& client, unsigned id, 
 void bind_virtual_keyboard_manager(wayland::client_connection& client, unsigned id, int version);
 /// The relay's sink (both halves), the router's focus hook and the seat keymap the router
 /// restores clients to. A no-op without a relay.
-void install_text_input(p0_protocol_context& ctx);
+void install_text_input(protocol_context& ctx);
 /// The zwp_text_input_v3 half of the relay's sink (wire_text_input.cpp; no-op without glue).
 void text_input_sink_events(lx::compositor::text_input_sink& sink);
 /// wl_surface hooks: an input popup's commit was applied (it shows or hides, and is placed);
@@ -871,13 +868,13 @@ void bind_seat(wayland::client_connection& client, unsigned id, int version);
 void bind_shell(wayland::client_connection& client, unsigned id, int version);
 /// Sends zlm_shell_v1.session_ending (v3) to every bound shell.
 void shell_send_session_ending();
-/// zlm_shell_v1 v7: see `p0_protocol_context::send_shell_config` / `send_shell_action`.
+/// zlm_shell_v1 v7: see `protocol_context::send_shell_config` / `send_shell_action`.
 void shell_send_config(void* shell_resource, const lx::compositor::shell_config_report& r);
 bool shell_send_action(const char* action, const char* argument, unsigned time_ms, bool input);
-/// zlm_key_grab_v1.activated (v4): see `p0_protocol_context::fire_key_grab`.
+/// zlm_key_grab_v1.activated (v4): see `protocol_context::fire_key_grab`.
 void shell_fire_key_grab(void* grab_resource, unsigned time_ms);
 /// zlm_shell_v1.held_action and zlm_held_action_v1 (v7): see
-/// `p0_protocol_context::send_held_action` and `send_hold_*`.
+/// `protocol_context::send_held_action` and `send_hold_*`.
 void* shell_send_held_action(const char* action, const char* argument, unsigned time_ms);
 void shell_send_hold_key(void* hold, unsigned keysym, unsigned mods, const char* binding,
                          unsigned time_ms);
@@ -893,10 +890,10 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
 
 // ── wire_output.cpp: wl_output, xdg-output, output membership ───────────────
 
-/// zxdg_output_manager_v1 (a P0 protocol; needs the generated glue).
+/// zxdg_output_manager_v1 (needs the generated glue).
 void bind_xdg_output_manager(wayland::client_connection& client, unsigned id, int version);
 /// Installs the surface tree's rect hook and the cursor's surface hook.
-void install_outputs(p0_protocol_context& ctx);
+void install_outputs(protocol_context& ctx);
 /// `surface_tree` rect hook: recomputes the surface's output membership from its node rect
 /// (empty: unmapped) and sends enter/leave and the preferred scale/transform. Unmapped, the
 /// surface's in-flight presentation feedback is discarded.
@@ -929,7 +926,7 @@ void output_power_outputs_changed();
 // ── wire_xdg_shell.cpp: liveness ───────────────────────────────────────────
 
 /// Installs the liveness tracker's wire ops (ping, the not-responding change).
-void install_liveness(p0_protocol_context& ctx);
+void install_liveness(protocol_context& ctx);
 void bind_data_device_manager(wayland::client_connection& client, unsigned id, int version);
 
 // ── wire_selection.cpp (both families), wire_data_device.cpp, wire_primary_selection.cpp ──
@@ -957,7 +954,7 @@ void xfer_focus_changed(void* user, void* old_client, void* new_client);
 void wire_client_destroyed(void* user, unsigned client_id, void* wl_client);
 /// The lx client id of a wl_client, for logs; 0 when unknown (already gone).
 unsigned wire_client_id(wl_client* client);
-void install_data_device(p0_protocol_context& ctx);
+void install_data_device(protocol_context& ctx);
 /// A new offer of `source` for `device`, announced on it: data_offer, then one `offer` per
 /// mime type. Null when no slot is left (the client holds too many live offers, or the
 /// table is full); `no_memory` has been posted when the resource could not be created.
@@ -1004,12 +1001,12 @@ void dnd_offer_destroyed(xfer_offer* offer);
 void dnd_source_destroyed(xfer_source* source);
 /// A client is gone (the server's client-destroyed hook).
 void dnd_client_destroyed(wl_client* client);
-void install_dnd(p0_protocol_context& ctx);
+void install_dnd(protocol_context& ctx);
 /// Defined only when the primary-selection glue exists (a P1 protocol); wire_install.cpp
 /// calls them under the same `LUMEN_PROTOCOL_*` guard.
 void bind_primary_selection_manager(wayland::client_connection& client, unsigned id,
                                     int version);
-void install_primary_selection(p0_protocol_context& ctx);
+void install_primary_selection(protocol_context& ctx);
 
 // ── wire_activation.cpp (xdg-activation) ──────────────────────────────────
 
@@ -1097,7 +1094,7 @@ void bind_image_copy_capture_manager(wayland::client_connection& client, unsigne
 void bind_screencopy_manager(wayland::client_connection& client, unsigned id, int version);
 /// The shell bridge's observer (maps, unmaps, title / app id changes): the foreign-toplevel
 /// lists and window captures follow the windows through it.
-void install_toplevel_observer(p0_protocol_context& ctx);
+void install_toplevel_observer(protocol_context& ctx);
 /// The window of an ext_foreign_toplevel_handle_v1 (empty: closed, or not a handle) and the
 /// identifier of that mapping.
 [[nodiscard]] lx::toplevel_id foreign_toplevel_of(wl_resource* handle, const char*& identifier);
@@ -1105,7 +1102,7 @@ void install_toplevel_observer(p0_protocol_context& ctx);
 bool capture_source_of(wl_resource* source, capture_source_kind& kind, unsigned& slot,
                        lx::output_id& output, lx::toplevel_id& toplevel, const char*& identifier);
 /// Binds the capture shm guards to libwayland (access guards, pool unref).
-void bind_capture_guards(p0_protocol_context& ctx);
+void bind_capture_guards(protocol_context& ctx);
 /// A window unmapped: its captures stop.
 void capture_toplevel_unmapped(lx::toplevel_id id);
 /// A capture fence registered in the readiness poller (`cu_poll_add`) signalled.
@@ -1138,8 +1135,7 @@ void workspaces_sync_all();
 
 // ── wire_install.cpp ───────────────────────────────────────────────────────
 
-void install_core(p0_protocol_context& ctx);
+void install_core(protocol_context& ctx);
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

@@ -16,7 +16,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_POINTER_CONSTRAINTS_UNSTABLE_V1) && \
     defined(LUMEN_PROTOCOL_RELATIVE_POINTER_UNSTABLE_V1) &&                                       \
@@ -27,7 +26,6 @@
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "pointer-gestures-unstable-v1-client-protocol.h"
 #define LUMEN_TEST_PART_C 1
-#endif
 #endif
 #include <stdint.h>
 

@@ -26,7 +26,6 @@ module;
 
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
 #include "ext-data-control-v1-server-protocol.h"
@@ -35,7 +34,6 @@ module;
 #if defined(LUMEN_PROTOCOL_WLR_DATA_CONTROL_UNSTABLE_V1)
 #include "wlr-data-control-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_WLR_DATA_CONTROL 1
-#endif
 #endif
 
 module lx.compositor;
@@ -53,9 +51,8 @@ constexpr lx::trace::category log_selection{"compositor.selection"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_EXT_DATA_CONTROL) || defined(LUMEN_HAS_WLR_DATA_CONTROL)
 
@@ -326,21 +323,21 @@ const dc_protocol wlr_proto = make_wlr();
 
 #if defined(LUMEN_HAS_EXT_DATA_CONTROL)
 void bind_ext_data_control_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &ext_data_control_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&ext_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&ext_manager_impl, g_ctx, nullptr);
 }
 #endif
 
 #if defined(LUMEN_HAS_WLR_DATA_CONTROL)
 void bind_wlr_data_control_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwlr_data_control_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&wlr_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&wlr_manager_impl, g_ctx, nullptr);
 }
 #endif
 
@@ -356,6 +353,5 @@ void data_control_selection_changed(xfer_family) {}
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

@@ -34,12 +34,12 @@
 
 #include <png.h>
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
+#if defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
 #include <wayland-client.h>
 #include "input-method-unstable-v2-client-protocol.h"
 #define LUMEN_TEST_IM 1
 #endif
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
+#if defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
 #include <wayland-client.h>
 #include "ext-data-control-v1-client-protocol.h"
 #define LUMEN_TEST_DC 1

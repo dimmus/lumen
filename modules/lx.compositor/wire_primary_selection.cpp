@@ -18,12 +18,10 @@ module;
 
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1)
 #include "primary-selection-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_PRIMARY_SELECTION 1
-#endif
 #endif
 
 module lx.compositor;
@@ -35,9 +33,9 @@ import lx.wayland.server;
 import lx.trace;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PRIMARY_SELECTION)
+#if defined(LUMEN_HAS_PRIMARY_SELECTION)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -94,7 +92,7 @@ const struct zwp_primary_selection_device_manager_v1_interface manager_impl = {
 
 } // namespace
 
-void install_primary_selection(p0_protocol_context&) {
+void install_primary_selection(protocol_context&) {
     auto& ops = xfer_ops[static_cast<unsigned>(xfer_family::primary)];
     ops.name = "primary";
     ops.offer_interface = &zwp_primary_selection_offer_v1_interface;
@@ -118,15 +116,15 @@ void install_primary_selection(p0_protocol_context&) {
 
 void bind_primary_selection_manager(wayland::client_connection& client, unsigned id,
                                     int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(
         client, &zwp_primary_selection_device_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND && LUMEN_HAS_PRIMARY_SELECTION
+#endif // LUMEN_HAS_PRIMARY_SELECTION

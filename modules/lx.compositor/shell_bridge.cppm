@@ -1,10 +1,8 @@
 module;
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "zlm_shell_v1-server-protocol.h"
-#endif
 #endif
 
 import lx.foundation;
@@ -149,7 +147,7 @@ private:
 
 namespace {
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
 /// The handle destructor has only the resource to go on. One compositor per process.
 lx::compositor::toplevel_manager* g_handle_toplevels = nullptr;
 
@@ -233,25 +231,20 @@ lx::result<void> lx::compositor::shell_bridge::install(const char* shell_binary_
 
 void lx::compositor::shell_bridge::set_toplevels(toplevel_manager* toplevels) {
     toplevels_ = toplevels;
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     g_handle_toplevels = toplevels;
 #endif
 }
 
 lx::toplevel_id lx::compositor::shell_bridge::toplevel_from_handle(void* resource) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!resource)
         return {};
     return lx::toplevel_id{static_cast<lx::toplevel_id::id_type>(reinterpret_cast<std::uintptr_t>(
         wl_resource_get_user_data(static_cast<wl_resource*>(resource))))};
-#else
-    (void)resource;
-    return {};
-#endif
 }
 
 void* lx::compositor::shell_bridge::create_handle(toplevel_record& rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_)
         return nullptr;
     auto* bridge = static_cast<wl_resource*>(bridge_);
@@ -277,7 +270,6 @@ void* lx::compositor::shell_bridge::create_handle(toplevel_record& rec) {
 }
 
 void lx::compositor::shell_bridge::detach_all_handles() {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!toplevels_)
         return;
     // The handles stay alive until the shell destroys them; they just stop meaning anything.
@@ -287,11 +279,10 @@ void lx::compositor::shell_bridge::detach_all_handles() {
         wl_resource_set_user_data(static_cast<wl_resource*>(rec.shell_handle), nullptr);
         rec.shell_handle = nullptr;
     });
-#endif
 }
 
 void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_id focused) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (bridge_ && bridge_ != resource) {
         // Only the configured shell binary gets here (the privilege check), so this is a
         // second instance of it: the newest wins and the old one's handles go inert.
@@ -396,7 +387,7 @@ void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
         observer_.mapped(observer_.user, rec);
     if (control_observer_.mapped)
         control_observer_.mapped(control_observer_.user, rec);
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || rec.shell_handle)
         return;
     void* handle = create_handle(rec);
@@ -420,7 +411,7 @@ void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_flags(const toplevel_record& rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || !rec.shell_handle)
         return;
     send_flags(static_cast<wl_resource*>(bridge_), static_cast<wl_resource*>(rec.shell_handle),
@@ -435,7 +426,7 @@ void lx::compositor::shell_bridge::emit_toplevel_destroyed(toplevel_record& rec)
         observer_.unmapped(observer_.user, rec);
     if (control_observer_.unmapped)
         control_observer_.unmapped(control_observer_.user, rec);
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!rec.shell_handle)
         return;
     auto* h = static_cast<wl_resource*>(rec.shell_handle);
@@ -455,7 +446,7 @@ void lx::compositor::shell_bridge::emit_toplevel_state(const toplevel_record& re
         observer_.changed(observer_.user, rec);
     if (control_observer_.changed)
         control_observer_.changed(control_observer_.user, rec);
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || !rec.shell_handle)
         return;
     zlm_policy_bridge_v1_send_toplevel_state(static_cast<wl_resource*>(bridge_),
@@ -467,7 +458,7 @@ void lx::compositor::shell_bridge::emit_toplevel_state(const toplevel_record& re
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_geometry(const toplevel_record& rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || !rec.shell_handle)
         return;
     zlm_policy_bridge_v1_send_toplevel_geometry(static_cast<wl_resource*>(bridge_),
@@ -482,7 +473,7 @@ void lx::compositor::shell_bridge::emit_toplevel_geometry(const toplevel_record&
 void lx::compositor::shell_bridge::emit_focus_changed(const toplevel_record* focused) {
     if (control_observer_.focused)
         control_observer_.focused(control_observer_.user, focused);
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_)
         return;
     zlm_policy_bridge_v1_send_focus_changed(
@@ -495,7 +486,7 @@ void lx::compositor::shell_bridge::emit_focus_changed(const toplevel_record* foc
 
 void lx::compositor::shell_bridge::emit_stacking_order_changed(const toplevel_record& rec,
                                                                unsigned index, bool done) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || !rec.shell_handle)
         return;
     zlm_policy_bridge_v1_send_stacking_order_changed(static_cast<wl_resource*>(bridge_),
@@ -509,7 +500,7 @@ void lx::compositor::shell_bridge::emit_stacking_order_changed(const toplevel_re
 }
 
 unsigned lx::compositor::shell_bridge::wire_state_of(const toplevel_record& rec) const {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
     // Minimized wins: the window is not on screen whatever xdg state it keeps.
     if (rec.minimized)
         return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_MINIMIZED;
@@ -531,7 +522,7 @@ void lx::compositor::shell_bridge::send_extras(const toplevel_record& rec) {
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_icon(const toplevel_record& rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) && \
     defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
     auto* bridge = static_cast<wl_resource*>(bridge_);
     if (!bridge_v6(bridge) || !rec.shell_handle)
@@ -554,7 +545,7 @@ void lx::compositor::shell_bridge::emit_toplevel_icon(const toplevel_record& rec
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_parent(const toplevel_record& rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) && \
     defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
     auto* bridge = static_cast<wl_resource*>(bridge_);
     if (!bridge_v6(bridge) || !rec.shell_handle)
@@ -569,7 +560,7 @@ void lx::compositor::shell_bridge::emit_toplevel_parent(const toplevel_record& r
 }
 
 void lx::compositor::shell_bridge::emit_bell(const toplevel_record* rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) && \
     defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
     auto* bridge = static_cast<wl_resource*>(bridge_);
     if (!bridge_v6(bridge))
@@ -582,7 +573,7 @@ void lx::compositor::shell_bridge::emit_bell(const toplevel_record* rec) {
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_workspace(const toplevel_record& rec) {
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) && \
     defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_WORKSPACE_SINCE_VERSION)
     auto* bridge = static_cast<wl_resource*>(bridge_);
     if (!bridge_v7(bridge) || !rec.shell_handle)

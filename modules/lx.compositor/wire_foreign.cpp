@@ -29,7 +29,6 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_XDG_FOREIGN_UNSTABLE_V2)
 #include "xdg-shell-server-protocol.h"
@@ -47,7 +46,6 @@ module;
 #pragma clang diagnostic pop
 #define LUMEN_HAS_FOREIGN_V1 1
 #endif
-#endif
 
 module lx.compositor;
 
@@ -60,9 +58,8 @@ import :toplevel;
 import :foreign_registry;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_FOREIGN_V2) || defined(LUMEN_HAS_FOREIGN_V1)
 
@@ -95,7 +92,7 @@ struct imported_obj {
 
 constexpr lx::trace::category log_foreign{"compositor.foreign"};
 
-lx::compositor::foreign_registry* registry() { return g_p0_ctx ? g_p0_ctx->foreign : nullptr; }
+lx::compositor::foreign_registry* registry() { return g_ctx ? g_ctx->foreign : nullptr; }
 
 void link(exported_obj* e, imported_obj* i) {
     i->exported = e;
@@ -124,13 +121,13 @@ void unlink(imported_obj* i) {
 /// window get no parent (nothing else of the client's choosing).
 void undo_children(imported_obj* i, lx::toplevel_id parent) {
     for (unsigned c = 0; c < i->child_count; ++c) {
-        auto* rec = g_p0_ctx && g_p0_ctx->toplevels
-                        ? g_p0_ctx->toplevels->find_mut(i->children[c])
+        auto* rec = g_ctx && g_ctx->toplevels
+                        ? g_ctx->toplevels->find_mut(i->children[c])
                         : nullptr;
         if (!rec || !parent || rec->parent != parent)
             continue;
-        if (g_p0_ctx->wm)
-            g_p0_ctx->wm->set_parent(rec->id, {});
+        if (g_ctx->wm)
+            g_ctx->wm->set_parent(rec->id, {});
         else
             rec->parent = {};
     }
@@ -186,9 +183,9 @@ void imported_destroy_resource(wl_resource* r) {
 /// The toplevel record of an xdg_toplevel's wl_surface, or null.
 lx::compositor::toplevel_record* toplevel_of_surface(wl_resource* surface_res) {
     surface_obj* s = surface_from(surface_res);
-    if (!s || s->role != surface_role::xdg_toplevel || !s->toplevel || !g_p0_ctx->toplevels)
+    if (!s || s->role != surface_role::xdg_toplevel || !s->toplevel || !g_ctx->toplevels)
         return nullptr;
-    return g_p0_ctx->toplevels->find_mut(s->toplevel);
+    return g_ctx->toplevels->find_mut(s->toplevel);
 }
 
 /// Creates the exported object for `surface_res` (`rec` null: an inert v1 export) and sends
@@ -253,7 +250,7 @@ bool do_set_parent_of(imported_obj* i, wl_resource* surface_res) {
     if (!child)
         return false;
     exported_obj* e = i->exported;
-    if (!e || !e->toplevel || !g_p0_ctx->wm || !g_p0_ctx->toplevels)
+    if (!e || !e->toplevel || !g_ctx->wm || !g_ctx->toplevels)
         return true; // inert: nothing to parent onto
     // A parent that is the child or one of its descendants would make a loop (the same rule
     // as xdg_toplevel.set_parent, which is an error there; here the request is ignored).
@@ -263,10 +260,10 @@ bool do_set_parent_of(imported_obj* i, wl_resource* surface_res) {
                 "set_parent_of ignored: the window is the exported one or its ancestor");
             return true;
         }
-        const auto* rec = g_p0_ctx->toplevels->find(at);
+        const auto* rec = g_ctx->toplevels->find(at);
         at = rec ? rec->parent : lx::toplevel_id{};
     }
-    g_p0_ctx->wm->set_parent(child->id, e->toplevel);
+    g_ctx->wm->set_parent(child->id, e->toplevel);
     bool known = false;
     for (unsigned c = 0; c < i->child_count; ++c)
         known = known || i->children[c] == child->id;
@@ -370,34 +367,34 @@ const struct zxdg_importer_v1_interface importer_v1_impl = {
 
 #if defined(LUMEN_HAS_FOREIGN_V2)
 void bind_exporter_v2(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zxdg_exporter_v2_interface, version, id);
     if (res)
-        res.set_implementation(&exporter_v2_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&exporter_v2_impl, g_ctx, nullptr);
 }
 void bind_importer_v2(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zxdg_importer_v2_interface, version, id);
     if (res)
-        res.set_implementation(&importer_v2_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&importer_v2_impl, g_ctx, nullptr);
 }
 #endif
 #if defined(LUMEN_HAS_FOREIGN_V1)
 void bind_exporter_v1(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zxdg_exporter_v1_interface, version, id);
     if (res)
-        res.set_implementation(&exporter_v1_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&exporter_v1_impl, g_ctx, nullptr);
 }
 void bind_importer_v1(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zxdg_importer_v1_interface, version, id);
     if (res)
-        res.set_implementation(&importer_v1_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&importer_v1_impl, g_ctx, nullptr);
 }
 #endif
 
@@ -418,6 +415,5 @@ void foreign_toplevel_destroyed(lx::toplevel_id) {}
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

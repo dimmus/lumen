@@ -38,12 +38,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_POINTER_CONSTRAINTS_UNSTABLE_V1)
 #include "pointer-constraints-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_POINTER_CONSTRAINTS 1
-#endif
 #endif
 
 module lx.compositor;
@@ -63,9 +61,8 @@ import :popup;
 import :pointer_constraints;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_POINTER_CONSTRAINTS)
 
@@ -144,9 +141,9 @@ void constraint_log(lx::trace::level lvl, const constraint_obj* c, const char* w
 
 /// The surface's global origin (logical), from its scene node.
 bool surface_origin(const surface_obj* s, double& x, double& y) {
-    if (!s || !g_p0_ctx || !g_p0_ctx->surfaces)
+    if (!s || !g_ctx || !g_ctx->surfaces)
         return false;
-    const lx::rect2i r = g_p0_ctx->surfaces->node_rect(s->id);
+    const lx::rect2i r = g_ctx->surfaces->node_rect(s->id);
     x = r.x;
     y = r.y;
     return r.width > 0 && r.height > 0;
@@ -155,7 +152,7 @@ bool surface_origin(const surface_obj* s, double& x, double& y) {
 lx::surface_id root_of(const surface_obj* s) {
     if (!s)
         return {};
-    return g_p0_ctx && g_p0_ctx->tree ? g_p0_ctx->tree->root_of(s->id) : s->id;
+    return g_ctx && g_ctx->tree ? g_ctx->tree->root_of(s->id) : s->id;
 }
 
 void recompute(constraint_obj* c) {
@@ -182,7 +179,7 @@ struct seat_view {
 
 seat_view look() {
     seat_view v{};
-    p0_protocol_context* ctx = g_p0_ctx;
+    protocol_context* ctx = g_ctx;
     if (!ctx)
         return v;
     if (ctx->input) {
@@ -246,8 +243,8 @@ void activate(constraint_obj* c) {
     c->active = true;
     c->region_changed = false; // the pointer is inside the region it activates on
     active = c;
-    if (c->lock && g_p0_ctx && g_p0_ctx->input)
-        g_p0_ctx->input->set_motion_locked(true);
+    if (c->lock && g_ctx && g_ctx->input)
+        g_ctx->input->set_motion_locked(true);
     send_state(c, true);
     constraint_log(lx::trace::level::info, c, "active");
 }
@@ -263,8 +260,8 @@ void deactivate(constraint_obj* c, bool send, const char* why) {
     c->active = false;
     if (active == c)
         active = nullptr;
-    if (c->lock && g_p0_ctx && g_p0_ctx->input)
-        g_p0_ctx->input->set_motion_locked(false);
+    if (c->lock && g_ctx && g_ctx->input)
+        g_ctx->input->set_motion_locked(false);
     if (send && !client_dying(c->client))
         send_state(c, false);
     constraint_log(lx::trace::level::info, c, why);
@@ -273,20 +270,20 @@ void deactivate(constraint_obj* c, bool send, const char* why) {
     const lx::compositor::constraint_point hint = c->hint;
     if (!c->persistent)
         c->surface = nullptr; // spent: inert, a new constraint may be made for the surface
-    if (!warp || !g_p0_ctx || !g_p0_ctx->warp_pointer)
+    if (!warp || !g_ctx || !g_ctx->warp_pointer)
         return;
     const lx::compositor::constraint_region area =
         lx::compositor::make_constraint_region(nullptr, s->input_current, s->surface_size);
     double ox = 0.0;
     double oy = 0.0;
     if (lx::compositor::constraint_hint_usable(area, hint) && surface_origin(s, ox, oy))
-        g_p0_ctx->warp_pointer(g_p0_ctx->warp_user, ox + hint.x, oy + hint.y);
+        g_ctx->warp_pointer(g_ctx->warp_user, ox + hint.x, oy + hint.y);
 }
 
 } // namespace
 
 void pointer_constraints_reevaluate() {
-    if (!constraints || !g_p0_ctx || !g_p0_ctx->input)
+    if (!constraints || !g_ctx || !g_ctx->input)
         return;
     if (in_eval) {
         eval_again = true; // a warp below moved focus: decided again with the new state
@@ -297,17 +294,17 @@ void pointer_constraints_reevaluate() {
     // A confinement whose region changed under the pointer: back to the nearest point inside
     // (wl_pointer.motion, no relative motion) before anything is decided.
     if (active && !active->lock && active->region_changed && active->surface &&
-        g_p0_ctx->seat && g_p0_ctx->warp_pointer) {
+        g_ctx->seat && g_ctx->warp_pointer) {
         active->region_changed = false;
         double ox = 0.0;
         double oy = 0.0;
         if (surface_origin(active->surface, ox, oy) && !active->effective.empty()) {
-            const lx::compositor::constraint_point p{g_p0_ctx->seat->pointer_x() - ox,
-                                                     g_p0_ctx->seat->pointer_y() - oy};
+            const lx::compositor::constraint_point p{g_ctx->seat->pointer_x() - ox,
+                                                     g_ctx->seat->pointer_y() - oy};
             if (!active->effective.contains(p.x, p.y)) {
                 const auto q = lx::compositor::nearest_inside(active->effective, p);
                 constraint_log(lx::trace::level::debug, active, "warped inside the new region");
-                g_p0_ctx->warp_pointer(g_p0_ctx->warp_user, ox + q.x, oy + q.y);
+                g_ctx->warp_pointer(g_ctx->warp_user, ox + q.x, oy + q.y);
             }
         }
     }
@@ -470,11 +467,11 @@ const struct zwp_pointer_constraints_v1_interface manager_impl = {
 } // namespace
 
 void bind_pointer_constraints(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_pointer_constraints_v1_interface, version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 void pointer_constraints_surface_committed(surface_obj* s, unsigned seq) {
@@ -590,55 +587,36 @@ int pointer_constraints_active_kind() { return 0; }
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
 lx::compositor::pointer_constraint_kind
-lx::compositor::pointer_constraint_motion(p0_protocol_context& ctx, double from_x,
+lx::compositor::pointer_constraint_motion(protocol_context& ctx, double from_x,
                                           double from_y, double& to_x, double& to_y) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    switch (p0::pointer_constraints_filter(from_x, from_y, to_x, to_y)) {
+    switch (wire::pointer_constraints_filter(from_x, from_y, to_x, to_y)) {
     case 1: return pointer_constraint_kind::locked;
     case 2: return pointer_constraint_kind::confined;
     default: return pointer_constraint_kind::none;
     }
-#else
-    (void)from_x;
-    (void)from_y;
-    (void)to_x;
-    (void)to_y;
-    return pointer_constraint_kind::none;
-#endif
 }
 
-void lx::compositor::pointer_constraints_update(p0_protocol_context& ctx) {
+void lx::compositor::pointer_constraints_update(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::pointer_constraints_reevaluate();
-#endif
+    wire::pointer_constraints_reevaluate();
 }
 
-bool lx::compositor::pointer_constraints_release(p0_protocol_context& ctx) {
+bool lx::compositor::pointer_constraints_release(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::pointer_constraints_escape();
-#else
-    return false;
-#endif
+    return wire::pointer_constraints_escape();
 }
 
 lx::compositor::pointer_constraint_kind
-lx::compositor::pointer_constraint_active(const p0_protocol_context& ctx) {
+lx::compositor::pointer_constraint_active(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    switch (p0::pointer_constraints_active_kind()) {
+    switch (wire::pointer_constraints_active_kind()) {
     case 1: return pointer_constraint_kind::locked;
     case 2: return pointer_constraint_kind::confined;
     default: return pointer_constraint_kind::none;
     }
-#else
-    return pointer_constraint_kind::none;
-#endif
 }

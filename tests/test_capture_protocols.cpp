@@ -23,7 +23,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1) && \
     defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1) &&                                     \
@@ -36,7 +35,6 @@
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_CAPTURE 1
-#endif
 #endif
 #include <stdint.h>
 

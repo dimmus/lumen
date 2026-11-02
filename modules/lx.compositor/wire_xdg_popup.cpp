@@ -9,11 +9,9 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
-#endif
 #endif
 
 module lx.compositor;
@@ -31,10 +29,9 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -225,7 +222,6 @@ void xdg_surface_get_popup(struct wl_client* client, struct wl_resource* resourc
     }
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_PROTOCOL_GLUE
-#endif // LUMEN_HAS_WAYLAND

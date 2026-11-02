@@ -9,11 +9,9 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "zlm_shell_v1-server-protocol.h"
-#endif
 #endif
 
 module lx.compositor;
@@ -40,9 +38,8 @@ constexpr lx::trace::category log_shell{"compositor.shell"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -64,7 +61,7 @@ namespace {
 // persistence) — they are declared here so the shell can bind and drive what does work,
 // rather than failing at bind. Every request has a body: libwayland calls the slot
 // unconditionally, so a missing one is a NULL call.
-lx::compositor::window_manager* bridge_wm() { return g_p0_ctx ? g_p0_ctx->wm : nullptr; }
+lx::compositor::window_manager* bridge_wm() { return g_ctx ? g_ctx->wm : nullptr; }
 
 /// Every bridge request is logged with what became of it (debug), so a shell's intent can
 /// be followed through to the window manager's own lines:
@@ -93,9 +90,9 @@ void bridge_log(const char* request, lx::toplevel_id id, bridge_result r) {
 /// Decodes the handle and classifies it; `ok` means "a mapped window, go ahead".
 bridge_result bridge_target(wl_resource* handle, lx::toplevel_id& id) {
     id = lx::compositor::shell_bridge::toplevel_from_handle(handle);
-    if (!id || !bridge_wm() || !g_p0_ctx->toplevels)
+    if (!id || !bridge_wm() || !g_ctx->toplevels)
         return bridge_result::inert;
-    const auto* rec = g_p0_ctx->toplevels->find(id);
+    const auto* rec = g_ctx->toplevels->find(id);
     if (!rec)
         return bridge_result::inert;
     return rec->mapped ? bridge_result::ok : bridge_result::unmapped;
@@ -234,8 +231,8 @@ const struct zlm_key_grab_v1_interface key_grab_impl = {
 };
 
 void key_grab_destroyed(struct wl_resource* r) {
-    if (g_p0_ctx && g_p0_ctx->keys)
-        g_p0_ctx->keys->remove_grab(r);
+    if (g_ctx && g_ctx->keys)
+        g_ctx->keys->remove_grab(r);
 }
 
 const char* refusal_name(lx::compositor::key_grab_refusal r) {
@@ -256,10 +253,10 @@ void shell_grab_key(struct wl_client* client, struct wl_resource* resource, uint
         wl_client_post_no_memory(client);
         return;
     }
-    wl_resource_set_implementation(res, &key_grab_impl, g_p0_ctx, &key_grab_destroyed);
+    wl_resource_set_implementation(res, &key_grab_impl, g_ctx, &key_grab_destroyed);
     lx::compositor::key_grab_refusal refusal = lx::compositor::key_grab_refusal::reserved;
-    if (g_p0_ctx && g_p0_ctx->keys)
-        refusal = g_p0_ctx->keys->add_grab(keysym, modifiers, flags, res);
+    if (g_ctx && g_ctx->keys)
+        refusal = g_ctx->keys->add_grab(keysym, modifiers, flags, res);
     if (refusal != lx::compositor::key_grab_refusal::none)
         zlm_key_grab_v1_send_refused(res, static_cast<uint32_t>(refusal));
     if (log_shell.enabled(lx::trace::level::debug)) {
@@ -277,7 +274,7 @@ const struct zlm_shell_v1_interface shell_impl = {
                                                   wl_resource_get_version(resource), id);
             if (!res)
                 return;
-            wl_resource_set_implementation(res, &workspace_manager_impl, g_p0_ctx, nullptr);
+            wl_resource_set_implementation(res, &workspace_manager_impl, g_ctx, nullptr);
         },
     .get_policy_bridge =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -285,17 +282,17 @@ const struct zlm_shell_v1_interface shell_impl = {
                                                   wl_resource_get_version(resource), id);
             if (!res)
                 return;
-            wl_resource_set_implementation(res, &policy_bridge_impl, g_p0_ctx,
+            wl_resource_set_implementation(res, &policy_bridge_impl, g_ctx,
                                            [](struct wl_resource* r) {
-                                               if (g_p0_ctx && g_p0_ctx->shell)
-                                                   g_p0_ctx->shell->on_bridge_destroyed(r);
+                                               if (g_ctx && g_ctx->shell)
+                                                   g_ctx->shell->on_bridge_destroyed(r);
                                            });
             // The shell's first act is to learn the current state — ADR-004 §5's
             // session-startup path. Emitted on bridge creation rather than on shell bind,
             // because the bridge is the object the events are addressed to.
-            if (g_p0_ctx && g_p0_ctx->shell)
-                g_p0_ctx->shell->on_bridge_bound(
-                    res, g_p0_ctx->wm ? g_p0_ctx->wm->keyboard_focus() : lx::toplevel_id{});
+            if (g_ctx && g_ctx->shell)
+                g_ctx->shell->on_bridge_bound(
+                    res, g_ctx->wm ? g_ctx->wm->keyboard_focus() : lx::toplevel_id{});
         },
     .get_window_rules =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -303,12 +300,12 @@ const struct zlm_shell_v1_interface shell_impl = {
                                                   wl_resource_get_version(resource), id);
             if (!res)
                 return;
-            wl_resource_set_implementation(res, &window_rules_impl, g_p0_ctx, nullptr);
+            wl_resource_set_implementation(res, &window_rules_impl, g_ctx, nullptr);
         },
     .request_logout =
         [](struct wl_client*, struct wl_resource*) {
-            if (g_p0_ctx && g_p0_ctx->request_logout)
-                g_p0_ctx->request_logout(g_p0_ctx->logout_user, "shell");
+            if (g_ctx && g_ctx->request_logout)
+                g_ctx->request_logout(g_ctx->logout_user, "shell");
         },
     .grab_key = &shell_grab_key,
 };
@@ -385,10 +382,10 @@ bool shell_send_action(const char* action, const char* argument, unsigned time_m
         unsigned serial = 0;
         // As a grab's activation: an input serial noted as a key press delivered to the
         // shell, which may quote it for the activation token of what it launches.
-        if (input && g_p0_ctx && g_p0_ctx->seat) {
-            serial = g_p0_ctx->seat->next_serial();
-            if (g_p0_ctx->input)
-                g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
+        if (input && g_ctx && g_ctx->seat) {
+            serial = g_ctx->seat->next_serial();
+            if (g_ctx->input)
+                g_ctx->input->serials().note(wl_resource_get_client(res), serial,
                                                 lx::compositor::input_serial_kind::key_press);
         }
         zlm_shell_v1_send_action(res, action ? action : "", argument ? argument : "", serial,
@@ -416,8 +413,8 @@ const struct zlm_held_action_v1_interface held_action_impl = {
 };
 
 void held_action_destroyed(struct wl_resource* r) {
-    if (g_p0_ctx && g_p0_ctx->keys && g_p0_ctx->keys->hold_owner() == r) {
-        (void)g_p0_ctx->keys->end_hold();
+    if (g_ctx && g_ctx->keys && g_ctx->keys->hold_owner() == r) {
+        (void)g_ctx->keys->end_hold();
         if (log_shell.enabled(lx::trace::level::debug))
             log_shell.debug("held action ended by the shell");
     }
@@ -425,11 +422,11 @@ void held_action_destroyed(struct wl_resource* r) {
 
 /// A fresh input serial noted as a key press delivered to `res`'s client.
 unsigned shell_key_serial(wl_resource* res) {
-    if (!g_p0_ctx || !g_p0_ctx->seat)
+    if (!g_ctx || !g_ctx->seat)
         return 0;
-    const unsigned serial = g_p0_ctx->seat->next_serial();
-    if (g_p0_ctx->input)
-        g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
+    const unsigned serial = g_ctx->seat->next_serial();
+    if (g_ctx->input)
+        g_ctx->input->serials().note(wl_resource_get_client(res), serial,
                                         lx::compositor::input_serial_kind::key_press);
     return serial;
 }
@@ -447,7 +444,7 @@ void* shell_send_held_action(const char* action, const char* argument, unsigned 
             wl_client_post_no_memory(wl_resource_get_client(res));
             return nullptr;
         }
-        wl_resource_set_implementation(hold, &held_action_impl, g_p0_ctx, &held_action_destroyed);
+        wl_resource_set_implementation(hold, &held_action_impl, g_ctx, &held_action_destroyed);
         zlm_shell_v1_send_held_action(res, hold, action ? action : "", argument ? argument : "",
                                       shell_key_serial(res), time_ms);
         if (log_shell.enabled(lx::trace::level::debug)) {
@@ -481,14 +478,14 @@ void shell_send_hold_cancelled(void* hold) {
 
 void shell_fire_key_grab(void* grab_resource, unsigned time_ms) {
     auto* res = static_cast<wl_resource*>(grab_resource);
-    if (!res || !g_p0_ctx || !g_p0_ctx->seat)
+    if (!res || !g_ctx || !g_ctx->seat)
         return;
     // An input serial, recorded as a key press delivered to the shell: the shell may quote
     // it to xdg_activation_token_v1.set_serial for the window it launches, and the focus-
     // stealing policy accepts it as the shell's last press.
-    const unsigned serial = g_p0_ctx->seat->next_serial();
-    if (g_p0_ctx->input)
-        g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
+    const unsigned serial = g_ctx->seat->next_serial();
+    if (g_ctx->input)
+        g_ctx->input->serials().note(wl_resource_get_client(res), serial,
                                         lx::compositor::input_serial_kind::key_press);
     zlm_key_grab_v1_send_activated(res, serial, time_ms);
     if (log_shell.enabled(lx::trace::level::debug)) {
@@ -497,13 +494,13 @@ void shell_fire_key_grab(void* grab_resource, unsigned time_ms) {
 }
 
 void bind_shell(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx || !g_p0_ctx->server)
+    if (!g_ctx || !g_ctx->server)
         return;
 
     // Privilege is checked at bind, against the connecting peer's credentials — not at
     // advertisement. A client that is not the shell gets a protocol error naming the
     // reason, which is debuggable; silently omitting the global is not.
-    if (!g_p0_ctx->server->allow_privileged_global(client.credentials(), "zlm_shell_v1")) {
+    if (!g_ctx->server->allow_privileged_global(client.credentials(), "zlm_shell_v1")) {
         auto reject = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
         if (reject)
             reject.post_error(0, "zlm_shell_v1 is restricted to the session shell");
@@ -513,7 +510,7 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     auto res = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&shell_impl, g_p0_ctx, [](void* r) {
+    res.set_implementation(&shell_impl, g_ctx, [](void* r) {
         bool v7 = false;
         for (auto*& s : shell_resources) {
             if (s == r)
@@ -522,8 +519,8 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
                 v7 = true;
         }
         // Shell actions are delivered only while a v7 shell is there to take them.
-        if (g_p0_ctx && g_p0_ctx->keys)
-            g_p0_ctx->keys->set_shell_actions(v7);
+        if (g_ctx && g_ctx->keys)
+            g_ctx->keys->set_shell_actions(v7);
     });
     for (auto*& s : shell_resources) {
         if (!s) {
@@ -544,16 +541,15 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     // "Sent on bind and on every change": a shell restarted behind a lock learns it at once.
     if (wl_resource_get_version(native) >= ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION)
         zlm_shell_v1_send_lock_state(
-            native, g_p0_ctx->lock ? lx::compositor::shell_lock_state(g_p0_ctx->lock->state()) : 0u);
-    if (wl_resource_get_version(native) >= ZLM_SHELL_V1_ACTION_SINCE_VERSION && g_p0_ctx->keys)
-        g_p0_ctx->keys->set_shell_actions(true);
+            native, g_ctx->lock ? lx::compositor::shell_lock_state(g_ctx->lock->state()) : 0u);
+    if (wl_resource_get_version(native) >= ZLM_SHELL_V1_ACTION_SINCE_VERSION && g_ctx->keys)
+        g_ctx->keys->set_shell_actions(true);
     // v7: the configuration in use, before the shell sets anything up (it applies its
     // sections from it), so a restarted shell starts with the current file.
     if (wl_resource_get_version(native) >= ZLM_SHELL_V1_CONFIG_SINCE_VERSION &&
-        g_p0_ctx->shell_config_on_bind)
-        g_p0_ctx->shell_config_on_bind(g_p0_ctx->shell_config_user, native);
+        g_ctx->shell_config_on_bind)
+        g_ctx->shell_config_on_bind(g_ctx->shell_config_user, native);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

@@ -18,22 +18,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <sys/socket.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
-#endif
 
 import std;
 import lx.foundation;
 import lx.wayland.server;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_WAYLAND)
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t*, size_t) { return 0; }
-
-#else
 
 namespace {
 
@@ -44,7 +37,7 @@ namespace {
 /// unreproducible from the single file the fuzzer hands you.
 struct fuzz_server {
     wl_display* display = nullptr;
-    lx::compositor::p0_protocol_context p0{};
+    lx::compositor::protocol_context ctx{};
     lx::wayland::server server{};
     bool ready = false;
 
@@ -57,8 +50,8 @@ struct fuzz_server {
         if (!display)
             return;
 
-        p0.server = &server;
-        if (auto installed = lx::compositor::install_p0_protocols(p0); !installed)
+        ctx.server = &server;
+        if (auto installed = lx::compositor::install_protocols(ctx); !installed)
             return;
         ready = true;
     }
@@ -111,4 +104,3 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     return 0;
 }
 
-#endif // LUMEN_HAS_WAYLAND

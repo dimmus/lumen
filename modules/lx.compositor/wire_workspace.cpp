@@ -25,12 +25,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
 #include "ext-workspace-v1-server-protocol.h"
 #define LUMEN_HAS_EXT_WORKSPACE 1
-#endif
 #endif
 
 module lx.compositor;
@@ -48,9 +46,8 @@ import :workspaces;
 import :session_lock;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_EXT_WORKSPACE)
 
@@ -120,7 +117,7 @@ unsigned long long text_hash(const char* s) {
     return h;
 }
 
-window_manager* wm() { return g_p0_ctx ? g_p0_ctx->wm : nullptr; }
+window_manager* wm() { return g_ctx ? g_ctx->wm : nullptr; }
 
 [[nodiscard]] unsigned state_of(const workspace_record& w) {
     return (w.active ? EXT_WORKSPACE_HANDLE_V1_STATE_ACTIVE : 0u) |
@@ -259,7 +256,7 @@ void run_pending(manager_obj* m) {
     if (!w || n == 0)
         return;
     // The model does not change behind the lock (W.6): a bar's click there is dropped.
-    if (g_p0_ctx->lock && g_p0_ctx->lock->state() != lock_state::unlocked) {
+    if (g_ctx->lock && g_ctx->lock->state() != lock_state::unlocked) {
         if (log_workspace.enabled(lx::trace::level::debug))
             log_workspace.debug("ext-workspace: commit while locked; ignored");
         return;
@@ -455,10 +452,10 @@ void finish_manager(manager_obj* m, bool sent) {
         m->first_done = true;
         // The shell bound ext-workspace after its policy bridge: toplevel_workspace again,
         // now that it holds a handle of every workspace.
-        if (g_p0_ctx && g_p0_ctx->shell && g_p0_ctx->shell->bridge_resource() &&
-            wl_resource_get_client(static_cast<wl_resource*>(g_p0_ctx->shell->bridge_resource())) ==
+        if (g_ctx && g_ctx->shell && g_ctx->shell->bridge_resource() &&
+            wl_resource_get_client(static_cast<wl_resource*>(g_ctx->shell->bridge_resource())) ==
                 m->client)
-            g_p0_ctx->shell->resend_toplevel_workspaces();
+            g_ctx->shell->resend_toplevel_workspaces();
     }
 }
 
@@ -475,7 +472,7 @@ void* lookup_handle(void* client, lx::workspace_id id) {
 } // namespace
 
 void bind_workspace_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx || !g_p0_ctx->wm)
+    if (!g_ctx || !g_ctx->wm)
         return;
     auto res = wayland::resource::create(client, &ext_workspace_manager_v1_interface, version, id);
     if (!res)
@@ -504,15 +501,15 @@ void bind_workspace_manager(wayland::client_connection& client, unsigned id, int
     g_managers = m;
     ++g_manager_count;
     wl_resource_set_implementation(native, &manager_impl, m, &manager_destroy_resource);
-    if (g_p0_ctx->shell)
-        g_p0_ctx->shell->set_workspace_lookup(&lookup_handle);
+    if (g_ctx->shell)
+        g_ctx->shell->set_workspace_lookup(&lookup_handle);
     // Outputs known now have their workspaces (start-up before any window).
-    g_p0_ctx->wm->sync_workspace_outputs(true);
-    (void)sync_manager(m, g_p0_ctx->wm->workspaces());
+    g_ctx->wm->sync_workspace_outputs(true);
+    (void)sync_manager(m, g_ctx->wm->workspaces());
     finish_manager(m, true);
     if (log_workspace.enabled(lx::trace::level::debug))
         log_workspace.debug("ext-workspace bind client={} version={} workspaces={}", client.id(),
-                            version, g_p0_ctx->wm->workspaces().count());
+                            version, g_ctx->wm->workspaces().count());
 }
 
 void workspace_output_bound(wl_client* client, wl_resource* output, unsigned slot) {
@@ -527,9 +524,9 @@ void workspace_output_bound(wl_client* client, wl_resource* output, unsigned slo
 }
 
 void workspaces_sync_all() {
-    if (!g_p0_ctx || !g_p0_ctx->wm)
+    if (!g_ctx || !g_ctx->wm)
         return;
-    const workspace_model& model = g_p0_ctx->wm->workspaces();
+    const workspace_model& model = g_ctx->wm->workspaces();
     for (manager_obj* m = g_managers; m; m = m->next)
         if (!m->stopped)
             finish_manager(m, sync_manager(m, model));
@@ -542,15 +539,10 @@ void workspaces_sync_all() {}
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::workspaces_changed(p0_protocol_context& ctx) {
-#if defined(LUMEN_HAS_WAYLAND)
+void lx::compositor::workspaces_changed(protocol_context& ctx) {
     (void)ctx;
-    p0::workspaces_sync_all();
-#else
-    (void)ctx;
-#endif
+    wire::workspaces_sync_all();
 }

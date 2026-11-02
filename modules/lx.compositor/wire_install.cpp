@@ -1,14 +1,13 @@
 module;
 
 // Installs every protocol global, in the order clients see them in the registry, and
-// implements the exported entry points of :protocols_p0. Part of the protocol wire split;
+// implements the exported entry points of :protocols. Part of the protocol wire split;
 // shared declarations live in the :wire partition (wire.cppm).
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
@@ -162,7 +161,6 @@ module;
 #if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
 #include "wlr-screencopy-unstable-v1-server-protocol.h"
 #endif
-#endif
 #include <signal.h>
 
 module lx.compositor;
@@ -182,11 +180,10 @@ import :content_update;
 import :capture_engine;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
-p0_protocol_context* g_p0_ctx = nullptr;
+protocol_context* g_ctx = nullptr;
 
 namespace {
 
@@ -205,7 +202,7 @@ void pointer_focus_changed(void*) { pointer_constraints_reevaluate(); }
 /// A closing window's ghost holds (or lets go of) a texture of `surface`: its retirement and
 /// the release of the dma-buf behind it wait (`window_manager::make_ghost`).
 bool wire_hold_content(void* user, lx::surface_id surface, unsigned texture, bool hold) {
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (!hold) {
         release_texture(texture);
         if (ctx && ctx->lifecycle)
@@ -221,7 +218,7 @@ bool wire_hold_content(void* user, lx::surface_id surface, unsigned texture, boo
 
 /// The window manager's hook before a toplevel record goes: what the wire keyed by it.
 void wire_toplevel_destroyed(void* user, lx::toplevel_id id) {
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (ctx && ctx->toplevels)
         if (auto* rec = ctx->toplevels->find_mut(id))
             toplevel_icon_released(*rec);
@@ -230,8 +227,8 @@ void wire_toplevel_destroyed(void* user, lx::toplevel_id id) {
 
 } // namespace
 
-void install_core(p0_protocol_context& ctx) {
-    g_p0_ctx = &ctx;
+void install_core(protocol_context& ctx) {
+    g_ctx = &ctx;
     if (!ctx.server)
         return;
     {
@@ -788,180 +785,105 @@ void install_core(p0_protocol_context& ctx) {
 #endif
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) {
-#if defined(LUMEN_HAS_WAYLAND)
+lx::result<void> lx::compositor::install_protocols(protocol_context& ctx) {
     if (!ctx.server) {
-        return lx::make_error(lx::wayland_err::bind_failed, "p0 install: null server");
+        return lx::make_error(lx::wayland_err::bind_failed, "protocol install: null server");
     }
-    p0::install_core(ctx);
-    p0::bind_shm_direct(ctx);
-    p0::bind_capture_guards(ctx);
+    wire::install_core(ctx);
+    wire::bind_shm_direct(ctx);
+    wire::bind_capture_guards(ctx);
     return {};
-#else
-    (void)ctx;
-    return lx::make_error(lx::wayland_err::bind_failed,
-                          "libwayland-server required for P0 protocols");
-#endif
 }
 
-void lx::compositor::fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms) {
-#if defined(LUMEN_HAS_WAYLAND)
+void lx::compositor::fire_frame_callbacks(protocol_context& ctx, unsigned frame_time_ms) {
     (void)ctx;
-    p0::fire_frames(frame_time_ms, false, p0::k_any_output, 0);
-#else
-    (void)ctx;
-    (void)frame_time_ms;
-#endif
+    wire::fire_frames(frame_time_ms, false, wire::k_any_output, 0);
 }
 
-void lx::compositor::fire_visible_frame_callbacks(p0_protocol_context& ctx,
+void lx::compositor::fire_visible_frame_callbacks(protocol_context& ctx,
                                                   unsigned frame_time_ms,
                                                   unsigned long long now_ns) {
-#if defined(LUMEN_HAS_WAYLAND)
     (void)ctx;
-    p0::fire_frames(frame_time_ms, true, p0::k_any_output, now_ns);
-#else
-    (void)ctx;
-    (void)frame_time_ms;
-    (void)now_ns;
-#endif
+    wire::fire_frames(frame_time_ms, true, wire::k_any_output, now_ns);
 }
 
-void lx::compositor::fire_output_frame_callbacks(p0_protocol_context& ctx, unsigned slot,
+void lx::compositor::fire_output_frame_callbacks(protocol_context& ctx, unsigned slot,
                                                  unsigned frame_time_ms,
                                                  unsigned long long now_ns) {
-#if defined(LUMEN_HAS_WAYLAND)
     (void)ctx;
-    p0::fire_frames(frame_time_ms, true, slot, now_ns);
-#else
-    (void)ctx;
-    (void)slot;
-    (void)frame_time_ms;
-    (void)now_ns;
-#endif
+    wire::fire_frames(frame_time_ms, true, slot, now_ns);
 }
 
-int lx::compositor::content_updates_poll_fd(p0_protocol_context& ctx) {
+int lx::compositor::content_updates_poll_fd(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::cu_poll_fd();
-#else
-    return -1;
-#endif
+    return wire::cu_poll_fd();
 }
 
-void lx::compositor::content_updates_poll(p0_protocol_context& ctx) {
+void lx::compositor::content_updates_poll(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::cu_poll();
-#endif
+    wire::cu_poll();
 }
 
-void lx::compositor::flush_deferred_retires(p0_protocol_context& ctx) {
+void lx::compositor::flush_deferred_retires(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::flush_deferred_retires();
-#endif
+    wire::flush_deferred_retires();
 }
 
-void lx::compositor::content_updates_try(p0_protocol_context& ctx) {
+void lx::compositor::content_updates_try(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::cu_try_all("tick");
-#endif
+    wire::cu_try_all("tick");
 }
 
-void lx::compositor::content_updates_latched(p0_protocol_context& ctx, unsigned slot,
+void lx::compositor::content_updates_latched(protocol_context& ctx, unsigned slot,
                                              unsigned frame) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::cu_after_latch(slot, frame);
-#else
-    (void)slot;
-    (void)frame;
-#endif
+    wire::cu_after_latch(slot, frame);
 }
 
-std::uint32_t lx::compositor::content_updates_waiting_outputs(p0_protocol_context& ctx) {
+std::uint32_t lx::compositor::content_updates_waiting_outputs(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::cu_waiting_outputs();
-#else
-    return 0;
-#endif
+    return wire::cu_waiting_outputs();
 }
 
-unsigned long long lx::compositor::content_updates_next_target(p0_protocol_context& ctx,
+unsigned long long lx::compositor::content_updates_next_target(protocol_context& ctx,
                                                                unsigned slot) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::cu_earliest_target(slot);
-#else
-    (void)slot;
-    return 0;
-#endif
+    return wire::cu_earliest_target(slot);
 }
 
-unsigned lx::compositor::content_updates_queued(const p0_protocol_context& ctx) {
+unsigned lx::compositor::content_updates_queued(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::cu_queue().used_count();
-#else
-    return 0;
-#endif
+    return wire::cu_queue().used_count();
 }
 
-bool lx::compositor::frame_callbacks_throttled(const p0_protocol_context& ctx) {
+bool lx::compositor::frame_callbacks_throttled(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::frames_throttled();
-#else
-    return false;
-#endif
+    return wire::frames_throttled();
 }
 
-bool lx::compositor::frame_callbacks_pending(const p0_protocol_context& ctx) {
+bool lx::compositor::frame_callbacks_pending(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::frames_pending();
-#else
-    return false;
-#endif
+    return wire::frames_pending();
 }
 
-std::uint32_t lx::compositor::frame_callbacks_pending_outputs(const p0_protocol_context& ctx) {
+std::uint32_t lx::compositor::frame_callbacks_pending_outputs(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::frames_pending_outputs();
-#else
-    return 0;
-#endif
+    return wire::frames_pending_outputs();
 }
 
 void lx::compositor::release_wl_buffer_resource(void* resource, void*) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!resource)
         return;
     // Explicit sync first: the release point carries the composite fence, so a client
     // waiting on it rather than on the event still never reuses a buffer the GPU reads.
-    p0::syncobj_buffer_released(static_cast<wl_resource*>(resource));
+    wire::syncobj_buffer_released(static_cast<wl_resource*>(resource));
     wl_buffer_send_release(static_cast<wl_resource*>(resource));
-#else
-    (void)resource;
-#endif
 }
 
 void lx::compositor::release_sync_point(unsigned timeline, unsigned long long point,
                                         bool signal, void*) {
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::syncobj_point_settle(timeline, point, signal);
-#else
-    (void)timeline;
-    (void)point;
-    (void)signal;
-#endif
+    wire::syncobj_point_settle(timeline, point, signal);
 }

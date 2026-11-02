@@ -13,9 +13,7 @@ module;
 #include <sys/socket.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 import lx.foundation;
 import lx.runtime;
@@ -109,7 +107,7 @@ public:
         return has_context_ ? &context_ : nullptr;
     }
 
-    /// Native `wl_client*` (nullptr when LUMEN_HAS_WAYLAND is off).
+    /// Native `wl_client*` (null only before the client is registered).
     [[nodiscard]] void* native() const;
     [[nodiscard]] server* owning_server() const;
 
@@ -290,8 +288,6 @@ private:
     [[nodiscard]] unsigned alloc_global_slot();
     void create_wl_global(global_entry& slot);
 
-    [[nodiscard]] lx::result<void> bind_raw_socket(const char* socket_name);
-#if defined(LUMEN_HAS_WAYLAND)
     [[nodiscard]] lx::result<void> bind_libwayland(const char* socket_name);
     static void global_bind_trampoline(struct wl_client* client, void* data, uint32_t version,
                                        uint32_t id);
@@ -299,7 +295,6 @@ private:
     /// sandboxed clients.
     static bool global_filter(const struct wl_client* client, const struct wl_global* global,
                               void* data);
-#endif
     void close_listen();
     void remove_client_slot(unsigned index);
     void advertise_pending_globals();
@@ -318,7 +313,6 @@ private:
     void* client_destroyed_user_ = nullptr;
     char shell_binary_path_[PATH_MAX]{};
 
-#if defined(LUMEN_HAS_WAYLAND)
     wl_display* display_ = nullptr;
 
     struct client_destroy_link {
@@ -345,7 +339,6 @@ private:
     static int on_listener_closed(int fd, uint32_t mask, void* data);
     void drop_listener(security_listener& l);
     void accept_sandboxed(security_listener& l);
-#endif
 };
 
 } // namespace lx::wayland
@@ -433,7 +426,6 @@ lx::wayland::resource lx::wayland::resource::create(client_connection& client,
                                                     const void* interface_desc, int version,
                                                     unsigned id) {
     resource out{};
-#if defined(LUMEN_HAS_WAYLAND)
     auto* wl_client = static_cast<struct wl_client*>(client.native());
     auto* iface = static_cast<const struct wl_interface*>(interface_desc);
     if (!wl_client || !iface)
@@ -445,20 +437,12 @@ lx::wayland::resource lx::wayland::resource::create(client_connection& client,
     out.native_ = res;
     out.id_ = id;
     out.iface_ = iface->name ? iface->name : "";
-#else
-    (void)client;
-    (void)interface_desc;
-    (void)version;
-    (void)id;
-#endif
     return out;
 }
 
 unsigned lx::wayland::resource::id() const {
-#if defined(LUMEN_HAS_WAYLAND)
     if (native_)
         return wl_resource_get_id(static_cast<struct wl_resource*>(native_));
-#endif
     return id_;
 }
 
@@ -469,37 +453,24 @@ void* lx::wayland::resource::native() const { return native_; }
 
 void lx::wayland::resource::set_implementation(const void* impl, void* data,
                                                void (*destroy)(void* wl_resource)) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!native_)
         return;
     user_data_ = data;
     wl_resource_set_implementation(static_cast<struct wl_resource*>(native_), impl, data,
                                    reinterpret_cast<wl_resource_destroy_func_t>(destroy));
-#else
-    (void)impl;
-    (void)data;
-    (void)destroy;
-    user_data_ = data;
-#endif
 }
 
 void lx::wayland::resource::post_error(unsigned code, const char* message) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!native_)
         return;
     wl_resource_post_error(static_cast<struct wl_resource*>(native_), code, "%s",
                            message ? message : "");
-#else
-    (void)code;
-    (void)message;
-#endif
 }
 
 lx::wayland::server::server() = default;
 
 lx::wayland::server::~server() {
     close_listen();
-#if defined(LUMEN_HAS_WAYLAND)
     for (auto& l : listeners_)
         if (l.used)
             drop_listener(l);
@@ -513,19 +484,16 @@ lx::wayland::server::~server() {
         wl_display_destroy(display_);
         display_ = nullptr;
     }
-#endif
     client_count_ = 0;
     global_count_ = 0;
 }
 
 void lx::wayland::server::close_listen() {
-#if defined(LUMEN_HAS_WAYLAND)
     if (display_) {
         listen_fd_ = -1;
         bound_ = false;
         return;
     }
-#endif
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
@@ -537,13 +505,6 @@ void lx::wayland::server::close_listen() {
     bound_ = false;
 }
 
-lx::result<void> lx::wayland::server::bind_raw_socket(const char* socket_name) {
-    (void)socket_name;
-    return lx::make_error(lx::wayland_err::bind_failed,
-                          "libwayland-server required for protocol dispatch");
-}
-
-#if defined(LUMEN_HAS_WAYLAND)
 void lx::wayland::server::advertise_pending_globals() {
     if (!display_)
         return;
@@ -561,7 +522,6 @@ void lx::wayland::server::advertise_pending_globals() {
     }
 }
 
-#if defined(LUMEN_HAS_WAYLAND)
 namespace {
 /// Per-client connection buffer: 1 MiB instead of libwayland's 4 KiB default (KWin MR 5984,
 /// "1 MiB ≈ 30 s of unprocessed motion"). With 4 KiB libwayland disconnects a client that
@@ -576,7 +536,6 @@ void raise_client_buffers(wl_display* display) {
 #endif
 }
 } // namespace
-#endif
 
 lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
     const char* name = (socket_name && socket_name[0] != '\0') ? socket_name : "lumen-0";
@@ -654,20 +613,13 @@ bool lx::wayland::server::global_filter(const struct wl_client* client,
     client_connection* conn = srv->ensure_client(const_cast<struct wl_client*>(client));
     return !conn || !conn->sandboxed();
 }
-#else
-void lx::wayland::server::advertise_pending_globals() {}
-#endif
 
 lx::result<void> lx::wayland::server::bind(const char* socket_name) {
     if (bound_) {
         return lx::make_error(lx::wayland_err::bind_failed, "server already bound");
     }
 
-#if defined(LUMEN_HAS_WAYLAND)
     return bind_libwayland(socket_name);
-#else
-    return bind_raw_socket(socket_name);
-#endif
 }
 
 lx::result<void> lx::wayland::server::bind_socketless() {
@@ -675,7 +627,6 @@ lx::result<void> lx::wayland::server::bind_socketless() {
         return lx::make_error(lx::wayland_err::bind_failed, "server already bound");
     }
 
-#if defined(LUMEN_HAS_WAYLAND)
     display_ = wl_display_create();
     if (!display_) {
         return lx::make_error(lx::wayland_err::bind_failed, "wl_display_create failed");
@@ -684,9 +635,6 @@ lx::result<void> lx::wayland::server::bind_socketless() {
     wl_display_set_global_filter(display_, &global_filter, this);
     bound_ = true;
     return {};
-#else
-    return lx::not_implemented("lx::wayland::server::bind_socketless");
-#endif
 }
 
 void lx::wayland::server::remove_client_slot(unsigned index) {
@@ -703,7 +651,6 @@ int lx::wayland::server::dispatch(int timeout_ms, bool flush) {
     if (!bound_)
         return 0;
 
-#if defined(LUMEN_HAS_WAYLAND)
     if (display_) {
         wl_event_loop* loop = wl_display_get_event_loop(display_);
         const int n = wl_event_loop_dispatch(loop, timeout_ms);
@@ -713,25 +660,17 @@ int lx::wayland::server::dispatch(int timeout_ms, bool flush) {
             wl_display_flush_clients(display_);
         return n;
     }
-#else
-    (void)timeout_ms;
-    (void)flush;
-#endif
     return 0;
 }
 
 void lx::wayland::server::destroy_clients() {
-#if defined(LUMEN_HAS_WAYLAND)
     if (display_)
         wl_display_destroy_clients(display_);
-#endif
 }
 
 void lx::wayland::server::flush() {
-#if defined(LUMEN_HAS_WAYLAND)
     if (display_)
         wl_display_flush_clients(display_);
-#endif
 }
 
 unsigned lx::wayland::server::alloc_global_slot() {
@@ -742,7 +681,6 @@ unsigned lx::wayland::server::alloc_global_slot() {
 }
 
 void lx::wayland::server::create_wl_global(global_entry& slot) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (display_ && bound_) {
         auto* iface = static_cast<const struct wl_interface*>(slot.desc.interface_desc);
         slot.wl_global =
@@ -752,9 +690,6 @@ void lx::wayland::server::create_wl_global(global_entry& slot) {
                 lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"));
         }
     }
-#else
-    (void)slot;
-#endif
 }
 
 lx::wayland::global_handle lx::wayland::server::add_global_ex(global_descriptor desc,
@@ -793,10 +728,8 @@ void lx::wayland::server::remove_global(global_handle handle, unsigned long long
     slot.user = nullptr;
     slot.destroy_at_ns = now_ns + k_global_destroy_delay_ns;
     ++removed_count_;
-#if defined(LUMEN_HAS_WAYLAND)
     if (slot.wl_global)
         wl_global_remove(static_cast<wl_global*>(slot.wl_global));
-#endif
 }
 
 void lx::wayland::server::collect_globals(unsigned long long now_ns) {
@@ -806,10 +739,8 @@ void lx::wayland::server::collect_globals(unsigned long long now_ns) {
         auto& slot = globals_[i];
         if (!slot.used || !slot.removed || now_ns < slot.destroy_at_ns)
             continue;
-#if defined(LUMEN_HAS_WAYLAND)
         if (slot.wl_global)
             wl_global_destroy(static_cast<wl_global*>(slot.wl_global));
-#endif
         const unsigned generation = slot.generation;
         slot = {};
         slot.generation = generation;
@@ -945,7 +876,6 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
         return nullptr;
 
     unix_credentials cred{};
-#if defined(LUMEN_HAS_WAYLAND)
     pid_t pid = 0;
     uid_t uid = 0;
     gid_t gid = 0;
@@ -963,19 +893,15 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
         else
             cred.peer_gone = true;
     }
-#endif
 
     auto& slot = clients_[client_count_++];
     slot.set_id(next_client_id_++);
     slot.set_credentials(cred);
-#if defined(LUMEN_HAS_WAYLAND)
     slot.pidfd_ = std::move(pidfd);
-#endif
     slot.set_native(wl_client);
     slot.set_server(this);
     slot.set_privileged_shell(cred.uid == static_cast<unsigned>(::getuid()));
 
-#if defined(LUMEN_HAS_WAYLAND)
     // A link stays where it is for its client's whole life: the listener is an element of
     // that client's destroy-signal list. Links are not tied to slot indices, because
     // remove_client_slot moves the last slot into the hole — a link indexed by slot would be
@@ -1014,29 +940,19 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
             srv->client_destroyed_(srv->client_destroyed_user_, self->client_id, data);
     };
     wl_client_add_destroy_listener(static_cast<struct wl_client*>(wl_client), &link->listener);
-#endif
     return &slot;
 }
 
 void* lx::wayland::server::native_display() const {
-#if defined(LUMEN_HAS_WAYLAND)
     return display_;
-#else
-    return nullptr;
-#endif
 }
 
 bool lx::wayland::server::has_clients() const {
-#if defined(LUMEN_HAS_WAYLAND)
     return display_ && !wl_list_empty(wl_display_get_client_list(display_));
-#else
-    return client_count_ > 0;
-#endif
 }
 
 int lx::wayland::server::event_fd() const { return listen_fd_; }
 
-#if defined(LUMEN_HAS_WAYLAND)
 void lx::wayland::server::drop_listener(security_listener& l) {
     if (l.accept_source)
         wl_event_source_remove(l.accept_source);
@@ -1101,12 +1017,10 @@ void lx::wayland::server::accept_sandboxed(security_listener& l) {
                      conn->id(), l.context.sandbox_engine[0] ? l.context.sandbox_engine : "-",
                      l.context.app_id[0] ? l.context.app_id : "-");
 }
-#endif
 
 lx::result<void> lx::wayland::server::add_security_listener(int listen_fd, int close_fd,
                                                             const security_context& context,
                                                             unsigned creator) {
-#if defined(LUMEN_HAS_WAYLAND)
     security_listener* slot = nullptr;
     unsigned of_creator = 0;
     for (auto& l : listeners_) {
@@ -1144,22 +1058,11 @@ lx::result<void> lx::wayland::server::add_security_listener(int listen_fd, int c
                               "security context listener: event source failed");
     }
     return {};
-#else
-    (void)context;
-    (void)creator;
-    ::close(listen_fd);
-    ::close(close_fd);
-    return lx::not_implemented("lx::wayland::server::add_security_listener");
-#endif
 }
 
 unsigned lx::wayland::server::security_listener_count() const {
-#if defined(LUMEN_HAS_WAYLAND)
     unsigned n = 0;
     for (const auto& l : listeners_)
         n += l.used ? 1u : 0u;
     return n;
-#else
-    return 0;
-#endif
 }

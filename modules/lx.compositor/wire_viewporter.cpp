@@ -25,12 +25,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_VIEWPORTER)
 #include "viewporter-server-protocol.h"
 #define LUMEN_HAS_VIEWPORTER 1
-#endif
 #endif
 
 module lx.compositor;
@@ -44,9 +42,8 @@ import :surface;
 import :viewport;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_VIEWPORTER)
 
@@ -165,12 +162,12 @@ const struct wp_viewporter_interface viewporter_impl = {
 } // namespace
 
 void bind_viewporter(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_viewporter_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&viewporter_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&viewporter_impl, g_ctx, nullptr);
 }
 
 bool viewport_precheck(surface_obj* s) {
@@ -208,6 +205,5 @@ void viewport_surface_destroyed(surface_obj* s) {
     }
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

@@ -278,9 +278,9 @@ return err;
 
 Suggested sequence:
 
-1. `lx.wayland.server` — real socket bind, dispatch, P0 globals
-   (wraps **libwayland-server** when `LUMEN_HAS_WAYLAND`; raw AF_UNIX otherwise —
-   wire layer is not from-scratch; see architecture §8)
+1. `lx.wayland.server` — real socket bind, dispatch, protocol globals
+   (wraps **libwayland-server**, a required dependency — the wire layer is not
+   from-scratch; see architecture §8)
 2. `lx.compositor.surface` — `on_commit`, dmabuf desc extraction (D0)
 3. `lx.gfx.dmabuf` — basic Vulkan import (D1) / soft-import for headless CI
 4. `tick_render` → record/present

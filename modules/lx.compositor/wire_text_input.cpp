@@ -24,12 +24,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3)
 #include "text-input-unstable-v3-server-protocol.h"
 #define LUMEN_HAS_TEXT_INPUT 1
-#endif
 #endif
 
 module lx.compositor;
@@ -49,16 +47,15 @@ constexpr lx::trace::category log_ime{"compositor.ime"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_TEXT_INPUT)
 
 namespace {
 
 [[nodiscard]] lx::compositor::text_input_relay* relay() {
-    return g_p0_ctx ? g_p0_ctx->text_input : nullptr;
+    return g_ctx ? g_ctx->text_input : nullptr;
 }
 
 /// The wire record: the relay's record and a per-object flag for the truncation log line.
@@ -240,12 +237,12 @@ void ev_done(void*, void* ti, unsigned serial) {
 } // namespace
 
 void bind_text_input_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_text_input_manager_v3_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 void text_input_sink_events(lx::compositor::text_input_sink& sink) {
@@ -263,6 +260,5 @@ void text_input_sink_events(lx::compositor::text_input_sink&) {}
 
 #endif // LUMEN_HAS_TEXT_INPUT
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

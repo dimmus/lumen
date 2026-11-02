@@ -25,7 +25,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) &&                          \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) &&                          \
     defined(LUMEN_PROTOCOL_XDG_SHELL) && defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2) &&    \
     defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3)
 #include <wayland-client.h>

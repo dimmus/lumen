@@ -26,7 +26,7 @@ export import :config_apply;
 export import :buffer_lifecycle;
 export import :protocol_managers;
 export import :hotplug;
-export import :protocols_p0;
+export import :protocols;
 export import :wm;
 export import :workspaces;
 export import :tiling;

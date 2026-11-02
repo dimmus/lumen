@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) &&                          \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) &&                          \
     defined(LUMEN_PROTOCOL_XDG_SHELL) && defined(LUMEN_PROTOCOL_XDG_DECORATION_UNSTABLE_V1) && \
     defined(LUMEN_PROTOCOL_LINUX_DMABUF_V1) && defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1) &&  \
     defined(LUMEN_PROTOCOL_VIEWPORTER) && defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1) &&        \

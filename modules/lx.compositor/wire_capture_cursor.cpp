@@ -26,13 +26,11 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1) &&                                    \
     defined(LUMEN_PROTOCOL_EXT_IMAGE_COPY_CAPTURE_V1)
 #include "ext-image-copy-capture-v1-server-protocol.h"
 #define LUMEN_HAS_IMAGE_CAPTURE 1
-#endif
 #endif
 
 module lx.compositor;
@@ -53,9 +51,8 @@ import :capture;
 import :capture_engine;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
 
@@ -125,7 +122,7 @@ struct placement {
 };
 
 bool place(const cursor_obj& c, double x, double y, placement& out) {
-    const capture_host* h = g_p0_ctx ? g_p0_ctx->capture : nullptr;
+    const capture_host* h = g_ctx ? g_ctx->capture : nullptr;
     if (!h)
         return false;
     if (c.kind == capture_source_kind::output) {
@@ -139,8 +136,8 @@ bool place(const cursor_obj& c, double x, double y, placement& out) {
         out.area = {0, 0, o.mode.width, o.mode.height};
         return true;
     }
-    if (c.kind == capture_source_kind::toplevel && g_p0_ctx->toplevels) {
-        const toplevel_record* rec = g_p0_ctx->toplevels->find(c.toplevel);
+    if (c.kind == capture_source_kind::toplevel && g_ctx->toplevels) {
+        const toplevel_record* rec = g_ctx->toplevels->find(c.toplevel);
         if (!rec || !rec->mapped || std::strcmp(rec->foreign_identifier, c.identifier) != 0)
             return false;
         const lx::rect2i f = frame_rect(rec->geometry, window_manager::extents_of(*rec));
@@ -444,12 +441,12 @@ void capture_cursor_session_create(wl_client* client, wl_resource* manager, uint
 }
 
 void capture_cursor_tick() {
-    const capture_host* h = g_p0_ctx ? g_p0_ctx->capture : nullptr;
-    if (!h || !g_p0_ctx->cursor)
+    const capture_host* h = g_ctx ? g_ctx->capture : nullptr;
+    if (!h || !g_ctx->cursor)
         return;
-    const bool locked = g_p0_ctx->lock && g_p0_ctx->lock->state() != lock_state::unlocked;
-    const double px = g_p0_ctx->cursor->x();
-    const double py = g_p0_ctx->cursor->y();
+    const bool locked = g_ctx->lock && g_ctx->lock->state() != lock_state::unlocked;
+    const double px = g_ctx->cursor->x();
+    const double py = g_ctx->cursor->y();
     for (cursor_obj* c : g_cursors) {
         if (!c || c->stopped)
             continue;
@@ -461,7 +458,7 @@ void capture_cursor_tick() {
         cursor_image_view img{};
         unsigned generation = 0;
         const bool shown =
-            !locked && g_p0_ctx->cursor->image_for_scale(static_cast<unsigned>(std::lround(p.scale * 120.0)),
+            !locked && g_ctx->cursor->image_for_scale(static_cast<unsigned>(std::lround(p.scale * 120.0)),
                                                          img, generation);
         // In the area: the image's rect intersects the source's.
         bool inside = false;
@@ -525,6 +522,5 @@ void capture_cursor_toplevel_unmapped(lx::toplevel_id) {}
 
 #endif // LUMEN_HAS_IMAGE_CAPTURE
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

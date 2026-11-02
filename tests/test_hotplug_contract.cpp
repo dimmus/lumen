@@ -19,7 +19,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-client-protocol.h"
@@ -30,7 +29,6 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#endif
 #endif
 #include <stdint.h>
 
@@ -44,7 +42,7 @@ import lx.input;
 import lx.drm;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_WAYLAND) || !defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if !defined(LUMEN_HAS_PROTOCOL_GLUE)
 
 int main() {
     std::printf("SKIP: needs libwayland and the generated protocol glue\n");

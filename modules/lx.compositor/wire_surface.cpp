@@ -20,7 +20,6 @@ module;
 #include <sys/ioctl.h>
 #endif
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
@@ -33,7 +32,6 @@ module;
 #include "wlr-layer-shell-unstable-v1-server-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#endif
 #endif
 
 #include <unistd.h>
@@ -67,9 +65,8 @@ constexpr lx::trace::category log_wm{"compositor.wm"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 surface_obj surfaces[k_max_surfaces]{};
 
@@ -2580,7 +2577,7 @@ const struct wl_surface_interface surface_impl = {
 
 void compositor_create_surface(struct wl_client* client, struct wl_resource* resource,
                                uint32_t id) {
-    auto* ctx = static_cast<p0_protocol_context*>(wl_resource_get_user_data(resource));
+    auto* ctx = static_cast<protocol_context*>(wl_resource_get_user_data(resource));
     if (!ctx || !ctx->server)
         return;
     auto* conn = ctx->server->find_client_by_native(client);
@@ -2654,37 +2651,37 @@ const struct wl_compositor_interface compositor_impl = {
 } // namespace
 
 void bind_compositor(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wl_compositor_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&compositor_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&compositor_impl, g_ctx, nullptr);
 }
 
 bool surface_visible(lx::surface_id surface, unsigned frame, unsigned slot) {
-    if (!g_p0_ctx || !g_p0_ctx->surfaces)
+    if (!g_ctx || !g_ctx->surfaces)
         return false;
-    const lx::scene::surface_node* n = g_p0_ctx->surfaces->node(surface);
+    const lx::scene::surface_node* n = g_ctx->surfaces->node(surface);
     return n && n->visible_in(frame, slot);
 }
 
 std::uint32_t surface_shown_mask(lx::surface_id surface) {
-    if (!g_p0_ctx || !g_p0_ctx->surfaces)
+    if (!g_ctx || !g_ctx->surfaces)
         return 0;
-    const lx::scene::surface_node* n = g_p0_ctx->surfaces->node(surface);
+    const lx::scene::surface_node* n = g_ctx->surfaces->node(surface);
     if (!n)
         return 0;
     std::uint32_t mask = 0;
     for (unsigned v = 0; v < 16; ++v)
-        if ((g_p0_ctx->published_mask & (1u << v)) && n->visible_in(g_p0_ctx->published_frame[v], v))
+        if ((g_ctx->published_mask & (1u << v)) && n->visible_in(g_ctx->published_frame[v], v))
             mask |= 1u << v;
     return mask;
 }
 
 int surface_pace_output(lx::surface_id surface) {
     const std::uint32_t shown = surface_shown_mask(surface);
-    if (shown == 0 || !g_p0_ctx || !g_p0_ctx->outputs)
+    if (shown == 0 || !g_ctx || !g_ctx->outputs)
         return -1;
     if ((shown & (shown - 1)) == 0) {
         // Shown on one output: that one (the common case, no rect needed).
@@ -2692,8 +2689,8 @@ int surface_pace_output(lx::surface_id surface) {
             if (shown & (1u << v))
                 return static_cast<int>(v);
     }
-    const lx::rect2i rect = g_p0_ctx->tree ? g_p0_ctx->tree->node_rect(surface) : lx::rect2i{};
-    return lx::compositor::pace_output(*g_p0_ctx->outputs, shown, rect);
+    const lx::rect2i rect = g_ctx->tree ? g_ctx->tree->node_rect(surface) : lx::rect2i{};
+    return lx::compositor::pace_output(*g_ctx->outputs, shown, rect);
 }
 
 void fire_frames(unsigned frame_time_ms, bool throttle, unsigned slot, unsigned long long now_ns) {
@@ -2857,14 +2854,14 @@ void cu_poll_drop(unsigned key) {
 }
 
 void cu_after_latch(unsigned slot, unsigned frame) {
-    if (g_barriers > 0 && g_p0_ctx) {
+    if (g_barriers > 0 && g_ctx) {
         for (auto& s : surfaces) {
             if (!s.used || !s.fifo_barrier)
                 continue;
             // "Cleared immediately after the following latching deadline": the frame that
             // first showed the update with set_barrier has latched on the surface's pace
             // output. A surface not on screen does not hold its barrier.
-            const bool shown = (surface_shown_mask(s.id) & g_p0_ctx->lit_mask) != 0;
+            const bool shown = (surface_shown_mask(s.id) & g_ctx->lit_mask) != 0;
             const int pace = shown ? surface_pace_output(s.id) : -1;
             if (pace >= 0 && (static_cast<unsigned>(pace) != slot ||
                               static_cast<int>(frame - s.fifo_barrier_frame) < 0))
@@ -2877,7 +2874,7 @@ void cu_after_latch(unsigned slot, unsigned frame) {
 }
 
 std::uint32_t cu_waiting_outputs() {
-    if (g_cu.used_count() == 0 || !g_p0_ctx)
+    if (g_cu.used_count() == 0 || !g_ctx)
         return 0;
     unsigned slots[lx::compositor::k_cu_surfaces];
     const unsigned n = g_cu.queued_surfaces(slots, lx::compositor::k_cu_surfaces);
@@ -2892,19 +2889,19 @@ std::uint32_t cu_waiting_outputs() {
             for (unsigned c = r.first_child; c && !recheck; c = g_cu.at(c).next_sibling)
                 recheck = g_cu.at(c).recheck;
             if (recheck) {
-                const int pace = (surface_shown_mask(s.id) & g_p0_ctx->lit_mask) != 0
+                const int pace = (surface_shown_mask(s.id) & g_ctx->lit_mask) != 0
                                      ? surface_pace_output(s.id)
                                      : -1;
                 if (pace >= 0)
                     mask |= 1u << static_cast<unsigned>(pace);
-                else if (g_p0_ctx->lit_mask)
-                    mask |= g_p0_ctx->lit_mask & (~g_p0_ctx->lit_mask + 1u);
+                else if (g_ctx->lit_mask)
+                    mask |= g_ctx->lit_mask & (~g_ctx->lit_mask + 1u);
                 continue;
             }
         }
         if (!r.fifo_wait || !s.fifo_barrier)
             continue;
-        const int pace = (surface_shown_mask(s.id) & g_p0_ctx->lit_mask) != 0
+        const int pace = (surface_shown_mask(s.id) & g_ctx->lit_mask) != 0
                              ? surface_pace_output(s.id)
                              : -1;
         if (pace >= 0)
@@ -2914,7 +2911,7 @@ std::uint32_t cu_waiting_outputs() {
 }
 
 unsigned long long cu_earliest_target(unsigned slot) {
-    if (g_cu.used_count() == 0 || !g_p0_ctx)
+    if (g_cu.used_count() == 0 || !g_ctx)
         return 0;
     unsigned slots[lx::compositor::k_cu_surfaces];
     const unsigned n = g_cu.queued_surfaces(slots, lx::compositor::k_cu_surfaces);
@@ -2966,6 +2963,5 @@ void cu_buffer_gone(wl_resource* buffer) {
     }
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

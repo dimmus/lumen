@@ -15,13 +15,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
 #include "xdg-shell-client-protocol.h"
 #include "ext-workspace-v1-client-protocol.h"
 #define LUMEN_TEST_EXT_WORKSPACE 1
-#endif
 #endif
 #include <stdint.h>
 
