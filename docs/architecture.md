@@ -2218,7 +2218,9 @@ compositor's before any method runs. Every call's parameters are validated again
 interface definition first. Sandboxed applications do not see it (only the Wayland socket is
 exposed into a sandbox). It can log the session out and act on the focused window — what
 the user's own keys can do — and nothing else: it reads no pixels (screenshots stay with
-the portals and their capture indicator).
+the portals and their capture indicator). `ListInputDevices` (ADR-013 Phase G) names the
+libinput devices and the configuration class each lands in — the only place those names
+exist, and what `[[input.device]]` overrides match against (`lumen-ctl devices`).
 
 **The shell on the user bus (ADR 011, N1–N6).** lumen-shell owns
 `org.freedesktop.Notifications`, `org.kde.StatusNotifierWatcher` and
@@ -2413,4 +2415,4 @@ returning `not_implemented` until P0 lands.
 | UI architecture | [subsystems/ui-architecture.md](subsystems/ui-architecture.md) |
 | Protocol registry | [../protocols/README.md](../protocols/README.md) |
 | Login session, control socket, health export | [adr/011-session-and-window-management.md](adr/011-session-and-window-management.md) |
-| Settings application (proposed) | [adr/013-settings-app.md](adr/013-settings-app.md) |
+| Settings application (Phases A–C implemented: the value controls, the schema-driven surface, the user layer's splice editor) | [adr/013-settings-app.md](adr/013-settings-app.md) |

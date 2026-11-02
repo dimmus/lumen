@@ -56,6 +56,7 @@ void usage(FILE* out) {
         "  health            the full health report\n"
         "  version           versions and the composite backend\n"
         "  outputs           outputs\n"
+        "  devices           input devices (name, class, keyboard)\n"
         "  windows           windows\n"
         "  workspaces        workspaces\n"
         "  reload            re-read the configuration and print its problems\n"
@@ -434,6 +435,11 @@ int cmd_list(connection& c, const char* method, const char* key) {
     const std::size_t n = count(arr);
     for (std::size_t i = 0; i < n; ++i) {
         sd_json_variant* e = sd_json_variant_by_index(arr, i);
+        if (std::strcmp(key, "devices") == 0) {
+            std::printf("%-40s %-10s %s\n", str(e, "name"), str(e, "kind"),
+                        num(e, "keyboard") ? "keyboard" : "-");
+            continue;
+        }
         if (std::strcmp(key, "outputs") == 0) {
             // The render scale only where it differs (supersampling or undersampling).
             const double scale = real(e, "scale", 1.0);
@@ -599,6 +605,8 @@ int main(int argc, char* argv[]) {
     }
     if (cmd == "outputs")
         return cmd_list(c, "ListOutputs", "outputs");
+    if (cmd == "devices")
+        return cmd_list(c, "ListInputDevices", "devices");
     if (cmd == "windows")
         return cmd_list(c, "ListWindows", "windows");
     if (cmd == "workspaces")

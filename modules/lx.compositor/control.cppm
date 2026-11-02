@@ -29,6 +29,13 @@ struct control_version {
     const char* backend = "";
 };
 
+/// One input device (ListInputDevices): libinput's name and the config class it lands in.
+struct control_input_device {
+    char name[128]{};
+    const char* kind = "other"; ///< "touchpad" | "mouse" | "trackpoint" | "other"
+    bool keyboard = false;
+};
+
 struct control_output {
     char name[32]{};
     char description[160]{};
@@ -104,6 +111,7 @@ struct control_host {
     void (*health)(void* user, unsigned token) = nullptr;
     void (*health_timeout)(void* user, unsigned token) = nullptr;
     unsigned (*outputs)(void* user, control_output* out, unsigned cap) = nullptr;
+    unsigned (*input_devices)(void* user, control_input_device* out, unsigned cap) = nullptr;
     unsigned (*windows)(void* user, control_window* out, unsigned cap) = nullptr;
     unsigned (*workspaces)(void* user, control_workspace* out, unsigned cap) = nullptr;
     /// The focused window (false: none).

@@ -106,6 +106,14 @@ type Health (
   config_warnings: int
 )
 
+# One input device: libinput's name and the configuration class its settings land in
+# ([input.touchpad] / [input.mouse] / [input.trackpoint]; "other": no pointer).
+type InputDevice (
+  name: string,
+  kind: string,
+  keyboard: bool
+)
+
 type Output (
   name: string,
   description: string,
@@ -479,6 +487,27 @@ struct control_server::impl {
         return sd_varlink_reply(link, r.v);
     }
 
+    static int list_input_devices(sd_varlink* link, sd_json_variant*,
+                                  sd_varlink_method_flags_t, void*) {
+        control_server* s = self(link);
+        // 32 covers every real seat (a dozen devices is exotic); past it the list
+        // truncates rather than grow a fixed stack array.
+        control_input_device devs[32];
+        const unsigned n =
+            s && s->host_.input_devices ? s->host_.input_devices(s->host_.user, devs, 32) : 0;
+        json arr;
+        for (unsigned i = 0; i < n && i < 32; ++i) {
+            json j;
+            j.str("name", devs[i].name);
+            j.str("kind", devs[i].kind);
+            j.flag("keyboard", devs[i].keyboard);
+            arr.append(j);
+        }
+        json r;
+        r.set_array("devices", arr);
+        return sd_varlink_reply(link, r.v);
+    }
+
     static int list_workspaces(sd_varlink* link, sd_json_variant*, sd_varlink_method_flags_t,
                                void*) {
         control_server* s = self(link);
@@ -699,6 +728,7 @@ lx::result<void> control_server::open(control_host host) {
             s, "io.lumen.Compositor.GetVersion", &impl::get_version,
             "io.lumen.Compositor.GetHealth", &impl::get_health,
             "io.lumen.Compositor.ListOutputs", &impl::list_outputs,
+            "io.lumen.Compositor.ListInputDevices", &impl::list_input_devices,
             "io.lumen.Compositor.ListWorkspaces", &impl::list_workspaces,
             "io.lumen.Compositor.ListWindows", &impl::list_windows,
             "io.lumen.Compositor.Reload", &impl::reload,
