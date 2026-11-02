@@ -61,6 +61,7 @@ import lx.config;
 import lx.runtime;
 import lx.text;
 import lx.wayland.client;
+import lx.ui;
 import lx.ui.host;
 
 export module lx.shell;
@@ -384,6 +385,8 @@ private:
     [[nodiscard]] switcher_options switcher_settings() const;
     /// Applies idle and background from `c` (the command line's settings stay).
     void apply_config(const lx::config::config_snapshot& c);
+    /// Applies the [ui] section (theme, density) live (ADR-013 §4.7).
+    void apply_ui();
     /// The idle and lock policy changed while running: notifications and power controls
     /// are made again (the bound globals stay).
     void reconfigure_idle();
@@ -431,6 +434,12 @@ private:
     std::string file_lock_command_{};
     /// The background spec text applied from the file ("" before).
     std::string file_background_{};
+    /// The [ui] section as last applied (ADR-013 §4.7): the shell re-themes and re-densifies
+    /// live when a reload changes it.
+    std::string file_ui_theme_{};
+    lx::config::ui_appearance ui_appearance_ = lx::config::ui_appearance::dark;
+    lx::config::ui_density_kind ui_density_ = lx::config::ui_density_kind::regular;
+    double ui_font_size_ = 16.0;
     /// The shell's own set-up ran: configuration changes apply live from now on.
     bool started_ = false;
     /// The last configuration report shown (generation, its lines).
@@ -2779,6 +2788,49 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
         panel_blur_ = c.panel.blur;
         update_panel_blur();
     }
+    // ── [ui]: the interface look, live for the shell ──
+    if (!same_str(c.ui.theme, file_ui_theme_.c_str()) ||
+        c.ui.appearance != ui_appearance_ || c.ui.density != ui_density_ ||
+        c.ui.ui_font_size != ui_font_size_) {
+        file_ui_theme_ = c.ui.theme;
+        ui_appearance_ = c.ui.appearance;
+        ui_density_ = c.ui.density;
+        ui_font_size_ = c.ui.ui_font_size;
+        apply_ui();
+    }
+}
+
+void lx::shell::shell_app::apply_ui() {
+    // The theme: "one-dark" / "one-light" (the built-ins), a `.lxtheme` path or file name
+    // (load_theme_file resolves the theme directories), empty: the appearance's built-in.
+    std::string name = file_ui_theme_;
+    if (name.empty())
+        name = ui_appearance_ == lx::config::ui_appearance::light ? "one-light" : "one-dark";
+    if (name == "one-dark") {
+        set_active_builtin_theme(lx::ui::appearance::dark);
+    } else if (name == "one-light") {
+        set_active_builtin_theme(lx::ui::appearance::light);
+    } else if (auto loaded = lx::ui::load_theme_file(name.c_str())) {
+        set_active_theme(std::move(loaded).value());
+    } else {
+        log_config.warn("ui.theme: \"{}\" does not load ({}) — keeping the theme shown",
+                        name, loaded.get_error().message);
+    }
+    switch (ui_density_) {
+    case lx::config::ui_density_kind::compact: set_ui_density(lx::ui::density::compact); break;
+    case lx::config::ui_density_kind::comfortable:
+        set_ui_density(lx::ui::density::comfortable);
+        break;
+    case lx::config::ui_density_kind::regular:
+    default: set_ui_density(lx::ui::density::standard); break;
+    }
+    // ui_font_size needs the engine's live font settings (a theme reload carries them);
+    // until then it applies to applications at their start (LUMEN_THEME's rule).
+    log_config.info("ui: theme \"{}\" density {} font-size {:.0f} px", name,
+                    ui_density_ == lx::config::ui_density_kind::compact    ? "compact"
+                    : ui_density_ == lx::config::ui_density_kind::comfortable ? "comfortable"
+                                                                              : "default",
+                    ui_font_size_);
 }
 
 void lx::shell::shell_app::reconfigure_idle() {
@@ -3075,6 +3127,7 @@ void lx::shell::shell_app::open_switcher() {}
 void lx::shell::shell_app::quick_switch(std::string_view) {}
 lx::shell::switcher_options lx::shell::shell_app::switcher_settings() const { return {}; }
 void lx::shell::shell_app::apply_config(const lx::config::config_snapshot&) {}
+void lx::shell::shell_app::apply_ui() {}
 void lx::shell::shell_app::reconfigure_idle() {}
 void lx::shell::shell_app::rebuild_backgrounds() {}
 

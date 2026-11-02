@@ -64,6 +64,27 @@ are not intuitive.
 **Target platform for implementation:** Linux (KMS, libinput, logind) only. POSIX and Linux
 APIs are used directly; do not add `_WIN32` (or other non-Linux) branches or stubs.
 
+### 1.2 User rules (binding)
+
+These come from the project owner and override convenience:
+
+- **Best-in-class bar** — every design decision must be state of the art and best in class
+  with maximum efficiency, not the simplest thing that works. Compare against
+  wlroots/sway, KWin, Mutter, Smithay/niri and Hyprland, choose deliberately, and back
+  efficiency claims with measurement (latency, allocations, damage), not assertion.
+- **No degradation** — no change may regress what exists, and no feature/functionality that
+  does not push Lumen forward. Gate every change on before/after measurement, keep all
+  baseline-passing tests and goldens green, and revert or abandon anything whose gain is
+  marginal or unproven. No new config keys, env vars or user-facing features unless asked.
+  The gate is the **Vulkan backend**: a change that helps Vulkan may be kept even if the
+  GL/CPU paths regress; the reverse is not. When a measurement, test, smoke or pixel check
+  shows a regression, **stop and show the user the A/B evidence** before keeping, working
+  around or accepting it — never decide alone that a regression is acceptable.
+
+Settled outcomes of past decisions (do not re-litigate without new evidence) live in
+`.zcode/skills/lumen-decisions/`; open work in `.zcode/TODO.md`; the archived reasoning in
+`.zcode/memories/`.
+
 ---
 
 ## 2. Required reading before changes
@@ -79,6 +100,8 @@ APIs are used directly; do not add `_WIN32` (or other non-Linux) branches or stu
 | Errors / logging | [docs/subsystems/errors-and-logging.md](docs/subsystems/errors-and-logging.md) |
 | Public API surface | [docs/api/README.md](docs/api/README.md) |
 | Protocols / codegen | [protocols/README.md](protocols/README.md), `protocols/manifest.toml` |
+| Building / running / smoke / benchmark on this host | `.zcode/skills/lumen-build-run/SKILL.md` |
+| Proposing optimizations, reverting or re-introducing features | `.zcode/skills/lumen-decisions/SKILL.md` |
 | Diagrams | [docs/uml/README.md](docs/uml/README.md) |
 
 If docs and code disagree, **fix code to match docs** unless the user explicitly
@@ -342,13 +365,14 @@ modules/
 ├── lx.drm/            KMS, atomic commit, kms_damage
 ├── lx.input/          libinput seat
 ├── lx.session/        logind, privilege, user session (sd_notify, environment export)
-├── lx.config/         config.toml: TOML reader, schema, actions
+├── lx.config/         config.toml: TOML reader, schema, actions, :edit (the user layer's
+│                      splice editor, ADR-013)
 ├── lx.health/         health report (pulled on request; served by lumen-ctl)
 ├── lx.gfx/            Vulkan, dmabuf, syncobj, import_cache
 ├── lx.scene/          scene graph, snapshot_buffer (triple-buffer + back-pressure)
 ├── lx.layout/         flex/grid
 ├── lx.text/           shaping
-├── lx.ui/             widgets, style, theme.compile
+├── lx.ui/             widgets, style, theme.compile, inputs (ADR-013's value controls)
 ├── lx.compositor/     compositor + surface, toplevel, shell_bridge, cursor, output
 ├── lx.shell/          shell + bridge
 ├── lx.shell.policy/   stacking policy
@@ -360,6 +384,8 @@ executables/
 ├── lumen-shell/
 ├── lumen-ctl/              control tool (Varlink io.lumen.Compositor)
 ├── xdg-desktop-portal-lumen/
+├── lumen-settings/         the settings application (ADR-013; schema-driven UI over
+│                           lx.config + lx.ui)
 └── lumen-hello/
 
 protocols/             manifest.toml, lumen/*.xml, upstream/*
@@ -441,6 +467,10 @@ lumen-compositor [socket-name] [-f fps]
 ```
 
 **Socket path:** `$XDG_RUNTIME_DIR/lumen-0` (default name `lumen-0`).
+
+Host-specific facts (vmwgfx VM has no hardware Vulkan → GL path; DRM master from SSH; input
+injection; smoke suites and their known environmental noise; the interleaved-A/B
+measurement discipline) live in `.zcode/skills/lumen-build-run/SKILL.md`.
 
 ---
 

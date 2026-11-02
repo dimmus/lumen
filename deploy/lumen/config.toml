@@ -139,6 +139,14 @@ history = 50            # entries kept in the panel's notification list (0: none
 default-bindings = true # false: start from no bindings (Lumen's own keys remain:
                         # Ctrl+Alt+F1…F12, Ctrl+Alt+BackSpace, Super+Escape)
 
+[ui]                    # the interface look (ADR-013); the shell and lumen-settings apply
+theme = ""              # a built-in theme ("one-dark", "one-light") or a .lxtheme path;
+                        # empty: LUMEN_THEME, else One Dark. Exported as LUMEN_THEME for
+                        # applications that start later
+appearance = "dark"     # dark | light (the built-in fallback pair)
+density = "default"     # compact | default | comfortable
+ui-font-size = 16.0     # the rem base, px (10..24)
+
 [bindings]
 # "combination" = "action [argument]", or { action = "…", argument = …,
 #   allow-when-inhibited = true, allow-when-locked = true, repeat = true }.

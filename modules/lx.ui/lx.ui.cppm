@@ -55,3 +55,5 @@ export import :scroll;
 export import :list;
 export import :text_input;
 export import :popups;
+// ADR-013 Phase A: the value-input controls — slider, segmented, select, stepper, swatch.
+export import :inputs;

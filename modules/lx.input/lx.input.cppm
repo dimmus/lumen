@@ -271,6 +271,18 @@ public:
 
     /// Devices currently attached. Zero is legitimate — a machine can boot with none.
     [[nodiscard]] unsigned device_count() const { return device_count_; }
+    /// Calls `fn(name, kind, keyboard)` for every device present (libinput's names, the
+    /// class sections' kinds). UI affinity, while the devices are open.
+    using device_visit = void (*)(void* user, const char* name, device_class kind,
+                                  bool keyboard);
+    unsigned enumerate_devices(device_visit fn, void* user) const {
+        if (!fn)
+            return static_cast<unsigned>(devices_.size());
+        for (const device_entry& e : devices_)
+            fn(user, libinput_device_get_name(static_cast<libinput_device*>(e.device)), e.kind,
+               e.keyboard);
+        return static_cast<unsigned>(devices_.size());
+    }
 
 
     /// Suspend and resume for VT switching: on switch away the fds must be released or the

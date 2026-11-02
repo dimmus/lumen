@@ -3552,6 +3552,30 @@ void compositor_impl::start_session() {
             static_cast<compositor_impl*>(u)->answer_health(
                 token, false, control_server::health_timeout_ms, 0, 0, 0, 0);
         };
+        host.input_devices = [](void* u, control_input_device* out, unsigned cap) {
+            auto* self = static_cast<compositor_impl*>(u);
+            struct collector {
+                control_input_device* out;
+                unsigned cap;
+                unsigned n = 0;
+            } c{out, cap};
+            self->input_devices_.enumerate_devices(
+                [](void* user, const char* name, lx::input::device_class kind, bool keyboard) {
+                    auto* col = static_cast<collector*>(user);
+                    if (col->n >= col->cap)
+                        return;
+                    control_input_device& d = col->out[col->n++];
+                    d = {};
+                    std::snprintf(d.name, sizeof(d.name), "%s", name);
+                    d.kind = kind == lx::input::device_class::touchpad   ? "touchpad"
+                             : kind == lx::input::device_class::mouse    ? "mouse"
+                             : kind == lx::input::device_class::trackpoint ? "trackpoint"
+                                                                           : "other";
+                    d.keyboard = keyboard;
+                },
+                &c);
+            return c.n;
+        };
         host.outputs = [](void* u, control_output* out, unsigned cap) {
             auto* self = static_cast<compositor_impl*>(u);
             unsigned n = 0;
@@ -3719,7 +3743,7 @@ void compositor_impl::start_session() {
         const char* current = std::getenv("XDG_CURRENT_DESKTOP");
         std::snprintf(desktop, sizeof(desktop), "XDG_CURRENT_DESKTOP=%s",
                       names_lumen(current) ? current : "Lumen");
-        std::array<std::string_view, 7> vars{
+        std::array<std::string_view, 8> vars{
             std::string_view{display}, std::string_view{desktop},
             std::string_view{"XDG_SESSION_TYPE=wayland"},
             std::string_view{"XDG_SESSION_DESKTOP=lumen"}};
@@ -3737,6 +3761,13 @@ void compositor_impl::start_session() {
         if (cur.size > 0) {
             std::snprintf(xsize, sizeof(xsize), "XCURSOR_SIZE=%d", cur.size);
             vars[count++] = xsize;
+        }
+        // The interface theme (config.toml [ui], ADR-013 §4.7): what lx.app reads at start
+        // (the shell gets it live over zlm_shell_v1.config; running apps keep theirs).
+        char uitheme[128];
+        if (config_.current().ui.theme[0]) {
+            std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%s", config_.current().ui.theme);
+            vars[count++] = uitheme;
         }
         if (auto exported = user_env_.export_async(
                 std::span<const std::string_view>{vars.data(), count}, 2000,

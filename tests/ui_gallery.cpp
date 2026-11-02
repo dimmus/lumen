@@ -46,7 +46,7 @@ using namespace lx::ui;
 using lx::layout::px;
 
 constexpr int k_width = 1040;
-constexpr int k_height = 1008;
+constexpr int k_height = 1232;
 
 /// The caches every pane draws with: the bundled fonts (ui_golden's text environment), one
 /// atlas for glyphs and icons.
@@ -381,6 +381,63 @@ void prepare_tooltip(ui_node& root) {
     return pane_box("Modal", div(style{}.flex_col().size_full(), kids));
 }
 
+// ── Pane 9: the ADR-013 value-input controls ──
+
+constexpr element_key k_input_slider_key = 2300;
+constexpr element_key k_input_segment_key = 2301;
+
+const char* const k_input_modes[3] = {"Click", "Sloppy", "Off"};
+const char* const k_input_words[2] = {"Top-right", "Bottom-right"};
+
+[[nodiscard]] child input_row(bool disabled, bool open) {
+    static char st_storage[32] = "600";
+    static text_buffer st_buffer{.storage = st_storage, .size = 3, .revision = 1};
+    static const swatch k_chips[5] = {
+        {"Graphite", lx::color::rgb(0.231f, 0.255f, 0.302f)},
+        {"Rose", lx::color::rgb(0.816f, 0.447f, 0.467f)},
+        {"Moss", lx::color::rgb(0.631f, 0.757f, 0.506f)},
+        {"Azure", lx::color::rgb(0.455f, 0.678f, 0.910f)},
+        {"Honey", lx::color::rgb(0.871f, 0.757f, 0.518f)},
+    };
+    const child kids[] = {
+        boxed(style{}.w(px(48.f)).flex_none(),
+              label("Ratio").size(label_size::small).color(tok::text_muted).single_line()),
+        slider(0.55f, 0.1f, 0.9f).steps(80).disabled(disabled).key(k_input_slider_key),
+        segmented(k_input_modes, 1).disabled(disabled).key(k_input_segment_key),
+        boxed(style{}.w(px(150.f)).flex_none(),
+              select(k_input_words, 0).open(open && !disabled).disabled(disabled)
+                  .name("position")),
+        stepper(st_buffer, 600).range(1, 3600).disabled(disabled),
+        swatch_row(k_chips, 2).disabled(disabled),
+    };
+    return div(style{}.flex_row().items_center().gap(sp::b12).h(px(34.f)), kids);
+}
+
+[[nodiscard]] child describe_inputs() {
+    const child rows[3] = {input_row(false, true), input_row(true, false), input_row(false, false)};
+    return pane_box("Slider, segmented, select (open), stepper, swatch row (ADR-013)",
+                    div(style{}.flex_col().gap(sp::b04).size_full(), rows));
+}
+
+void prepare_inputs(ui_node& root) {
+    // The third row's slider has the keyboard focus (its ring); a segment is hovered.
+    if (ui_node* s = find_key(&root, k_input_slider_key);
+        s && s->parent() && s->parent()->parent()) {
+        ui_node* rows = s->parent()->parent();
+        if (rows->child_count() >= 3) {
+            ui_node* row = rows->child_at(2); // the last row
+            if (row->child_count() > 1 && row->child_at(1)->type() == slider_node::static_type()) {
+                auto& sl = *static_cast<slider_node*>(row->child_at(1));
+                sl.set_flag(node_flag::focused, true);
+                sl.set_flag(node_flag::focus_ring, true);
+            }
+        }
+    }
+    if (ui_node* g = find_key(&root, k_input_segment_key);
+        g && g->child_count() > 2)
+        ui_golden::set_state(*g->child_at(2), node_flag::interactive, node_flag::hovered);
+}
+
 // ── The image ──
 
 struct pane_spec {
@@ -398,6 +455,7 @@ constexpr pane_spec k_panes[] = {
     {{272, 756, 240, 236}, describe_tooltip_pane, prepare_tooltip},
     {{528, 756, 240, 236}, describe_toasts, nullptr},
     {{784, 756, 240, 236}, describe_modal, nullptr},
+    {{16, 1008, 1008, 208}, describe_inputs, prepare_inputs},
 };
 
 [[nodiscard]] lx::color clear_color() { return active_theme().color(tok::background); }

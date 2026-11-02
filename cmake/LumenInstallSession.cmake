@@ -41,6 +41,11 @@ lumen_stage(deploy/wayland-sessions/lumen.desktop.in lumen.desktop)
 file(INSTALL DESTINATION "${_data}/wayland-sessions" TYPE FILE FILES
     "${LUMEN_STAGE_DIR}/lumen.desktop")
 
+# The settings application's launcher entry (ADR-013): the app's binary is in bindir,
+# which the launcher's PATH covers.
+file(INSTALL DESTINATION "${_data}/applications" TYPE FILE FILES
+    "${CMAKE_BINARY_DIR}/share/applications/org.lumen.Settings.desktop")
+
 lumen_stage(scripts/lumen-session.in lumen-session)
 file(INSTALL DESTINATION "${LUMEN_BINDIR}" TYPE PROGRAM FILES "${LUMEN_STAGE_DIR}/lumen-session")
 

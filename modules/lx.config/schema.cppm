@@ -95,6 +95,23 @@ struct cursor_settings {
     int size = 0;
 };
 
+/// [ui] (ADR-013 §4.7): the engine-wide interface look. `theme` is a built-in name or a
+/// `.lxtheme` path; the compositor exports it as `LUMEN_THEME` into the session
+/// environment, so applications that start later pick it up (the shell and
+/// lumen-settings get it live, over the config push / their own parse). Density and font
+/// size ride the schema for the UI that reads them (ADR-013 Phase D).
+enum class ui_appearance : unsigned char { dark, light };
+enum class ui_density_kind : unsigned char { compact, regular, comfortable };
+
+struct ui_settings {
+    char theme[96]{};
+    ui_appearance appearance = ui_appearance::dark;
+    /// The engine's densities (§5.3); `regular` is the file's "default".
+    ui_density_kind density = ui_density_kind::regular;
+    /// The rem base, px.
+    double ui_font_size = 16.0;
+};
+
 enum class focus_mode : unsigned char { click, sloppy };
 struct focus_settings {
     focus_mode mode = focus_mode::click;
@@ -238,6 +255,7 @@ struct config_snapshot {
     background_settings background{};
     panel_settings panel{};
     notification_settings notifications{};
+    ui_settings ui{};
     bool default_bindings = true;
     /// Effective: the defaults (unless `default_bindings` is false) with the files' bindings
     /// over them.
@@ -332,6 +350,8 @@ constexpr const char* k_switcher_scopes[] = {"workspace", "all"};
 constexpr const char* k_idle_policies[] = {"shell", "none"};
 constexpr const char* k_positions[] = {"top-right", "top-center", "top-left", "bottom-right",
                                        "bottom-left"};
+constexpr const char* k_ui_appearances[] = {"dark", "light"};
+constexpr const char* k_ui_densities[] = {"compact", "default", "comfortable"};
 
 template <std::size_t N>
 constexpr unsigned count_of(const char* const (&)[N]) {
@@ -452,6 +472,14 @@ const key_desc k_keys[] = {
     {"notifications", "history", value_kind::integer, k_s, k_live, 0, 500, nullptr, 0, 0,
      LX_FIELD(notifications.history)},
     // [general]
+    {"ui", "theme", value_kind::string, k_c, k_live, 0, 0, nullptr, 0, 96,
+     LX_FIELD(ui.theme)},
+    {"ui", "appearance", value_kind::enumeration, k_c, k_live, 0, 0, k_ui_appearances,
+     count_of(k_ui_appearances), 0, LX_FIELD(ui.appearance)},
+    {"ui", "density", value_kind::enumeration, k_c, k_live, 0, 0, k_ui_densities,
+     count_of(k_ui_densities), 0, LX_FIELD(ui.density)},
+    {"ui", "ui-font-size", value_kind::number, k_c, k_live, 10.0, 24.0, nullptr, 0, 0,
+     LX_FIELD(ui.ui_font_size)},
     {"general", "default-bindings", value_kind::boolean, k_c, k_live, 0, 0, nullptr, 0, 0,
      LX_FIELD(default_bindings)},
 };
@@ -490,7 +518,7 @@ constexpr const char* k_sections[] = {
     "input",      "input.keyboard", "input.touchpad", "input.mouse",   "input.trackpoint",
     "input.device", "cursor",       "focus",          "windows",       "tiling",
     "animations", "workspaces",     "switcher",       "idle",          "background",
-    "panel",      "notifications",  "general",        "bindings",
+    "panel",      "notifications",  "ui",             "general",       "bindings",
 };
 
 using enum lx::config::action_id;

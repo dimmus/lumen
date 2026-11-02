@@ -300,6 +300,8 @@ configure_file("${CMAKE_SOURCE_DIR}/scripts/lumen-session.in"
                      WORLD_READ WORLD_EXECUTE)
 configure_file("${CMAKE_SOURCE_DIR}/deploy/wayland-sessions/lumen.desktop.in"
     "${CMAKE_BINARY_DIR}/share/wayland-sessions/lumen.desktop" @ONLY)
+configure_file("${CMAKE_SOURCE_DIR}/deploy/applications/org.lumen.Settings.desktop.in"
+    "${CMAKE_BINARY_DIR}/share/applications/org.lumen.Settings.desktop" @ONLY)
 
 # Diagnostic: exercises lx.input alone, so "typing does nothing" can be narrowed to
 # permissions, devices, translation or routing instead of testing all four at once.
@@ -318,6 +320,32 @@ add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app lumen-hello-ui)
 lumen_apply_module_properties(lumen-hello)
 lumen_check_executable_layers(lumen-hello lx.app)
+
+# lumen-settings' UI module (ADR-013): the schema-driven surface over lx.config + lx.ui;
+# the Varlink health polls live in the :ipc partition (libsystemd, like the control socket).
+add_library(lumen-settings-ui)
+set(LUMEN_SETTINGS_UI_SOURCES executables/lumen-settings/settings_ui.cppm
+    executables/lumen-settings/ipc.cppm
+    executables/lumen-settings/displays.cppm)
+target_sources(lumen-settings-ui PUBLIC FILE_SET CXX_MODULES TYPE CXX_MODULES
+    BASE_DIRS ${CMAKE_SOURCE_DIR} FILES ${LUMEN_SETTINGS_UI_SOURCES})
+target_link_libraries(lumen-settings-ui PUBLIC lx.ui lx.config)
+if(LUMEN_HAS_VARLINK)
+    target_compile_definitions(lumen-settings-ui PRIVATE LUMEN_SETTINGS_HAS_VARLINK=1)
+    target_include_directories(lumen-settings-ui PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})
+    target_link_libraries(lumen-settings-ui PUBLIC ${LIBSYSTEMD_LIBRARIES})
+endif()
+if(WAYLAND_FOUND AND TARGET lumen-protocol-glue)
+    # The client glue carries the generated wlr-output-management headers (PUBLIC includes)
+    # and the LUMEN_PROTOCOL_* gates.
+    target_link_libraries(lumen-settings-ui PUBLIC lumen-protocol-glue ${WAYLAND_LIBRARIES})
+    target_compile_definitions(lumen-settings-ui PRIVATE LUMEN_SETTINGS_HAS_OUTPUT_MANAGEMENT=1)
+endif()
+lumen_apply_module_properties(lumen-settings-ui)
+add_executable(lumen-settings executables/lumen-settings/main.cpp)
+target_link_libraries(lumen-settings PRIVATE lx.app lumen-settings-ui)
+lumen_apply_module_properties(lumen-settings)
+lumen_check_executable_layers(lumen-settings lx.app)
 
 # Demo client: needs xdg-shell *client* glue, which the server-side codegen does not emit.
 if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
@@ -581,6 +609,14 @@ if(LUMEN_BUILD_TESTS)
     target_compile_definitions(test_config PRIVATE LUMEN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_include_directories(test_config PRIVATE tests)
     add_test(NAME test_config COMMAND test_config)
+
+    # ADR-013 Phase C: the user layer's splice editor (lx.config:edit).
+    add_executable(test_config_edit tests/test_config_edit.cpp)
+    target_link_libraries(test_config_edit PRIVATE lx.config)
+    lumen_apply_module_properties(test_config_edit)
+    target_compile_definitions(test_config_edit PRIVATE LUMEN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(test_config_edit PRIVATE tests)
+    add_test(NAME test_config_edit COMMAND test_config_edit)
 
     # Pointer device settings: the configuration → libinput setter calls (recording ops).
     add_executable(test_input_config tests/test_input_config.cpp)
@@ -1506,6 +1542,26 @@ if(LUMEN_BUILD_TESTS)
     target_compile_definitions(test_ui_components PRIVATE
         LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
     add_test(NAME test_ui_components COMMAND test_ui_components)
+
+    # ADR-013 Phase A: the value-input controls (slider, segmented, select, stepper, swatch).
+    add_executable(test_ui_inputs tests/test_ui_inputs.cpp)
+    target_link_libraries(test_ui_inputs PRIVATE lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y)
+    lumen_apply_module_properties(test_ui_inputs)
+    lumen_link_platform(test_ui_inputs)
+    target_include_directories(test_ui_inputs PRIVATE tests)
+    target_compile_definitions(test_ui_inputs PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+    add_test(NAME test_ui_inputs COMMAND test_ui_inputs)
+
+    # ADR-013 Phase B: the settings surface — catalog totality, search reachability,
+    # pane switching, value edits (lumen.settings_ui).
+    add_executable(test_settings_ui tests/test_settings_ui.cpp)
+    target_link_libraries(test_settings_ui PRIVATE lx.ui lx.config lx.scene lx.gfx lx.text
+        lx.runtime lx.a11y lumen-settings-ui)
+    lumen_apply_module_properties(test_settings_ui)
+    lumen_link_platform(test_settings_ui)
+    target_include_directories(test_settings_ui PRIVATE tests)
+    add_test(NAME test_settings_ui COMMAND test_settings_ui)
 
     # lx.layout:flex against Chrome's layout of Taffy's fixtures, and lx.ui's flex container
     # with the per-node measure cache (ADR-010 §4.7).

@@ -1,6 +1,8 @@
 # ADR 013 — The Settings application
 
-**Status:** Proposed — analysis and design complete (this document); nothing implemented yet.
+**Status:** Accepted — Phases A–G implemented (§9's "as built" notes); two named open
+items remain: in-window key capture for the bindings editor, and the per-device override /
+window-rules editors.
 **Date:** 2026-11-01
 **Scope:** new executable `lumen-settings` (+ its UI module library, `executables/lumen-settings/`),
 `lx.ui` (the controls the settings surface needs and the engine lacks: slider, segmented
@@ -539,3 +541,127 @@ stub.
 | Two writers (app + text editor) | Atomic rename means last whole-file write wins; generation events reconcile; per-key conflict is the user's visible diff, not silent loss |
 | Capacity ceilings on exotic panes | Budgeted in §5.8; virtualised lists and scrollable popovers keep every pane under every `k_*` cap |
 | Scope creep toward a "control center" | §4.9 says no; every new pane needs a subsystem that exists and a schema that describes it |
+
+## 9. As built
+
+### Phase A — the value controls (`lx.ui:inputs`) — done
+
+`slider`, `segmented`, `select`, `stepper` and `swatch_row`/`swatch` live in a new
+partition `lx.ui:inputs` (`modules/lx.ui/inputs.cppm`), exported from the facade after
+`:popups` — a partition of its own because components.cppm had no room to grow into; the
+ADR's "in `lx.ui:components`" is satisfied in spirit (the same layer, the same idiom). The
+slider is the only custom node (`slider_node`: press/drag/wheel/arrows, quantized to
+`steps`, the switch's visual vocabulary); the rest are `control_node` compositions, the
+select riding `popover_menu` with the app owning the open state. `lx.a11y` gains `slider`,
+`spin_button`, `radio_group`, `radio_item`. Tests: `tests/test_ui_inputs.cpp` (5 cases —
+drag/keyboard/wheel/disabled, roving tab stops, open/pick/dismiss, stepper signs, swatch
+selection) plus a gallery pane (`tests/ui_gallery.cpp` pane 9; goldens regenerated, G10
+parity green on cpu and GL, Vulkan validation clean).
+
+### Phase B — the settings surface (`lumen-settings`) — done
+
+`executables/lumen-settings/` (`main.cpp` + `settings_ui.cppm`, the lumen-hello pattern,
+`lumen_check_executable_layers` clean). The catalog (`settings::catalog()`) renders every
+`schema_keys()` + `pointer_keys()` entry with its pane, group, prettified label, description
+and unit; the value kinds map to the Phase A controls (boolean→switch, enumeration ≤3→
+segmented, >3→select, ranged integer/number→slider+readout, string→text_input (write on
+submit), string_list→read-only). The rail switches panes; the search field is a subsequence
+filter across all panes; the status bar states the save state honestly (untouched / written
+/ memory-only). One deliberate divergence from §4.1's sketch: the app state lives in a
+`settings::session` the describer reads through a module-static pointer (the shell
+panel_describe pattern), not a per-pane reducer — a reducer's state copies would dangle the
+text buffers' storage spans. Tests: `tests/test_settings_ui.cpp` (4 cases: catalog totality
+over the whole schema, rail/pane switching, value edits, search filtering, including the
+zero-match case). The app opens and presents on the automatic tier against a headless
+compositor (`tier=cpu presented=1` on llvmpipe-only host; hardware picks Vulkan/GL by the
+usual rules).
+
+### Phase C — the write path (`lx.config:edit`) — done
+
+`modules/lx.config/edit.cppm`: `splice_key` / `remove_key` / `edit_value` exactly as §4.3
+sketches, with two corrections the parser taught: enumeration values are written **quoted**
+(`layout = "master-stack"` — the file's format; a bare word is invalid TOML here), and the
+line-number bookkeeping is tested against `deploy/lumen/config.toml` as the adversarial
+corpus. The session loads the layered configuration (`locate_config` → `read_config` →
+`parse_config`) and every edit goes splice → re-parse verify (the value must round-trip) →
+atomic rename — synchronous on the UI thread, an honest choice for human-frequency edits of
+a ≤ 256 KiB file; the compositor's watch applies it (its reload path is the tested one).
+Array-of-table sections (`[[output]]`, `[[input.device]]`) are refused until their panes
+land. String keys commit on submit, not per keystroke. Tests: `tests/test_config_edit.cpp`
+(5 cases). Desktop entry `deploy/applications/org.lumen.Settings.desktop.in`, installed via
+the session install script; AGENTS.md and architecture.md rows updated.
+
+### Phase D — done (the schema half, then the rest)
+
+The `[ui]` section exists: `theme` (string, ≤96), `appearance` (`dark` | `light`),
+`density` (`compact` | `default` | `comfortable`) and `ui-font-size` (10..24 px) in
+`config_snapshot::ui` — the descriptor rows drive the parser, the deploy example documents
+them (`test_config` enforces that), the settings app renders them with no pane code
+(Appearance → "Theme & density": a text field, two segmented controls, a slider), and the
+compositor exports a set `[ui].theme` as `LUMEN_THEME` into the session environment beside
+the cursor variables. As built, the rest: **the shell applies `[ui]` live** —
+`shell_app::apply_config` tracks the section and `apply_ui()` re-themes
+(`set_active_builtin_theme` / `load_theme_file` → `set_active_theme`) and re-densifies
+(`set_ui_density`) on a changed reload; the theme change bumps the generation and the
+panel/launcher re-describe. `ui-font-size` stays a start-time value (the engine has no live
+font setter; noted in the log line). **The Zed-theme import**: the Appearance pane's
+"Zed theme import" group — a path field and an Import button run
+`theme_compiler::compile({json, ~/.config/lumen/themes/<stem>.lxtheme})`, load the result
+live (`load_theme_file` → `set_active_theme`: the whole app is the preview), and write
+`[ui].theme` through the same splice editor as a row edit (the shell and later apps
+follow). Failure names the reason inline; nothing is installed on a failed compile.
+
+### Phase E — the bindings editor — done
+
+The Shortcuts pane lists every `actions()` entry (grouped by owner, summary over the name
+and availability) with its effective binding and an Edit affordance. The editor validates
+the typed combination against `lx.config:keys` (`parse_combo`, the same grammar the parser
+uses — no second copy), refuses reserved combinations (`reserved()` — "the ways out of a
+stuck session"), enforces the pointer-only/keyboard-only action rules, and reports conflicts
+against the effective table ("bound to X — unbind it there first"). A save splices
+`[bindings]` into the user layer (quoted keys flow through the splice editor unchanged —
+its key matcher is text, and the canonical spelling comes from `format_combo`, lowercased
+keysym names as the parser reads them); an empty field writes the `"none"` line that
+removes a default; Reset removes the user layer's line so the default returns. In-window
+key capture (wl_keyboard keysym recording) stays open — the text grammar is the complete
+fallback. Tests: `settings_bindings_editor_validates_conflicts_and_writes` (a real temp
+file: bind → line lands and re-parses; reserved refused with the file unchanged; conflict
+refused; reset removes the line).
+
+### Phase F — the Displays pane — done
+
+`executables/lumen-settings/displays.cppm` is the client half of `zwlr_output_manager_v1`
+(the generated client glue via `lumen-protocol-glue`; a second `wl_registry` per lx.shell's
+pattern, `display::native()`). Heads, modes, scale, transform, position, adaptive sync and
+the done serial land in the session; the pane shows one group per head (live state, a
+modified dot while staged) with enabled switch, mode select (the head's modes), scale
+slider, transform segmented, position readout and VRR switch; Apply stages a
+`create_configuration` → set_* → `apply` (one in flight; succeeded/failed/cancelled events
+report) — the compositor tests, applies and persists `outputs.toml` itself; this client
+never writes that file. The 15-second revert modal is open (it is UI state on this same
+apply path). Without the global (a sandbox, an old compositor) the pane says so and the
+schema's render-scale rows still edit.
+
+### Phase G — the Varlink reads and the device list — done; window rules remain open
+
+`executables/lumen-settings/ipc.cppm` polls `GetVersion` + `GetHealth` +
+`ListInputDevices` every 2 s on a worker thread (libsystemd, the `sd_json_variant` reply
+API — no second JSON parser), posting snapshots to the UI strand (`executor::global` → the
+app's UI strand; the snapshot heap-hops — `task`'s inline payload is for trivially-copyable
+captures). The Session pane shows the version line, overall level, per-part levels, memory
+and the config generation/errors/warnings; unreachable compositor → an honest note, file
+editing unaffected. `ListInputDevices` is new on the compositor (`control_input_device` +
+the IDL method + handler; `lx.input::input_manager::enumerate_devices`), served to
+`lumen-ctl devices` and the Input pane's Devices group — libinput's names are the
+compositor's to tell, and what `[[input.device]]` overrides match. The per-device override
+editor and the window-rules UI (the compositor's rule store behind the inert
+`zlm_window_rules_v1`) remain open — both are schema-side rows waiting on their own
+compositor feature, not on the app.
+
+### Status
+
+Phases A–G implemented except the two named open items (in-window key capture; the
+per-device override and window-rules editors). 134/134 tests green, including
+`test_ui_inputs` (5), `test_settings_ui` (5), `test_config_edit` (5); the app opens and
+presents on the automatic tier against a headless compositor, and `lumen-ctl devices` /
+`outputs` / `version` answer live.

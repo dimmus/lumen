@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Settings
+GenericName=Settings
+Comment=Configure and tune the Lumen desktop
+Keywords=settings;preferences;configuration;lumen;
+Exec=lumen-settings
+TryExec=lumen-settings
+Icon=preferences-system
+Terminal=false
+Type=Application
+Categories=Settings;
+# Only in a Lumen session (the app talks to the compositor and edits its configuration).
+OnlyShowIn=Lumen;

@@ -37,6 +37,11 @@ enum class role {
     list_item,
     scroll_area,
     scrollbar,
+    // ADR-013 Phase A: the value-input controls (lx.ui:inputs).
+    slider,
+    spin_button,
+    radio_group,
+    radio_item,
 };
 
 enum class state_flag : unsigned {

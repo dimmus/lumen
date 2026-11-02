@@ -12,6 +12,7 @@
 //   :schema       config_snapshot, defaults, key descriptors, default bindings
 //   :parse        layers → snapshot + diagnostics; effective bytes; keymap check
 //   :locate       XDG layers, LUMEN_CONFIG, bounded reads
+//   :edit         the user layer's splice editor (ADR-013 §4.3)
 //   :watch        inotify on the layers' directories
 
 export module lx.config;
@@ -23,4 +24,5 @@ export import :actions;
 export import :schema;
 export import :parse;
 export import :locate;
+export import :edit;
 export import :watch;
