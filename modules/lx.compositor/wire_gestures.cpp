@@ -20,12 +20,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_POINTER_GESTURES_UNSTABLE_V1)
 #include "pointer-gestures-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_POINTER_GESTURES 1
-#endif
 #endif
 
 module lx.compositor;
@@ -39,9 +37,8 @@ import lx.input;
 import :input_router;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_POINTER_GESTURES)
 
@@ -139,7 +136,7 @@ const struct zwp_pointer_gestures_v1_interface manager_impl = {
 bool gesture_consumed(const lx::input::gesture_event&) { return false; }
 
 void send_gesture(const lx::input::gesture_event& e) {
-    p0_protocol_context* ctx = g_p0_ctx;
+    protocol_context* ctx = g_ctx;
     if (!ctx || !ctx->input)
         return;
     if (e.stage == gphase::begin) {
@@ -212,11 +209,11 @@ void send_gesture(const lx::input::gesture_event& e) {
 } // namespace
 
 void bind_pointer_gestures(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_pointer_gestures_v1_interface, version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 void pointer_gestures_client_destroyed(wl_client* client) {
@@ -234,16 +231,11 @@ void pointer_gestures_client_destroyed(wl_client*) {}
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::pointer_gesture(p0_protocol_context& ctx,
+void lx::compositor::pointer_gesture(protocol_context& ctx,
                                      const lx::input::gesture_event& event) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    p0::send_gesture(event);
-#else
-    (void)event;
-#endif
+    wire::send_gesture(event);
 }

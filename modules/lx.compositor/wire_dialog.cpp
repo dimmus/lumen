@@ -21,13 +21,11 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_XDG_DIALOG_V1)
 #include "xdg-shell-server-protocol.h"
 #include "xdg-dialog-v1-server-protocol.h"
 #define LUMEN_HAS_XDG_DIALOG 1
-#endif
 #endif
 
 module lx.compositor;
@@ -39,9 +37,9 @@ import lx.wayland.server;
 import :toplevel;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_XDG_DIALOG)
+#if defined(LUMEN_HAS_XDG_DIALOG)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -53,15 +51,15 @@ struct dialog_obj {
 };
 
 lx::compositor::toplevel_record* dialog_record(dialog_obj* d) {
-    if (!d || !d->toplevel || !g_p0_ctx || !g_p0_ctx->toplevels)
+    if (!d || !d->toplevel || !g_ctx || !g_ctx->toplevels)
         return nullptr;
-    return g_p0_ctx->toplevels->find_mut(d->toplevel);
+    return g_ctx->toplevels->find_mut(d->toplevel);
 }
 
 void dialog_set_modal(wl_resource* r, bool modal) {
     auto* d = static_cast<dialog_obj*>(wl_resource_get_user_data(r));
-    if (auto* rec = dialog_record(d); rec && g_p0_ctx->wm)
-        g_p0_ctx->wm->set_modal(rec->id, modal);
+    if (auto* rec = dialog_record(d); rec && g_ctx->wm)
+        g_ctx->wm->set_modal(rec->id, modal);
 }
 
 void dialog_destroy_resource(wl_resource* r) {
@@ -72,8 +70,8 @@ void dialog_destroy_resource(wl_resource* r) {
         rec->dialog = false;
         // Not at client teardown: the window goes with the client anyway, and the shell must
         // not be told a dying window changed state.
-        if (g_p0_ctx->wm && !client_dying(wl_resource_get_client(r)))
-            g_p0_ctx->wm->set_modal(rec->id, false);
+        if (g_ctx->wm && !client_dying(wl_resource_get_client(r)))
+            g_ctx->wm->set_modal(rec->id, false);
         else
             rec->modal = false;
     }
@@ -119,13 +117,13 @@ const struct xdg_wm_dialog_v1_interface wm_dialog_impl = {
 } // namespace
 
 void bind_wm_dialog(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &xdg_wm_dialog_v1_interface, version, id);
     if (res)
-        res.set_implementation(&wm_dialog_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&wm_dialog_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND && LUMEN_HAS_XDG_DIALOG
+#endif // LUMEN_HAS_XDG_DIALOG

@@ -1,10 +1,12 @@
 # Platform dependencies (Linux compositor target)
 
 find_package(Vulkan QUIET)
-find_package(PkgConfig QUIET)
+find_package(PkgConfig REQUIRED)
 
 if(PkgConfig_FOUND)
-    pkg_check_modules(WAYLAND QUIET wayland-server wayland-client)
+    # Lumen is a Wayland compositor: without libwayland there is nothing to build (a build
+    # that "succeeded" without it could not bind a socket or accept one client).
+    pkg_check_modules(WAYLAND REQUIRED wayland-server wayland-client)
     # A Wayland client alone (lumen-shell): libwayland-client without the server, and the
     # server alone (lx.wayland.server, lx.compositor): a compositor is not a client.
     pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client)
@@ -177,11 +179,10 @@ function(lumen_link_platform target)
         message(STATUS "${target}: Vulkan not found — building stubs")
     endif()
 
-    if(WAYLAND_FOUND)
-        target_include_directories(${target} PRIVATE ${WAYLAND_INCLUDE_DIRS})
-        target_link_libraries(${target} PRIVATE ${WAYLAND_LIBRARIES})
-        target_compile_definitions(${target} PRIVATE LUMEN_HAS_WAYLAND=1)
-    endif()
+    # Wayland is required (checked at configure); no LUMEN_HAS_WAYLAND macro — the
+    # compositor cannot exist without libwayland, so there is nothing to guard.
+    target_include_directories(${target} PRIVATE ${WAYLAND_INCLUDE_DIRS})
+    target_link_libraries(${target} PRIVATE ${WAYLAND_LIBRARIES})
 
     if(LIBDRM_FOUND)
         target_include_directories(${target} PRIVATE ${LIBDRM_INCLUDE_DIRS})
@@ -242,13 +243,13 @@ endfunction()
 # Only the named platform parts, for a target that is not the compositor (lumen-shell and the
 # modules it is built from): `lumen_link_platform` brings Vulkan, DRM, libinput, udev and
 # EGL/GBM as well, which a client loads and relocates at every start for nothing.
-#   wayland_client  libwayland-client          LUMEN_HAS_WAYLAND
+#   wayland_client  libwayland-client          (no macro — Wayland is required)
 #   xkb             xkbcommon                  LUMEN_HAS_XKBCOMMON
 #   text            HarfBuzz, FreeType, fontconfig  LUMEN_HAS_TEXT
 #                   fribidi                         LUMEN_HAS_FRIBIDI
 #                   libunibreak                     LUMEN_HAS_UNIBREAK
 #   systemd         libsystemd (sd-bus)        LUMEN_HAS_LOGIND (+ LUMEN_HAS_VARLINK)
-#   wayland_server  libwayland-server          LUMEN_HAS_WAYLAND
+#   wayland_server  libwayland-server          (no macro — Wayland is required)
 #   vulkan          the Vulkan loader          LUMEN_HAS_VULKAN
 #   drm             libdrm                     LUMEN_HAS_DRM
 #   display_info    libdisplay-info            LUMEN_HAS_DISPLAY_INFO
@@ -263,7 +264,6 @@ function(lumen_link_platform_parts target)
             if(WAYLAND_CLIENT_FOUND)
                 target_include_directories(${target} PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
                 target_link_libraries(${target} PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
-                target_compile_definitions(${target} PRIVATE LUMEN_HAS_WAYLAND=1)
             endif()
         elseif(part STREQUAL "xkb")
             if(XKBCOMMON_FOUND)
@@ -291,7 +291,6 @@ function(lumen_link_platform_parts target)
             if(WAYLAND_SERVER_FOUND)
                 target_include_directories(${target} PRIVATE ${WAYLAND_SERVER_INCLUDE_DIRS})
                 target_link_libraries(${target} PRIVATE ${WAYLAND_SERVER_LIBRARIES})
-                target_compile_definitions(${target} PRIVATE LUMEN_HAS_WAYLAND=1)
             endif()
         elseif(part STREQUAL "vulkan")
             if(Vulkan_FOUND)

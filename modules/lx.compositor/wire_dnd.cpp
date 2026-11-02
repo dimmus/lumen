@@ -31,9 +31,7 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 module lx.compositor;
 
@@ -49,9 +47,8 @@ import :wm;
 import :dnd;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -120,8 +117,8 @@ void send_leave(wl_client* client) {
 }
 
 void feedback(unsigned action) {
-    if (g_p0_ctx && g_p0_ctx->dnd)
-        g_p0_ctx->dnd->set_feedback(drag.target_client != nullptr && drag.offer != nullptr,
+    if (g_ctx && g_ctx->dnd)
+        g_ctx->dnd->set_feedback(drag.target_client != nullptr && drag.offer != nullptr,
                                     action);
 }
 
@@ -191,11 +188,11 @@ void op_focus(void*, void* surface_res_ptr, double sx, double sy) {
             ? xfer_devices_of(client, xfer_family::clipboard, devs, k_max_target_devices)
             : 0u;
     const surface_obj* s = surface_from(surface_res);
-    if (n > 0 && g_p0_ctx && g_p0_ctx->seat) {
+    if (n > 0 && g_ctx && g_ctx->seat) {
         drag.target_client = client;
         drag.target_surface = surface_res;
         drag.target_id = s ? s->id : lx::surface_id{};
-        const unsigned serial = g_p0_ctx->seat->next_serial();
+        const unsigned serial = g_ctx->seat->next_serial();
         const wl_fixed_t fx = wl_fixed_from_double(sx);
         const wl_fixed_t fy = wl_fixed_from_double(sy);
         for (unsigned i = 0; i < n; ++i) {
@@ -234,7 +231,7 @@ void op_motion(void*, unsigned time_ms, double sx, double sy) {
         return;
     // A target that stopped answering pings is not fed motion it cannot read (as for
     // wl_pointer.motion); enter, leave and drop still reach it.
-    if (g_p0_ctx && g_p0_ctx->input && g_p0_ctx->input->motion_muted(drag.target_client))
+    if (g_ctx && g_ctx->input && g_ctx->input->motion_muted(drag.target_client))
         return;
     xfer_device* devs[k_max_target_devices];
     const unsigned n =
@@ -329,7 +326,7 @@ bool op_drop(void*, lx::compositor::dnd_end_reason& why) {
 
 void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* origin_res,
                     wl_resource* icon_res, uint32_t serial) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     wl_client* client = dev->client;
 
@@ -345,7 +342,7 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
         return;
     }
     if (icon) {
-        if (g_p0_ctx->tree && !g_p0_ctx->tree->make_root(icon->id, lx::compositor::root_kind::dnd_icon)) {
+        if (g_ctx->tree && !g_ctx->tree->make_root(icon->id, lx::compositor::root_kind::dnd_icon)) {
             // A surface linked as a subsurface has that role already; nothing else gets here.
             wl_resource_post_error(dev->resource, WL_DATA_DEVICE_ERROR_ROLE,
                                    "wl_surface@%u already has another role",
@@ -369,8 +366,8 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
         src->role = source_role::dnd;
     }
 
-    auto* wm = g_p0_ctx->wm;
-    auto* grab = g_p0_ctx->dnd;
+    auto* wm = g_ctx->wm;
+    auto* grab = g_ctx->dnd;
     const char* reject = !wm || !grab ? "no-wm" : wm->validate_drag_serial(client, serial);
     if (reject) {
         if (log_dnd.enabled(lx::trace::level::debug)) {
@@ -398,8 +395,8 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
     const lx::client_id origin_client =
         origin ? origin->client : lx::client_id{wire_client_id(client)};
     grab->begin(origin_client, src == nullptr, icon ? icon->id : lx::surface_id{},
-                g_p0_ctx->seat ? g_p0_ctx->seat->pointer_x() : 0.0,
-                g_p0_ctx->seat ? g_p0_ctx->seat->pointer_y() : 0.0);
+                g_ctx->seat ? g_ctx->seat->pointer_x() : 0.0,
+                g_ctx->seat ? g_ctx->seat->pointer_y() : 0.0);
     // The origin's implicit grab ends (leave), and the surface under the pointer — usually the
     // origin itself — becomes the first target at once.
     wm->begin_drag();
@@ -538,8 +535,8 @@ void dnd_source_destroyed(xfer_source* s) {
     leave_target();
     inert_drag_offers(s, nullptr);
     drag = {};
-    if (g_p0_ctx && g_p0_ctx->dnd)
-        g_p0_ctx->dnd->end(lx::compositor::dnd_end_reason::source_destroyed);
+    if (g_ctx && g_ctx->dnd)
+        g_ctx->dnd->end(lx::compositor::dnd_end_reason::source_destroyed);
 }
 
 void dnd_client_destroyed(wl_client* client) {
@@ -549,11 +546,11 @@ void dnd_client_destroyed(wl_client* client) {
         return;
     leave_target();
     drag = {};
-    if (g_p0_ctx && g_p0_ctx->dnd)
-        g_p0_ctx->dnd->end(lx::compositor::dnd_end_reason::client_gone);
+    if (g_ctx && g_ctx->dnd)
+        g_ctx->dnd->end(lx::compositor::dnd_end_reason::client_gone);
 }
 
-void install_dnd(p0_protocol_context& ctx) {
+void install_dnd(protocol_context& ctx) {
     if (!ctx.dnd)
         return;
     lx::compositor::dnd_ops ops{};
@@ -566,6 +563,5 @@ void install_dnd(p0_protocol_context& ctx) {
     ctx.dnd->set_ops(ops);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

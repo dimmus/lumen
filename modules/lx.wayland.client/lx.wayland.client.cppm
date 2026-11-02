@@ -8,9 +8,9 @@ module;
 // on it (ADR-010 §7 Phase 4). Platform layer: lx.foundation and lx.runtime only; no lx.gfx or
 // lx.ui type, no Vulkan, EGL or GBM.
 //
-// Built with libwayland-client and the protocol glue (LUMEN_HAS_WAYLAND +
-// LUMEN_HAS_PROTOCOL_GLUE with xdg-shell and the other protocols of protocols/manifest.toml);
-// without them every create/connect returns not_implemented.
+// Built with libwayland-client and the protocol glue (LUMEN_HAS_PROTOCOL_GLUE with
+// xdg-shell and the other protocols of protocols/manifest.toml); without the glue every
+// create/connect returns not_implemented.
 
 export module lx.wayland.client;
 

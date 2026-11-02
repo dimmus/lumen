@@ -22,11 +22,9 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-output-unstable-v1-server-protocol.h"
-#endif
 #endif
 
 module lx.compositor;
@@ -44,9 +42,8 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -102,7 +99,7 @@ template <class T> void list_unlink(T*& head, T* n) {
 }
 
 lx::compositor::output_manager* outputs() {
-    return g_p0_ctx ? g_p0_ctx->outputs : nullptr;
+    return g_ctx ? g_ctx->outputs : nullptr;
 }
 
 /// One wl_output global per live output (by slot), and what its objects were last told.
@@ -268,10 +265,10 @@ void cursor_surface_changed(void*, lx::surface_id old_surface, lx::surface_id ne
     if (surface_obj* s = surface_by_id(old_surface))
         update_membership(s, 0, -1);
     surface_obj* s = surface_by_id(new_surface);
-    if (!s || !g_p0_ctx || !g_p0_ctx->seat)
+    if (!s || !g_ctx || !g_ctx->seat)
         return;
-    const lx::rect2i at{static_cast<int>(std::floor(g_p0_ctx->seat->pointer_x())),
-                        static_cast<int>(std::floor(g_p0_ctx->seat->pointer_y())), 1, 1};
+    const lx::rect2i at{static_cast<int>(std::floor(g_ctx->seat->pointer_x())),
+                        static_cast<int>(std::floor(g_ctx->seat->pointer_y())), 1, 1};
     membership_from_rect(s, at);
 }
 
@@ -376,8 +373,8 @@ std::uint32_t expected_scale_120(const surface_obj* s) {
         return lx::compositor::preferred_scale_120(*om, s->outputs,
                                                    s->role != surface_role::cursor);
     // A subsurface shows where its parent does.
-    if (s && g_p0_ctx && g_p0_ctx->tree) {
-        const surface_obj* p = surface_by_id(g_p0_ctx->tree->parent_of(s->id));
+    if (s && g_ctx && g_ctx->tree) {
+        const surface_obj* p = surface_by_id(g_ctx->tree->parent_of(s->id));
         if (p && p->outputs)
             return lx::compositor::preferred_scale_120(*om, p->outputs);
     }
@@ -385,16 +382,16 @@ std::uint32_t expected_scale_120(const surface_obj* s) {
     // parent's, else the one under the pointer), a layer surface's own output, anything else
     // the output under the pointer (ADR 008 §A.11).
     int slot = -1;
-    if (s && g_p0_ctx) {
-        if (g_p0_ctx->toplevels && g_p0_ctx->wm) {
-            if (const auto* rec = g_p0_ctx->toplevels->find_by_surface(s->id))
-                slot = g_p0_ctx->wm->window_output(*rec);
+    if (s && g_ctx) {
+        if (g_ctx->toplevels && g_ctx->wm) {
+            if (const auto* rec = g_ctx->toplevels->find_by_surface(s->id))
+                slot = g_ctx->wm->window_output(*rec);
         }
-        if (slot < 0 && g_p0_ctx->layers)
-            slot = g_p0_ctx->layers->output_of(s->id);
+        if (slot < 0 && g_ctx->layers)
+            slot = g_ctx->layers->output_of(s->id);
     }
-    if (slot < 0 && g_p0_ctx && g_p0_ctx->seat)
-        slot = lx::compositor::output_at(*om, g_p0_ctx->seat->pointer_x(), g_p0_ctx->seat->pointer_y());
+    if (slot < 0 && g_ctx && g_ctx->seat)
+        slot = lx::compositor::output_at(*om, g_ctx->seat->pointer_x(), g_ctx->seat->pointer_y());
     if (slot < 0 && om->count() > 0)
         slot = om->slot_of(om->nth(0));
     return slot >= 0 ? lx::compositor::preferred_scale_120(*om, 1u << static_cast<unsigned>(slot))
@@ -417,7 +414,7 @@ int output_resource_slot(wl_resource* output) {
 /// removed (or its output is gone): the object is then inert — implementation set, no
 /// record, no events; `release` works (wlroots' `output_bind` on a destroyed output).
 void bind_output_ex(wayland::client_connection& client, unsigned id, int version, void* user) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wl_output_interface, version, id);
     if (!res)
@@ -471,12 +468,12 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
 
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 void bind_xdg_output_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zxdg_output_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&xdg_output_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&xdg_output_manager_impl, g_ctx, nullptr);
 }
 #endif
 
@@ -511,7 +508,7 @@ void make_inert(unsigned slot, lx::output_id id) {
 /// Returns true when a global came or went.
 bool sync_globals() {
     auto* om = outputs();
-    if (!om || !g_p0_ctx || !g_p0_ctx->server)
+    if (!om || !g_ctx || !g_ctx->server)
         return false;
     bool changed = false;
     const unsigned long long now = monotonic_now_ns();
@@ -519,7 +516,7 @@ bool sync_globals() {
         output_global& g = g_globals[slot];
         const bool live = om->slot_live(slot);
         if (g.live && (!live || om->slot_state(slot).id != g.id)) {
-            g_p0_ctx->server->remove_global(g.handle, now);
+            g_ctx->server->remove_global(g.handle, now);
             make_inert(slot, g.id);
             if (log_output.enabled(lx::trace::level::debug)) {
                 log_output.debug("output global remove output={}", slot);
@@ -532,7 +529,7 @@ bool sync_globals() {
             g.id = om->slot_state(slot).id;
             g.sent = om->slot_state(slot);
             g.live = true;
-            g.handle = g_p0_ctx->server->add_global_ex({.interface_name = "wl_output",
+            g.handle = g_ctx->server->add_global_ex({.interface_name = "wl_output",
                                                         .version = 4,
                                                         .privileged = false,
                                                         .interface_desc = &wl_output_interface},
@@ -557,15 +554,15 @@ bool sync_globals() {
 
 void outputs_changed() {
     auto* om = outputs();
-    if (!om || !g_p0_ctx)
+    if (!om || !g_ctx)
         return;
     // 1. Membership first, from where each node is now: a surface leaving an output that went
     //    is told on the wl_output objects that still stand for it. Cursor surfaces have no
     //    node; theirs follows the pointer (the cursor hook).
     for (auto& s : surfaces) {
-        if (!s.used || !s.resource || !g_p0_ctx->tree || s.role == surface_role::cursor)
+        if (!s.used || !s.resource || !g_ctx->tree || s.role == surface_role::cursor)
             continue;
-        membership_from_rect(&s, g_p0_ctx->tree->node_rect(s.id));
+        membership_from_rect(&s, g_ctx->tree->node_rect(s.id));
     }
     // 2. Globals: a gone output's removed (its objects inert), a new output's created.
     (void)sync_globals();
@@ -601,7 +598,7 @@ void outputs_changed() {
 
 } // namespace
 
-void install_outputs(p0_protocol_context& ctx) {
+void install_outputs(protocol_context& ctx) {
     if (ctx.tree)
         ctx.tree->set_rect_hook(&output_node_rect, &ctx);
     if (ctx.cursor)
@@ -610,15 +607,10 @@ void install_outputs(p0_protocol_context& ctx) {
     (void)sync_globals();
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::notify_outputs_changed(p0_protocol_context& ctx) {
-#if defined(LUMEN_HAS_WAYLAND)
+void lx::compositor::notify_outputs_changed(protocol_context& ctx) {
     (void)ctx;
-    p0::outputs_changed();
-#else
-    (void)ctx;
-#endif
+    wire::outputs_changed();
 }

@@ -27,12 +27,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
 #include "wlr-output-power-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_POWER 1
-#endif
 #endif
 
 module lx.compositor;
@@ -51,9 +49,8 @@ constexpr lx::trace::category log_power{"compositor.power"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -106,11 +103,11 @@ void power_destroy_resource(wl_resource* r) {
 }
 
 [[nodiscard]] bool slot_live(unsigned slot) {
-    return g_p0_ctx && g_p0_ctx->outputs && g_p0_ctx->outputs->slot_live(slot);
+    return g_ctx && g_ctx->outputs && g_ctx->outputs->slot_live(slot);
 }
 
 [[nodiscard]] bool power_available() {
-    return g_p0_ctx && g_p0_ctx->set_output_power && g_p0_ctx->output_power_on;
+    return g_ctx && g_ctx->set_output_power && g_ctx->output_power_on;
 }
 
 void set_mode(struct wl_client*, struct wl_resource* r, uint32_t mode) {
@@ -131,7 +128,7 @@ void set_mode(struct wl_client*, struct wl_resource* r, uint32_t mode) {
         log_power.debug("set_mode output={} mode={} client_object={}", slot,
                         mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ? "on" : "off", wl_resource_get_id(r));
     }
-    g_p0_ctx->set_output_power(g_p0_ctx->idle_user, static_cast<unsigned>(slot),
+    g_ctx->set_output_power(g_ctx->idle_user, static_cast<unsigned>(slot),
                                mode == ZWLR_OUTPUT_POWER_V1_MODE_ON);
 }
 
@@ -168,7 +165,7 @@ void get_output_power(struct wl_client* client, struct wl_resource* manager, uin
         return;
     }
     o->live = true;
-    zwlr_output_power_v1_send_mode(r, g_p0_ctx->output_power_on(g_p0_ctx->idle_user,
+    zwlr_output_power_v1_send_mode(r, g_ctx->output_power_on(g_ctx->idle_user,
                                                                  static_cast<unsigned>(slot))
                                           ? ZWLR_OUTPUT_POWER_V1_MODE_ON
                                           : ZWLR_OUTPUT_POWER_V1_MODE_OFF);
@@ -186,13 +183,13 @@ const struct zwlr_output_power_manager_v1_interface power_manager_impl = {
 
 #if defined(LUMEN_HAS_OUTPUT_POWER)
 void bind_output_power_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &zwlr_output_power_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&power_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&power_manager_impl, g_ctx, nullptr);
 }
 #endif
 
@@ -204,15 +201,14 @@ void output_power_outputs_changed() {
 #endif
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::notify_output_power(p0_protocol_context& ctx, unsigned slot, bool on) {
+void lx::compositor::notify_output_power(protocol_context& ctx, unsigned slot, bool on) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_OUTPUT_POWER)
-    for (p0::power_obj* o = p0::g_power_objects; o; o = o->next) {
-        if (!o->live || p0::client_dying(wl_resource_get_client(o->resource)))
+#if defined(LUMEN_HAS_OUTPUT_POWER)
+    for (wire::power_obj* o = wire::g_power_objects; o; o = o->next) {
+        if (!o->live || wire::client_dying(wl_resource_get_client(o->resource)))
             continue;
         if (o->slot != slot)
             continue;

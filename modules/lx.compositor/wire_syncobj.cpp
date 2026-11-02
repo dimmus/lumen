@@ -4,7 +4,7 @@ module;
 // S1–S4). A client imports DRM timeline syncobjs and, with every buffer it attaches, sets an
 // acquire point (the compositor must not sample before it signals) and a release point (the
 // compositor signals it when done with the buffer).
-//   - Offered only where it works end to end (`p0_protocol_context::syncobj_supported`:
+//   - Offered only where it works end to end (`protocol_context::syncobj_supported`:
 //     timeline syncobjs, DRM_IOCTL_SYNCOBJ_EVENTFD, and a backend whose composite exports a
 //     completion fence) — wlroots and Mutter hide it otherwise, and so does this host
 //     (vmwgfx has no syncobjs).
@@ -35,12 +35,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1)
 #include "linux-drm-syncobj-v1-server-protocol.h"
 #define LUMEN_HAS_SYNCOBJ 1
-#endif
 #endif
 
 #include <unistd.h>
@@ -57,9 +55,8 @@ import lx.trace;
 import :surface;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -69,8 +66,8 @@ lx::gfx::drm_timeline_table g_timelines{};
 unsigned g_syncobj_surfaces = 0;
 
 void note_syncobj_surfaces() {
-    if (g_p0_ctx && g_p0_ctx->release_fences)
-        g_p0_ctx->release_fences->set_wanted(g_syncobj_surfaces > 0);
+    if (g_ctx && g_ctx->release_fences)
+        g_ctx->release_fences->set_wanted(g_syncobj_surfaces > 0);
 }
 
 void log_timeline_error(const lx::error& err) {
@@ -109,7 +106,7 @@ void sync_point_signal_after_composite(sync_point& p) {
     if (!p.timeline)
         return;
     const int fence =
-        g_p0_ctx && g_p0_ctx->release_fences ? g_p0_ctx->release_fences->dup() : -1;
+        g_ctx && g_ctx->release_fences ? g_ctx->release_fences->dup() : -1;
     if (auto r = g_timelines.signal_after(p.timeline, p.point, fence); !r)
         log_timeline_error(r.get_error());
     if (fence >= 0)
@@ -250,14 +247,14 @@ const struct wp_linux_drm_syncobj_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_syncobj_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     if (!g_timelines.bound())
-        g_timelines.bind(lx::gfx::drm_timeline_ops_for(g_p0_ctx->syncobj_drm_fd));
+        g_timelines.bind(lx::gfx::drm_timeline_ops_for(g_ctx->syncobj_drm_fd));
     auto res =
         wayland::resource::create(client, &wp_linux_drm_syncobj_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 bool syncobj_precheck(surface_obj* s) {
@@ -308,6 +305,5 @@ bool syncobj_precheck(surface_obj*) { return true; }
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

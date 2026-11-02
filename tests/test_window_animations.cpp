@@ -28,12 +28,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-client-protocol.h"
 #define LUMEN_TEST_WM_ANIM 1
-#endif
 #endif
 #include <stdint.h>
 

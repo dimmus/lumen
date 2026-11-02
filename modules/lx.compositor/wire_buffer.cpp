@@ -11,9 +11,7 @@ module;
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 module lx.compositor;
 
@@ -30,9 +28,8 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -66,7 +63,7 @@ constexpr unsigned k_max_texture_holds = 128;
 texture_hold g_texture_holds[k_max_texture_holds]{};
 /// Entries of `g_texture_holds` in use: none (always, with animations off) costs one test.
 unsigned g_texture_hold_count = 0;
-/// Retirements held back until the next tick (`p0_protocol_context::defer_retire`).
+/// Retirements held back until the next tick (`protocol_context::defer_retire`).
 constexpr unsigned k_max_deferred_retires = 64;
 unsigned g_deferred_retires[k_max_deferred_retires]{};
 unsigned g_deferred_count = 0;
@@ -82,7 +79,7 @@ void retire_texture_now(unsigned texture_id);
 /// one frame conservative costs a frame of texture memory; being one frame early drops a
 /// texture out from under a draw.
 void retire_texture(unsigned texture_id) {
-    if (!g_p0_ctx || !g_p0_ctx->textures || texture_id == 0)
+    if (!g_ctx || !g_ctx->textures || texture_id == 0)
         return;
     // A ghost holds it: retired when the ghost lets go.
     if (g_texture_hold_count > 0)
@@ -91,7 +88,7 @@ void retire_texture(unsigned texture_id) {
                 h.retire = true;
                 return;
             }
-    if (g_p0_ctx->defer_retire && g_deferred_count < k_max_deferred_retires) {
+    if (g_ctx->defer_retire && g_deferred_count < k_max_deferred_retires) {
         g_deferred_retires[g_deferred_count++] = texture_id;
         return;
     }
@@ -156,20 +153,20 @@ void flush_deferred_retires() {
 namespace {
 
 void retire_texture_now(unsigned texture_id) {
-    if (!g_p0_ctx || !g_p0_ctx->textures || texture_id == 0)
+    if (!g_ctx || !g_ctx->textures || texture_id == 0)
         return;
     texture_update forget{};
     forget.kind = texture_update::op::forget;
     forget.texture_id = texture_id;
-    forget.retire_after_frame = g_p0_ctx->frame_index + 1;
-    forget.visible_from_frame = g_p0_ctx->building_frame;
-    (void)g_p0_ctx->textures->try_push(forget);
+    forget.retire_after_frame = g_ctx->frame_index + 1;
+    forget.visible_from_frame = g_ctx->building_frame;
+    (void)g_ctx->textures->try_push(forget);
     // The CPU store keeps a texture's pixels for its lifetime; once the render thread has
     // applied this forget and let go of the slots, `collect` frees them.
-    if (g_p0_ctx->shm_store)
-        g_p0_ctx->shm_store->retire(texture_id);
-    if (g_p0_ctx->headless)
-        g_p0_ctx->headless->forget_texture(texture_id);
+    if (g_ctx->shm_store)
+        g_ctx->shm_store->retire(texture_id);
+    if (g_ctx->headless)
+        g_ctx->headless->forget_texture(texture_id);
 }
 
 } // namespace
@@ -204,13 +201,13 @@ void destroy_buffer(buffer_obj* b) {
     // frame after that skipped the draw. The retirement belongs where the surface stops
     // referencing the content — a new commit, or the surface being destroyed.
     const unsigned texture_id =
-        g_p0_ctx && g_p0_ctx->surfaces ? g_p0_ctx->surfaces->texture_for(b->id) : 0;
+        g_ctx && g_ctx->surfaces ? g_ctx->surfaces->texture_for(b->id) : 0;
     if (texture_id != 0 && !buffer_is_displayed(b->resource))
         retire_texture(texture_id);
     // The surface manager's record goes with the object (it owns duplicated plane fds);
     // a surface still showing the content keeps the texture id itself.
-    if (g_p0_ctx && g_p0_ctx->surfaces)
-        g_p0_ctx->surfaces->forget_buffer(b->id);
+    if (g_ctx && g_ctx->surfaces)
+        g_ctx->surfaces->forget_buffer(b->id);
 
     b->dmabuf = {};
     *b = {};
@@ -234,7 +231,7 @@ lx::fourcc shm_format_to_fourcc(uint32_t shm_format) {
 lx::fourcc staged_shm_format(wl_shm_buffer* shm) {
     if (!shm)
         return static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
-    if (g_p0_ctx && g_p0_ctx->shm_native_format)
+    if (g_ctx && g_ctx->shm_native_format)
         return shm_format_to_fourcc(wl_shm_buffer_get_format(shm));
     return static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
 }
@@ -291,24 +288,24 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     lx::trace::scoped_span span{"wayland", "shm.stage"};
     token_out = 0;
     pool_token_out = 0;
-    if (!buf || !shm || !g_p0_ctx)
+    if (!buf || !shm || !g_ctx)
         return nullptr;
 
     const int stride = wl_shm_buffer_get_stride(shm);
     const uint32_t fmt = wl_shm_buffer_get_format(shm);
     if (buf->width == 0 || buf->height == 0 || stride <= 0)
         return nullptr;
-    const bool native = g_p0_ctx->shm_native_format;
+    const bool native = g_ctx->shm_native_format;
     const lx::rect2i full{0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
 
-    if (g_p0_ctx->shm_store) {
+    if (g_ctx->shm_store) {
         // The CPU compositor samples the store's slot as the texture itself, so the slot
         // always holds a whole image; only the rects that changed since the content it
         // already has are rewritten. A typing terminal rewrites a line, not the window.
         const unsigned dst_stride = buf->width * 4u;
         shm_pixel_store::stamp held{};
         const shm_pixel_store::stamp now{surface, history ? history->seq : 0};
-        unsigned char* image = g_p0_ctx->shm_store->acquire(texture_id, dst_stride * buf->height,
+        unsigned char* image = g_ctx->shm_store->acquire(texture_id, dst_stride * buf->height,
                                                             token_out, now, &held);
         if (!image)
             return nullptr;
@@ -332,7 +329,7 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
 
     // The transient pool carries just the region, packed at its own width, where the
     // backend uploads regions (GL); the Vulkan upload takes whole images.
-    const bool whole = region.width <= 0 || region.height <= 0 || !g_p0_ctx->shm_regions ||
+    const bool whole = region.width <= 0 || region.height <= 0 || !g_ctx->shm_regions ||
                        (region.x == 0 && region.y == 0 &&
                         static_cast<unsigned>(region.width) == buf->width &&
                         static_cast<unsigned>(region.height) == buf->height);
@@ -341,8 +338,8 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     const unsigned dst_stride = static_cast<unsigned>(region.width) * 4u;
     const unsigned bytes = dst_stride * static_cast<unsigned>(region.height);
     unsigned char* out = nullptr;
-    if (g_p0_ctx->shm_pool)
-        out = g_p0_ctx->shm_pool->acquire(bytes, pool_token_out, g_p0_ctx->now_ns);
+    if (g_ctx->shm_pool)
+        out = g_ctx->shm_pool->acquire(bytes, pool_token_out, g_ctx->now_ns);
     if (!out)
         return nullptr;
     wl_shm_buffer_begin_access(shm);
@@ -354,7 +351,7 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
 
 unsigned direct_shm_upload(wl_resource* buffer, wl_shm_buffer* shm, buffer_obj* buf,
                            lx::rect2i region, const unsigned char*& pixels, unsigned& stride) {
-    if (!g_p0_ctx || !g_p0_ctx->shm_direct || !g_p0_ctx->textures || !buffer || !shm || !buf)
+    if (!g_ctx || !g_ctx->shm_direct || !g_ctx->textures || !buffer || !shm || !buf)
         return 0;
     const uint32_t fmt = wl_shm_buffer_get_format(shm);
     const int client_stride = wl_shm_buffer_get_stride(shm);
@@ -369,7 +366,7 @@ unsigned direct_shm_upload(wl_resource* buffer, wl_shm_buffer* shm, buffer_obj* 
     const auto* first = base + static_cast<size_t>(region.y) * static_cast<unsigned>(client_stride) +
                         static_cast<size_t>(region.x) * 4u;
     wl_shm_pool* pool = wl_shm_buffer_ref_pool(shm);
-    const unsigned handle = g_p0_ctx->shm_direct->add(buffer, shm, pool, first,
+    const unsigned handle = g_ctx->shm_direct->add(buffer, shm, pool, first,
                                                       static_cast<unsigned>(client_stride), region);
     if (!handle) {
         wl_shm_pool_unref(pool);
@@ -380,7 +377,7 @@ unsigned direct_shm_upload(wl_resource* buffer, wl_shm_buffer* shm, buffer_obj* 
     return handle;
 }
 
-void bind_shm_direct(p0_protocol_context& ctx) {
+void bind_shm_direct(protocol_context& ctx) {
     if (!ctx.shm_direct)
         return;
     shm_direct_uploads::hooks h{};
@@ -408,12 +405,12 @@ void buffer_gone(struct wl_resource* resource, buffer_obj* b) {
     // still owed goes with it (signalled after the last composite that read the buffer), so
     // the client cannot recycle the memory while the GPU reads it.
     bool adopted = false;
-    if (g_p0_ctx && g_p0_ctx->lifecycle)
-        adopted = g_p0_ctx->lifecycle->on_buffer_destroyed(
+    if (g_ctx && g_ctx->lifecycle)
+        adopted = g_ctx->lifecycle->on_buffer_destroyed(
             resource, b ? b->release.timeline : 0u, b ? b->release.point : 0ull);
     // Likewise an upload still to read it: it keeps a copy, made now while it is readable.
-    if (g_p0_ctx && g_p0_ctx->shm_direct)
-        g_p0_ctx->shm_direct->on_buffer_gone(resource);
+    if (g_ctx && g_ctx->shm_direct)
+        g_ctx->shm_direct->on_buffer_gone(resource);
     // Explicit sync: a release point no lifecycle record took (the buffer was never
     // sampled, or already released) is signalled now.
     if (b) {
@@ -517,7 +514,7 @@ buffer_obj* track_shm_buffer(wl_resource* res, wl_shm_buffer* shm) {
 /// order the active backend samples (native for CPU, RGBA otherwise).
 bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned width,
                  unsigned height, unsigned stride_px, unsigned canvas_w, unsigned canvas_h) {
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (!ctx || !ctx->textures || !argb || canvas_w == 0 || canvas_h == 0)
         return false;
     const unsigned bytes = canvas_w * canvas_h * 4u;
@@ -573,6 +570,5 @@ void buffer_release_now(wl_resource* buffer) {
     wl_buffer_send_release(buffer);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

@@ -16,12 +16,10 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1)
 #include "xdg-system-bell-v1-server-protocol.h"
 #define LUMEN_HAS_SYSTEM_BELL 1
-#endif
 #endif
 
 module lx.compositor;
@@ -44,9 +42,9 @@ constexpr lx::trace::category log_bell{"compositor.bell"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_SYSTEM_BELL)
+#if defined(LUMEN_HAS_SYSTEM_BELL)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -106,31 +104,31 @@ bool take_token(unsigned client, unsigned long long now) {
 /// window; null for a layer surface, a cursor, a lock surface or no surface at all.
 const lx::compositor::toplevel_record* bell_window(wl_resource* surface_res) {
     surface_obj* s = surface_from(surface_res);
-    if (!s || !g_p0_ctx->toplevels)
+    if (!s || !g_ctx->toplevels)
         return nullptr;
-    lx::surface_id root = g_p0_ctx->tree ? g_p0_ctx->tree->root_of(s->id) : s->id;
+    lx::surface_id root = g_ctx->tree ? g_ctx->tree->root_of(s->id) : s->id;
     if (!root)
         root = s->id;
-    if (const auto* rec = g_p0_ctx->toplevels->find_by_surface(root))
+    if (const auto* rec = g_ctx->toplevels->find_by_surface(root))
         return rec;
-    if (g_p0_ctx->popups)
-        if (const auto* p = g_p0_ctx->popups->find(root); p && p->owner)
-            return g_p0_ctx->toplevels->find(p->owner);
+    if (g_ctx->popups)
+        if (const auto* p = g_ctx->popups->find(root); p && p->owner)
+            return g_ctx->toplevels->find(p->owner);
     return nullptr;
 }
 
 void bell_ring(struct wl_client* client, struct wl_resource*, struct wl_resource* surface_res) {
-    if (!g_p0_ctx || !g_p0_ctx->shell)
+    if (!g_ctx || !g_ctx->shell)
         return;
     const unsigned cid = wire_client_id(client);
     const char* result = "sent";
     const lx::compositor::toplevel_record* rec = bell_window(surface_res);
-    if (g_p0_ctx->lock && g_p0_ctx->lock->state() != lx::compositor::lock_state::unlocked)
+    if (g_ctx->lock && g_ctx->lock->state() != lx::compositor::lock_state::unlocked)
         result = "locked";
     else if (!take_token(cid, now_ns()))
         result = "rate-limited";
     else
-        g_p0_ctx->shell->emit_bell(rec && rec->mapped ? rec : nullptr);
+        g_ctx->shell->emit_bell(rec && rec->mapped ? rec : nullptr);
     // One line per ring at debug; a client that hits the limit is noted once at info.
     if (log_bell.enabled(lx::trace::level::debug)) {
         log_bell.debug("bell client={} toplevel={} result={}", cid, rec ? rec->id.id() : 0ull,
@@ -149,13 +147,13 @@ const struct xdg_system_bell_v1_interface bell_impl = {
 } // namespace
 
 void bind_system_bell(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &xdg_system_bell_v1_interface, version, id);
     if (res)
-        res.set_implementation(&bell_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&bell_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND && LUMEN_HAS_SYSTEM_BELL
+#endif // LUMEN_HAS_SYSTEM_BELL

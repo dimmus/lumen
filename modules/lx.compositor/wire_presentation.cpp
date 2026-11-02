@@ -28,12 +28,10 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
 #include "presentation-time-server-protocol.h"
 #define LUMEN_HAS_PRESENTATION 1
-#endif
 #endif
 
 module lx.compositor;
@@ -54,14 +52,13 @@ constexpr lx::trace::category log_presentation{"compositor.presentation"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
 lx::compositor::presentation_feedback_table* table() {
-    return g_p0_ctx ? g_p0_ctx->presentation : nullptr;
+    return g_ctx ? g_ctx->presentation : nullptr;
 }
 
 [[nodiscard]] unsigned long long monotonic_ns() {
@@ -187,12 +184,12 @@ const struct wp_presentation_interface presentation_impl = {
 #if defined(LUMEN_HAS_PRESENTATION)
 
 void bind_presentation(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_presentation_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&presentation_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&presentation_impl, g_ctx, nullptr);
     if (auto* native = static_cast<wl_resource*>(res.native()))
         wp_presentation_send_clock_id(native, CLOCK_MONOTONIC);
 }
@@ -200,8 +197,8 @@ void bind_presentation(wayland::client_connection& client, unsigned id, int vers
 #endif
 
 void presentation_apply(surface_obj* s) {
-    if (auto* t = table(); t && g_p0_ctx)
-        t->on_apply(s->id, s->cached.feedback, g_p0_ctx->building_frame, sink());
+    if (auto* t = table(); t && g_ctx)
+        t->on_apply(s->id, s->cached.feedback, g_ctx->building_frame, sink());
 }
 
 void presentation_surface_destroyed(surface_obj* s) {
@@ -234,77 +231,53 @@ void presentation_drop_list(unsigned& list) {
         t->discard_list(list, sink());
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::presentation_published(p0_protocol_context& ctx, unsigned frame,
+void lx::compositor::presentation_published(protocol_context& ctx, unsigned frame,
                                             unsigned slot) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!ctx.presentation)
         return;
     ctx.presentation->on_publish(
         frame, slot,
         [](void*, lx::surface_id surface, unsigned f, unsigned output) {
-            return p0::surface_visible(surface, f, output);
+            return wire::surface_visible(surface, f, output);
         },
-        [](void*, lx::surface_id surface) { return p0::surface_pace_output(surface); }, nullptr);
-#else
-    (void)ctx;
-    (void)frame;
-    (void)slot;
-#endif
+        [](void*, lx::surface_id surface) { return wire::surface_pace_output(surface); }, nullptr);
 }
 
-void lx::compositor::presentation_flipped(p0_protocol_context& ctx, unsigned frame, unsigned slot,
+void lx::compositor::presentation_flipped(protocol_context& ctx, unsigned frame, unsigned slot,
                                           const present_info& info) {
-#if defined(LUMEN_HAS_WAYLAND)
     if (!ctx.presentation)
         return;
-    p0::g_flip_output = static_cast<int>(slot);
-    ctx.presentation->on_flip(frame, slot, info, p0::sink());
-    p0::g_flip_output = -1;
-    if (p0::g_counts.presented + p0::g_counts.discarded == 0)
+    wire::g_flip_output = static_cast<int>(slot);
+    ctx.presentation->on_flip(frame, slot, info, wire::sink());
+    wire::g_flip_output = -1;
+    if (wire::g_counts.presented + wire::g_counts.discarded == 0)
         return;
     if (log_presentation.enabled(lx::trace::level::debug)) {
         log_presentation.debug("flip frame={} t={}.{:09} seq={} refresh_ns={} "
                                "flags=0x{:x} presented={} discarded={} output={}",
                                frame, info.timestamp_ns / 1'000'000'000ull,
                                info.timestamp_ns % 1'000'000'000ull, info.seq, info.refresh_ns,
-                               info.flags, p0::g_counts.presented, p0::g_counts.discarded, slot);
+                               info.flags, wire::g_counts.presented, wire::g_counts.discarded, slot);
     }
-    p0::g_counts = {};
-#else
-    (void)ctx;
-    (void)frame;
-    (void)slot;
-    (void)info;
-#endif
+    wire::g_counts = {};
 }
 
-void lx::compositor::presentation_discard_output(p0_protocol_context& ctx, unsigned slot) {
-#if defined(LUMEN_HAS_WAYLAND)
+void lx::compositor::presentation_discard_output(protocol_context& ctx, unsigned slot) {
     if (!ctx.presentation)
         return;
     ctx.presentation->discard_output(
-        slot, [](void*, lx::surface_id surface) { return p0::surface_pace_output(surface); },
-        nullptr, p0::sink());
-#else
-    (void)ctx;
-    (void)slot;
-#endif
+        slot, [](void*, lx::surface_id surface) { return wire::surface_pace_output(surface); },
+        nullptr, wire::sink());
 }
 
-void lx::compositor::presentation_discard(p0_protocol_context& ctx, bool queued_only) {
-#if defined(LUMEN_HAS_WAYLAND)
+void lx::compositor::presentation_discard(protocol_context& ctx, bool queued_only) {
     if (!ctx.presentation)
         return;
     if (queued_only)
-        ctx.presentation->discard_queued(p0::sink());
+        ctx.presentation->discard_queued(wire::sink());
     else
-        ctx.presentation->discard_unpresented(p0::sink());
-#else
-    (void)ctx;
-    (void)queued_only;
-#endif
+        ctx.presentation->discard_unpresented(wire::sink());
 }

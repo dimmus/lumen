@@ -15,9 +15,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server-core.h>
-#endif
 
 #include "lumen_test.hpp"
 
@@ -168,7 +166,6 @@ LUMEN_TEST(exited_peer_pidfd_is_not_alive) {
     ::close(child.conn);
 }
 
-#if defined(LUMEN_HAS_WAYLAND)
 LUMEN_TEST(privileged_check_confirms_through_pidfd) {
     lx::wayland::server srv;
     LUMEN_CHECK(srv.bind_socketless().has_value());
@@ -294,6 +291,5 @@ LUMEN_TEST(peer_whose_leader_exited_is_sandboxed_and_denied) {
     child.release();
     wl_client_destroy(client);
 }
-#endif
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

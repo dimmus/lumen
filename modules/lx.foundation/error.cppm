@@ -6,7 +6,7 @@ export import :result;
 
 export namespace lx {
 
-/// Domain-specific error codes (extend per subsystem during P0).
+/// Domain-specific error codes, extended per subsystem.
 enum class io_err : int {
     none = 0,
     not_found = 1,

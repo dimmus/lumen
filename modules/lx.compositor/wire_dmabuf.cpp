@@ -9,14 +9,12 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_DRM)
 #include <drm_fourcc.h>
 #endif
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "linux-dmabuf-v1-server-protocol.h"
-#endif
 #endif
 
 #include <fcntl.h>
@@ -43,10 +41,9 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -215,7 +212,7 @@ void create_dmabuf_feedback(struct wl_client* client, struct wl_resource* resour
         zwp_linux_dmabuf_feedback_v1_send_format_table(res, table, sizeof(k_dmabuf_formats));
 
     // Arrays over stack storage, never released (wl_array_add would allocate).
-    uint64_t device = g_p0_ctx ? g_p0_ctx->dmabuf_main_device : 0;
+    uint64_t device = g_ctx ? g_ctx->dmabuf_main_device : 0;
     wl_array dev{};
     dev.data = &device;
     dev.size = sizeof(device);
@@ -243,7 +240,7 @@ const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
     .create_params =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
-            auto* ctx = static_cast<p0_protocol_context*>(wl_resource_get_user_data(resource));
+            auto* ctx = static_cast<protocol_context*>(wl_resource_get_user_data(resource));
             dmabuf_params_obj* p = nullptr;
             for (auto& slot : dmabuf_params)
                 if (!slot.used) {
@@ -280,12 +277,12 @@ const struct zwp_linux_dmabuf_v1_interface dmabuf_impl = {
 } // namespace
 
 void bind_linux_dmabuf(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_linux_dmabuf_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&dmabuf_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&dmabuf_impl, g_ctx, nullptr);
     auto* native = static_cast<wl_resource*>(res.native());
     if (!native)
         return;
@@ -303,7 +300,6 @@ void bind_linux_dmabuf(wayland::client_connection& client, unsigned id, int vers
     }
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_PROTOCOL_GLUE
-#endif // LUMEN_HAS_WAYLAND

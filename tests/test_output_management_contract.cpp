@@ -22,14 +22,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-output-unstable-v1-client-protocol.h"
 #if defined(LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1)
 #include "wlr-output-management-unstable-v1-client-protocol.h"
 #define LUMEN_HAS_OUTPUT_MANAGEMENT 1
-#endif
 #endif
 #endif
 #include <errno.h>
@@ -45,7 +43,7 @@ import lx.input;
 import lx.drm;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_WAYLAND) || !defined(LUMEN_HAS_PROTOCOL_GLUE) || \
+#if !defined(LUMEN_HAS_PROTOCOL_GLUE) || \
     !defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
 
 int main() {

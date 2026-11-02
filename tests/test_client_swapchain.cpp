@@ -33,7 +33,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) &&                          \
+#if defined(LUMEN_HAS_PROTOCOL_GLUE) &&                          \
     defined(LUMEN_PROTOCOL_XDG_SHELL) && defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1) && \
     defined(LUMEN_PROTOCOL_EXT_IMAGE_COPY_CAPTURE_V1)
 #include <wayland-client.h>

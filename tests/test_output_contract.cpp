@@ -18,12 +18,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
-#endif
 #endif
 #include <stdint.h>
 
@@ -33,7 +31,7 @@ import lx.runtime;
 import lx.scheduler;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_WAYLAND) || !defined(LUMEN_HAS_PROTOCOL_GLUE)
+#if !defined(LUMEN_HAS_PROTOCOL_GLUE)
 
 int main() {
     std::printf("SKIP: needs libwayland and the generated protocol glue\n");

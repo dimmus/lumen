@@ -15,12 +15,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
 #include "xdg-activation-v1-server-protocol.h"
 #define LUMEN_HAS_XDG_ACTIVATION 1
-#endif
 #endif
 
 module lx.compositor;
@@ -37,12 +35,11 @@ import :toplevel;
 import :activation;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 unsigned wm_last_user_serial(void* user, void* surface) {
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (!ctx || !ctx->input || !surface)
         return 0;
     return ctx->input->serials().last_user_serial(
@@ -50,8 +47,8 @@ unsigned wm_last_user_serial(void* user, void* surface) {
 }
 
 void activation_surface_destroyed(lx::surface_id surface) {
-    if (g_p0_ctx && g_p0_ctx->activation)
-        g_p0_ctx->activation->forget_surface(surface);
+    if (g_ctx && g_ctx->activation)
+        g_ctx->activation->forget_surface(surface);
 }
 
 #if defined(LUMEN_HAS_XDG_ACTIVATION)
@@ -88,7 +85,7 @@ void log_prefix(const char* token, char (&out)[9]) {
 /// per launch or activation, never per frame.
 struct token_builder {
     wl_resource* resource = nullptr;
-    p0_protocol_context* ctx = nullptr;
+    protocol_context* ctx = nullptr;
     lx::client_id client{};
     unsigned serial = 0;
     bool has_serial = false;
@@ -138,7 +135,7 @@ void token_commit(wl_client* client, wl_resource* resource) {
         return;
     }
     b->committed = true;
-    p0_protocol_context* ctx = b->ctx;
+    protocol_context* ctx = b->ctx;
     const lx::runtime::clock_time now = steady_ns();
     activation_token* t = ctx && ctx->activation
                               ? ctx->activation->create(now, k_activation_lifetime_ns)
@@ -207,14 +204,14 @@ void activation_get_token(wl_client* client, wl_resource* resource, uint32_t id)
         return;
     }
     b->resource = res;
-    b->ctx = g_p0_ctx;
+    b->ctx = g_ctx;
     b->client = lx::client_id{wire_client_id(client)};
     wl_resource_set_implementation(res, &token_impl, b, token_destroy_resource);
 }
 
 /// The toplevel a surface activates: its own, or its root's for a subsurface. Popups, layer
 /// and cursor surfaces, and surfaces with no role, have none.
-lx::toplevel_id toplevel_for(p0_protocol_context* ctx, surface_obj* s) {
+lx::toplevel_id toplevel_for(protocol_context* ctx, surface_obj* s) {
     if (!s)
         return {};
     surface_obj* root = s;
@@ -224,7 +221,7 @@ lx::toplevel_id toplevel_for(p0_protocol_context* ctx, surface_obj* s) {
 }
 
 void activation_activate(wl_client*, wl_resource*, const char* token, wl_resource* surface) {
-    p0_protocol_context* ctx = g_p0_ctx;
+    protocol_context* ctx = g_ctx;
     if (!ctx)
         return;
     const lx::runtime::clock_time now = steady_ns();
@@ -267,6 +264,5 @@ void bind_activation(wayland::client_connection& client, unsigned id, int versio
 
 #endif // LUMEN_HAS_XDG_ACTIVATION
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

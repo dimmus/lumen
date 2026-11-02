@@ -515,7 +515,7 @@ two strips as well.
 ### Texture updates wait for their snapshot
 
 Every `texture_update` carries `visible_from_frame`: the index of the snapshot that was being
-built when it was queued (`p0_protocol_context::building_frame` — the tick's frame during
+built when it was queued (`protocol_context::building_frame` — the tick's frame during
 its dispatch, the next one once that frame is published, unchanged when a publish is
 dropped). The render thread applies an update only when it composites a snapshot at least
 that new; anything newer waits in a fixed 256-entry ring, and so does everything queued

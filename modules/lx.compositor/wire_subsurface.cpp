@@ -9,9 +9,7 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 module lx.compositor;
 
@@ -28,9 +26,8 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -212,6 +209,5 @@ void bind_subcompositor(wayland::client_connection& client, unsigned id, int ver
     res.set_implementation(&subcompositor_impl, nullptr, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

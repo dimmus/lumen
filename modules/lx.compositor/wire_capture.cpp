@@ -44,7 +44,6 @@ module;
 #include <fcntl.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1) &&                                    \
     defined(LUMEN_PROTOCOL_EXT_IMAGE_COPY_CAPTURE_V1)
@@ -54,7 +53,6 @@ module;
 #if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
 #include "wlr-screencopy-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_SCREENCOPY 1
-#endif
 #endif
 #endif
 
@@ -86,9 +84,8 @@ constexpr lx::trace::category log_capture{"compositor.capture"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -203,7 +200,7 @@ unsigned g_toplevel_views = 0; // bit per capture view in use
 bool g_indicator = false;
 lock_state g_lock_seen = lock_state::unlocked;
 
-[[nodiscard]] capture_host* host() { return g_p0_ctx ? g_p0_ctx->capture : nullptr; }
+[[nodiscard]] capture_host* host() { return g_ctx ? g_ctx->capture : nullptr; }
 
 [[nodiscard]] session_obj* session_of(unsigned handle) {
     return handle >= 1 && handle <= k_capture_sessions ? g_by_handle[handle - 1] : nullptr;
@@ -264,9 +261,9 @@ void send_failed(frame_obj* f, capture_failure reason) {
 }
 
 [[nodiscard]] const toplevel_record* window_of(const capture_session& cs, const session_obj* so) {
-    if (!g_p0_ctx || !g_p0_ctx->toplevels)
+    if (!g_ctx || !g_ctx->toplevels)
         return nullptr;
-    const toplevel_record* rec = g_p0_ctx->toplevels->find(cs.toplevel);
+    const toplevel_record* rec = g_ctx->toplevels->find(cs.toplevel);
     if (!rec || !rec->mapped || !so || std::strcmp(rec->foreign_identifier, so->identifier) != 0)
         return nullptr;
     return rec;
@@ -441,9 +438,9 @@ bool make_target(frame_obj* f, capture_target& t) {
 [[nodiscard]] capture_env env_for(const capture_session& cs, const session_obj* so) {
     capture_env env{};
     capture_host* h = host();
-    if (g_p0_ctx && g_p0_ctx->lock && g_p0_ctx->lock->state() != lock_state::unlocked) {
+    if (g_ctx && g_ctx->lock && g_ctx->lock->state() != lock_state::unlocked) {
         env.locked = true;
-        if (auto* lock_res = static_cast<wl_resource*>(g_p0_ctx->lock->current()))
+        if (auto* lock_res = static_cast<wl_resource*>(g_ctx->lock->current()))
             env.locker_client = wire_client_id(wl_resource_get_client(lock_res));
     }
     if (cs.kind == capture_source_kind::output) {
@@ -464,7 +461,7 @@ bool make_target(frame_obj* f, capture_target& t) {
 /// none is free.
 bool configure_view(session_obj* so, const capture_session& cs) {
     capture_host* h = host();
-    if (!h || !h->scene || !g_p0_ctx || !g_p0_ctx->tree)
+    if (!h || !h->scene || !g_ctx || !g_ctx->tree)
         return false;
     const toplevel_record* rec = window_of(cs, so);
     if (!rec)
@@ -487,7 +484,7 @@ bool configure_view(session_obj* so, const capture_session& cs) {
     c.projection.scale = window_scale(*rec);
     c.projection.size = cs.constraints.size;
     c.projection.transform = lx::buffer_transform::normal;
-    c.root = g_p0_ctx->tree->container(rec->surface);
+    c.root = g_ctx->tree->container(rec->surface);
     if (!c.root)
         return false;
     h->scene->set_output_view(lx::scene::k_capture_view_base + static_cast<unsigned>(so->view), c);
@@ -561,8 +558,8 @@ void schedule(session_obj* so, bool in_tick) {
             return; // render still holds every slot of the view: the next tick
         // The view's frame samples the client buffers on screen now, like an output's: the
         // buffer lifecycle tags them with it.
-        if (g_p0_ctx && g_p0_ctx->lifecycle)
-            g_p0_ctx->lifecycle->on_frame_submitted(h->frame);
+        if (g_ctx && g_ctx->lifecycle)
+            g_ctx->lifecycle->on_frame_submitted(h->frame);
         job.kind = capture_job_kind::toplevel;
         job.view = view;
         job.view_frame = h->frame;
@@ -714,7 +711,7 @@ void frame_destroy_resource(wl_resource* resource) {
         if (f->session->frame == f)
             f->session->frame = nullptr;
         // A fence wait of this frame is of no use any more.
-        if (g_p0_ctx && (f->state == frame_state::waiting_fence ||
+        if (g_ctx && (f->state == frame_state::waiting_fence ||
                          f->state == frame_state::waiting_read))
             cu_poll_drop(k_poll_base + f->session->handle);
     }
@@ -1207,7 +1204,7 @@ void bind_output_capture_source_manager(wayland::client_connection& client, unsi
     auto res = wayland::resource::create(client, &ext_output_image_capture_source_manager_v1_interface,
                                          version, id);
     if (res)
-        res.set_implementation(&output_source_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&output_source_manager_impl, g_ctx, nullptr);
 }
 
 void bind_toplevel_capture_source_manager(wayland::client_connection& client, unsigned id,
@@ -1215,14 +1212,14 @@ void bind_toplevel_capture_source_manager(wayland::client_connection& client, un
     auto res = wayland::resource::create(
         client, &ext_foreign_toplevel_image_capture_source_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&toplevel_source_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&toplevel_source_manager_impl, g_ctx, nullptr);
 }
 
 #if defined(LUMEN_HAS_SCREENCOPY)
 void bind_screencopy_manager(wayland::client_connection& client, unsigned id, int version) {
     auto res = wayland::resource::create(client, &zwlr_screencopy_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&screencopy_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&screencopy_manager_impl, g_ctx, nullptr);
 }
 #endif
 
@@ -1230,7 +1227,7 @@ void bind_image_copy_capture_manager(wayland::client_connection& client, unsigne
     auto res = wayland::resource::create(client, &ext_image_copy_capture_manager_v1_interface,
                                          version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 bool capture_source_of(wl_resource* source, capture_source_kind& kind, unsigned& slot,
@@ -1300,16 +1297,16 @@ void capture_fence_signalled(unsigned key, unsigned serial) {
 
 void capture_buffer_gone(wl_resource* buffer, buffer_obj* b) {
     (void)buffer;
-    if (!b || !b->capture_imported || !g_p0_ctx || !g_p0_ctx->capture)
+    if (!b || !b->capture_imported || !g_ctx || !g_ctx->capture)
         return;
     capture_job forget{};
     forget.kind = capture_job_kind::forget_buffer;
     forget.target.buffer_key = static_cast<unsigned>(b->id.id());
-    if (capture_channel* ch = g_p0_ctx->capture->channel)
+    if (capture_channel* ch = g_ctx->capture->channel)
         (void)ch->post(forget); // full: the import is evicted with its LRU slot instead
 }
 
-void bind_capture_guards(p0_protocol_context& ctx) {
+void bind_capture_guards(protocol_context& ctx) {
     if (!ctx.capture || !ctx.capture->guards)
         return;
     capture_shm_guards::hooks h{};
@@ -1321,10 +1318,10 @@ void bind_capture_guards(p0_protocol_context& ctx) {
 
 bool capture_paces_surface(lx::surface_id surface) {
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
-    if (g_toplevel_views == 0 || !g_p0_ctx || !g_p0_ctx->tree || !g_p0_ctx->toplevels)
+    if (g_toplevel_views == 0 || !g_ctx || !g_ctx->tree || !g_ctx->toplevels)
         return false;
-    const lx::surface_id root = g_p0_ctx->tree->root_of(surface);
-    const toplevel_record* rec = g_p0_ctx->toplevels->find_by_surface(root ? root : surface);
+    const lx::surface_id root = g_ctx->tree->root_of(surface);
+    const toplevel_record* rec = g_ctx->toplevels->find_by_surface(root ? root : surface);
     if (!rec)
         return false;
     bool paced = false;
@@ -1341,11 +1338,11 @@ bool capture_paces_surface(lx::surface_id surface) {
 #endif
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-void lx::compositor::capture_complete(p0_protocol_context& ctx) {
+void lx::compositor::capture_complete(protocol_context& ctx) {
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
-    using namespace lx::compositor::p0;
+    using namespace lx::compositor::wire;
     capture_host* h = ctx.capture;
     if (!h || !h->channel || !h->channel->has_completions())
         return;
@@ -1431,9 +1428,9 @@ void lx::compositor::capture_complete(p0_protocol_context& ctx) {
 #endif
 }
 
-void lx::compositor::capture_tick(p0_protocol_context& ctx, unsigned frame, bool publish) {
+void lx::compositor::capture_tick(protocol_context& ctx, unsigned frame, bool publish) {
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
-    using namespace lx::compositor::p0;
+    using namespace lx::compositor::wire;
     capture_host* h = ctx.capture;
     if (!h)
         return;
@@ -1495,9 +1492,9 @@ void lx::compositor::capture_tick(p0_protocol_context& ctx, unsigned frame, bool
 #endif
 }
 
-void lx::compositor::capture_lock_check(p0_protocol_context& ctx) {
+void lx::compositor::capture_lock_check(protocol_context& ctx) {
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
-    using namespace lx::compositor::p0;
+    using namespace lx::compositor::wire;
     capture_host* h = ctx.capture;
     const lock_state now = ctx.lock ? ctx.lock->state() : lock_state::unlocked;
     const bool was_locked = g_lock_seen != lock_state::unlocked;
@@ -1527,9 +1524,9 @@ void lx::compositor::capture_lock_check(p0_protocol_context& ctx) {
 #endif
 }
 
-long long lx::compositor::capture_view_floor(const p0_protocol_context& ctx) {
+long long lx::compositor::capture_view_floor(const protocol_context& ctx) {
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
-    using namespace lx::compositor::p0;
+    using namespace lx::compositor::wire;
     if (!ctx.capture || g_toplevel_views == 0)
         return -1;
     long long floor = -1;
@@ -1550,9 +1547,9 @@ long long lx::compositor::capture_view_floor(const p0_protocol_context& ctx) {
 #endif
 }
 
-std::uint32_t lx::compositor::capture_wanted_outputs(const p0_protocol_context& ctx) {
+std::uint32_t lx::compositor::capture_wanted_outputs(const protocol_context& ctx) {
 #if defined(LUMEN_HAS_IMAGE_CAPTURE)
-    using namespace lx::compositor::p0;
+    using namespace lx::compositor::wire;
     const capture_host* h = ctx.capture;
     if (!h || !h->scene || g_toplevel_views == 0)
         return 0;
@@ -1591,12 +1588,3 @@ std::uint32_t lx::compositor::capture_wanted_outputs(const p0_protocol_context& 
 #endif
 }
 
-#else // !LUMEN_HAS_WAYLAND
-
-void lx::compositor::capture_complete(p0_protocol_context&) {}
-void lx::compositor::capture_tick(p0_protocol_context&, unsigned, bool) {}
-void lx::compositor::capture_lock_check(p0_protocol_context&) {}
-std::uint32_t lx::compositor::capture_wanted_outputs(const p0_protocol_context&) { return 0; }
-long long lx::compositor::capture_view_floor(const p0_protocol_context&) { return -1; }
-
-#endif // LUMEN_HAS_WAYLAND

@@ -19,12 +19,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
 #include "ext-background-effect-v1-server-protocol.h"
 #define LUMEN_HAS_BACKGROUND_EFFECT 1
-#endif
 #endif
 
 module lx.compositor;
@@ -38,7 +36,7 @@ import :wire;
 
 #if defined(LUMEN_HAS_BACKGROUND_EFFECT)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -100,19 +98,19 @@ const struct ext_background_effect_manager_v1_interface effect_manager_impl = {
 
 void bind_background_effect_manager(wayland::client_connection& client, unsigned id,
                                     int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &ext_background_effect_manager_v1_interface,
                                          version, id);
     if (!res)
         return;
-    res.set_implementation(&effect_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&effect_manager_impl, g_ctx, nullptr);
     // The backend is chosen before clients connect and never changes: sent once, at bind.
     ext_background_effect_manager_v1_send_capabilities(
         static_cast<wl_resource*>(res.native()),
-        g_p0_ctx->background_blur ? EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR : 0u);
+        g_ctx->background_blur ? EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR : 0u);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_BACKGROUND_EFFECT

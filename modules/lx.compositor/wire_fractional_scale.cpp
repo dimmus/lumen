@@ -23,12 +23,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
 #include "fractional-scale-v1-server-protocol.h"
 #define LUMEN_HAS_FRACTIONAL_SCALE 1
-#endif
 #endif
 
 module lx.compositor;
@@ -47,9 +45,8 @@ constexpr lx::trace::category log_scale{"compositor.scale"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_FRACTIONAL_SCALE)
 
@@ -121,13 +118,13 @@ const struct wp_fractional_scale_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_fractional_scale(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &wp_fractional_scale_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 void fractional_scale_update(surface_obj* s, std::uint32_t scale120) {
@@ -143,6 +140,5 @@ void fractional_scale_update(surface_obj*, std::uint32_t) {}
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

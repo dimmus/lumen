@@ -20,12 +20,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_RELATIVE_POINTER_UNSTABLE_V1)
 #include "relative-pointer-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_RELATIVE_POINTER 1
-#endif
 #endif
 
 module lx.compositor;
@@ -38,9 +36,8 @@ import lx.trace;
 import :input_router;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_RELATIVE_POINTER)
 
@@ -102,23 +99,23 @@ const struct zwp_relative_pointer_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_relative_pointer_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwp_relative_pointer_manager_v1_interface,
                                          version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
 namespace {
 
 bool send_relative(unsigned long long time_us, double dx, double dy, double dxu, double dyu) {
-    if (!relatives || !g_p0_ctx || !g_p0_ctx->input)
+    if (!relatives || !g_ctx || !g_ctx->input)
         return false;
-    auto* focus = static_cast<wl_client*>(g_p0_ctx->input->pointer_focus_client());
+    auto* focus = static_cast<wl_client*>(g_ctx->input->pointer_focus_client());
     // A client that stopped answering pings is not fed motion it cannot read (the router
     // mutes its wl_pointer.motion the same way).
-    if (!focus || g_p0_ctx->input->motion_muted(focus))
+    if (!focus || g_ctx->input->motion_muted(focus))
         return false;
     bool sent = false;
     const auto hi = static_cast<uint32_t>(time_us >> 32);
@@ -145,22 +142,12 @@ bool send_relative(unsigned long long, double, double, double, double) { return 
 
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-bool lx::compositor::relative_pointer_motion(p0_protocol_context& ctx, unsigned long long time_us,
+bool lx::compositor::relative_pointer_motion(protocol_context& ctx, unsigned long long time_us,
                                              double dx, double dy, double dx_unaccel,
                                              double dy_unaccel) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    return p0::send_relative(time_us, dx, dy, dx_unaccel, dy_unaccel);
-#else
-    (void)time_us;
-    (void)dx;
-    (void)dy;
-    (void)dx_unaccel;
-    (void)dy_unaccel;
-    return false;
-#endif
+    return wire::send_relative(time_us, dx, dy, dx_unaccel, dy_unaccel);
 }

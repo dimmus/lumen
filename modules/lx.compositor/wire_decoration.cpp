@@ -9,12 +9,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-unstable-v1-server-protocol.h"
-#endif
 #endif
 
 module lx.compositor;
@@ -38,10 +36,9 @@ constexpr lx::trace::category log_deco{"compositor.deco"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -138,7 +135,7 @@ const struct zxdg_decoration_manager_v1_interface decoration_manager_impl = {
             *d = {};
             d->used = true;
             d->resource = res;
-            d->ctx = g_p0_ctx;
+            d->ctx = g_ctx;
             wl_resource_set_implementation(res, &decoration_impl, d, decoration_destroy_resource);
 
             // Errors are posted on the new object: the error enum is
@@ -174,23 +171,22 @@ const struct zxdg_decoration_manager_v1_interface decoration_manager_impl = {
             if (log_deco.enabled(lx::trace::level::debug)) {
                 log_deco.debug("decoration create id={} version={}", rec->id.id(), version);
             }
-            if (g_p0_ctx && g_p0_ctx->wm)
-                g_p0_ctx->wm->on_decoration_request(rec->id, true);
+            if (g_ctx && g_ctx->wm)
+                g_ctx->wm->on_decoration_request(rec->id, true);
         },
 };
 
 } // namespace
 
 void bind_decoration_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zxdg_decoration_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&decoration_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&decoration_manager_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_PROTOCOL_GLUE
-#endif // LUMEN_HAS_WAYLAND

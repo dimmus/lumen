@@ -5,7 +5,7 @@ module;
 //     value: a surface, a pending state and every description object hold their own copy,
 //     so nothing here is reference counted. Every ready description has a fresh 64-bit
 //     identity (never recycled); the outputs' share one.
-//   - What is offered follows the composite backend (`p0_protocol_context::color_management`,
+//   - What is offered follows the composite backend (`protocol_context::color_management`,
 //     every backend draws the same transform: lx.gfx color.cppm). With it: the perceptual
 //     intent; features parametric, set_primaries, set_tf_power, set_luminances,
 //     set_mastering_display_primaries and (version 3) windows_bt2100; transfer functions
@@ -56,12 +56,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1)
 #include "color-management-v1-server-protocol.h"
 #define LUMEN_HAS_COLOR_MANAGEMENT 1
-#endif
 #endif
 
 module lx.compositor;
@@ -78,7 +76,7 @@ import :wire;
 
 #if defined(LUMEN_HAS_COLOR_MANAGEMENT)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -91,7 +89,7 @@ std::uint64_t g_next_identity = 2;
 /// The description every output has (and every surface's feedback prefers).
 constexpr lx::gfx::color_description k_output_description = lx::gfx::k_srgb_description;
 
-bool offered() { return g_p0_ctx && g_p0_ctx->color_management; }
+bool offered() { return g_ctx && g_ctx->color_management; }
 
 // ── wp_image_description_v1 / _info_v1 ─────────────────────────────────────────
 
@@ -456,9 +454,9 @@ const struct wp_color_management_output_v1_interface output_impl = {
     .get_image_description =
         [](struct wl_client* client, struct wl_resource* r, uint32_t id) {
             const output_obj* o = output_obj_from(r);
-            const bool there = o && o->live && g_p0_ctx && g_p0_ctx->outputs &&
-                               g_p0_ctx->outputs->slot_live(o->slot) &&
-                               g_p0_ctx->outputs->slot_state(o->slot).id == o->id;
+            const bool there = o && o->live && g_ctx && g_ctx->outputs &&
+                               g_ctx->outputs->slot_live(o->slot) &&
+                               g_ctx->outputs->slot_state(o->slot).id == o->id;
             if (!there) {
                 make_description(client, wl_resource_get_version(r), id, {}, false,
                                  WP_IMAGE_DESCRIPTION_V1_CAUSE_NO_OUTPUT, "the output is gone");
@@ -587,10 +585,10 @@ const struct wp_color_manager_v1_interface manager_impl = {
             }
             wl_resource_set_implementation(res, &output_impl, o, &output_obj_destroy_resource);
             const int slot = output_resource_slot(output);
-            if (slot >= 0 && g_p0_ctx && g_p0_ctx->outputs &&
-                g_p0_ctx->outputs->slot_live(static_cast<unsigned>(slot))) {
+            if (slot >= 0 && g_ctx && g_ctx->outputs &&
+                g_ctx->outputs->slot_live(static_cast<unsigned>(slot))) {
                 o->slot = static_cast<unsigned>(slot);
-                o->id = g_p0_ctx->outputs->slot_state(o->slot).id;
+                o->id = g_ctx->outputs->slot_state(o->slot).id;
                 o->live = true;
             }
         },
@@ -677,12 +675,12 @@ const struct wp_color_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_color_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_color_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
     auto* r = static_cast<wl_resource*>(res.native());
     wp_color_manager_v1_send_supported_intent(r, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
     if (offered()) {
@@ -716,6 +714,6 @@ void bind_color_manager(wayland::client_connection& client, unsigned id, int ver
     }
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_COLOR_MANAGEMENT

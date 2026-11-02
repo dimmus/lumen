@@ -10,7 +10,6 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
@@ -22,7 +21,6 @@ module;
 #include "wlr-layer-shell-unstable-v1-server-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#endif
 #endif
 
 module lx.compositor;
@@ -40,10 +38,9 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -292,15 +289,14 @@ const struct zwlr_layer_shell_v1_interface layer_shell_impl = {
 } // namespace
 
 void bind_layer_shell(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &zwlr_layer_shell_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&layer_shell_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&layer_shell_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_PROTOCOL_GLUE
-#endif // LUMEN_HAS_WAYLAND

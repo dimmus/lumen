@@ -17,7 +17,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_XDG_DIALOG_V1) &&             \
     defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1) && defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1) && \
@@ -38,7 +37,6 @@
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "security-context-v1-client-protocol.h"
 #define LUMEN_TEST_PART_B 1
-#endif
 #endif
 #include <stdint.h>
 

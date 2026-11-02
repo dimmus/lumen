@@ -38,9 +38,7 @@ module;
 
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#endif
 
 module lx.compositor;
 
@@ -53,9 +51,8 @@ import :data_transfer;
 import :input_router;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 xfer_family_ops xfer_ops[k_xfer_families]{};
 
@@ -359,9 +356,9 @@ unsigned xfer_devices_of(wl_client* client, xfer_family family, xfer_device** ou
 }
 
 unsigned wire_client_id(wl_client* client) {
-    if (!client || !g_p0_ctx || !g_p0_ctx->server)
+    if (!client || !g_ctx || !g_ctx->server)
         return 0;
-    const auto* conn = g_p0_ctx->server->find_client_by_native(client);
+    const auto* conn = g_ctx->server->find_client_by_native(client);
     return conn ? conn->id() : 0;
 }
 
@@ -487,7 +484,7 @@ void xfer_set_selection(xfer_device* dev, wl_resource* source_res, uint32_t seri
     // in place: a stale request (raced by a newer copy elsewhere) must not win.
     auto& sel = selection[static_cast<unsigned>(f)];
     const char* why = nullptr;
-    if (!g_p0_ctx || !g_p0_ctx->input || !g_p0_ctx->input->serials().delivered(client, serial))
+    if (!g_ctx || !g_ctx->input || !g_ctx->input->serials().delivered(client, serial))
         why = "serial";
     else if (sel.ever_set && serial_newer(sel.serial, serial))
         why = "stale";
@@ -575,16 +572,15 @@ void xfer_focus_changed(void*, void* old_client_ptr, void* new_client_ptr) {
 }
 
 void wire_client_destroyed(void*, unsigned client_id, void* client) {
-    if (g_p0_ctx && g_p0_ctx->input)
-        g_p0_ctx->input->forget_client(client);
-    if (g_p0_ctx && g_p0_ctx->liveness)
-        g_p0_ctx->liveness->forget(lx::client_id{client_id});
+    if (g_ctx && g_ctx->input)
+        g_ctx->input->forget_client(client);
+    if (g_ctx && g_ctx->liveness)
+        g_ctx->liveness->forget(lx::client_id{client_id});
     if (focus_client == client)
         focus_client = nullptr;
     dnd_client_destroyed(static_cast<wl_client*>(client));
     pointer_gestures_client_destroyed(static_cast<wl_client*>(client));
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

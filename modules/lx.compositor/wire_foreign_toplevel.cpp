@@ -25,12 +25,10 @@ module;
 #include <sys/random.h>
 #endif
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1)
 #include "ext-foreign-toplevel-list-v1-server-protocol.h"
 #define LUMEN_HAS_FOREIGN_TOPLEVEL_LIST 1
-#endif
 #endif
 
 module lx.compositor;
@@ -44,9 +42,8 @@ import :toplevel;
 import :shell_bridge;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -225,7 +222,7 @@ const struct ext_foreign_toplevel_list_v1_interface list_impl = {
 } // namespace
 
 void bind_foreign_toplevel_list(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx || !g_p0_ctx->toplevels)
+    if (!g_ctx || !g_ctx->toplevels)
         return;
     auto res = wayland::resource::create(client, &ext_foreign_toplevel_list_v1_interface, version, id);
     if (!res)
@@ -242,7 +239,7 @@ void bind_foreign_toplevel_list(wayland::client_connection& client, unsigned id,
     g_lists = l;
     wl_resource_set_implementation(l->resource, &list_impl, l, &list_destroy_resource);
     // Every window mapped now, bottom to top.
-    g_p0_ctx->toplevels->for_each_bottom_up([&](const toplevel_record& rec) { announce(l, rec); });
+    g_ctx->toplevels->for_each_bottom_up([&](const toplevel_record& rec) { announce(l, rec); });
 }
 
 lx::toplevel_id foreign_toplevel_of(wl_resource* handle, const char*& identifier) {
@@ -304,7 +301,7 @@ void observe_changed(void*, const toplevel_record& rec) {
 
 } // namespace
 
-void install_toplevel_observer(p0_protocol_context& ctx) {
+void install_toplevel_observer(protocol_context& ctx) {
     if (!ctx.shell)
         return;
     toplevel_observer o{};
@@ -314,6 +311,5 @@ void install_toplevel_observer(p0_protocol_context& ctx) {
     ctx.shell->set_observer(o);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

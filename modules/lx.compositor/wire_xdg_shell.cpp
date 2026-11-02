@@ -10,12 +10,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-unstable-v1-server-protocol.h"
-#endif
 #endif
 
 module lx.compositor;
@@ -41,10 +39,9 @@ constexpr lx::trace::category log_wm{"compositor.wm"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -718,7 +715,7 @@ unsigned wm_next_serial(void* user) {
     // The seat's counter, not wl_display_next_serial: every input event already draws from
     // it, and one serial space is what lets a move/resize request's serial be checked
     // against the press that allowed it without colliding with a configure serial.
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (ctx && ctx->seat)
         return ctx->seat->next_serial();
     if (ctx && ctx->server && ctx->server->native_display())
@@ -727,7 +724,7 @@ unsigned wm_next_serial(void* user) {
 }
 
 void bind_xdg_wm_base(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     xdg_wm_base_obj* o = nullptr;
     for (auto& slot : xdg_wm_bases)
@@ -742,7 +739,7 @@ void bind_xdg_wm_base(wayland::client_connection& client, unsigned id, int versi
         return;
     *o = {};
     o->used = true;
-    o->ctx = g_p0_ctx;
+    o->ctx = g_ctx;
     o->client = lx::client_id{client.id()};
     o->resource = static_cast<wl_resource*>(res.native());
     wl_resource_set_implementation(o->resource, &xdg_wm_base_impl, o, wm_base_destroy_resource);
@@ -775,7 +772,7 @@ unsigned liveness_next_serial(void* user) { return wm_next_serial(user); }
 /// suffix, dim, the shell's flag) and the router withholds (or resumes) pointer motion.
 /// Shown, never acted on: the client is not killed.
 void liveness_changed(void* user, lx::client_id client, bool on, unsigned ms) {
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (!ctx)
         return;
     wayland::client_connection* conn =
@@ -797,7 +794,7 @@ void liveness_changed(void* user, lx::client_id client, bool on, unsigned ms) {
 /// due (Mutter pings on click).
 void liveness_user_input(void* user, void* client, unsigned,
                          lx::compositor::input_serial_kind kind) {
-    auto* ctx = static_cast<p0_protocol_context*>(user);
+    auto* ctx = static_cast<protocol_context*>(user);
     if (!ctx || !ctx->liveness)
         return;
     const unsigned id = wire_client_id(static_cast<wl_client*>(client));
@@ -811,7 +808,7 @@ void liveness_user_input(void* user, void* client, unsigned,
 
 } // namespace
 
-void install_liveness(p0_protocol_context& ctx) {
+void install_liveness(protocol_context& ctx) {
     if (!ctx.liveness)
         return;
     lx::compositor::liveness_ops ops{};
@@ -824,7 +821,6 @@ void install_liveness(p0_protocol_context& ctx) {
         ctx.input->set_user_input_hook(&liveness_user_input, &ctx);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_PROTOCOL_GLUE
-#endif // LUMEN_HAS_WAYLAND

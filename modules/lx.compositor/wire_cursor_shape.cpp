@@ -9,11 +9,9 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "cursor-shape-v1-server-protocol.h"
-#endif
 #endif
 
 module lx.compositor;
@@ -31,10 +29,9 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -74,7 +71,7 @@ const struct wp_cursor_shape_device_v1_interface shape_device_impl = {
                 return;
             if (!cursor_request_allowed(client, serial))
                 return;
-            g_p0_ctx->cursor->set_client_shape(static_cast<lx::compositor::cursor_shape>(shape));
+            g_ctx->cursor->set_client_shape(static_cast<lx::compositor::cursor_shape>(shape));
         },
 };
 
@@ -125,16 +122,15 @@ const struct wp_cursor_shape_manager_v1_interface shape_manager_impl = {
 } // namespace
 
 void bind_cursor_shape(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_cursor_shape_manager_v1_interface, version,
                                          id);
     if (!res)
         return;
-    res.set_implementation(&shape_manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&shape_manager_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
 #endif // LUMEN_HAS_PROTOCOL_GLUE
-#endif // LUMEN_HAS_WAYLAND

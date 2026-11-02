@@ -24,7 +24,6 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
 #include "single-pixel-buffer-v1-server-protocol.h"
@@ -33,7 +32,6 @@ module;
 #if defined(LUMEN_PROTOCOL_ALPHA_MODIFIER_V1)
 #include "alpha-modifier-v1-server-protocol.h"
 #define LUMEN_HAS_ALPHA_MODIFIER 1
-#endif
 #endif
 
 module lx.compositor;
@@ -45,9 +43,8 @@ import lx.wayland.server;
 import :surface;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -136,25 +133,24 @@ const struct wp_alpha_modifier_v1_interface alpha_manager_impl = {
 #if defined(LUMEN_HAS_SINGLE_PIXEL)
 void bind_single_pixel_buffer_manager(wayland::client_connection& client, unsigned id,
                                       int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_single_pixel_buffer_manager_v1_interface,
                                          version, id);
     if (res)
-        res.set_implementation(&single_pixel_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&single_pixel_impl, g_ctx, nullptr);
 }
 #endif
 
 #if defined(LUMEN_HAS_ALPHA_MODIFIER)
 void bind_alpha_modifier(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_alpha_modifier_v1_interface, version, id);
     if (res)
-        res.set_implementation(&alpha_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&alpha_manager_impl, g_ctx, nullptr);
 }
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

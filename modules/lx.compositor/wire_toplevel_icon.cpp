@@ -25,13 +25,11 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1)
 #include "xdg-shell-server-protocol.h"
 #include "xdg-toplevel-icon-v1-server-protocol.h"
 #define LUMEN_HAS_TOPLEVEL_ICON 1
-#endif
 #endif
 
 module lx.compositor;
@@ -51,9 +49,8 @@ constexpr lx::trace::category log_icon{"compositor.icon"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 #if defined(LUMEN_HAS_TOPLEVEL_ICON)
 
@@ -183,7 +180,7 @@ const struct xdg_toplevel_icon_v1_interface icon_impl = {
 /// Snapshots `icon` into the table: 0 for the default icon (null, or neither a name nor a
 /// usable buffer).
 unsigned snapshot(icon_obj* icon) {
-    auto* table = g_p0_ctx ? g_p0_ctx->icons : nullptr;
+    auto* table = g_ctx ? g_ctx->icons : nullptr;
     if (!icon || !table)
         return 0;
     lx::compositor::icon_candidate cand[k_icon_buffers]{};
@@ -233,15 +230,15 @@ void manager_set_icon(struct wl_client*, struct wl_resource*, struct wl_resource
     if (icon)
         icon->immutable = true;
     lx::compositor::toplevel_record* rec = record_of(toplevel_of(toplevel_res));
-    if (!rec || !g_p0_ctx->icons)
+    if (!rec || !g_ctx->icons)
         return;
     const unsigned id = snapshot(icon);
     if (rec->icon_pending_set)
-        g_p0_ctx->icons->unref(rec->icon_pending);
+        g_ctx->icons->unref(rec->icon_pending);
     rec->icon_pending = id;
     rec->icon_pending_set = true;
     if (log_icon.enabled(lx::trace::level::debug)) {
-        const auto* e = g_p0_ctx->icons->get(id);
+        const auto* e = g_ctx->icons->get(id);
         log_icon.debug("icon staged toplevel={} name={} buffers={}", rec->id.id(), e ? e->name : "",
                        e ? e->count : 0u);
     }
@@ -269,13 +266,13 @@ const struct xdg_toplevel_icon_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_toplevel_icon_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &xdg_toplevel_icon_manager_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&manager_impl, g_ctx, nullptr);
     // The panel draws 16 px icons, a task switcher 32 (surface-local; clients add their own
     // scale's buffers).
     auto* native = static_cast<wl_resource*>(res.native());
@@ -307,16 +304,15 @@ void toplevel_icon_commit(surface_obj* s) {
 }
 
 void toplevel_icon_released(lx::compositor::toplevel_record& rec) {
-    if (!g_p0_ctx || !g_p0_ctx->icons)
+    if (!g_ctx || !g_ctx->icons)
         return;
-    g_p0_ctx->icons->unref(rec.icon);
+    g_ctx->icons->unref(rec.icon);
     if (rec.icon_pending_set)
-        g_p0_ctx->icons->unref(rec.icon_pending);
+        g_ctx->icons->unref(rec.icon_pending);
     rec.icon = 0;
     rec.icon_pending = 0;
     rec.icon_pending_set = false;
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND

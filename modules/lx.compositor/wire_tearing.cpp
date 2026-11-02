@@ -22,7 +22,6 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_TEARING_CONTROL_V1)
 #include "tearing-control-v1-server-protocol.h"
@@ -31,7 +30,6 @@ module;
 #if defined(LUMEN_PROTOCOL_CONTENT_TYPE_V1)
 #include "content-type-v1-server-protocol.h"
 #define LUMEN_HAS_CONTENT_TYPE 1
-#endif
 #endif
 
 module lx.compositor;
@@ -43,9 +41,8 @@ import lx.wayland.server;
 import :surface;
 import :wire;
 
-#if defined(LUMEN_HAS_WAYLAND)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -142,48 +139,37 @@ const struct wp_content_type_manager_v1_interface content_type_manager_impl = {
 
 #if defined(LUMEN_HAS_TEARING_CONTROL)
 void bind_tearing_control_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &wp_tearing_control_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&tearing_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&tearing_manager_impl, g_ctx, nullptr);
 }
 #endif
 
 #if defined(LUMEN_HAS_CONTENT_TYPE)
 void bind_content_type_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res =
         wayland::resource::create(client, &wp_content_type_manager_v1_interface, version, id);
     if (res)
-        res.set_implementation(&content_type_manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&content_type_manager_impl, g_ctx, nullptr);
 }
 #endif
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND
 
-bool lx::compositor::surface_wants_async(p0_protocol_context& ctx, lx::surface_id surface) {
+bool lx::compositor::surface_wants_async(protocol_context& ctx, lx::surface_id surface) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    const p0::surface_obj* s = p0::surface_by_id(surface);
-    return s && s->tearing_current == p0::k_tearing_async;
-#else
-    (void)surface;
-    return false;
-#endif
+    const wire::surface_obj* s = wire::surface_by_id(surface);
+    return s && s->tearing_current == wire::k_tearing_async;
 }
 
-unsigned lx::compositor::surface_content_type(p0_protocol_context& ctx, lx::surface_id surface) {
+unsigned lx::compositor::surface_content_type(protocol_context& ctx, lx::surface_id surface) {
     (void)ctx;
-#if defined(LUMEN_HAS_WAYLAND)
-    const p0::surface_obj* s = p0::surface_by_id(surface);
+    const wire::surface_obj* s = wire::surface_by_id(surface);
     return s ? s->content_type_current : 0u;
-#else
-    (void)surface;
-    return 0;
-#endif
 }

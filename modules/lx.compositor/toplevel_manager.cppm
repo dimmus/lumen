@@ -291,7 +291,7 @@ struct toplevel_record {
     /// Its geometry before it joined the layout, restored when it leaves (`float_set`).
     lx::rect2i float_geometry{};
     bool float_set = false;
-    unsigned wire_id = 0;           ///< zlm_toplevel_v1 Wayland object id (P0)
+    unsigned wire_id = 0;           ///< zlm_toplevel_v1 Wayland object id
     bool override_redirect = false; ///< XWayland / OR windows — no decorations, fixed stacking
     unsigned net_wm_type = 0;       ///< _NET_WM_WINDOW_TYPE atom value (XWayland bridge)
     unsigned net_wm_state = 0;      ///< _NET_WM_STATE bitmask (fullscreen, maximized, …)

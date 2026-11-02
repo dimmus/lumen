@@ -32,12 +32,10 @@ module;
 #include <sys/socket.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_SECURITY_CONTEXT_V1)
 #include "security-context-v1-server-protocol.h"
 #define LUMEN_HAS_SECURITY_CONTEXT 1
-#endif
 #endif
 
 module lx.compositor;
@@ -55,9 +53,9 @@ constexpr lx::trace::category log_wayland{"wayland"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_SECURITY_CONTEXT)
+#if defined(LUMEN_HAS_SECURITY_CONTEXT)
 
-namespace lx::compositor::p0 {
+namespace lx::compositor::wire {
 
 namespace {
 
@@ -176,8 +174,8 @@ const struct wp_security_context_v1_interface context_impl = {
             const int close_fd = c->close_fd;
             c->listen_fd = c->close_fd = -1; // the server owns them now, whatever happens
             auto added =
-                g_p0_ctx && g_p0_ctx->server
-                    ? g_p0_ctx->server->add_security_listener(listen_fd, close_fd, c->ctx,
+                g_ctx && g_ctx->server
+                    ? g_ctx->server->add_security_listener(listen_fd, close_fd, c->ctx,
                                                               c->creator)
                     : lx::result<void>{lx::make_error(lx::wayland_err::bind_failed, "no server")};
             if (!added) {
@@ -196,7 +194,7 @@ const struct wp_security_context_v1_interface context_impl = {
 
 void manager_create_listener(struct wl_client* client, struct wl_resource* resource, uint32_t id,
                              int32_t listen_fd, int32_t close_fd) {
-    const auto* conn = g_p0_ctx && g_p0_ctx->server ? g_p0_ctx->server->find_client_by_native(client)
+    const auto* conn = g_ctx && g_ctx->server ? g_ctx->server->find_client_by_native(client)
                                                     : nullptr;
     if (conn && conn->context()) {
         ::close(listen_fd);
@@ -238,14 +236,14 @@ const struct wp_security_context_manager_v1_interface manager_impl = {
 } // namespace
 
 void bind_security_context_manager(wayland::client_connection& client, unsigned id, int version) {
-    if (!g_p0_ctx)
+    if (!g_ctx)
         return;
     auto res = wayland::resource::create(client, &wp_security_context_manager_v1_interface,
                                          version, id);
     if (res)
-        res.set_implementation(&manager_impl, g_p0_ctx, nullptr);
+        res.set_implementation(&manager_impl, g_ctx, nullptr);
 }
 
-} // namespace lx::compositor::p0
+} // namespace lx::compositor::wire
 
-#endif // LUMEN_HAS_WAYLAND && LUMEN_HAS_SECURITY_CONTEXT
+#endif // LUMEN_HAS_SECURITY_CONTEXT
