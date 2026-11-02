@@ -128,7 +128,7 @@ private:
 
 // ── The describing function and the root node (friends of `overlay`) ─────────
 
-lx::ui::child lx::portal::overlay_describe(lx::ui::build_context&) {
+lx::ui::child overlay_describe(lx::ui::build_context&) {
     if (!g_describing)
         return nullptr;
     return g_describing->build_ui(*g_describing_view);

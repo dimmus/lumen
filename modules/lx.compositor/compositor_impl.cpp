@@ -9203,6 +9203,10 @@ compositor::~compositor() {
 }
 
 lx::result<void> compositor::start() {
+    // The calling thread becomes the UI thread (run() re-states it): start() already
+    // mutates the scene graph (sync_output_views), whose assert_affinity(ui) would abort
+    // on an unlabeled thread in debug builds.
+    runtime::set_current_affinity(runtime::affinity::ui);
     // LUMEN_TRACE_FILE=path records a Perfetto-readable timeline of this run.
     lx::trace::timeline_start_from_env();
     lx::trace::name_thread("lx-ui");

@@ -3,6 +3,9 @@ module;
 // The notification popups (`:notify_view`). See the partition.
 
 #include <stdint.h>
+#if defined(LUMEN_SHELL_WAYLAND)
+#include <wayland-client.h>
+#endif
 
 module lx.shell;
 
@@ -19,10 +22,6 @@ import :notifications;
 import :notify_view;
 import :view_ui;
 import :icon_theme;
-
-#if defined(LUMEN_SHELL_WAYLAND)
-#include <wayland-client.h>
-#endif
 
 namespace {
 

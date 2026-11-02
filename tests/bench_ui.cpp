@@ -2921,6 +2921,10 @@ int main(int argc, char** argv) {
                      std::strerror(errno));
         return 1;
     }
+    // The scene globals (their glyph caches) unwind in static destructors after main
+    // returns; that teardown asserts UI ownership. The bench thread has joined and this
+    // thread is alone with the state — take the label for the unwind.
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     if (job.backend_failed)
         return 2;
 

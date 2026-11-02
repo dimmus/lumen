@@ -1428,7 +1428,7 @@ if(LUMEN_BUILD_TESTS)
     # ext-background-effect-v1: the GL and Vulkan blur against a reference computed in the
     # test, the planner's cache, the scene's blur draws (GL skips without a render node).
     add_executable(test_backdrop_blur tests/test_backdrop_blur.cpp)
-    target_link_libraries(test_backdrop_blur PRIVATE lx.gfx lx.scene)
+    target_link_libraries(test_backdrop_blur PRIVATE lx.gfx lx.runtime lx.scene)
     lumen_apply_module_properties(test_backdrop_blur)
     lumen_link_platform(test_backdrop_blur)
     target_include_directories(test_backdrop_blur PRIVATE tests)

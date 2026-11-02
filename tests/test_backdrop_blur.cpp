@@ -16,6 +16,7 @@
 import std;
 import lx.foundation;
 import lx.gfx;
+import lx.runtime;
 import lx.scene;
 
 namespace {
@@ -1143,6 +1144,9 @@ LUMEN_TEST(vulkan_validation_clean) {
 }
 
 int main(int argc, char** argv) {
+    // The scene-graph cases below mutate nodes: this thread is the UI thread (the
+    // harness pattern most tests state).
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     if (const char* v = std::getenv("LUMEN_VULKAN_VALIDATION"); v && *v == '1') {
         const char* found = std::getenv("LUMEN_VK_VALIDATION_LAYER");
         const std::string manifest =
