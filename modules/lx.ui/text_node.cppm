@@ -211,6 +211,8 @@ private:
     float prop_scale_ = 1.f;
     mutable float ui_scale_ = 1.f;
     bool wraps_ = true;
+    /// Unwrapped text consumes a width too when it ellipsizes at it (`truncate`).
+    bool ellipsizes_ = false;
     lx::text::glyph_hinting hinting_ = lx::text::glyph_hinting::none;
     lx::text::glyph_cache* glyphs_ = nullptr;
     /// The engine's face cache (null: the shared one): its lock guards rasterising.
@@ -344,6 +346,7 @@ bool lx::ui::text_block_node::apply(const text_block_props& p) {
     ui_scale_ = ui_device_scale();
     scale_ = prop_scale_ * ui_scale_;
     wraps_ = p.wrap == lx::text::text_wrap::word;
+    ellipsizes_ = p.ellipsize;
     hinting_ = p.hinting;
     glyphs_ = p.context.glyphs;
     faces_ = p.context.engine.faces;
@@ -506,7 +509,7 @@ lx::ui::text_async_stats lx::ui::text_block_node::async_stats() const {
 }
 
 float lx::ui::text_block_node::logical_width(int width_px) const {
-    if (!wraps_ || width_px <= 0 || width_px >= 99999)
+    if ((!wraps_ && !ellipsizes_) || width_px <= 0 || width_px >= 99999)
         return 0.f;
     // Layout px → the layout's own logical units: device px over the raster scale, which
     // is the props' scale (the UI's device scale cancels).
@@ -553,6 +556,13 @@ lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint
     int width = c.max.width;
     if (hint == size_hint::min && wraps_)
         width = std::min(width, std::max(to_layout_px(layout_.min_content_width()), 1));
+    else if (hint == size_hint::min && ellipsizes_) {
+        // An ellipsizing single line shrinks to its `…` and no further: its min-content is
+        // that advance, not the whole text — floored there (flex's automatic minimum, CSS
+        // `min-width:auto`), a truncating label could never narrow and the ellipsis would
+        // never show.
+        width = std::min(width, std::max(to_layout_px(layout_.ellipsis_width()), 1));
+    }
     layout_.set_max_width(logical_width(width));
     lx::size2i out = layout_.bounding_size();
     out = {to_layout_px(out.width), to_layout_px(out.height)};

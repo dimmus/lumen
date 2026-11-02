@@ -526,7 +526,7 @@ lx::ui::child lx::shell::switcher_describe(lx::ui::build_context&) {
 
 namespace {
 
-/// One line of text in the switcher's fonts, clipped to its box and centred in it.
+/// One line of text in the switcher's fonts, ellipsized at its box and centred in it.
 [[nodiscard]] lx::ui::child switcher_text(const char* text, std::uint32_t argb,
                                           const lx::text::font_desc& font,
                                           lx::ui::element_key key) {
@@ -535,6 +535,7 @@ namespace {
     t.font = font;
     t.color = lx::shell::shell_color(argb);
     t.wrap = lx::text::text_wrap::none;
+    t.ellipsize = true;
     t.context = lx::ui::active_ui_resources().text;
     return lx::ui::text_block(t, key);
 }

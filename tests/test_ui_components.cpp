@@ -2714,6 +2714,34 @@ LUMEN_TEST(text_attr_at_names_the_span_under_a_point) {
     LUMEN_CHECK(t.attr_at({-5, 4}) == -1);
 }
 
+// ── A truncating label: unwrapped text ellipsizes at the width it is given ──
+
+namespace {
+
+child describe_truncating(build_context&) {
+    // A panel tab's title: one line (`truncate`) in a fixed row narrower than the text
+    // (the entry box is a `flex_row` that clips its overflow).
+    const child kids[] = {label("dimmus@iritur:~/lumen/build").truncate()};
+    const child sized[1] = {div(
+        style{}.absolute().left(px(0)).top(px(0)).w(px(120)).h(px(20)).flex_row().items_center()
+            .overflow_hidden(),
+        kids)};
+    return div(style{}.flex_col().items_start(), sized);
+}
+
+} // namespace
+
+LUMEN_TEST(a_truncating_label_ellipsizes_at_its_box) {
+    harness h{describe_truncating, {0, 0, 400, 100}};
+    const auto* t = static_cast<text_block_node*>(
+        find_type(h.root.tree(), text_block_node::static_type()));
+    LUMEN_CHECK(t != nullptr);
+    print_rect("truncating label", t->bounds());
+    // The block takes the box's width, not the text's, and the layout ends in `…`.
+    LUMEN_CHECK(t->bounds().width <= 120);
+    LUMEN_CHECK(t->layout().ellipsized());
+}
+
 int main(int argc, char** argv) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     const int status = lumen_test::run_all(argc, argv);

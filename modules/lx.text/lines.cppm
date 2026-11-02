@@ -318,6 +318,10 @@ public:
     /// width is still broken by the wrap pass, `overflow-wrap: break-word`). The widest
     /// paragraph when no face resolved (`has_faces()` false).
     [[nodiscard]] int min_content_width() const;
+    /// The ellipsis run's advance in whole device pixels (rounded up): the narrowest an
+    /// ellipsizing line can be and still show its `…` — a truncating line's min-content.
+    /// 0 when no face resolves (`has_faces()` false).
+    [[nodiscard]] int ellipsis_width() const;
     [[nodiscard]] std::string_view text() const { return {text_.data(), text_.size()}; }
     [[nodiscard]] std::span<const text_attr> attrs() const { return attrs_; }
     [[nodiscard]] std::span<const layout_line> lines() const;
@@ -1423,6 +1427,13 @@ int lx::text::text_layout::min_content_width() const {
         }
     }
     return (widest + 63) / 64;
+}
+
+int lx::text::text_layout::ellipsis_width() const {
+    (void)refresh();
+    if (faces_.empty())
+        return 0;
+    return ensure_ellipsis(0) ? (faces_[0].ellipsis_advance + 63) / 64 : 0;
 }
 
 std::span<const lx::text::layout_line> lx::text::text_layout::lines() const {

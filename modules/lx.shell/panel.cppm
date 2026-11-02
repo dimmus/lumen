@@ -1464,7 +1464,7 @@ namespace {
     return lx::ui::control(c, children);
 }
 
-/// One line of text in the panel's font, clipped to its box.
+/// One line of text in the panel's font, ellipsized at its box.
 [[nodiscard]] lx::ui::child panel_text(const char* text, lx::color color, bool bold,
                                        lx::ui::element_key key) {
     lx::ui::text_block_props t{};
@@ -1472,6 +1472,7 @@ namespace {
     t.font = bold ? k_panel_font_bold : k_panel_font;
     t.color = color;
     t.wrap = lx::text::text_wrap::none;
+    t.ellipsize = true;
     t.context = lx::ui::active_ui_resources().text;
     return lx::ui::text_block(t, key);
 }
