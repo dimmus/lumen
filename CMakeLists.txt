@@ -566,6 +566,7 @@ if(PkgConfig_FOUND)
 endif()
 install(CODE "
     set(LUMEN_SOURCE_DIR \"${CMAKE_SOURCE_DIR}\")
+    set(LUMEN_BINARY_DIR \"${CMAKE_BINARY_DIR}\")
     set(LUMEN_STAGE_DIR \"${CMAKE_BINARY_DIR}/install-stage\")
     set(LUMEN_UNIT_DIR_OVERRIDE \"${LUMEN_SYSTEMD_USER_UNIT_DIR}\")
     set(LUMEN_SYSTEMD_UNIT_DIR_USR \"${_lumen_unit_dir_usr}\")

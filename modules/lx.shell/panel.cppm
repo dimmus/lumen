@@ -572,6 +572,9 @@ private:
     panel_layout frame_{};
     /// The last frame answered an arrangement change (a whole-strip repaint).
     bool arranged_ = false;
+    /// The configure size as last logged (`configure w=… h=…`, −1: none yet).
+    int configure_logged_w_ = -1;
+    int configure_logged_h_ = -1;
 
     friend lx::ui::child panel_describe(lx::ui::build_context&);
 };
@@ -1986,6 +1989,17 @@ void lx::shell::panel::after_dispatch(unsigned changes) {
     if (surface_.frame_due()) {
         describing_guard guard{this};
         surface_.run_frame();
+        // The `configure w=… h=…` line the session scripts wait for before starting the
+        // first client (run-desktop.sh: the panel's strip reserved): logged when a
+        // configure's size settled — the first, and any later one that changes it.
+        if (surface_.configured()) {
+            const auto settled = surface_.logical_size();
+            if (settled.width != configure_logged_w_ || settled.height != configure_logged_h_) {
+                configure_logged_w_ = settled.width;
+                configure_logged_h_ = settled.height;
+                log_panel.info("configure w={} h={}", settled.width, settled.height);
+            }
+        }
         if (log_panel.enabled(lx::trace::level::debug) && surface_.stats().frames > 0) {
             // The `draw entries=…` line the smokes parse: what the last frame showed and
             // what it damaged (the engine's damage rects; `(full)` the whole panel).
