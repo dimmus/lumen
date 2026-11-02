@@ -632,6 +632,20 @@ private:
     return lx::ui::text_block(t, key);
 }
 
+/// A line of text centred in and clipped to `r` (its box relative to the region that draws
+/// it) — the canvas's rect for the prompt, the query, a row's name or generic name, the
+/// status line. A bare text_block in a region's flow starts at its edge; the canvas drew
+/// every text at an inset, and the generic name right-aligned.
+[[nodiscard]] lx::ui::child launcher_text_at(lx::rect2i r, const char* text, std::uint32_t argb,
+                                             const lx::text::font_desc& font,
+                                             lx::ui::element_key text_key,
+                                             lx::ui::element_key box_key) {
+    const lx::ui::child inside[1] = {launcher_text(text, argb, font, text_key)};
+    lx::shell::shell_box_props box{};
+    box.control.layout = at(r).flex_row().items_center().overflow_hidden();
+    return lx::shell::shell_box(box, inside, box_key);
+}
+
 /// The text's width at `scale`, as the canvas measured it for the generic-name fit.
 [[nodiscard]] int launcher_text_width(const char* text, const lx::text::font_desc& font,
                                       float scale) {
@@ -717,20 +731,24 @@ lx::ui::child lx::shell::launcher::build_ui() {
     const unsigned first = layout_.first;
     lx::ui::child kids[3 + k_launcher_max_rows];
     unsigned n = 0;
+    // The scale the canvas measured at: the surface's own (1: identical values).
+    const float measure_scale = surface_.valid() ? surface_.scale() : 1.f;
 
     // The search row: the prompt, the query (or the placeholder) and a static caret after
-    // it — no blinking, so no timer (as the canvas drew it).
+    // it — no blinking, so no timer (as the canvas drew it: the prompt at k_lpad, the text
+    // at tx, the caret a pixel past its measured width).
     {
         const char* q = model_.query();
         lx::ui::child search[3];
         unsigned s = 0;
-        search[s++] = launcher_text("\xE2\x80\xBA", k_ltext_dim, k_lfont_search, 0x8100u);
-        const int pw = launcher_text_width("\xE2\x80\xBA", k_lfont_search, 1.f);
+        search[s++] = launcher_text_at({k_lpad, 0, 16, k_launcher_search_h}, "\xE2\x80\xBA",
+                                       k_ltext_dim, k_lfont_search, 0x8100u, 0x8106u);
+        const int pw = launcher_text_width("\xE2\x80\xBA", k_lfont_search, measure_scale);
         const int tx = k_lpad + (pw > 0 ? pw : 8) + 8;
         const int tw = layout_.width - tx - k_lpad;
-        lx::ui::child caret{};
         if (!q[0]) {
-            search[s++] = launcher_text("Type to search", k_ltext_dim, k_lfont_search, 0x8101u);
+            search[s++] = launcher_text_at({tx, 0, tw, k_launcher_search_h}, "Type to search",
+                                           k_ltext_dim, k_lfont_search, 0x8101u, 0x8107u);
             lx::ui::quad_style c{};
             c.background = shell_color(k_lcaret);
             lx::shell::shell_box_props cb{};
@@ -743,8 +761,9 @@ lx::ui::child lx::shell::launcher::build_ui() {
             cb.rest = c;
             search[s++] = lx::shell::shell_box(cb, {}, 0x8102u);
         } else {
-            search[s++] = launcher_text(q, k_ltext, k_lfont_search, 0x8103u);
-            int qw = launcher_text_width(q, k_lfont_search, 1.f);
+            search[s++] = launcher_text_at({tx, 0, tw, k_launcher_search_h}, q, k_ltext,
+                                           k_lfont_search, 0x8103u, 0x8108u);
+            int qw = launcher_text_width(q, k_lfont_search, measure_scale);
             qw = qw < 0 ? 0 : (qw > tw - 2 ? tw - 2 : qw);
             lx::ui::quad_style c{};
             c.background = shell_color(k_lcaret);
@@ -783,33 +802,30 @@ lx::ui::child lx::shell::launcher::build_ui() {
             continue;
         }
         const bool sel = (r.flags & row_selected) != 0;
-        const int inner_x = cell.x + 8;
+        // The canvas's inner column: 8 in from the cell's sides, the generic name
+        // right-aligned on it (rects relative to the row box, as the menu's rows place them).
         const int inner_w = cell.width - 16;
         int name_w = inner_w;
         int gw = 0;
         if (!e->generic_name.empty() && e->generic_name != e->name) {
-            gw = launcher_text_width(e->generic_name.data(), k_lfont, 1.f);
-            const int nw = launcher_text_width(e->name.data(), k_lfont, 1.f);
+            gw = launcher_text_width(e->generic_name.data(), k_lfont, measure_scale);
+            const int nw = launcher_text_width(e->name.data(), k_lfont, measure_scale);
             // GenericName right-aligned and dimmed, only when both fit whole.
             if (gw > 0 && nw > 0 && nw + 24 + gw <= inner_w)
                 name_w = inner_w - gw - 24;
             else
                 gw = 0;
         }
-        lx::ui::child inside[3];
+        lx::ui::child inside[2];
         unsigned m = 0;
-        inside[m++] = launcher_text(e->name.data(), sel ? k_ltext_selected : k_ltext, k_lfont,
-                                    0x8201'0000u + i);
-        if (gw > 0) {
-            lx::ui::text_block_props t{};
-            t.text = e->generic_name.data();
-            t.font = k_lfont;
-            t.color = shell_color(sel ? k_ltext_dim_selected : k_ltext_dim);
-            t.wrap = lx::text::text_wrap::none;
-            t.align = lx::text::text_align::end;
-            t.context = lx::ui::active_ui_resources().text;
-            inside[m++] = lx::ui::text_block(t, 0x8202'0000u + i);
-        }
+        inside[m++] = launcher_text_at({8, 0, name_w, cell.height}, e->name.data(),
+                                       sel ? k_ltext_selected : k_ltext, k_lfont,
+                                       0x8201'0000u + i, 0x8204'0000u + i);
+        if (gw > 0)
+            inside[m++] = launcher_text_at({inner_w - gw + 8, 0, gw, cell.height},
+                                           e->generic_name.data(),
+                                           sel ? k_ltext_dim_selected : k_ltext_dim, k_lfont,
+                                           0x8202'0000u + i, 0x8205'0000u + i);
         lx::shell::shell_box_props row{};
         row.control.layout = at(cell).flex_row().items_center().overflow_hidden();
         row.control.interactive = true;
@@ -853,8 +869,9 @@ lx::ui::child lx::shell::launcher::build_ui() {
                           layout_.total == 1 ? "%u application" : "%u applications",
                           layout_.total);
         }
-        const lx::ui::child status_text[1] = {launcher_text(
-            text, layout_.notice ? k_ltext_warning : k_ltext_dim, k_lfont, 0x8300u)};
+        const lx::ui::child status_text[1] = {launcher_text_at(
+            {k_lpad, 0, layout_.width - 2 * k_lpad, k_launcher_status_h}, text,
+            layout_.notice ? k_ltext_warning : k_ltext_dim, k_lfont, 0x8300u, 0x8302u)};
         lx::ui::quad_style sb{};
         sb.background = shell_color(k_lsearch);
         lx::shell::shell_box_props box{};
