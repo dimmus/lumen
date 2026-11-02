@@ -2168,6 +2168,10 @@ void lx::shell::shell_app::start_launch(const prepared_launch& p, const char* to
 // ── Main loop ──
 
 int lx::shell::shell_app::run() {
+    // This loop (and the lx.wayland.client connection and the panels it drives) runs on the
+    // shell's one UI thread: the main thread, marked as such as in lx.app and the compositor
+    // (lx.wayland.client asserts the dispatching affinity at its entry points).
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     // The panel's faces from the last run's fontconfig answers: its first paint does not wait
     // for fontconfig to start.
     lx::text::face_cache::shared().persist_matches();
