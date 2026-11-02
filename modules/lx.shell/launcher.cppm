@@ -11,6 +11,7 @@ module;
 #endif
 
 import lx.foundation;
+import lx.gfx;
 import lx.layout;
 import lx.text;
 import lx.trace;
@@ -108,28 +109,33 @@ unsigned launcher_diff(const launcher_layout& from, const launcher_layout& to, l
 
 // ── Launcher model (pure) ─────────────────────────────────────────────────────
 
-/// `menu`: the selected application's menu (the Menu key, Shift+F10).
-enum class launcher_key_result : unsigned char { ignored, changed, launch, close, menu };
+/// `menu`: the selected application's menu (the Menu key, Shift+F10); `cleared`: the query
+/// is to be emptied (Escape with text — the text lives in the view's `text_buffer`).
+enum class launcher_key_result : unsigned char { ignored, changed, cleared, close, menu };
 
-/// Query, matches, selection and scroll. Keys are xkb keysyms plus the UTF-8 they produce.
+/// Matches, selection and scroll. The query is the view's `text_buffer` (the search field
+/// edits it; `sync_query` re-ranks when its revision moved). Keys are xkb keysyms: the
+/// navigation and menu keys — the field takes the editing keys (typing, backspace, the
+/// word shortcuts, Enter's submit) and the launcher's root takes what it declines.
 class launcher_model {
 public:
     static constexpr std::size_t k_max_query = 128;
 
-    void bind(const app_catalog* catalog) { catalog_ = catalog; }
-    /// Empty query, selection on the first match, scrolled to the top.
+    void bind(const app_catalog* catalog, const lx::ui::text_buffer* query);
+    /// Selection on the first match, scrolled to the top; the query stays as it is.
     void reset();
-    /// Re-ranks against the catalog (the query or the catalog changed); keeps the
-    /// selection on the first match.
+    /// Re-ranks against the catalog; keeps the selection on the first match.
     void refresh();
+    /// Re-ranks when the buffer's revision moved since the last rank.
+    void sync_query();
     void set_rows(unsigned rows);
-    [[nodiscard]] launcher_key_result key(unsigned keysym, const char* utf8, bool ctrl, bool shift);
+    [[nodiscard]] launcher_key_result key(unsigned keysym, bool shift);
     /// Scrolls by `rows` (the selection stays where it is, possibly off the page).
     void scroll(int rows);
     void select(unsigned match);
 
-    [[nodiscard]] const char* query() const { return query_; }
-    [[nodiscard]] unsigned query_rev() const { return query_rev_; }
+    [[nodiscard]] const char* query() const { return query_ ? query_->storage.data() : ""; }
+    [[nodiscard]] unsigned query_rev() const { return query_ ? query_->revision : 0u; }
     [[nodiscard]] const unsigned* matches() const { return matches_.data(); }
     [[nodiscard]] unsigned count() const { return count_; }
     [[nodiscard]] unsigned selection() const { return selection_; }
@@ -141,12 +147,10 @@ public:
 
 private:
     void set_selection(unsigned s);
-    void changed_query();
 
     const app_catalog* catalog_ = nullptr;
-    char query_[k_max_query + 1]{};
-    std::size_t query_len_ = 0;
-    unsigned query_rev_ = 0;
+    const lx::ui::text_buffer* query_ = nullptr;
+    unsigned seen_rev_ = 0;
     std::vector<unsigned> matches_{};
     unsigned count_ = 0;
     unsigned selection_ = 0;
@@ -167,9 +171,15 @@ struct key_press {
 
 // ── The launcher ──────────────────────────────────────────────────────────────
 
+/// An entry's theme icon (`Icon=`) as ARGB pixels at `px`², or null.
+using launcher_icon_fn = const std::uint32_t* (*)(const char* name, int px, void* user);
+
 struct launcher_globals {
     /// The shell's lx.ui.host context (null: the launcher cannot be created).
     lx::ui::host::context* ui = nullptr;
+    /// The icon theme (null: rows draw without icons).
+    launcher_icon_fn icons = nullptr;
+    void* icons_user = nullptr;
 };
 
 /// The application launcher: an overlay-layer surface under the panel's left end
@@ -179,13 +189,16 @@ struct launcher_globals {
 /// (with an empty query), on its toggle, on launch, and when it loses the keyboard (a
 /// click elsewhere, a window taking focus).
 ///
-/// The view is an lx.ui tree on an lx.ui.host surface (ADR-010 Phase 5 P5-7): the same
-/// `layout_launcher` geometry, described into the engine's retained tree with the canvas's
-/// exact palette (view_ui's literal boxes). The root is the tree's focused node — every key
-/// arrives at it and goes through the model's own key handling (editing, the arrows, the
-/// word shortcuts), so the semantics are the canvas's; the rows are the tree's interactive
-/// nodes (hover and press ride the engine's states, a release on the pressed row launches,
-/// a right press opens its menu), and the wheel scrolls the page.
+/// The view is an lx.ui tree on an lx.ui.host surface (ADR-010 Phase 5 P5-7), drawn with
+/// the theme's tokens like every §5.6 component (the one view that left view_ui's
+/// canvas-palette stance): the search row is a real `text_input` on the model's
+/// `text_buffer` — the engine's caret, selection, word editing and clipboard — the rows
+/// are themed cells with the entry's icon, its name and a right-aligned GenericName, and
+/// the status row is a muted label. The field holds the tree's focus: it edits the query,
+/// Enter submits (launches), and every key it declines (the arrows, Page keys, Escape, the
+/// Menu key) bubbles to the root, which runs the model's navigation. The rows are the
+/// tree's interactive nodes (hover and press ride the engine's states, a release on the
+/// pressed row launches, a right press opens its menu), and the wheel scrolls the page.
 class launcher {
 public:
     launcher() = default;
@@ -245,6 +258,13 @@ private:
         launcher* self = nullptr;
         unsigned match = 0;
     };
+    /// One rasterised entry icon, keyed by theme-icon name and size (the atlas holds the
+    /// pixels; a slot only remembers where).
+    struct icon_slot {
+        char name[128]{};
+        int px = 0;
+        lx::gfx::atlas_tile_id tile{};
+    };
 
     friend lx::ui::child launcher_describe(lx::ui::build_context& ctx);
     friend class launcher_root_node;
@@ -260,6 +280,16 @@ private:
     void on_keyboard_focus(bool entered);
     void launch_selected(unsigned serial);
     void menu_for(unsigned match, unsigned serial);
+    /// The query changed under the field's editing: repaint (the describe re-ranks).
+    void on_query_changed();
+    /// Enter in the field: launch the selection.
+    void on_submit();
+    /// The theme icon `name` at `px`² as an atlas tile (invalid: none).
+    [[nodiscard]] lx::gfx::atlas_tile_id icon_tile(const char* name, int px);
+    /// The tree's search field (null: not described yet).
+    [[nodiscard]] lx::ui::ui_node* field_node();
+    /// Points the tree's focus at the field (the launcher's keys are its keys).
+    void focus_field();
 
     launcher_globals g_{};
     app_catalog* catalog_ = nullptr;
@@ -269,6 +299,9 @@ private:
     bool (*keyboard_stay_)(void* user) = nullptr;
     void* user_ = nullptr;
     launcher_model model_{};
+    /// The query the field edits (`k_max_query` bytes of text).
+    char query_storage_[launcher_model::k_max_query + 1]{};
+    lx::ui::text_buffer query_buffer_{};
     lx::ui::host::surface surface_{};
     lx::ui::host::layer_role role_{};
     launcher_view layout_view_{};
@@ -283,6 +316,7 @@ private:
     unsigned press_serial_ = 0;
     root_ref root_ref_{};
     row_ref row_refs_[k_launcher_max_rows]{};
+    icon_slot icon_slots_[32]{};
     char notice_[192]{};
     unsigned notice_rev_ = 0;
 };
@@ -416,20 +450,24 @@ unsigned lx::shell::launcher_scroll(unsigned selection, unsigned first, unsigned
 namespace {
 
 // xkb keysyms (xkbcommon-keysyms.h), spelled out so the model needs no xkb headers.
-constexpr unsigned k_xk_backspace = 0xff08, k_xk_tab = 0xff09, k_xk_return = 0xff0d,
-                   k_xk_escape = 0xff1b, k_xk_home = 0xff50, k_xk_up = 0xff52,
+constexpr unsigned k_xk_escape = 0xff1b, k_xk_home = 0xff50, k_xk_up = 0xff52,
                    k_xk_down = 0xff54, k_xk_page_up = 0xff55, k_xk_page_down = 0xff56,
-                   k_xk_end = 0xff57, k_xk_kp_enter = 0xff8d, k_xk_kp_home = 0xff95,
+                   k_xk_end = 0xff57, k_xk_kp_home = 0xff95,
                    k_xk_kp_up = 0xff97, k_xk_kp_down = 0xff99, k_xk_kp_page_up = 0xff9a,
-                   k_xk_kp_page_down = 0xff9b, k_xk_kp_end = 0xff9c, k_xk_iso_left_tab = 0xfe20;
+                   k_xk_kp_page_down = 0xff9b, k_xk_kp_end = 0xff9c;
 constexpr unsigned k_xk_menu = 0xff67, k_xk_f10 = 0xffc7;
 
 } // namespace
 
+void lx::shell::launcher_model::bind(const app_catalog* catalog,
+                                     const lx::ui::text_buffer* query) {
+    catalog_ = catalog;
+    query_ = query;
+    seen_rev_ = query_ ? query_->revision : 0u;
+}
+
 void lx::shell::launcher_model::reset() {
-    query_[0] = '\0';
-    query_len_ = 0;
-    ++query_rev_;
+    seen_rev_ = query_ ? query_->revision : seen_rev_;
     refresh();
 }
 
@@ -439,11 +477,18 @@ void lx::shell::launcher_model::refresh() {
         const std::size_t cap = catalog_->listed().size();
         if (matches_.size() < cap)
             matches_.resize(cap);
-        count_ = catalog_->rank({query_, query_len_}, matches_.data(),
-                                static_cast<unsigned>(matches_.size()));
+        const std::string_view q = query_ ? query_->view() : std::string_view{};
+        count_ = catalog_->rank(q, matches_.data(), static_cast<unsigned>(matches_.size()));
     }
     selection_ = 0;
     first_ = 0;
+}
+
+void lx::shell::launcher_model::sync_query() {
+    if (!query_ || query_->revision == seen_rev_)
+        return;
+    seen_rev_ = query_->revision;
+    refresh();
 }
 
 void lx::shell::launcher_model::set_rows(unsigned rows) {
@@ -462,11 +507,6 @@ void lx::shell::launcher_model::set_selection(unsigned s) {
 
 void lx::shell::launcher_model::select(unsigned match) { set_selection(match); }
 
-void lx::shell::launcher_model::changed_query() {
-    ++query_rev_;
-    refresh();
-}
-
 void lx::shell::launcher_model::scroll(int rows) {
     if (count_ <= rows_)
         return;
@@ -482,37 +522,22 @@ int lx::shell::launcher_model::entry_at(unsigned match) const {
 
 int lx::shell::launcher_model::selected_entry() const { return entry_at(selection_); }
 
-lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, const char* utf8,
-                                                              bool ctrl, bool shift) {
+lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, bool shift) {
     switch (sym) {
-    case k_xk_return:
-    case k_xk_kp_enter: return count_ ? launcher_key_result::launch : launcher_key_result::ignored;
     case k_xk_menu:
         return count_ ? launcher_key_result::menu : launcher_key_result::ignored;
     case k_xk_f10:
         return count_ && shift ? launcher_key_result::menu : launcher_key_result::ignored;
     case k_xk_escape:
-        if (query_len_ == 0)
-            return launcher_key_result::close;
-        query_[0] = '\0';
-        query_len_ = 0;
-        changed_query();
-        return launcher_key_result::changed;
+        // Text in the field: the view empties the buffer (`cleared`); empty: close.
+        return query_ && query_->size != 0 ? launcher_key_result::cleared
+                                           : launcher_key_result::close;
     case k_xk_up:
     case k_xk_kp_up:
         set_selection(selection_ ? selection_ - 1 : 0);
         return launcher_key_result::changed;
     case k_xk_down:
     case k_xk_kp_down: set_selection(selection_ + 1); return launcher_key_result::changed;
-    case k_xk_tab:
-        if (shift)
-            set_selection(selection_ ? selection_ - 1 : 0);
-        else
-            set_selection(selection_ + 1);
-        return launcher_key_result::changed;
-    case k_xk_iso_left_tab:
-        set_selection(selection_ ? selection_ - 1 : 0);
-        return launcher_key_result::changed;
     case k_xk_page_up:
     case k_xk_kp_page_up:
         set_selection(selection_ > rows_ ? selection_ - rows_ : 0);
@@ -525,53 +550,8 @@ lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, cons
     case k_xk_kp_end:
         set_selection(count_ ? count_ - 1 : 0);
         return launcher_key_result::changed;
-    case k_xk_backspace:
-        if (query_len_ == 0)
-            return launcher_key_result::ignored;
-        if (ctrl) {
-            // A word: trailing spaces, then up to the previous space.
-            while (query_len_ && query_[query_len_ - 1] == ' ')
-                --query_len_;
-            while (query_len_ && query_[query_len_ - 1] != ' ')
-                --query_len_;
-        } else {
-            // One code point: continuation bytes, then the lead byte.
-            while (query_len_ && (static_cast<unsigned char>(query_[query_len_ - 1]) & 0xC0) == 0x80)
-                --query_len_;
-            if (query_len_)
-                --query_len_;
-        }
-        query_[query_len_] = '\0';
-        changed_query();
-        return launcher_key_result::changed;
-    default: break;
+    default: return launcher_key_result::ignored;
     }
-    if (ctrl) {
-        if (sym == 'u' || sym == 'U') {
-            if (query_len_ == 0)
-                return launcher_key_result::ignored;
-            query_len_ = 0;
-            query_[0] = '\0';
-            changed_query();
-            return launcher_key_result::changed;
-        }
-        if (sym == 'w' || sym == 'W')
-            return key(k_xk_backspace, nullptr, true, false);
-        return launcher_key_result::ignored;
-    }
-    if (!utf8 || !utf8[0])
-        return launcher_key_result::ignored;
-    const std::size_t n = std::strlen(utf8);
-    // Control characters are not text.
-    if (static_cast<unsigned char>(utf8[0]) < 0x20 || utf8[0] == 0x7f)
-        return launcher_key_result::ignored;
-    if (query_len_ + n > k_max_query)
-        return launcher_key_result::ignored;
-    std::memcpy(query_ + query_len_, utf8, n);
-    query_len_ += n;
-    query_[query_len_] = '\0';
-    changed_query();
-    return launcher_key_result::changed;
 }
 
 
@@ -580,22 +560,18 @@ lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, cons
 namespace {
 
 constexpr lx::trace::category log_launcher{"shell.launcher"};
-constexpr std::uint32_t k_lbg = 0xFF26262Bu;
-constexpr std::uint32_t k_lsearch = 0xFF1E1E22u;
-constexpr std::uint32_t k_lhover = 0xFF34343Au;
-constexpr std::uint32_t k_lpressed = 0xFF2A2A30u;
-constexpr std::uint32_t k_lselected = 0xFF3D6FB4u;
-constexpr std::uint32_t k_lcaret = 0xFFE6E6E6u;
-constexpr std::uint32_t k_ltext = 0xFFE6E6E6u;
-constexpr std::uint32_t k_ltext_selected = 0xFFFFFFFFu;
-constexpr std::uint32_t k_ltext_dim = 0xFFA8A8ACu;
-constexpr std::uint32_t k_ltext_dim_selected = 0xFFD0DCEEu;
-constexpr std::uint32_t k_ltext_warning = 0xFFF0B45Au;
-constexpr lx::text::font_desc k_lfont{"Sans", 10.f, lx::text::weight::normal,
-                                      lx::text::style::normal};
-constexpr lx::text::font_desc k_lfont_search{"Sans", 11.f, lx::text::weight::normal,
-                                             lx::text::style::normal};
+/// The search field's inset in its band (the field is the engine's 32 px on the 40 px row).
+constexpr float k_lfield_px = 4.f;
+/// The status line's text inset.
 constexpr int k_lpad = 12;
+/// The search field's element key in the tree (`field_node` finds it by it).
+constexpr lx::ui::element_key k_field_key = 0x8100u;
+/// The row's icon, logical px.
+constexpr float k_licon_px = 16.f;
+/// The gap between a row's icon and its name.
+constexpr float k_licon_gap = 8.f;
+/// The room the generic name keeps from the name (the fit rule).
+constexpr int k_lgeneric_gap = 24;
 
 lx::shell::launcher* g_describing = nullptr;
 struct describing_guard {
@@ -619,42 +595,46 @@ private:
         .h(lx::layout::px(static_cast<float>(r.height)));
 }
 
-/// One line of text in the launcher's fonts.
-[[nodiscard]] lx::ui::child launcher_text(const char* text, std::uint32_t argb,
-                                          const lx::text::font_desc& font,
-                                          lx::ui::element_key key) {
-    lx::ui::text_block_props t{};
-    t.text = text;
-    t.font = font;
-    t.color = lx::shell::shell_color(argb);
-    t.wrap = lx::text::text_wrap::none;
-    t.context = lx::ui::active_ui_resources().text;
-    return lx::ui::text_block(t, key);
+/// The theme's UI font at the label size (what the row and status labels draw with).
+[[nodiscard]] lx::text::font_desc launcher_ui_font() {
+    lx::text::font_desc f{};
+    f.family = lx::ui::active_theme().fonts().ui_family;
+    f.size_pt = lx::ui::label_size_px(lx::ui::label_size::normal, lx::ui::ui_rem_px()) * 0.75f;
+    return f;
 }
 
-/// A line of text centred in and clipped to `r` (its box relative to the region that draws
-/// it) — the canvas's rect for the prompt, the query, a row's name or generic name, the
-/// status line. A bare text_block in a region's flow starts at its edge; the canvas drew
-/// every text at an inset, and the generic name right-aligned.
-[[nodiscard]] lx::ui::child launcher_text_at(lx::rect2i r, const char* text, std::uint32_t argb,
-                                             const lx::text::font_desc& font,
-                                             lx::ui::element_key text_key,
-                                             lx::ui::element_key box_key) {
-    const lx::ui::child inside[1] = {launcher_text(text, argb, font, text_key)};
-    lx::shell::shell_box_props box{};
-    box.control.layout = at(r).flex_row().items_center().overflow_hidden();
-    return lx::shell::shell_box(box, inside, box_key);
-}
-
-/// The text's width at `scale`, as the canvas measured it for the generic-name fit.
-[[nodiscard]] int launcher_text_width(const char* text, const lx::text::font_desc& font,
-                                      float scale) {
-    lx::text::font_desc f = font;
+/// The text's width at `scale` (device px over it), for the generic-name fit.
+[[nodiscard]] int launcher_text_width(const char* text, float scale) {
+    lx::text::font_desc f = launcher_ui_font();
     f.size_pt = static_cast<float>(f.size_pt * scale);
     lx::text::shaped_line line{};
     if (!lx::text::shape_line(text, f, line))
         return 0;
     return static_cast<int>(std::ceil(line.width_px / scale));
+}
+
+/// A row cell's boxes, themed like a list item: the selection on `rest`, the engine's
+/// hover and press over it (a selected row keeps its selection under the pointer).
+[[nodiscard]] lx::ui::quad_style row_quad(lx::ui::tok which) {
+    lx::ui::quad_style q{};
+    q.background = lx::ui::active_theme().color(which);
+    for (float& cr : q.corner_radii)
+        cr = lx::ui::radius_px(lx::ui::radius::sm);
+    return q;
+}
+
+/// A row cell's paint for its state.
+[[nodiscard]] lx::shell::shell_box_props row_props(lx::rect2i cell, bool selected) {
+    lx::shell::shell_box_props row{};
+    row.control.layout = at(cell).flex_row().items_center().overflow_hidden()
+                             .gap(lx::layout::px(k_licon_gap))
+                             .pl(lx::layout::px(8.f))
+                             .pr(lx::layout::px(8.f));
+    row.rest = selected ? row_quad(lx::ui::tok::ghost_element_selected) : lx::ui::quad_style{};
+    row.hover = row_quad(selected ? lx::ui::tok::ghost_element_selected
+                                  : lx::ui::tok::ghost_element_hover);
+    row.active = row_quad(lx::ui::tok::ghost_element_active);
+    return row;
 }
 
 } // namespace
@@ -725,69 +705,43 @@ void lx::shell::launcher::make_view(launcher_view& v) const {
 }
 
 lx::ui::child lx::shell::launcher::build_ui() {
+    model_.sync_query();
     make_view(layout_view_);
     layout_launcher(layout_view_, width_, height_, rows_, layout_);
 
     const unsigned first = layout_.first;
     lx::ui::child kids[3 + k_launcher_max_rows];
     unsigned n = 0;
-    // The scale the canvas measured at: the surface's own (1: identical values).
+    // The scale icons and the generic-name fit measure at: the surface's own.
     const float measure_scale = surface_.valid() ? surface_.scale() : 1.f;
+    const int icon_px = static_cast<int>(std::lround(k_licon_px * measure_scale));
 
-    // The search row: the prompt, the query (or the placeholder) and a static caret after
-    // it — no blinking, so no timer (as the canvas drew it: the prompt at k_lpad, the text
-    // at tx, the caret a pixel past its measured width).
+    // The search row: the field on the model's buffer — the engine's caret, selection and
+    // editing; Enter submits, and every key it declines (the arrows, Page keys, Escape, the
+    // Menu key) bubbles to the root and into the model's navigation.
     {
-        const char* q = model_.query();
-        lx::ui::child search[3];
-        unsigned s = 0;
-        search[s++] = launcher_text_at({k_lpad, 0, 16, k_launcher_search_h}, "\xE2\x80\xBA",
-                                       k_ltext_dim, k_lfont_search, 0x8100u, 0x8106u);
-        const int pw = launcher_text_width("\xE2\x80\xBA", k_lfont_search, measure_scale);
-        const int tx = k_lpad + (pw > 0 ? pw : 8) + 8;
-        const int tw = layout_.width - tx - k_lpad;
-        if (!q[0]) {
-            search[s++] = launcher_text_at({tx, 0, tw, k_launcher_search_h}, "Type to search",
-                                           k_ltext_dim, k_lfont_search, 0x8101u, 0x8107u);
-            lx::ui::quad_style c{};
-            c.background = shell_color(k_lcaret);
-            lx::shell::shell_box_props cb{};
-            cb.control.layout = lx::ui::style{}
-                                    .absolute()
-                                    .top(lx::layout::px(12.f))
-                                    .left(lx::layout::px(static_cast<float>(tx - 1)))
-                                    .w(lx::layout::px(2.f))
-                                    .h(lx::layout::px(static_cast<float>(k_launcher_search_h - 24)));
-            cb.rest = c;
-            search[s++] = lx::shell::shell_box(cb, {}, 0x8102u);
-        } else {
-            search[s++] = launcher_text_at({tx, 0, tw, k_launcher_search_h}, q, k_ltext,
-                                           k_lfont_search, 0x8103u, 0x8108u);
-            int qw = launcher_text_width(q, k_lfont_search, measure_scale);
-            qw = qw < 0 ? 0 : (qw > tw - 2 ? tw - 2 : qw);
-            lx::ui::quad_style c{};
-            c.background = shell_color(k_lcaret);
-            lx::shell::shell_box_props cb{};
-            cb.control.layout = lx::ui::style{}
-                                    .absolute()
-                                    .top(lx::layout::px(12.f))
-                                    .left(lx::layout::px(static_cast<float>(tx + qw + 1)))
-                                    .w(lx::layout::px(2.f))
-                                    .h(lx::layout::px(static_cast<float>(k_launcher_search_h - 24)));
-            cb.rest = c;
-            search[s++] = lx::shell::shell_box(cb, {}, 0x8104u);
-        }
-        lx::ui::quad_style sb{};
-        sb.background = shell_color(k_lsearch);
-        lx::shell::shell_box_props box{};
-        box.control.layout = at(launcher_search_rect(layout_));
-        box.rest = sb;
-        kids[n++] = lx::shell::shell_box(box, {search, s}, 0x8105u);
+        lx::ui::child field =
+            lx::ui::text_input()
+                .buffer(query_buffer_)
+                .placeholder("Type to search")
+                .max_bytes(launcher_model::k_max_query)
+                .on_change([self = this](int) { self->on_query_changed(); })
+                .on_submit([self = this](int) { self->on_submit(); })
+                .layout(lx::ui::style{}.w_full())
+                .key(k_field_key);
+        const lx::ui::child search[1] = {field};
+        lx::shell::shell_box_props band{};
+        band.control.layout = at(launcher_search_rect(layout_))
+                                  .flex_row()
+                                  .items_center()
+                                  .pl(lx::layout::px(k_lfield_px))
+                                  .pr(lx::layout::px(k_lfield_px));
+        kids[n++] = lx::shell::shell_box(band, search, 0x8101u);
     }
 
     // A page of rows: each an interactive cell (hover and press are the engine's states;
-    // the selection is the model's), the name and — when both fit whole — the dimmed
-    // generic name right-aligned.
+    // the selection is the model's), the entry's icon, the name and — when both fit whole —
+    // the dimmed generic name at the row's end.
     for (unsigned i = 0; i < layout_.rows; ++i) {
         const launcher_row& r = layout_.row[i];
         const lx::rect2i box = launcher_row_rect(layout_, i);
@@ -802,51 +756,50 @@ lx::ui::child lx::shell::launcher::build_ui() {
             continue;
         }
         const bool sel = (r.flags & row_selected) != 0;
-        // The canvas's inner column: 8 in from the cell's sides, the generic name
-        // right-aligned on it (rects relative to the row box, as the menu's rows place them).
-        const int inner_w = cell.width - 16;
-        int name_w = inner_w;
+
+        lx::ui::child inside[3];
+        unsigned m = 0;
+        if (icon_px > 0 && !e->icon.empty()) {
+            char icon_name[128];
+            std::snprintf(icon_name, sizeof(icon_name), "%.*s",
+                          static_cast<int>(e->icon.size()), e->icon.data());
+            if (const lx::gfx::atlas_tile_id tile = icon_tile(icon_name, icon_px); tile.valid())
+                inside[m++] = lx::ui::image(surface_.atlas(), tile, {icon_px, icon_px},
+                                            0x8200'0000u + i);
+        }
+        // The name takes the room left of the generic; alone it truncates with an ellipsis.
+        const int inner_w = cell.width - 16 - (m ? icon_px + static_cast<int>(k_licon_gap) : 0);
         int gw = 0;
         if (!e->generic_name.empty() && e->generic_name != e->name) {
-            gw = launcher_text_width(e->generic_name.data(), k_lfont, measure_scale);
-            const int nw = launcher_text_width(e->name.data(), k_lfont, measure_scale);
+            gw = launcher_text_width(e->generic_name.data(), measure_scale);
+            const int nw = launcher_text_width(e->name.data(), measure_scale);
             // GenericName right-aligned and dimmed, only when both fit whole.
-            if (gw > 0 && nw > 0 && nw + 24 + gw <= inner_w)
-                name_w = inner_w - gw - 24;
-            else
+            if (gw <= 0 || nw <= 0 || nw + k_lgeneric_gap + gw > inner_w)
                 gw = 0;
         }
-        lx::ui::child inside[2];
-        unsigned m = 0;
-        inside[m++] = launcher_text_at({8, 0, name_w, cell.height}, e->name.data(),
-                                       sel ? k_ltext_selected : k_ltext, k_lfont,
-                                       0x8201'0000u + i, 0x8204'0000u + i);
-        if (gw > 0)
-            inside[m++] = launcher_text_at({inner_w - gw + 8, 0, gw, cell.height},
-                                           e->generic_name.data(),
-                                           sel ? k_ltext_dim_selected : k_ltext_dim, k_lfont,
-                                           0x8202'0000u + i, 0x8205'0000u + i);
-        lx::shell::shell_box_props row{};
-        row.control.layout = at(cell).flex_row().items_center().overflow_hidden();
-        row.control.interactive = true;
-        // Pressed over selected over hover, as the canvas painted (the engine's states).
-        lx::ui::quad_style sel_q{}, hover_q{}, press_q{};
-        sel_q.background = shell_color(k_lselected);
-        hover_q.background = shell_color(k_lhover);
-        press_q.background = shell_color(k_lpressed);
-        for (float& cr : sel_q.corner_radii)
-            cr = 4.f;
-        for (float& cr : hover_q.corner_radii)
-            cr = 4.f;
-        for (float& cr : press_q.corner_radii)
-            cr = 4.f;
-        if (sel) {
-            row.rest = sel_q;
-            row.hover = sel_q;
+        lx::ui::child name_label = lx::ui::label(e->name.data())
+                                       .single_line()
+                                       .truncate()
+                                       .key(0x8201'0000u + i);
+        lx::ui::child name_box = lx::ui::div(
+            lx::ui::style{}.flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
+                .overflow_hidden(),
+            {&name_label, 1});
+        if (gw > 0) {
+            lx::ui::child generic_label = lx::ui::label(e->generic_name.data())
+                                              .single_line()
+                                              .color(lx::ui::tok::text_muted)
+                                              .key(0x8202'0000u + i);
+            lx::ui::child generic_box = lx::ui::div(lx::ui::style{}.flex_none(),
+                                                    {&generic_label, 1});
+            inside[m++] = name_box;
+            inside[m++] = generic_box;
         } else {
-            row.hover = hover_q;
+            inside[m++] = name_box;
         }
-        row.active = press_q;
+
+        lx::shell::shell_box_props row = row_props(cell, sel);
+        row.control.interactive = true;
         row.notify = [](void* user, bool hovered) {
             static_cast<row_ref*>(user)->self->on_row_hover(*static_cast<row_ref*>(user),
                                                              hovered);
@@ -869,26 +822,31 @@ lx::ui::child lx::shell::launcher::build_ui() {
                           layout_.total == 1 ? "%u application" : "%u applications",
                           layout_.total);
         }
-        const lx::ui::child status_text[1] = {launcher_text_at(
-            {k_lpad, 0, layout_.width - 2 * k_lpad, k_launcher_status_h}, text,
-            layout_.notice ? k_ltext_warning : k_ltext_dim, k_lfont, 0x8300u, 0x8302u)};
-        lx::ui::quad_style sb{};
-        sb.background = shell_color(k_lsearch);
+        lx::ui::child status = lx::ui::label(text)
+                                   .size(lx::ui::label_size::small)
+                                   .single_line()
+                                   .color(layout_.notice ? lx::ui::tok::warning
+                                                         : lx::ui::tok::text_muted)
+                                   .key(0x8300u);
+        const lx::ui::child status_row[1] = {status};
         lx::shell::shell_box_props box{};
-        box.control.layout = at(launcher_status_rect(layout_));
-        box.rest = sb;
-        kids[n++] = lx::shell::shell_box(box, status_text, 0x8301u);
+        box.control.layout = at(launcher_status_rect(layout_))
+                                 .flex_row()
+                                 .items_center()
+                                 .pl(lx::layout::px(static_cast<float>(k_lpad)));
+        kids[n++] = lx::shell::shell_box(box, status_row, 0x8301u);
     }
 
-    // The root: the launcher's background over everything, focused (every key is the
-    // model's), the wheel over the page scrolls it.
+    // The root: the launcher's surface over everything (the field holds the tree's focus;
+    // a row click finds no focusable ancestor and blurs nothing), the wheel over the page
+    // scrolls it, and every key the field declines is the model's.
     launcher_root_props root{};
     root.box.control.layout = lx::ui::style{}
                                   .w(lx::layout::percent(100.f))
                                   .h(lx::layout::percent(100.f));
-    root.box.control.focusable = true;
+    root.box.control.focusable = false;
     lx::ui::quad_style bg{};
-    bg.background = shell_color(k_lbg);
+    bg.background = lx::ui::active_theme().color(lx::ui::tok::elevated_surface_background);
     root.box.rest = bg;
     root.self = this;
     root_ref_ = {this};
@@ -915,65 +873,40 @@ void lx::shell::launcher::catalog_changed() {
 void lx::shell::launcher::on_root_key(const lx::ui::key_event& e) {
     if (!is_open() || !e.pressed)
         return;
-    // The keysyms the model knows, from the engine's key event: the named keys, the
-    // keypad's enter, the Menu key and F10 by their Linux keycodes, a character's
-    // codepoint as the printable keysym.
+    // The keysyms the model knows: the navigation keys the field declined (its editing
+    // keys never get here), the Menu key and F10 by their Linux keycodes.
     unsigned sym = 0;
-    char utf8[16]{};
     const unsigned kc = e.keycode;
     switch (e.key) {
-    case lx::ui::key::enter: sym = kc == 96 ? 0xff8d : 0xff0d; break;
-    case lx::ui::key::escape: sym = 0xff1b; break;
-    case lx::ui::key::up: sym = 0xff52; break;
-    case lx::ui::key::down: sym = 0xff54; break;
-    case lx::ui::key::tab: sym = 0xff09; break;
-    case lx::ui::key::page_up: sym = 0xff55; break;
-    case lx::ui::key::page_down: sym = 0xff56; break;
-    case lx::ui::key::home: sym = 0xff50; break;
-    case lx::ui::key::end: sym = 0xff57; break;
-    case lx::ui::key::backspace: sym = 0xff08; break;
+    case lx::ui::key::escape: sym = k_xk_escape; break;
+    case lx::ui::key::up: sym = k_xk_up; break;
+    case lx::ui::key::down: sym = k_xk_down; break;
+    case lx::ui::key::page_up: sym = k_xk_page_up; break;
+    case lx::ui::key::page_down: sym = k_xk_page_down; break;
     default:
         if (kc == 139)
-            sym = 0xff67; // Menu
+            sym = k_xk_menu; // Menu
         else if (kc == 76)
-            sym = 0xffc7; // F10
-        else if (e.codepoint >= 0x20 && e.codepoint != 0x7f) {
-            sym = e.codepoint < 0x80 ? e.codepoint : 0;
-            char* out = utf8;
-            char32_t cp = e.codepoint;
-            if (cp < 0x80) {
-                *out++ = static_cast<char>(cp);
-            } else if (cp < 0x800) {
-                *out++ = static_cast<char>(0xC0 | (cp >> 6));
-                *out++ = static_cast<char>(0x80 | (cp & 0x3F));
-            } else if (cp < 0x10000) {
-                *out++ = static_cast<char>(0xE0 | (cp >> 12));
-                *out++ = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                *out++ = static_cast<char>(0x80 | (cp & 0x3F));
-            } else {
-                *out++ = static_cast<char>(0xF0 | (cp >> 18));
-                *out++ = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-                *out++ = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                *out++ = static_cast<char>(0x80 | (cp & 0x3F));
-            }
-        }
+            sym = k_xk_f10; // F10
         break;
     }
-    if (!sym && !utf8[0])
+    if (!sym)
         return;
-    const bool ctrl = (e.modifiers & lx::ui::k_mod_ctrl) != 0;
     const bool shift = (e.modifiers & lx::ui::k_mod_shift) != 0;
-    const unsigned rev = model_.query_rev();
     const unsigned serial = g_.ui ? g_.ui->last_press_serial() : 0u;
-    switch (model_.key(sym, utf8, ctrl, shift)) {
+    switch (model_.key(sym, shift)) {
     case launcher_key_result::ignored: return;
-    case launcher_key_result::changed:
-        if (model_.query_rev() != rev && notice_[0])
-            set_notice(nullptr); // typing on clears a failure notice
+    case launcher_key_result::changed: dirty_ = true; return;
+    case launcher_key_result::cleared:
+        // Escape with text: empty the buffer (the field re-reads it on the describe).
+        query_storage_[0] = '\0';
+        query_buffer_.size = 0;
+        ++query_buffer_.revision;
+        if (notice_[0])
+            set_notice(nullptr);
         dirty_ = true;
         return;
     case launcher_key_result::close: closed_by_itself("escape"); return;
-    case launcher_key_result::launch: launch_selected(serial); return;
     case launcher_key_result::menu: menu_for(model_.selection(), serial); return;
     }
 }
@@ -1045,13 +978,87 @@ void lx::shell::launcher::on_row_event(const row_ref& ref, const lx::ui::pointer
     }
 }
 
+void lx::shell::launcher::on_query_changed() {
+    // Typing on clears a failure notice; the describe re-ranks (sync_query).
+    if (notice_[0])
+        set_notice(nullptr);
+    dirty_ = true;
+}
+
+void lx::shell::launcher::on_submit() {
+    launch_selected(g_.ui ? g_.ui->last_press_serial() : 0u);
+}
+
+lx::gfx::atlas_tile_id lx::shell::launcher::icon_tile(const char* name, int px) {
+    if (!name || !name[0] || px <= 0 || px > 64)
+        return {};
+    icon_slot* free_slot = nullptr;
+    for (icon_slot& s : icon_slots_) {
+        if (s.px == px && std::strcmp(s.name, name) == 0) {
+            lx::gfx::atlas_tile place{};
+            if (s.tile.valid() && surface_.atlas().lookup(s.tile, place))
+                return s.tile;
+            break;
+        }
+        if (!free_slot && s.px == 0)
+            free_slot = &s;
+    }
+    if (!g_.icons)
+        return {};
+    const std::uint32_t* pixels = g_.icons(name, px, g_.icons_user);
+    if (!pixels)
+        return {};
+    std::uint8_t rgba[64 * 64 * 4];
+    for (int i = 0; i < px * px; ++i) {
+        const std::uint32_t v = pixels[i];
+        rgba[i * 4 + 0] = static_cast<std::uint8_t>((v >> 16) & 0xFF);
+        rgba[i * 4 + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+        rgba[i * 4 + 2] = static_cast<std::uint8_t>(v & 0xFF);
+        rgba[i * 4 + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFF);
+    }
+    auto made = surface_.atlas().insert(
+        lx::gfx::atlas_format::rgba8, static_cast<unsigned>(px), static_cast<unsigned>(px),
+        std::span<const std::uint8_t>{rgba, sizeof(rgba)}, static_cast<unsigned>(px * 4));
+    if (!made)
+        return {};
+    icon_slot& s = free_slot ? *free_slot : icon_slots_[0];
+    std::snprintf(s.name, sizeof(s.name), "%s", name);
+    s.px = px;
+    s.tile = made.value();
+    return s.tile;
+}
+
+lx::ui::ui_node* lx::shell::launcher::field_node() {
+    lx::ui::ui_node* tree = surface_.valid() ? surface_.root().tree() : nullptr;
+    if (!tree)
+        return nullptr;
+    lx::ui::ui_node* found = nullptr;
+    auto walk = [&](auto&& self, lx::ui::ui_node* n) -> void {
+        if (found || !n)
+            return;
+        if (n->key() == k_field_key && n->type() == lx::ui::text_input_node::static_type()) {
+            found = n;
+            return;
+        }
+        for (unsigned i = 0; i < n->child_count(); ++i)
+            self(self, n->child_at(i));
+    };
+    walk(walk, tree);
+    return found;
+}
+
+void lx::shell::launcher::focus_field() {
+    if (lx::ui::ui_node* f = field_node())
+        (void)surface_.root().focus().focus(*f, lx::ui::focus_cause::programmatic);
+}
+
 void lx::shell::launcher::on_keyboard_focus(bool entered) {
     if (entered) {
         had_keyboard_ = true;
-        // The tree's keys are the focused node's, and nothing is focused until something
-        // focuses it: the root takes it on the keyboard's arrival (programmatic — no ring).
-        if (lx::ui::ui_node* tree = surface_.valid() ? surface_.root().tree() : nullptr)
-            (void)surface_.root().focus().focus(*tree, lx::ui::focus_cause::programmatic);
+        // The field takes the tree's focus (programmatic — no ring): it edits the query,
+        // and the navigation keys bubble from it to the root. Nothing focusable but the
+        // field exists, so a row click blurs nothing.
+        focus_field();
         return;
     }
     const bool had = had_keyboard_;
@@ -1079,7 +1086,8 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     on_launch_ = on_launch;
     on_closed_ = on_closed;
     user_ = user;
-    model_.bind(&catalog);
+    query_buffer_.storage = {query_storage_, sizeof query_storage_};
+    model_.bind(&catalog, &query_buffer_);
 }
 
 bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, unsigned output_slot) {
@@ -1134,6 +1142,11 @@ bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, unsigned
     pressed_ = -1;
     notice_[0] = '\0';
     ++notice_rev_;
+    query_storage_[0] = '\0';
+    query_buffer_.size = 0;
+    ++query_buffer_.revision;
+    for (icon_slot& s : icon_slots_)
+        s = {};
     model_.reset();
     model_.set_rows(rows_);
     layout_ = {};
@@ -1156,6 +1169,11 @@ void lx::shell::launcher::close() {
     had_keyboard_ = false;
     pressed_ = -1;
     layout_ = {};
+    query_storage_[0] = '\0';
+    query_buffer_.size = 0;
+    ++query_buffer_.revision;
+    for (icon_slot& s : icon_slots_)
+        s = {}; // the tiles went with the surface's atlas
     model_.reset();
     log_launcher.info("launcher: close");
 }
@@ -1175,10 +1193,13 @@ void lx::shell::launcher::after_dispatch() {
         dirty_ = false;
     }
     // The surface's frame loop: a frame when its frame callback allows one and the ledger
-    // has work (our repaint, the engine's hover damage, a configure).
+    // has work (our repaint, the engine's hover damage, a configure, the caret's blink).
     if (surface_.frame_due()) {
         describing_guard guard{this};
         surface_.run_frame();
+        // The keyboard may have arrived before a frame described the field.
+        if (had_keyboard_ && !surface_.root().focus().focused())
+            focus_field();
         if (log_launcher.enabled(lx::trace::level::debug) && surface_.stats().frames > 0)
             log_launcher.debug("launcher: draw matches={} selection={} first={} damage={}",
                                layout_.total, model_.selection(), layout_.first,
@@ -1195,7 +1216,8 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     on_launch_ = on_launch;
     on_closed_ = on_closed;
     user_ = user;
-    model_.bind(&catalog);
+    query_buffer_.storage = {query_storage_, sizeof query_storage_};
+    model_.bind(&catalog, &query_buffer_);
 }
 bool lx::shell::launcher::open(int, int, int, unsigned) { return false; }
 void lx::shell::launcher::close() {}

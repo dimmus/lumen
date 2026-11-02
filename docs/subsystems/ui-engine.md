@@ -100,7 +100,7 @@ GL). Slint, Qt Quick and Flutter are not installed on this host.
 |-------|--------|-------|
 | engine core | `lx.ui` | `:element`, `:node`, `:reconcile`, `:flex`, `:style`, `:theme`, `:text_node`, `:input`, `:overlay`, `:scroll`, `:list`, `:text_input`, `:popups`, `:clipboard` |
 | Wayland host | `lx.ui.host` | `:context` (per-UI-thread shared state), `:surface` (any role), `:roles`, `:input` (seat router + repeat + IME + cursor shape) |
-| shell views | `lx.shell` | `panel`, `switcher`, `notify_view`, `launcher`, `menu_popup` on the host; `:view_ui` — the literal-colour boxes the smoke suites pin |
+| shell views | `lx.shell` | `panel`, `switcher`, `notify_view`, `launcher`, `menu_popup` on the host; `:view_ui` — the literal-colour boxes the smoke suites pin (the launcher draws the theme's tokens instead: a `text_input` search field and icon rows) |
 | portal overlay | `lx.portal:overlay` | select / pick / choose on its own connection; `desktop` keeps the raw capture machinery |
 | app windows | `lx.app` | toplevels on the host, multiple per app |
 | bench | `lumen-ui-bench`, `scripts/ui-bench.sh` | S1–S4 per backend, JSON under `tests/bench/results/` |
