@@ -23,7 +23,7 @@ export namespace lx::compositor {
 // ── Frame geometry (scale 1) ───────────────────────────────────────────────
 
 /// Title bar height.
-inline constexpr int k_deco_title_height = 28;
+inline constexpr int k_deco_title_height = 36;
 /// Visible border around the client area (none when maximized).
 inline constexpr int k_deco_border = 1;
 /// Invisible resize band outside the visible frame (Mutter style): a 1 px border is not a
@@ -36,17 +36,22 @@ inline constexpr int k_deco_title_padding = 10;
 
 /// The close glyph's edge at scale 1 (its tile in the compositor's text atlas).
 inline constexpr int k_deco_close_glyph = 10;
-/// The close button's hover / pressed circle: its diameter at scale 1, centred in the button.
-inline constexpr int k_deco_close_circle = 20;
+/// A hover / pressed button's circle: its diameter at scale 1, centred in the button.
+inline constexpr int k_deco_close_circle = 24;
+/// The minimize / maximize glyph's box at scale 1 (strokes of `k_deco_glyph_stroke`).
+inline constexpr int k_deco_glyph_box = 12;
+/// The stroke of the minimize / maximize glyphs (logical px; the project scales it).
+inline constexpr int k_deco_glyph_stroke = 1;
 
 // Palette (sRGB, straight). Fills are drawn as these bytes (dimmed by `deco_fill_color`'s rule
-// for a not-responding window).
+// for a not-responding window). The button hover / pressed fills are neutral — Zed's flat
+// title bar: no per-button accent, the glyph brightens instead.
 inline constexpr std::uint32_t k_deco_title_active = 0x303033u;
 inline constexpr std::uint32_t k_deco_title_inactive = 0x48484Cu;
 inline constexpr std::uint32_t k_deco_border_active = 0x1B1B1Du;
 inline constexpr std::uint32_t k_deco_border_inactive = 0x2C2C30u;
-inline constexpr std::uint32_t k_deco_button_hover = 0xE0443Eu;
-inline constexpr std::uint32_t k_deco_button_pressed = 0xB8322Du;
+inline constexpr std::uint32_t k_deco_button_hover = 0x404048u;
+inline constexpr std::uint32_t k_deco_button_pressed = 0x4A4A54u;
 /// The close glyph's colours, and the title text's (active, inactive).
 inline constexpr std::uint32_t k_deco_glyph_light = 0xF2F2F2u;
 inline constexpr std::uint32_t k_deco_glyph_dim = 0xA8A8ACu;
@@ -71,6 +76,8 @@ struct frame_extents {
 enum class deco_zone : unsigned char {
     none,
     title,
+    minimize,
+    maximize,
     close,
     top,
     bottom,
@@ -96,9 +103,16 @@ enum class deco_zone : unsigned char {
 
 /// Title bar rect (global) of a frame around `geometry`.
 [[nodiscard]] lx::rect2i title_rect(lx::rect2i geometry);
+/// A title-bar button's rect (global): a T x T square, close rightmost, maximize and
+/// minimize following leftward (Zed's − □ × row).
+[[nodiscard]] lx::rect2i button_rect(lx::rect2i geometry, deco_zone zone);
 /// Close button rect (global): the title bar's right end, a T x T square.
 [[nodiscard]] lx::rect2i close_rect(lx::rect2i geometry);
-/// Width left for the title text in a frame `geometry_width` wide.
+/// The index of a button zone in `frame_node::buttons` (0 minimize, 1 maximize, 2 close);
+/// 3 for every other zone.
+[[nodiscard]] unsigned button_index(deco_zone zone);
+/// Width left for the title text in a frame `geometry_width` wide (the three buttons
+/// subtracted).
 [[nodiscard]] int title_text_room(int geometry_width);
 
 // ── Close glyph ────────────────────────────────────────────────────────────
@@ -162,8 +176,9 @@ struct close_glyph {
     int size = 0;
 };
 
-/// The title font at scale 1: "Sans", bold, 10 pt — the CPU titles' font.
-inline constexpr text::font_desc k_title_font{"Sans", 10.f, text::weight::bold, text::style::normal};
+/// The title font at scale 1: "Sans", regular, 10 pt — Zed's plain title bar weight.
+inline constexpr text::font_desc k_title_font{"Sans", 10.f, text::weight::normal,
+                                              text::style::normal};
 
 /// Server-side frames' text in the compositor's atlas (`chrome_atlas`): titles shaped and
 /// fitted by `lx.text` (the single-line API: one face, the ellipsis and the not-responding
@@ -231,16 +246,17 @@ enum class deco_button : unsigned char { normal, hover, pressed };
 /// The frame of one window: the underlay of its tree container, so it restacks with the
 /// window and paints below its surfaces. Drawn with UI primitives only (ADR-010 §4.11): the
 /// four border fills and the title fill are radius-0 solid quads in the palette's colours;
-/// the close button's hover / pressed circle is one quad whose radius is half its side; the
-/// title text and the close glyph are `mono_sprite`s from the compositor's text atlas
+/// a hovered / pressed title-bar button's circle is one quad whose radius is half its side;
+/// the title text and the close glyph are `mono_sprite`s from the compositor's text atlas
 /// (`text`), drawn 1:1 on an output whose scale the title was rasterised for (the manager
 /// keeps one run per output scale the frame is on) and resampled from the largest run
-/// elsewhere. Every path draws them: the primitive renderers (CPU, GLES 3.1, `:ui_vk`) as
-/// they are, a path without one through `gfx::lower_to_blits` (a rounded solid blit, coverage
-/// blits from the atlas's pages). A frame draws from the first frame it is shown. A dimmed
-/// frame's fills and glyphs carry the dim already applied, the way `cpu_compositor` tints an
-/// encoded byte (`(c · 166) >> 8` for 0.65) — one colour rule on every backend. Without
-/// `text` (a node built by hand) no title or close glyph is drawn.
+/// elsewhere — the minimize and maximize glyphs are 1 px strokes (plain quads). Every path
+/// draws them: the primitive renderers (CPU, GLES 3.1, `:ui_vk`) as they are, a path without
+/// one through `gfx::lower_to_blits` (a rounded solid blit, coverage blits from the atlas's
+/// pages). A frame draws from the first frame it is shown. A dimmed frame's fills and glyphs
+/// carry the dim already applied, the way `cpu_compositor` tints an encoded byte
+/// (`(c · 166) >> 8` for 0.65) — one colour rule on every backend. Without `text` (a node
+/// built by hand) no title or close glyph is drawn.
 class frame_node final : public scene::scene_node {
 public:
     ~frame_node() override;
@@ -254,7 +270,10 @@ public:
     frame_extents extents{};
     bool shown = false;
     bool active = false;
-    deco_button button = deco_button::normal;
+    /// Per title-bar button (indexed by `button_index(zone)`): its hover / pressed look.
+    deco_button buttons[3]{};
+    /// The maximize button paints the restore glyph while the window is maximized.
+    bool maximized = false;
     /// The window's title, laid out per output scale (the manager's); null: no title.
     const title_text* title = nullptr;
     /// The compositor's text atlas the title and close glyphs are tiles of; null: no glyph
@@ -296,8 +315,9 @@ public:
     /// "<title> (Not Responding)" — the suffix always visible, the title part ellipsized to
     /// the room left (KWin) — and the frame is dimmed. Rasterized at the next `on_tick`.
     void set_not_responding(lx::toplevel_id id, bool on);
-    /// Close-button look (hover / pressed). Damages the button only.
-    void set_button(lx::toplevel_id id, deco_button state);
+    /// A title-bar button's look (hover / pressed); `zone` outside the three buttons is
+    /// ignored. Damages the button only.
+    void set_button(lx::toplevel_id id, deco_zone zone, deco_button state);
     /// Damages the whole visible frame (the window was restacked).
     void damage(lx::toplevel_id id);
     /// The toplevel record is going: frame off the tree, textures retired, slot freed.
@@ -457,25 +477,48 @@ lx::rect2i lx::compositor::title_rect(lx::rect2i g) {
     return {g.x, g.y - k_deco_title_height, g.width, k_deco_title_height};
 }
 
+unsigned lx::compositor::button_index(deco_zone zone) {
+    switch (zone) {
+    case deco_zone::minimize:
+        return 0;
+    case deco_zone::maximize:
+        return 1;
+    case deco_zone::close:
+        return 2;
+    default:
+        return 3;
+    }
+}
+
+lx::rect2i lx::compositor::button_rect(lx::rect2i g, deco_zone zone) {
+    const unsigned i = button_index(zone);
+    const int t = k_deco_title_height;
+    return {g.x + g.width - t * static_cast<int>(3 - i), g.y - t, t, t};
+}
+
 lx::rect2i lx::compositor::close_rect(lx::rect2i g) {
-    return {g.x + g.width - k_deco_title_height, g.y - k_deco_title_height, k_deco_title_height,
-            k_deco_title_height};
+    return button_rect(g, deco_zone::close);
 }
 
 int lx::compositor::title_text_room(int geometry_width) {
-    return geometry_width - 2 * k_deco_title_padding - k_deco_title_height;
+    return geometry_width - 2 * k_deco_title_padding - 3 * k_deco_title_height;
 }
 
 lx::compositor::deco_zone lx::compositor::deco_hit(lx::rect2i g, frame_extents e, double gx,
                                                    double gy) {
     if (e.empty() || g.width <= 0 || g.height <= 0)
         return deco_zone::none;
-    const lx::rect2i close = close_rect(g);
     const lx::rect2i title = title_rect(g);
-    if (in_rect(close, gx, gy) && in_rect(title, gx, gy))
-        return deco_zone::close;
-    if (in_rect(title, gx, gy))
+    if (in_rect(title, gx, gy)) {
+        // The buttons first: close rightmost, then maximize, minimize (Zed's − □ × row).
+        if (in_rect(button_rect(g, deco_zone::close), gx, gy))
+            return deco_zone::close;
+        if (in_rect(button_rect(g, deco_zone::maximize), gx, gy))
+            return deco_zone::maximize;
+        if (in_rect(button_rect(g, deco_zone::minimize), gx, gy))
+            return deco_zone::minimize;
         return deco_zone::title;
+    }
     // Maximized: the title bar is all there is.
     if (!e.left && !e.right && !e.bottom)
         return deco_zone::none;
@@ -533,6 +576,8 @@ unsigned lx::compositor::edges_for_zone(deco_zone zone) {
         return edge_bottom | edge_right;
     case deco_zone::none:
     case deco_zone::title:
+    case deco_zone::minimize:
+    case deco_zone::maximize:
     case deco_zone::close:
         break;
     }
@@ -550,6 +595,10 @@ const char* lx::compositor::deco_zone_name(deco_zone zone) {
         return "none";
     case deco_zone::title:
         return "title";
+    case deco_zone::minimize:
+        return "minimize";
+    case deco_zone::maximize:
+        return "maximize";
     case deco_zone::close:
         return "close";
     case deco_zone::top:
@@ -906,7 +955,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         const int y = bar.y + (bar.height - h) / 2;
         const int baseline = y + static_cast<int>(std::lround(run->ascent * k));
         const lx::rect2i clip =
-            project({title.x, title.y, g.width - k_deco_title_height, k_deco_title_height});
+            project({title.x, title.y, g.width - 3 * k_deco_title_height, k_deco_title_height});
         const lx::rect2i span{std::max(x, clip.x), y, std::min(text_w, clip.width), h};
         if (clip.width > 0 && span.width > 0 && span.height > 0) {
             // One order for the run: its glyphs do not overlap anything of the frame's above
@@ -938,18 +987,65 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         }
     }
 
-    const lx::rect2i close = close_rect(g);
-    if (button != deco_button::normal) {
+    // The title-bar buttons (Zed's flat row: − □ ×): a neutral circle under the hovered or
+    // pressed one, the glyphs brightening with it. The close "×" comes from the atlas; the
+    // minus and the square (the restore pair when maximized) are 1 px strokes.
+    const auto button_rgb = [&](deco_zone zone) -> std::uint32_t {
+        const bool light = active || buttons[button_index(zone)] != deco_button::normal;
+        return light ? k_deco_glyph_light : k_deco_glyph_dim;
+    };
+    const auto button_fill = [&](deco_zone zone) {
+        const deco_button st = buttons[button_index(zone)];
+        if (st == deco_button::normal)
+            return;
+        const lx::rect2i r = button_rect(g, zone);
+        const int d = k_deco_close_circle;
         // One quad, its radius half its side: a circle at any scale, anti-aliased by the
         // primitive renderer (or the lowered path's rounded blit).
-        const int d = k_deco_close_circle;
-        push_fill({close.x + (close.width - d) / 2, close.y + (close.height - d) / 2, d, d},
-                  button == deco_button::pressed ? k_deco_button_pressed : k_deco_button_hover,
+        push_fill({r.x + (r.width - d) / 2, r.y + (r.height - d) / 2, d, d},
+                  st == deco_button::pressed ? k_deco_button_pressed : k_deco_button_hover,
                   true, bar);
+    };
+    button_fill(deco_zone::minimize);
+    button_fill(deco_zone::maximize);
+    button_fill(deco_zone::close);
+    // Minimize: one horizontal stroke, centred.
+    {
+        const lx::rect2i r = button_rect(g, deco_zone::minimize);
+        const int cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+        push_fill({cx - k_deco_glyph_box / 2, cy - k_deco_glyph_stroke / 2, k_deco_glyph_box,
+                   k_deco_glyph_stroke},
+                  button_rgb(deco_zone::minimize), false, bar);
     }
-    const bool light = button != deco_button::normal || active;
+    // Maximize: a square outline; maximized, the restore pair — the back square behind the
+    // front one, its overlap masked by a title-coloured fill before the front outline.
+    {
+        const lx::rect2i r = button_rect(g, deco_zone::maximize);
+        const int cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+        const int s = k_deco_glyph_box, w = k_deco_glyph_stroke;
+        const std::uint32_t rgb = button_rgb(deco_zone::maximize);
+        const auto outline = [&](lx::rect2i b) {
+            push_fill({b.x, b.y, b.width, w}, rgb, false, bar);
+            push_fill({b.x, b.y + b.height - w, b.width, w}, rgb, false, bar);
+            push_fill({b.x, b.y, w, b.height}, rgb, false, bar);
+            push_fill({b.x + b.width - w, b.y, w, b.height}, rgb, false, bar);
+        };
+        if (maximized) {
+            const int front = s - 2; // the front square; the back one peeks up-right
+            const int fx = cx - front / 2, fy = cy - front / 2 + 1;
+            outline({fx + 2, fy - 2, front, front});
+            push_fill({fx + w, fy + w, front - 2 * w, front - 2 * w},
+                      active ? k_deco_title_active : k_deco_title_inactive, false, bar);
+            outline({fx, fy, front, front});
+        } else {
+            outline({cx - s / 2, cy - s / 2, s, s});
+        }
+    }
+    const bool light_close =
+        active || buttons[button_index(deco_zone::close)] != deco_button::normal;
     if (const close_glyph* cg = text ? text->find_close(vs) : nullptr) {
         // The glyph rasterised for this scale, centred in the projected button.
+        const lx::rect2i close = close_rect(g);
         const lx::rect2i cr = project(close);
         const float box[4] = {static_cast<float>(cr.x + (cr.width - cg->size) / 2),
                               static_cast<float>(cr.y + (cr.height - cg->size) / 2),
@@ -957,7 +1053,8 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         const lx::rect2i at{static_cast<int>(box[0]), static_cast<int>(box[1]), cg->size, cg->size};
         if (!push_glyph(cg->tile, false, box, bar,
                         gfx::premultiplied_half(
-                            deco_fill_color(light ? k_deco_glyph_light : k_deco_glyph_dim, dimmed)),
+                            deco_fill_color(light_close ? k_deco_glyph_light : k_deco_glyph_dim,
+                                            dimmed)),
                         out.orders().assign(at)))
             text->note_stale();
     }
@@ -1001,7 +1098,9 @@ lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
         s.node.extents = {};
         s.node.shown = false;
         s.node.active = rec.id == active_;
-        s.node.button = deco_button::normal;
+        for (deco_button& b : s.node.buttons)
+            b = deco_button::normal;
+        s.node.maximized = false;
         s.node.title = &s.text;
         s.node.text = text_.get();
         ensure_close(s);
@@ -1071,14 +1170,15 @@ void lx::compositor::decoration_manager::sync(const toplevel_record& rec) {
         tree_->set_underlay(s->root, &s->node);
         s->installed = true;
     }
-    const frame_extents ext =
-        extents_for(decoration_mode::server, rec.state == lx::toplevel_state::maximized);
+    const bool maximized = rec.state == lx::toplevel_state::maximized;
+    const frame_extents ext = extents_for(decoration_mode::server, maximized);
     if (s->node.shown && rect_eq(s->node.geometry, rec.geometry) && s->node.extents == ext)
         return;
     const bool width_changed = !s->node.shown || s->node.geometry.width != rec.geometry.width;
     damage_strips(s->node);
     s->node.geometry = rec.geometry;
     s->node.extents = ext;
+    s->node.maximized = maximized;
     s->node.shown = true;
     damage_strips(s->node);
     if (width_changed) {
@@ -1130,13 +1230,17 @@ void lx::compositor::decoration_manager::set_not_responding(lx::toplevel_id id, 
     damage_strips(s->node);
 }
 
-void lx::compositor::decoration_manager::set_button(lx::toplevel_id id, deco_button state) {
-    slot* s = find(id);
-    if (!s || s->node.button == state)
+void lx::compositor::decoration_manager::set_button(lx::toplevel_id id, deco_zone zone,
+                                                    deco_button state) {
+    const unsigned i = button_index(zone);
+    if (i >= 3)
         return;
-    s->node.button = state;
+    slot* s = find(id);
+    if (!s || s->node.buttons[i] == state)
+        return;
+    s->node.buttons[i] = state;
     if (scene_ && s->node.shown)
-        scene_->note_damage(close_rect(s->node.geometry));
+        scene_->note_damage(button_rect(s->node.geometry, zone));
 }
 
 void lx::compositor::decoration_manager::damage(lx::toplevel_id id) {

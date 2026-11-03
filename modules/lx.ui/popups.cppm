@@ -69,6 +69,8 @@ struct menu_entry {
     bool is_disabled = false;
     /// −1: not a toggle; 0 / 1: a check mark's slot, empty or checked.
     std::int8_t toggled = -1;
+    /// The check mark at the row's right edge, not the left slot.
+    bool check_at_end = false;
     std::span<const char* const> keystrokes{};
     handler action{};
     int value = 0;
@@ -78,6 +80,12 @@ struct menu_entry {
     menu_entry& keys(std::span<const char* const> k) { keystrokes = k; return *this; }
     menu_entry& disabled(bool on = true) { is_disabled = on; return *this; }
     menu_entry& toggle(bool on) { toggled = on ? 1 : 0; return *this; }
+    /// The check mark at the row's right edge instead of its left slot (a dropdown's
+    /// current-value entry).
+    menu_entry& check_end() {
+        check_at_end = true;
+        return *this;
+    }
     /// What `action` is called with.
     menu_entry& with_value(int v) { value = v; return *this; }
 };
@@ -311,7 +319,7 @@ child lx_ui_pp_entries(std::span<const menu_entry> entries, const char* name);
     // The label: `h_flex().gap_1p5()` over the icon (or a toggle's check slot) and the label.
     child head[2]{};
     unsigned hn = 0;
-    if (e.toggled >= 0) {
+    if (e.toggled >= 0 && !e.check_at_end) {
         const child check = icon_view(icon::check, small, disabled ? tok::icon_muted : tok::icon_accent);
         control_props slot{};
         slot.layout = style{}.flex_none().size(lx::layout::px(small));
@@ -333,6 +341,15 @@ child lx_ui_pp_entries(std::span<const menu_entry> entries, const char* name);
         control_props wrap{};
         wrap.layout = style{}.flex_row().items_center().flex_none().ml(rems_from_px(16.f));
         parts[pn++] = control(wrap, {&kb, 1u});
+    }
+    if (e.toggled >= 0 && e.check_at_end) {
+        // A dropdown's current value: the check at the row's right edge, an invisible slot
+        // otherwise so every row's label lines up.
+        const child check = icon_view(icon::check, small, disabled ? tok::icon_muted : tok::icon_accent);
+        control_props end_slot{};
+        end_slot.layout = style{}.flex_none().size(lx::layout::px(small));
+        end_slot.paint.opacity = e.toggled ? 255 : 0;
+        parts[pn++] = control(end_slot, {&check, 1u});
     }
     if (e.kind == menu_entry_kind::submenu) {
         parts[pn++] = icon_view(icon::chevron_right, small, tok::icon_muted);

@@ -154,6 +154,9 @@ struct text_input_props {
     /// Enter: called with the length.
     handler on_submit{};
     bool disabled = false;
+    /// Unframed: no border, no background — the chrome around the field paints (a
+    /// spinner's middle, an inline cell). Caret, selection and editing are unchanged.
+    bool framed = true;
     std::int16_t tab_index = 0;
     const char* name = nullptr;
 };
@@ -258,6 +261,7 @@ private:
 
     text_block_node* text_ = nullptr;
     text_buffer* buffer_ = nullptr;
+    bool framed_ = true;
     std::uint32_t seen_revision_ = 0;
     std::uint32_t own_size_ = 0;
     std::uint32_t max_bytes_ = k_text_input_capacity;
@@ -312,6 +316,7 @@ public:
     text_input_builder& on_change(handler h) { props_.on_change = h; return *this; }
     text_input_builder& on_submit(handler h) { props_.on_submit = h; return *this; }
     text_input_builder& disabled(bool on = true) { props_.disabled = on; return *this; }
+    text_input_builder& framed(bool on = true) { props_.framed = on; return *this; }
     text_input_builder& tab_index(int i) { props_.tab_index = static_cast<std::int16_t>(i); return *this; }
     text_input_builder& name(const char* a11y) { props_.name = a11y; return *this; }
     text_input_builder& key(element_key k) { key_ = k; return *this; }
@@ -506,6 +511,13 @@ std::string_view lx::ui::text_input_node::text() const { return {data(), size()}
 void lx::ui::text_input_node::resolve_paint() {
     const theme& t = active_theme();
     quad_style q{};
+    if (!framed_) {
+        // The chrome around the field paints; only the text, caret and selection remain.
+        q.background = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+        box_[0] = pack_quad_style(q);
+        box_[1] = box_[0];
+        return;
+    }
     q.background = t.color(tok::editor_background);
     for (unsigned i = 0; i < 4; ++i) {
         q.corner_radii[i] = radius_px(radius::md, ui_rem_px());
@@ -529,7 +541,9 @@ bool lx::ui::text_input_node::apply(const text_input_props& p) {
         flex_ = flex;
         layout_ = p.layout;
     }
-    const bool repaint = !applied_ || generation != generation_;
+    const bool framed_changed = p.framed != framed_;
+    framed_ = p.framed;
+    const bool repaint = !applied_ || generation != generation_ || framed_changed;
     if (repaint)
         resolve_paint();
     generation_ = generation;

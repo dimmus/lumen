@@ -660,8 +660,50 @@ compositor feature, not on the app.
 
 ### Status
 
-Phases A–G implemented except the two named open items (in-window key capture; the
+Phases A–H implemented (H is the Zed design pass above) except the two named open items (in-window key capture; the
 per-device override and window-rules editors). 134/134 tests green, including
 `test_ui_inputs` (5), `test_settings_ui` (5), `test_config_edit` (5); the app opens and
 presents on the automatic tier against a headless compositor, and `lumen-ctl devices` /
 `outputs` / `version` answer live.
+
+### Phase H — the Zed design pass — done
+
+The user-facing pass over the shipped app (2026-11), from Zed's own settings UI:
+
+- **`lx.ui:inputs` gains `drop_down` and `spinner`.** `drop_down` is Zed's dropdown: a
+  bordered trigger that hugs its content (a `min_width` floor), the current word and the
+  stacked up/down chevrons, opening a `popover_menu` whose current entry carries its check
+  mark at the row's *right* edge (`menu_entry::check_end()` — the menu's new right-check
+  mode; the left-slot check stays for toggles). `spinner` is Zed's number input: one
+  bordered box — − button, a 1 px rule, a **borderless** editable field (`text_input`'s new
+  `.framed(false)`: no border, no background, the chrome around it paints), a rule, + —
+  the buttons reporting ±1, a submit reporting through the field's own `on_submit`. Both
+  fix a latent bug `spinner`'s first test caught: `range()` never set `has_range_`, so the
+  end-disable was dead in the stepper too.
+- **The app takes Zed's settings-modal shape.** The search moves into the left sidebar,
+  which becomes a tree: a pane row with its chevron (click: navigate; click again:
+  collapse) and its groups indented beneath — a leaf click narrows the pane to that group
+  (`session::open_group`; the content header's subtitle names the focus, else the pane's
+  `[sections]` in the mono family). Every pane leads with the content header — the "User"
+  badge left, "Edit in config.toml" right (a popover naming the user layer with a
+  Copy-path entry; `lx.ui::clipboard`) — then the title, the subtitle, a rule, and setting
+  rows separated by rules (Zed's divider rows). The save state moved to the sidebar's
+  bottom, where Zed keeps its keybinding hint. Enumerations pick through `drop_down`,
+  integers through `spinner` (integers take text-buffer slots beside the strings');
+  numbers stay on the slider + readout. Integer edits parse on submit
+  (`session::commit_int`), ±1 steps re-seed the buffer's canonical text
+  (`session::step_int`).
+- **Server-side frames take the Zed title bar** (`lx.compositor:decoration`): 36 px, a
+  regular-weight title, the flat − □ × row at the right (the × from the atlas; the − and
+  the □ — the restore pair while maximized — are 1 px stroke quads), neutral grey hover /
+  pressed circles (no per-button accent), per-button state (`frame_node::buttons[]`,
+  `decoration_manager::set_button(id, zone, state)`), and the new `deco_zone::minimize` /
+  `maximize` wired through press / drag-over / release (`in_button`) — minimize calls
+  `set_minimized`, maximize toggles `set_maximized`, both already in the WM. The button
+  clicks still happen on release over their button, and the release flows on as before.
+
+The settings tests still find controls by role and element key (unchanged keys);
+`test_deco_titles` keeps its reference fixtures non-overlapping (the capture comparison's
+precondition — occluded windows carry visibility rects the crop path does not move) with
+the three-button geometry regolded. 134/134 test targets green (`test_ui_inputs` now runs
+8 cases; the gallery grew a dropdown-and-spinner row, both themes regolded).

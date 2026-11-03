@@ -109,10 +109,11 @@ struct string_field {
 class session {
 public:
     static constexpr unsigned k_no_row = ~0u;
-    /// The schema's string keys each get their own edit buffer (9 today). Headroom for the
-    /// editors still open (per-device overrides, window rules); a schema past the cap makes
-    /// those rows read-only — never two rows sharing one buffer.
-    static constexpr unsigned k_max_string_rows = 16;
+    /// The schema's string and integer keys each get their own edit buffer (the strings'
+    /// fields, the integers' spinners — 9 + 16 today). Headroom for the editors still open
+    /// (per-device overrides, window rules); a key past the cap renders read-only — never
+    /// two rows sharing one buffer.
+    static constexpr unsigned k_max_string_rows = 32;
 
     /// `load_files`: read the layered configuration (main does this; tests keep the
     /// defaults). Seeds `config_` and the string buffers from what Lumen runs with.
@@ -134,6 +135,29 @@ public:
     void set_current(pane_id p) {
         current_ = p;
         open_menu_ = k_no_row;
+        focus_group_[0] = '\0';
+        expanded_[static_cast<unsigned>(p) % k_pane_count] = true;
+        repaint();
+    }
+
+    // ── the sidebar tree (Zed's settings navigation) ──
+    /// The pane's section in the tree is expanded (its groups listed under it).
+    [[nodiscard]] bool expanded(pane_id p) const {
+        return expanded_[static_cast<unsigned>(p) % k_pane_count];
+    }
+    void toggle_expanded(pane_id p) {
+        bool& on = expanded_[static_cast<unsigned>(p) % k_pane_count];
+        on = !on;
+        repaint();
+    }
+    /// The group the pane is narrowed to (the tree's leaf click); "" shows every group.
+    [[nodiscard]] std::string_view focus_group() const { return focus_group_; }
+    /// Opens `pane` narrowed to `group` (an empty `group` shows the whole pane).
+    void open_group(pane_id p, const char* group) {
+        current_ = p;
+        expanded_[static_cast<unsigned>(p) % k_pane_count] = true;
+        open_menu_ = k_no_row;
+        std::snprintf(focus_group_, sizeof(focus_group_), "%s", group ? group : "");
         repaint();
     }
 
@@ -148,6 +172,17 @@ public:
     void set_bool(unsigned row, bool v);
     /// An integer key takes `v` (already clamped to the descriptor's range).
     void set_int(unsigned row, int v);
+    /// A spinner's − / +: the snapshot's value steps by `delta` (±1) and writes through
+    /// the same path; the row's buffer re-seeds with the canonical text.
+    void step_int(unsigned row, int delta);
+    /// A spinner's field submit: the buffer's text becomes the value (invalid text
+    /// re-seeds from the snapshot).
+    void commit_int(unsigned row);
+    /// The user layer's path ("" when there is none — LUMEN_CONFIG=0 or a missing
+    /// location).
+    [[nodiscard]] std::string_view config_path() const {
+        return std::string_view(user_file_);
+    }
     /// A number key takes `v`.
     void set_number(unsigned row, double v);
     /// An enumeration key takes the word index.
@@ -272,6 +307,9 @@ private:
     lx::config::config_snapshot config_{};
     pane_id current_ = pane_id::appearance;
     unsigned open_menu_ = k_no_row;
+    /// The sidebar tree's expansion, and the group the pane is narrowed to.
+    bool expanded_[k_pane_count]{};
+    char focus_group_[64]{};
     save_state save_ = save_state::untouched;
     bool user_file_disabled_ = true;
     /// The user file came from `force_user_file` (a test's temp file), not the located
@@ -331,10 +369,13 @@ namespace cfg = lx::config;
 
 settings::session* g_session = nullptr; // NOLINT(cppcoreguidelines-avoid-non-const-global-variable)
 
-constexpr float k_rail_w = 220.f;   ///< px at the rem
+constexpr float k_rail_w = 240.f;   ///< px at the rem (Zed's sidebar)
 constexpr float k_value_w = 220.f;  ///< the value column, px at the rem
 constexpr float k_row_h = 32.f;     ///< a setting row without a badge
 constexpr float k_badge_row_h = 40.f;
+/// The "Edit in config.toml" popover's slot in the session's open-menu state (beyond the
+/// catalog rows and the displays pane's 0x4000+head keys).
+constexpr unsigned k_path_menu = 0x6000u;
 
 // ── The components' file-local vocabulary, mirrored ───────────────────────────────────
 
@@ -379,6 +420,20 @@ constexpr float k_badge_row_h = 40.f;
 }
 
 [[nodiscard]] float st_text_px(float px) { return px * st_rem() / 16.f; }
+
+/// Text in the theme's buffer (mono) family — Zed's section subtitles and the status line.
+[[nodiscard]] lx::ui::child st_mono(const char* text, float px, tok color) {
+    lx::ui::text_block_props p{};
+    p.text = text ? text : "";
+    const char* family = active_theme().fonts().buffer_family;
+    p.font = {family && family[0] ? family : lx::text::k_ui_family, px * 0.75f,
+              lx::text::weight::normal, lx::text::style::normal};
+    p.color = active_theme().color(color);
+    p.line_height = 1.f;
+    p.wrap = lx::text::text_wrap::none;
+    p.context = active_ui_resources().text;
+    return text_block(p);
+}
 
 [[nodiscard]] unsigned st_a11y(lx::a11y::state_flag f) { return static_cast<unsigned>(f); }
 
@@ -622,21 +677,28 @@ void build_catalog() {
             r.label = intern_label(p.key);
             push(std::move(r));
         }
-    // The string rows take their buffer slots in catalog order; a string row past the cap
-    // gets k_no_row (read-only) — never another row's buffer.
+    // The string rows take their buffer slots in catalog order, the integer rows follow
+    // (their spinners edit through a buffer too); a row past the cap gets k_no_row
+    // (read-only) — never another row's buffer.
     for (unsigned& s : g_string_slots)
         s = session::k_no_row;
     unsigned slot = 0;
-    for (unsigned i = 0; i < g_catalog.size() && i < std::size(g_string_slots); ++i) {
-        if (!g_catalog[i].desc || g_catalog[i].desc->kind != cfg::value_kind::string)
-            continue;
+    const auto take = [&](unsigned i) {
         if (slot >= session::k_max_string_rows) {
-            log_settings.warn("settings: {} string keys, the session holds {} — the rest "
-                              "render read-only",
-                              slot + 1, session::k_max_string_rows);
-            break;
+            log_settings.warn("settings: more than {} editable keys, the session holds {} — "
+                              "the rest render read-only",
+                              session::k_max_string_rows + 1, session::k_max_string_rows);
+            return;
         }
         g_string_slots[i] = slot++;
+    };
+    for (unsigned i = 0; i < g_catalog.size() && i < std::size(g_string_slots); ++i) {
+        if (g_catalog[i].desc && g_catalog[i].desc->kind == cfg::value_kind::string)
+            take(i);
+    }
+    for (unsigned i = 0; i < g_catalog.size() && i < std::size(g_string_slots); ++i) {
+        if (g_catalog[i].desc && g_catalog[i].desc->kind == cfg::value_kind::integer)
+            take(i);
     }
 }
 
@@ -720,19 +782,35 @@ void session::load_strings() {
     for (unsigned& s : string_rows_)
         s = k_no_row;
     const std::vector<row_ref>& rows = catalog();
-    for (unsigned i = 0, used = 0; i < rows.size() && used < k_max_string_rows; ++i) {
-        if (!rows[i].desc || rows[i].desc->kind != cfg::value_kind::string)
+    for (unsigned i = 0; i < rows.size() && i < std::size(g_string_slots); ++i) {
+        const unsigned slot = g_string_slots[i];
+        if (slot == k_no_row || slot >= k_max_string_rows)
             continue;
+        string_rows_[slot] = i;
         const cfg::key_desc& d = *rows[i].desc;
-        string_rows_[used] = i;
-        const char* value = static_cast<const char*>(d.field(config_));
-        strings_[used].set(value ? std::string_view(value) : std::string_view{});
-        ++used;
+        if (d.kind == cfg::value_kind::string) {
+            const char* value = static_cast<const char*>(d.field(config_));
+            strings_[slot].set(value ? std::string_view(value) : std::string_view{});
+        } else if (d.kind == cfg::value_kind::integer) {
+            char text[24];
+            std::snprintf(text, sizeof(text), "%d",
+                          *static_cast<const int*>(d.field(config_)));
+            strings_[slot].set(text);
+        }
     }
     // The query buffer starts empty.
     query_.storage[0] = '\0';
     query_.bind();
     query_.buffer.size = 0;
+}
+
+/// The text slot of the integer row `row`, or k_no_row.
+[[nodiscard]] unsigned int_slot(unsigned row) {
+    const std::vector<row_ref>& rows = catalog();
+    if (row >= rows.size() || row >= std::size(g_string_slots) ||
+        !rows[row].desc || rows[row].desc->kind != cfg::value_kind::integer)
+        return session::k_no_row;
+    return g_string_slots[row];
 }
 
 void* session::field_of(unsigned row) {
@@ -907,10 +985,43 @@ void session::set_int(unsigned row, int v) {
         return;
     const field_spec spec = spec_of(rows[row]);
     v = std::clamp(v, static_cast<int>(spec.lo), static_cast<int>(spec.hi));
+    // The spinner's buffer takes the canonical text either way.
+    const unsigned slot = int_slot(row);
+    if (slot != k_no_row) {
+        char text[24];
+        std::snprintf(text, sizeof(text), "%d", v);
+        (void)string_buffer(slot).assign(text);
+    }
     if (write_key(row, lx::config::edit_value::integer(v)))
         return written();
     *static_cast<int*>(field_of(row)) = v;
     repaint();
+}
+
+void session::step_int(unsigned row, int delta) {
+    const std::vector<row_ref>& rows = catalog();
+    if (row >= rows.size())
+        return;
+    set_int(row, *static_cast<const int*>(rows[row].desc->field(config_)) + delta);
+}
+
+void session::commit_int(unsigned row) {
+    const std::vector<row_ref>& rows = catalog();
+    if (row >= rows.size())
+        return;
+    const unsigned slot = int_slot(row);
+    if (slot == k_no_row)
+        return;
+    const char* text = string_buffer(slot).storage.data();
+    char* end = nullptr;
+    const long parsed = text ? std::strtol(text, &end, 10) : 0L;
+    if (!text || end == text || (end && *end != '\0')) {
+        // Not a number: the field shows the snapshot's value again.
+        set_int(row, *static_cast<const int*>(rows[row].desc->field(config_)));
+        refresh();
+        return;
+    }
+    set_int(row, static_cast<int>(parsed));
 }
 
 void session::set_number(unsigned row, double v) {
@@ -1358,32 +1469,54 @@ namespace {
     const lx::ui::element_key key = k_row_control_base + index;
     const cfg::config_snapshot& c = s->config();
     switch (spec.kind) {
-    case cfg::value_kind::boolean:
-        return toggle_switch(read_bool(r, c))
-            .on_toggle([s, index](int v) { s->set_bool(index, v != 0); })
-            .name(r.label)
-            .key(key);
+    case cfg::value_kind::boolean: {
+        lx::ui::child sw = toggle_switch(read_bool(r, c))
+                              .on_toggle([s, index](int v) { s->set_bool(index, v != 0); })
+                              .name(r.label)
+                              .key(key);
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+                      control_paint{}, {&sw, 1u});
+    }
     case cfg::value_kind::enumeration: {
         const std::span<const char* const> words{spec.names, spec.name_count};
         const unsigned v = read_enum(r, c);
-        if (spec.name_count <= 3)
-            return segmented(words, static_cast<int>(v))
-                .on_select([s, index](int i) { s->set_enum(index, static_cast<unsigned>(i)); })
-                .name(r.label)
-                .key(key);
-        return select(words, static_cast<int>(v))
-            .open(s->open_menu() == index)
-            .on_open([s, index](int) { s->set_open_menu(index); })
-            .on_dismiss([s, index](int) { s->set_open_menu(session::k_no_row); })
-            .on_select([s, index](int i) {
-                s->set_enum(index, static_cast<unsigned>(i));
-                s->set_open_menu(session::k_no_row);
-            })
-            .name(r.label)
-            .key(key);
+        lx::ui::child ctl;
+        if (spec.name_count <= 3) {
+            ctl = segmented(words, static_cast<int>(v))
+                      .on_select([s, index](int i) { s->set_enum(index, static_cast<unsigned>(i)); })
+                      .name(r.label)
+                      .key(key);
+        } else {
+            // Zed's dropdown: the trigger hugs its content, the check at the row's edge.
+            ctl = drop_down(words, static_cast<int>(v))
+                      .open(s->open_menu() == index)
+                      .on_open([s, index](int) { s->set_open_menu(index); })
+                      .on_dismiss([s, index](int) { s->set_open_menu(session::k_no_row); })
+                      .on_select([s, index](int i) {
+                          s->set_enum(index, static_cast<unsigned>(i));
+                          s->set_open_menu(session::k_no_row);
+                      })
+                      .name(r.label)
+                      .key(key);
+        }
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+                      control_paint{}, {&ctl, 1u});
     }
     case cfg::value_kind::integer:
     case cfg::value_kind::number: {
+        // Integers are Zed's number input (− value +, the field editable); the buffer cap's
+        // leftovers and the numbers stay on the slider + readout.
+        const unsigned slot = int_slot(index);
+        if (spec.kind == cfg::value_kind::integer && slot != session::k_no_row) {
+            lx::ui::child sp = spinner(s->string_buffer(slot), read_int(r, c))
+                                   .range(static_cast<int>(spec.lo), static_cast<int>(spec.hi))
+                                   .on_change([s, index](int d) { s->step_int(index, d); })
+                                   .on_submit([s, index](int) { s->commit_int(index); })
+                                   .name(r.label)
+                                   .key(key);
+            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+                          control_paint{}, {&sp, 1u});
+        }
         const int steps =
             std::max(1, static_cast<int>(std::min(spec.hi - spec.lo, spec.kind ==
                                                                         cfg::value_kind::integer
@@ -1511,33 +1644,25 @@ namespace {
                   control_paint{}, {kids, 2u});
 }
 
-/// The pane note under its rows (what this build does not yet edit: ADR-013's phases).
-[[nodiscard]] lx::ui::child pane_note(pane_id p) {
-    const char* note = p == pane_id::displays
-                           ? "Modes, scale and arrangement are driven through the output "
-                             "manager and arrive with the Displays pane (ADR-013 Phase F)."
-                         : p == pane_id::shortcuts
-                             ? "The bindings editor arrives with the write path (ADR-013 "
-                               "Phase E); the defaults are on the Session pane."
-                             : nullptr;
-    if (!note)
-        return nullptr;
-    lx::ui::child note_text = st_text(note, st_text_px(12.f), tok::text_muted, false, true);
-    return st_box(st_v_flex().flex_none().w_full().pt(st_px16(8.f)),
-                  control_paint::fixed({k_transparent, k_transparent}),
-                  {&note_text, 1u});
-}
-
 /// The Shortcuts pane (ADR-013 Phase E): every action with its effective binding, the
 /// editor for one of them, resets. Bindings write `[bindings]` lines through the same
 /// splice editor as every other key.
 [[nodiscard]] lx::ui::child shortcuts_pane(session* s) {
     lx::ui::build_context* ctx = lx::ui::build_context::current();
     const std::span<const lx::config::action_info> all = lx::config::actions();
+    // The tree's leaf click narrows the pane to one owner ("Shell" / "Compositor").
+    const std::string_view focus = s->focus_group();
+    const auto wanted = [&focus](const lx::config::action_info& a) {
+        if (focus.empty())
+            return true;
+        return focus == (a.owner == lx::config::action_owner::shell ? "Shell" : "Compositor");
+    };
     unsigned count = 0;
     unsigned groups = 0;
     lx::config::action_owner last_owner = lx::config::action_owner::none;
     for (const lx::config::action_info& a : all) {
+        if (!wanted(a))
+            continue;
         ++count;
         if (a.owner != last_owner) {
             ++groups;
@@ -1552,6 +1677,8 @@ namespace {
     last_owner = lx::config::action_owner::none;
     for (unsigned i = 0; i < all.size(); ++i) {
         const lx::config::action_info& a = all[i];
+        if (!wanted(a))
+            continue;
         if (a.owner != last_owner) {
             kids[n++] = group_header(a.owner == lx::config::action_owner::shell
                                          ? "Shell (its windows, launcher, notifications)"
@@ -1780,6 +1907,93 @@ namespace {
     return st_box(st_v_flex().w_full(), control_paint{}, {kids, n});
 }
 
+/// The content header every pane shows (Zed's settings modal): the "User" badge left, the
+/// config-file button right (a popover naming the user layer, a click on "Copy path"
+/// clipboarding it), then the pane's title over its subtitle — the focused group (the
+/// tree's leaf click), else the pane's `[sections]`, in the mono family — over a rule.
+[[nodiscard]] lx::ui::child pane_header(session* s, bool searching) {
+    lx::ui::build_context* ctx = lx::ui::build_context::current();
+    const auto** kids = ctx ? ctx->alloc_children(2) : nullptr;
+    if (!kids)
+        return nullptr;
+    unsigned n = 0;
+    // The badge: tinted info background, accent text — Zed's "User".
+    const status_colors badge_c = status_tokens(status_kind::info);
+    lx::ui::child badge_text = st_text("User", st_text_px(11.f), tok::text_accent, false, true);
+    lx::ui::control_props badge{};
+    badge.layout = st_h_flex().flex_none().items_center().px(st_px16(8.f)).h(st_px16(20.f));
+    badge.paint = st_rounded(
+        control_paint::fixed({paint(badge_c.background), k_transparent}), lx::ui::radius::sm);
+    kids[n++] = control(badge, {&badge_text, 1u});
+
+    const bool path_open = s->open_menu() == k_path_menu;
+    lx::ui::child file_btn = button("Edit in config.toml")
+                                 .style(lx::ui::button_style::outlined)
+                                 .on_press([s](int) { s->set_open_menu(k_path_menu); })
+                                 .name("Edit in config.toml");
+    std::array<menu_entry, 2> path_entries{};
+    path_entries[0] = menu_header(frame_format(
+        "{}", s->config_path().empty() ? std::string_view("no writable config.toml")
+                                       : s->config_path()));
+    path_entries[1] = menu_item("Copy path", [s](int) {
+        const std::string_view p = s->config_path();
+        if (!p.empty())
+            lx::ui::clipboard::global().set_text(p.data());
+        s->set_open_menu(session::k_no_row);
+    });
+    popover_builder pop = popover_menu(
+        file_btn, std::span<const menu_entry>{path_entries.data(), path_entries.size()});
+    pop.open(path_open);
+    pop.on_dismiss([s](int) { s->set_open_menu(session::k_no_row); });
+    lx::ui::child pop_child = pop;
+    lx::ui::control_props file_wrap{};
+    file_wrap.layout = lx::ui::style{}.flex_none().flex_col().items_end();
+    kids[n++] = control(file_wrap, {&pop_child, 1u});
+    lx::ui::child header_row = st_box(
+        st_h_flex().flex_none().w_full().justify_between().items_center().pb(st_px16(12.f)),
+        control_paint{}, {kids, n});
+
+    // The title and its subtitle.
+    const char* title = searching ? "Search"
+                                  : k_pane_names[static_cast<unsigned>(s->current())].data();
+    lx::ui::child headline_child = st_text(title, st_text_px(24.f), tok::text);
+    std::string subtitle;
+    if (!searching) {
+        const std::string_view focus = s->focus_group();
+        if (!focus.empty()) {
+            subtitle = std::string(focus);
+        } else if (s->current() == pane_id::shortcuts) {
+            subtitle = "[bindings]";
+        } else if (s->current() == pane_id::displays) {
+            subtitle = "outputs — zwlr_output_manager_v1";
+        } else {
+            const char* last = nullptr;
+            for (const row_ref& r : catalog()) {
+                if (r.owner != s->current() || !r.desc)
+                    continue;
+                if (last && std::strcmp(last, r.desc->section) == 0)
+                    continue;
+                if (!subtitle.empty())
+                    subtitle += " · ";
+                subtitle += "[" + std::string(r.desc->section) + "]";
+                last = r.desc->section;
+            }
+        }
+    }
+    lx::ui::child title_kids[2]{};
+    unsigned tn = 0;
+    title_kids[tn++] = headline_child;
+    if (!subtitle.empty())
+        title_kids[tn++] = st_mono(frame_format("{}", subtitle), st_text_px(12.5f),
+                                   tok::text_muted);
+    lx::ui::child title_block = st_box(
+        st_v_flex().flex_none().w_full().gap(st_px16(2.f)).pb(st_px16(12.f)),
+        control_paint{}, {title_kids, tn});
+    lx::ui::child rule = divider();
+    lx::ui::child outer[3] = {header_row, title_block, rule};
+    return st_box(st_v_flex().flex_none().w_full(), control_paint{}, {outer, 3u});
+}
+
 /// The content column: the pane's rows grouped by their group header, or the search
 /// results across all panes.
 [[nodiscard]] lx::ui::child pane_content(session* s) {
@@ -1789,13 +2003,22 @@ namespace {
         return std::string_view(q ? q : "", s->query_buffer().size);
     }();
     const bool searching = !query.empty();
+    // The tree's leaf click narrows the pane to one of its groups.
+    const std::string_view focus = s->focus_group();
+    const auto shown = [&](unsigned i) {
+        if (searching)
+            return row_matches(rows[i], query);
+        if (rows[i].owner != s->current())
+            return false;
+        return focus.empty() || std::strcmp(rows[i].group, focus.data()) == 0;
+    };
 
     // Count first (fixed arrays come from the frame arena).
     unsigned count = 0;
     unsigned groups = 0;
     const char* last_group = nullptr;
     for (unsigned i = 0; i < rows.size(); ++i) {
-        if (searching ? !row_matches(rows[i], query) : rows[i].owner != s->current())
+        if (!shown(i))
             continue;
         ++count;
         const char* g = searching ? k_pane_names[static_cast<unsigned>(rows[i].owner)].data()
@@ -1805,34 +2028,50 @@ namespace {
             last_group = g;
         }
     }
-    if (!searching && s->current() == pane_id::shortcuts)
-        return shortcuts_pane(s);
-    if (!searching && s->current() == pane_id::displays)
-        return displays_pane(s);
+    if (!searching && s->current() == pane_id::shortcuts) {
+        lx::ui::child body = shortcuts_pane(s);
+        lx::ui::child head = pane_header(s, searching);
+        lx::ui::child kids[2] = {head, body};
+        return st_box(st_v_flex().w_full(), control_paint{}, {kids, 2u});
+    }
+    if (!searching && s->current() == pane_id::displays) {
+        lx::ui::child body = displays_pane(s);
+        lx::ui::child head = pane_header(s, searching);
+        lx::ui::child kids[2] = {head, body};
+        return st_box(st_v_flex().w_full(), control_paint{}, {kids, 2u});
+    }
     const bool import_row = !searching && s->current() == pane_id::appearance;
     lx::ui::build_context* ctx = lx::ui::build_context::current();
     const auto** kids =
-        ctx ? ctx->alloc_children(count + groups + 1 + (import_row ? 3 : 0)) : nullptr;
+        ctx ? ctx->alloc_children(count * 2 + groups + 8 + (import_row ? 3 : 0)) : nullptr;
     if (!kids)
         return nullptr;
-
     unsigned n = 0;
+    kids[n++] = pane_header(s, searching);
+
+    unsigned rn = 0;
     last_group = nullptr;
     pane_id last_pane = pane_id::appearance;
     bool first_pane_row = true;
     for (unsigned i = 0; i < rows.size(); ++i) {
-        if (searching ? !row_matches(rows[i], query) : rows[i].owner != s->current())
+        if (!shown(i))
             continue;
         if (searching && (rows[i].owner != last_pane || first_pane_row)) {
             kids[n++] = group_header(
                 frame_format("{}", k_pane_names[static_cast<unsigned>(rows[i].owner)]));
             first_pane_row = false;
             last_pane = rows[i].owner;
+            rn = 0;
         } else if (!searching && rows[i].group != last_group) {
             kids[n++] = group_header(rows[i].group);
             last_group = rows[i].group;
+            rn = 0;
+        } else if (rn > 0) {
+            // Zed's modal: a rule between consecutive setting rows.
+            kids[n++] = divider();
         }
         kids[n++] = setting_row(rows[i], i, s);
+        ++rn;
     }
     // The Input pane's live device list (the compositor knows libinput's names; the
     // per-device overrides below match them exactly).
@@ -1905,80 +2144,122 @@ namespace {
                            control_paint::fixed({k_transparent, k_transparent}),
                            {&status_text, 1u});
     }
-    const lx::ui::child note = searching ? nullptr : pane_note(s->current());
-    if (note)
-        kids[n++] = note;
-    if (n == 0) {
-        // A pane with nothing of its own yet (Shortcuts in this build).
-        lx::ui::child empty[2] = {
-            headline("Nothing here yet").size(lx::ui::headline_size::medium),
-            st_text("This pane's editor arrives with a later phase of ADR-013.",
-                    st_text_px(12.f), tok::text_muted, false, true),
-        };
-        return st_box(st_v_flex().gap(st_px16(8.f)).p(st_px16(24.f)), control_paint{},
-                      {empty, 2u});
-    }
+    // The header always leads (n ≥ 1); a pane the schema routes nothing to shows it alone.
     return st_box(st_v_flex().w_full(), control_paint{}, {kids, n});
 }
 
 // ── the window shell ───────────────────────────────────────────────────────────────────
 
-[[nodiscard]] lx::ui::child rail(session* s) {
+/// The groups the sidebar tree lists under `p`: the catalog's distinct group names in
+/// catalog order (the leaf rows navigate). The panes the catalog does not route get one
+/// leaf per natural section.
+[[nodiscard]] unsigned pane_groups(pane_id p, const char** out, unsigned cap) {
+    unsigned n = 0;
+    const char* last = nullptr;
+    for (const row_ref& r : catalog()) {
+        if (r.owner != p)
+            continue;
+        if (last && std::strcmp(last, r.group) == 0)
+            continue;
+        last = r.group;
+        if (n < cap)
+            out[n++] = r.group;
+    }
+    if (n == 0) {
+        if (p == pane_id::shortcuts && cap >= 2) {
+            out[n++] = "Shell";
+            out[n++] = "Compositor";
+        } else if (p == pane_id::displays && cap >= 1) {
+            out[n++] = "Outputs";
+        }
+    }
+    return n;
+}
+
+/// The left sidebar (Zed's settings navigation): the search field over the pane tree — a
+/// pane row with its chevron, its groups indented beneath it when expanded — and the save
+/// state at the bottom, where Zed keeps the keybinding hint. A pane row navigates and
+/// expands (the active pane's row collapses again); a leaf narrows the pane to that group.
+[[nodiscard]] lx::ui::child sidebar(session* s) {
     lx::ui::build_context* ctx = lx::ui::build_context::current();
-    const auto** rows = ctx ? ctx->alloc_children(k_pane_count) : nullptr;
+    // A pane row plus its groups (the leaf cap `pane_groups` writes: 12) — the worst case
+    // every pane expanded at once.
+    const auto** rows = ctx ? ctx->alloc_children(k_pane_count * (1 + 12)) : nullptr;
     if (!rows)
         return nullptr;
+    unsigned n = 0;
+    const std::string_view focus = s->focus_group();
     for (unsigned i = 0; i < k_pane_count; ++i) {
         const pane_id p = static_cast<pane_id>(i);
         const bool active = s->current() == p;
-        lx::ui::child glyph = icon_view(k_pane_icons[i], st_text_px(14.f),
-                                        active ? tok::icon_accent : tok::icon_muted);
+        const bool open = s->expanded(p);
+        const bool pane_selected = active && focus.empty();
+        lx::ui::child chev = icon_view(
+            open ? lx::ui::icon::chevron_down : lx::ui::icon::chevron_right,
+            st_text_px(14.f), tok::icon_muted);
         lx::ui::child text = st_text(k_pane_names[i].data(), st_text_px(13.f),
-                                     active ? tok::text_accent : tok::text);
-        lx::ui::child pair[2] = {glyph, text};
+                                     pane_selected ? tok::text_accent : tok::text);
+        lx::ui::child pair[2] = {chev, text};
         lx::ui::control_props row{};
-        row.layout = st_h_flex().flex_none().w_full().h(st_px16(32.f)).px(st_px16(12.f))
-                         .gap(st_px16(8.f)).rounded(lx::ui::radius::sm);
+        row.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f)).px(st_px16(8.f))
+                         .gap(st_px16(6.f)).rounded(lx::ui::radius::sm);
         lx::ui::control_paint paint_{};
-        if (active) {
+        if (pane_selected)
             paint_.rest = {paint(tok::ghost_element_selected), k_transparent};
-            paint_.hover = paint_.active = paint_.rest;
-        } else {
+        else
             paint_.rest = {paint(tok::ghost_element_background), k_transparent};
-            paint_.hover = {paint(tok::ghost_element_hover), k_transparent};
-            paint_.active = {paint(tok::ghost_element_active), k_transparent};
-        }
+        paint_.hover = {paint(tok::ghost_element_hover), k_transparent};
+        paint_.active = {paint(tok::ghost_element_active), k_transparent};
         row.paint = paint_;
-        row.on_activate = [s, p](int) { s->set_current(p); };
+        row.on_activate = [s, p](int) {
+            if (s->current() == p)
+                s->toggle_expanded(p);
+            else
+                s->set_current(p);
+        };
         row.role = lx::a11y::role::button;
         row.name = k_pane_names[i].data();
-        row.a11y_state = active ? st_a11y(lx::a11y::state_flag::selected) : 0u;
+        row.a11y_state = pane_selected ? st_a11y(lx::a11y::state_flag::selected) : 0u;
         row.interactive = true;
         row.focusable = true;
-        row.selected = active;
+        row.selected = pane_selected;
         row.focus_ring = true;
-        rows[i] = control(row, {pair, 2u});
+        rows[n++] = control(row, {pair, 2u});
+        if (!open)
+            continue;
+        const char* groups[12];
+        const unsigned gn = pane_groups(p, groups, 12);
+        for (unsigned gi = 0; gi < gn; ++gi) {
+            const char* g = groups[gi];
+            const bool leaf_active = active && focus == std::string_view(g);
+            lx::ui::child leaf_text = st_text(g, st_text_px(12.5f),
+                                              leaf_active ? tok::text_accent : tok::text_muted);
+            lx::ui::control_props leaf{};
+            leaf.layout = st_h_flex().flex_none().w_full().h(st_px16(26.f)).px(st_px16(8.f))
+                              .ml(st_px16(22.f)).rounded(lx::ui::radius::sm);
+            lx::ui::control_paint leaf_paint{};
+            if (leaf_active)
+                leaf_paint.rest = {paint(tok::ghost_element_selected), k_transparent};
+            else
+                leaf_paint.rest = {paint(tok::ghost_element_background), k_transparent};
+            leaf_paint.hover = {paint(tok::ghost_element_hover), k_transparent};
+            leaf_paint.active = {paint(tok::ghost_element_active), k_transparent};
+            leaf.paint = leaf_paint;
+            leaf.on_activate = [s, p, g](int) { s->open_group(p, g); };
+            leaf.role = lx::a11y::role::button;
+            leaf.name = frame_format("{} — {}", k_pane_names[i], g);
+            leaf.a11y_state = leaf_active ? st_a11y(lx::a11y::state_flag::selected) : 0u;
+            leaf.interactive = true;
+            leaf.focusable = true;
+            leaf.selected = leaf_active;
+            leaf.focus_ring = true;
+            rows[n++] = control(leaf, {&leaf_text, 1u});
+        }
     }
-    lx::ui::child header = st_text("Lumen", st_text_px(11.f), tok::text_muted, true, true);
-    lx::ui::child kids[2] = {
-        st_box(st_v_flex().flex_none().w_full().px(st_px16(16.f)).pt(st_px16(16.f))
-                   .pb(st_px16(4.f)),
-               control_paint{}, {&header, 1u}),
-        st_box(st_v_flex().flex_none().w_full().gap(st_px16(2.f)).px(st_px16(8.f)),
-               control_paint{}, {rows, k_pane_count}),
-    };
-    lx::ui::control_props rail_props{};
-    rail_props.layout = st_v_flex().flex_none().w(st_px16(k_rail_w)).h_full()
-                            .bg(tok::surface_background)
-                            .border_r_1(tok::border_variant);
-    rail_props.paint = control_paint::fixed({paint(tok::surface_background), k_transparent});
-    rail_props.role = lx::a11y::role::list;
-    rail_props.name = "Panes";
-    return control(rail_props, {kids, 2u}, k_rail_key);
-}
 
-[[nodiscard]] lx::ui::child search_row(session* s) {
-    lx::ui::child glyph = icon_view(lx::ui::icon::search, st_text_px(14.f), tok::icon_muted);
+    // The search field (Zed keeps it at the sidebar's top).
+    lx::ui::child search_icon =
+        icon_view(lx::ui::icon::search, st_text_px(14.f), tok::icon_muted);
     lx::ui::child field =
         text_input()
             .buffer(s->query_buffer())
@@ -1988,33 +2269,49 @@ namespace {
             .layout(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
                         .h(st_px16(28.f)))
             .key(k_search_key);
-    lx::ui::child kids[2] = {glyph, field};
-    lx::ui::control_props bar{};
-    bar.layout = st_h_flex().flex_none().w_full().h(st_px16(44.f)).px(st_px16(16.f))
-                     .gap(st_px16(8.f));
-    lx::ui::control_paint paint_ = control_paint::fixed(
-        {paint(tok::background), k_transparent});
-    paint_.border_widths[2] = 1; // a rule under the search row
-    paint_.rest.border = paint(tok::border_variant);
-    paint_.hover = paint_.active = paint_.rest;
-    bar.paint = paint_;
-    bar.role = lx::a11y::role::toolbar;
-    bar.name = "Search";
-    return control(bar, {kids, 2u});
-}
+    lx::ui::child search_kids[2] = {search_icon, field};
+    lx::ui::control_props search_bar{};
+    search_bar.layout = st_h_flex().flex_none().w_full().px(st_px16(12.f)).pt(st_px16(12.f))
+                            .pb(st_px16(8.f)).gap(st_px16(8.f));
+    search_bar.paint = control_paint::fixed({paint(tok::surface_background), k_transparent});
+    search_bar.role = lx::a11y::role::toolbar;
+    search_bar.name = "Search";
+    lx::ui::child search_child = control(search_bar, {search_kids, 2u});
 
-[[nodiscard]] lx::ui::child status_line(session* s) {
-    lx::ui::child left_kids[1] = {st_text("Lumen Settings", st_text_px(11.f), tok::text_muted,
-                                          true, true)};
-    const char* right_text =
+    // The save state at the bottom, where Zed keeps its keybinding hint.
+    const char* state_text =
         s->state() == session::save_state::written
             ? "saved to config.toml — Lumen applies it as it watches the file"
-        : s->state() == session::save_state::memory_only
-            ? "in memory only (no writable config.toml: LUMEN_CONFIG or a bad file)"
-            : "the configuration as Lumen runs it";
-    lx::ui::child right_kids[1] = {st_text(right_text, st_text_px(11.f), tok::text_muted, false,
-                                           true)};
-    return status_bar({left_kids, 1u}, {right_kids, 1u}).key(k_status_key);
+            : s->state() == session::save_state::memory_only
+                ? "in memory only (no writable config.toml)"
+                : "the configuration as Lumen runs it";
+    lx::ui::child status_child = st_mono(state_text, st_text_px(11.f), tok::text_muted);
+    lx::ui::control_props status_props{};
+    status_props.layout = st_h_flex().flex_none().w_full().px(st_px16(12.f))
+                              .py(st_px16(10.f));
+    lx::ui::control_paint status_paint =
+        control_paint::fixed({paint(tok::surface_background), k_transparent});
+    status_paint.border_widths[0] = 1; // a rule over the status line
+    status_paint.rest.border = paint(tok::border_variant);
+    status_paint.hover = status_paint.active = status_paint.rest;
+    status_props.paint = status_paint;
+    status_props.role = lx::a11y::role::status_bar;
+    status_props.name = "Save state";
+    lx::ui::child status_row = control(status_props, {&status_child, 1u}, k_status_key);
+
+    lx::ui::child tree = st_box(
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f))
+            .w_full().gap(st_px16(1.f)).px(st_px16(8.f)).pt(st_px16(4.f)),
+        control_paint{}, {rows, n});
+    lx::ui::child col[3] = {search_child, tree, status_row};
+    lx::ui::control_props rail_props{};
+    rail_props.layout = st_v_flex().flex_none().w(st_px16(k_rail_w)).h_full()
+                            .bg(tok::surface_background)
+                            .border_r_1(tok::border_variant);
+    rail_props.paint = control_paint::fixed({paint(tok::surface_background), k_transparent});
+    rail_props.role = lx::a11y::role::list;
+    rail_props.name = "Panes";
+    return control(rail_props, {col, 3u}, k_rail_key);
 }
 
 } // namespace
@@ -2026,20 +2323,18 @@ lx::ui::child describe(lx::ui::build_context&) {
     session* s = g_session ? g_session : &g_fallback;
     (void)catalog();
 
-    lx::ui::child search = search_row(s);
-    lx::ui::child rail_child = rail(s);
+    lx::ui::child sidebar_child = sidebar(s);
     lx::ui::child content = pane_content(s);
     lx::ui::child body_kids[2] = {
-        rail_child,
+        sidebar_child,
         scroll_area(st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)),
                     {&content, 1u}, lx::ui::scroll_axes::vertical,
-                    st_v_flex().w_full().p(st_px16(20.f)).gap(st_px16(0.f))),
+                    st_v_flex().w_full().p(st_px16(24.f)).gap(st_px16(0.f))),
     };
     lx::ui::child body = st_box(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f)),
                                 control_paint{}, {body_kids, 2u});
-    lx::ui::child shell[3] = {search, body, status_line(s)};
     lx::ui::child root[1] = {st_box(st_v_flex().size_full().bg(tok::background),
-                                    control_paint{}, {shell, 3u}, k_content_key)};
+                                    control_paint{}, {&body, 1u}, k_content_key)};
     return div(st_v_flex().size_full().bg(tok::background), {root, 1u});
 }
 

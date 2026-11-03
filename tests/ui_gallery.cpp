@@ -46,7 +46,7 @@ using namespace lx::ui;
 using lx::layout::px;
 
 constexpr int k_width = 1040;
-constexpr int k_height = 1232;
+constexpr int k_height = 1270;
 
 /// The caches every pane draws with: the bundled fonts (ui_golden's text environment), one
 /// atlas for glyphs and icons.
@@ -413,9 +413,25 @@ const char* const k_input_words[2] = {"Top-right", "Bottom-right"};
     return div(style{}.flex_row().items_center().gap(sp::b12).h(px(34.f)), kids);
 }
 
+/// Pane 9's fourth row: Zed's dropdown and number input (`drop_down`, `spinner`).
+[[nodiscard]] child input_row_new(bool disabled, bool open) {
+    static char sp_storage[32] = "1000";
+    static text_buffer sp_buffer{.storage = sp_storage, .size = 4, .revision = 1};
+    static const char* const k_dd_words[3] = {"Platform Default", "Close Window",
+                                              "Keep Window Open"};
+    const child kids[] = {
+        drop_down(k_dd_words, 1).open(open && !disabled).disabled(disabled).name("on-close"),
+        spinner(sp_buffer, 1000).range(0, 2000).disabled(disabled).name("history"),
+    };
+    return div(style{}.flex_row().items_center().gap(sp::b12).h(px(34.f)), kids);
+}
+
 [[nodiscard]] child describe_inputs() {
-    const child rows[3] = {input_row(false, true), input_row(true, false), input_row(false, false)};
-    return pane_box("Slider, segmented, select (open), stepper, swatch row (ADR-013)",
+    // The open dropdown overlays the rows below it, as the open select does.
+    const child rows[4] = {input_row(false, true), input_row_new(false, true), input_row(true, false),
+                           input_row(false, false)};
+    return pane_box("Slider, segmented, select (open), stepper, swatch row; dropdown (open) and "
+                    "spinner (ADR-013)",
                     div(style{}.flex_col().gap(sp::b04).size_full(), rows));
 }
 
@@ -455,7 +471,7 @@ constexpr pane_spec k_panes[] = {
     {{272, 756, 240, 236}, describe_tooltip_pane, prepare_tooltip},
     {{528, 756, 240, 236}, describe_toasts, nullptr},
     {{784, 756, 240, 236}, describe_modal, nullptr},
-    {{16, 1008, 1008, 208}, describe_inputs, prepare_inputs},
+    {{16, 1008, 1008, 246}, describe_inputs, prepare_inputs},
 };
 
 [[nodiscard]] lx::color clear_color() { return active_theme().color(tok::background); }
