@@ -142,6 +142,13 @@ struct panel_bell {
     bool dnd = false;
     unsigned unread = 0;
 };
+/// The clock's input: the shell's "HH:MM" (24 h), as laid out at `width` logical px in the
+/// panel's font, and a revision that changes with it.
+struct panel_clock {
+    char text[8]{};
+    int width = 0;
+    unsigned rev = 0;
+};
 enum panel_bell_flag : unsigned {
     bell_flag_hover = 1u << 0,
     bell_flag_pressed = 1u << 1,
@@ -230,6 +237,10 @@ struct panel_layout {
     int bell_w = 0;
     unsigned bell_flags = 0;
     unsigned bell_unread = 0;
+    /// The clock, left of the tray; clock_w 0 = not shown.
+    int clock_x = 0;
+    int clock_w = 0;
+    unsigned clock_rev = 0;
 };
 
 /// The logical edge of a task entry's icon, left of its title.
@@ -255,12 +266,17 @@ struct panel_filter {
 /// `ws`: the workspace indicator's cells (null or fewer than two: not shown).
 /// `tray`: the tray's items (null: none); `tray_pressed` the key a button went down on.
 /// `bell`: the notification indicator (`bell_pressed`: a button is down on it).
+/// `clock`: the clock (empty text or width 0: not shown).
 void layout_panel(const task_model& model, int width, int height, double pointer_x,
                   double pointer_y, task_handle pressed, panel_layout& out,
                   panel_logout logout = {}, panel_apps apps = {}, panel_notice notice = {},
                   panel_filter filter = {}, bool capturing = false,
                   const panel_ws_input* ws = nullptr, const panel_tray_input* tray = nullptr,
-                  unsigned tray_pressed = 0, panel_bell bell = {}, bool bell_pressed = false);
+                  unsigned tray_pressed = 0, panel_bell bell = {}, bool bell_pressed = false,
+                  panel_clock clock = {});
+/// The width of `text` in the panel's font at `scale` (the clock is laid out with it),
+/// rounded up to whole logical px.
+[[nodiscard]] int panel_text_width(const char* text, float scale);
 /// Copies the used part of `from` (the cells in use, not all k_max_panel_cells).
 ///
 /// Also a workaround: Clang 23.1 finds no viable copy assignment for this class here and
@@ -336,6 +352,8 @@ struct panel_widgets_source {
     /// A letter for an item without an icon.
     char (*tray_letter)(unsigned key, void* user) = nullptr;
     panel_bell (*bell)(void* user) = nullptr;
+    /// The clock, refreshed by the shell at each minute.
+    panel_clock (*clock)(void* user) = nullptr;
     void* user = nullptr;
 };
 
@@ -401,6 +419,8 @@ public:
     /// The output's windows may have changed (a window moved, an output moved): redraw if
     /// the list differs.
     void filter_changed() { dirty_ = true; }
+    /// The clock's minute passed: its text changed, redraw.
+    void clock_changed() { dirty_ = true; }
     /// The workspace indicator's source (none: no indicator).
     void set_workspaces(panel_ws_source source) {
         ws_source_ = source;
@@ -555,6 +575,8 @@ private:
     bool bell_pressed_ = false;
     unsigned bell_pressed_button_ = 0;
     unsigned bell_pressed_serial_ = 0;
+    /// The clock's text of the layout being drawn.
+    char clock_text_[sizeof(panel_clock::text)]{};
     bool menu_keyboard_ = false;
     /// The indicator's input of the layout being drawn (its names).
     panel_ws_input ws_input_{};
@@ -1015,7 +1037,7 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
                              panel_logout logout, panel_apps apps, panel_notice notice,
                              panel_filter filter, bool capturing, const panel_ws_input* ws,
                              const panel_tray_input* tray, unsigned tray_pressed, panel_bell bell,
-                             bool bell_pressed) {
+                             bool bell_pressed, panel_clock clock) {
     out.width = width;
     out.height = height;
     out.cell_h = height < k_entry_height ? height : k_entry_height;
@@ -1097,6 +1119,15 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
         }
         if (out.tray_count > 0)
             reserve += k_panel_gap - k_tray_gap;
+    }
+    // The clock, left of whatever the right end holds (the tray, the bell, the logout
+    // button): status icons keep the corner, as GNOME's and KDE's panels place it.
+    if (clock.width > 0 && clock.text[0] &&
+        width >= 2 * k_panel_pad + reserve + clock.width + k_panel_gap + k_entry_min_width) {
+        out.clock_w = clock.width;
+        out.clock_x = right - clock.width;
+        out.clock_rev = clock.rev;
+        reserve += clock.width + k_panel_gap;
     }
     int start = k_panel_pad;
     if (apps.shown && width >= 2 * k_panel_pad + reserve + k_apps_width + k_entry_min_width) {
@@ -1210,6 +1241,17 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
     out.hidden = n - visible;
     if (out.hidden)
         out.more_x = start + static_cast<int>(visible) * (w + k_panel_gap);
+}
+
+int lx::shell::panel_text_width(const char* text, float scale) {
+    if (!text || !text[0])
+        return 0;
+    lx::text::font_desc f = k_panel_font;
+    f.size_pt = static_cast<float>(f.size_pt * scale);
+    lx::text::shaped_line line{};
+    if (!lx::text::shape_line(text, f, line))
+        return 0;
+    return static_cast<int>(std::ceil(line.width_px / scale));
 }
 
 void lx::shell::copy_layout(panel_layout& to, const panel_layout& from) {
@@ -1361,6 +1403,9 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
     if (b.bell_w > 0 && (a.bell_flags != b.bell_flags || a.bell_unread != b.bell_unread) &&
         !add({b.bell_x, b.cell_y, b.bell_w, b.cell_h}))
         return 1;
+    if (b.clock_w > 0 && (a.clock_rev != b.clock_rev || a.clock_x != b.clock_x) &&
+        !add({b.clock_x, b.cell_y, b.clock_w, b.cell_h}))
+        return 1;
     return n;
 }
 
@@ -1375,12 +1420,15 @@ void lx::shell::panel::relayout() {
     if (widgets_.fill_tray)
         widgets_.fill_tray(tray_input_, widgets_.user);
     const panel_bell bell = widgets_.bell ? widgets_.bell(widgets_.user) : panel_bell{};
+    const panel_clock clock =
+        widgets_.clock ? widgets_.clock(widgets_.user) : panel_clock{};
+    std::snprintf(clock_text_, sizeof(clock_text_), "%s", clock.text);
     layout_panel(bridge_->model(), width(), k_panel_height, pointer_x_, pointer_y_, pressed_,
                  next_, panel_logout{bridge_->can_logout(), logout_armed_, logout_pressed_},
                  panel_apps{apps_shown_, apps_open_, apps_pressed_},
                  panel_notice{notice_[0] != '\0', notice_rev_}, filter_,
                  bridge_->capture_active(), &ws_input_, &tray_input_, tray_pressed_, bell,
-                 bell_pressed_);
+                 bell_pressed_, clock);
     copy_layout(committed_, next_);
 }
 
@@ -1713,6 +1761,20 @@ lx::ui::child lx::shell::panel::build_ui() {
                                      .items_center()
                                      .justify_center(),
                                  lx::ui::tok::none, {parts, k}, this, 0x7500'0000u + i);
+    }
+    // The clock, left of the status icons: one line of the panel's own text.
+    if (l.clock_w > 0) {
+        const lx::ui::child text[1] = {panel_text(clock_text_, k_text, false, 0x7700u)};
+        kids[n++] = lx::ui::styled(lx::ui::style{}
+                                       .absolute()
+                                       .top(cell_y)
+                                       .left(lx::layout::px(static_cast<float>(l.clock_x)))
+                                       .w(lx::layout::px(static_cast<float>(l.clock_w)))
+                                       .h(cell_h)
+                                       .flex_row()
+                                       .items_center()
+                                       .justify_center(),
+                                   text[0]);
     }
     // The notification indicator: a bell, the unread count beside it.
     if (l.bell_w > 0) {

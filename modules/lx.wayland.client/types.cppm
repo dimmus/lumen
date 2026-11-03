@@ -51,6 +51,10 @@ enum class global_kind : unsigned {
     /// binds it). Only with its protocol glue (LUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1);
     /// otherwise it reaches `global_handler::on_global` like any extension.
     layer_shell,
+    /// xdg_toplevel_icon_manager_v1, cap 1. Bound on demand, by the first toplevel created
+    /// with an icon (most applications set none). Only with its protocol glue
+    /// (LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1); otherwise the icon is quietly absent.
+    toplevel_icon,
     count,
 };
 inline constexpr unsigned k_global_kinds = static_cast<unsigned>(global_kind::count);

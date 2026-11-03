@@ -35,6 +35,7 @@ import lx.foundation;
 import lx.app;
 import lx.gfx;
 import lx.trace;
+import lumen.hello.icon;
 import lumen.hello.ui;
 
 namespace {
@@ -138,6 +139,10 @@ int main(int argc, char* argv[]) {
     lx::app::window_options o{};
     o.title = "Hello Lumen";
     o.app_id = "org.lumen.hello";
+    // The window's own taskbar pixels: the panel and the switcher show it without any
+    // desktop entry or themed icon (xdg-toplevel-icon_v1).
+    o.icon = hello::icon;
+    o.icon_size = hello::icon_size;
     o.size = {640, 480};
     o.min_size = {360, 320};
     o.describe = &hello::describe;

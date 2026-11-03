@@ -48,6 +48,8 @@ constexpr global_desc k_globals[k_global_kinds] = {
     {"zwp_primary_selection_device_manager_v1", 1, false},
     // Only panels, docks and launchers make layer surfaces: an application never binds it.
     {"zwlr_layer_shell_v1", 5, false, true},
+    // A toplevel with an icon binds it (most applications set none).
+    {"xdg_toplevel_icon_manager_v1", 1, false, true},
 };
 
 constexpr unsigned k_seat_cap = 10;
@@ -92,6 +94,12 @@ const wl_interface* interface_of(global_kind k) {
     case global_kind::layer_shell: return &zwlr_layer_shell_v1_interface;
 #else
     case global_kind::layer_shell: return nullptr; // no glue: an extension global
+#endif
+    case global_kind::toplevel_icon:
+#if LX_WLC_TOPLEVEL_ICON
+        return &xdg_toplevel_icon_manager_v1_interface;
+#else
+        return nullptr; // no glue: the icon option is quietly absent
 #endif
     case global_kind::count: break;
     }
@@ -155,6 +163,11 @@ void destroy_global(global_kind k, void* p, std::uint32_t version) {
             zwlr_layer_shell_v1_destroy(static_cast<zwlr_layer_shell_v1*>(p));
         else
             wl_proxy_destroy(static_cast<wl_proxy*>(p));
+#endif
+        break;
+    case global_kind::toplevel_icon:
+#if LX_WLC_TOPLEVEL_ICON
+        xdg_toplevel_icon_manager_v1_destroy(static_cast<xdg_toplevel_icon_manager_v1*>(p));
 #endif
         break;
     case global_kind::count: break;

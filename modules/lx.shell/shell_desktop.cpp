@@ -272,6 +272,9 @@ lx::shell::shell_app::output_record* lx::shell::shell_app::notify_output() {
 void lx::shell::shell_app::attach_widgets(output_record& o) {
     if (!o.bar)
         return;
+    // The clock ticks only while a panel can show it: armed once, re-armed at each minute.
+    if (deadline_[t_clock] == 0)
+        set_timer(t_clock, ((now_ns() / 60'000'000'000ll) + 1) * 60'000'000'000ll);
     o.bar->set_widgets(
         {.fill_tray =
              [](panel_tray_input& in, void* user) {
@@ -294,6 +297,7 @@ void lx::shell::shell_app::attach_widgets(output_record& o) {
                  auto& a = *static_cast<shell_app*>(user);
                  return panel_bell{a.notifications_owned(), a.notes_.dnd(), a.notes_.unread()};
              },
+         .clock = [](void* user) { return static_cast<shell_app*>(user)->clock_state(); },
          .user = this},
         [](const panel_widget_event& e, void* user) {
             auto& r = *static_cast<output_record*>(user);

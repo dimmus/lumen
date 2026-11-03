@@ -84,6 +84,11 @@ struct window_options {
     /// xdg_toplevel.set_min_size, and the floor of a size the client picks. Never above a
     /// maximized, tiled, fullscreen or resizing configure's size (xdg-shell).
     lx::size2i min_size{};
+    /// The window's taskbar icon (xdg_toplevel_icon_v1): `icon_size`² premultiplied
+    /// 0xAARRGGBB words, read once at open. Null: the compositor resolves the icon from
+    /// the app_id (the theme, the desktop entry).
+    const std::uint32_t* icon = nullptr;
+    int icon_size = 0;
     /// The UI. Required.
     lx::ui::describe_fn describe = nullptr;
     bool server_side_decorations = true;
