@@ -381,11 +381,11 @@ LUMEN_TEST(frame_draws_baked_colours_where_the_zones_are) {
     const composited h = composite_frame(node, 160, 120);
     // Inside the circle, off the glyph's strokes: the neutral hover fill; the button's
     // corner (outside the circle) the title colour.
-    LUMEN_CHECK(h.at(c.x + 6, c.y + c.height / 2) == k_deco_button_hover);
+    LUMEN_CHECK(h.at(c.x + 10, c.y + c.height / 2) == k_deco_button_hover);
     LUMEN_CHECK(h.at(c.x + 1, c.y + 1) == k_deco_title_active);
     node.buttons[button_index(deco_zone::close)] = deco_button::pressed;
     const composited p = composite_frame(node, 160, 120);
-    LUMEN_CHECK(p.at(c.x + 6, c.y + c.height / 2) == k_deco_button_pressed);
+    LUMEN_CHECK(p.at(c.x + 10, c.y + c.height / 2) == k_deco_button_pressed);
 
     // Maximized: no borders, the title bar directly above the client.
     node.buttons[button_index(deco_zone::close)] = deco_button::normal;
@@ -596,7 +596,7 @@ LUMEN_TEST(gles2_context_draws_the_circle_and_the_close_glyph) {
             const std::uint32_t want = b == deco_button::hover ? k_deco_button_hover : k_deco_button_pressed;
             // Inside the circle, off the strokes: the button colour; the button's corner: the
             // title bar; the centre: the × (light).
-            LUMEN_CHECK(at(c.x + 6, c.y + c.height / 2) == want);
+            LUMEN_CHECK(at(c.x + 10, c.y + c.height / 2) == want);
             LUMEN_CHECK(at(c.x + 1, c.y + 1) == k_deco_title_active);
             LUMEN_CHECK(((at(c.x + c.width / 2, c.y + c.height / 2) >> 8) & 0xFFu) > 0xC0u);
         }

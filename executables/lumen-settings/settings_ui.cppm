@@ -1474,32 +1474,26 @@ namespace {
                               .on_toggle([s, index](int v) { s->set_bool(index, v != 0); })
                               .name(r.label)
                               .key(key);
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
                       control_paint{}, {&sw, 1u});
     }
     case cfg::value_kind::enumeration: {
+        // Every selector is Zed's dropdown — the trigger hugs its content, the current
+        // entry's check at the row's right edge (also the two- and three-word ones).
         const std::span<const char* const> words{spec.names, spec.name_count};
         const unsigned v = read_enum(r, c);
-        lx::ui::child ctl;
-        if (spec.name_count <= 3) {
-            ctl = segmented(words, static_cast<int>(v))
-                      .on_select([s, index](int i) { s->set_enum(index, static_cast<unsigned>(i)); })
-                      .name(r.label)
-                      .key(key);
-        } else {
-            // Zed's dropdown: the trigger hugs its content, the check at the row's edge.
-            ctl = drop_down(words, static_cast<int>(v))
-                      .open(s->open_menu() == index)
-                      .on_open([s, index](int) { s->set_open_menu(index); })
-                      .on_dismiss([s, index](int) { s->set_open_menu(session::k_no_row); })
-                      .on_select([s, index](int i) {
-                          s->set_enum(index, static_cast<unsigned>(i));
-                          s->set_open_menu(session::k_no_row);
-                      })
-                      .name(r.label)
-                      .key(key);
-        }
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+        lx::ui::child ctl =
+            drop_down(words, static_cast<int>(v))
+                .open(s->open_menu() == index)
+                .on_open([s, index](int) { s->set_open_menu(index); })
+                .on_dismiss([s, index](int) { s->set_open_menu(session::k_no_row); })
+                .on_select([s, index](int i) {
+                    s->set_enum(index, static_cast<unsigned>(i));
+                    s->set_open_menu(session::k_no_row);
+                })
+                .name(r.label)
+                .key(key);
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
                       control_paint{}, {&ctl, 1u});
     }
     case cfg::value_kind::integer:
@@ -1514,7 +1508,7 @@ namespace {
                                    .on_submit([s, index](int) { s->commit_int(index); })
                                    .name(r.label)
                                    .key(key);
-            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
                           control_paint{}, {&sp, 1u});
         }
         const int steps =
@@ -1562,7 +1556,7 @@ namespace {
             st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
                 .h(st_px16(20.f)));
         const child parts[2] = {bar_child, readout};
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).gap(st_px16(8.f)),
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).gap(st_px16(8.f)),
                       control_paint{}, parts);
     }
     case cfg::value_kind::string: {
@@ -1572,7 +1566,7 @@ namespace {
             // it does not edit.
             lx::ui::child text = st_text(frame_format("{}", value_text(r, c)),
                                          st_text_px(12), tok::text_muted, false, true);
-            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
                           control_paint::fixed({k_transparent, k_transparent}),
                           {&text, 1});
         }
@@ -1588,13 +1582,13 @@ namespace {
                             .h(st_px16(28.f)))
                 .key(key);
         // The value column keeps every control aligned down the pane (§5.3).
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)), control_paint{},
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)), control_paint{},
                       {&field, 1});
     }
     case cfg::value_kind::string_list: {
         lx::ui::child list_text = st_text(frame_format("{}", value_text(r, c)),
                                           st_text_px(12.f), tok::text_muted, false, true);
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).justify_end(),
+        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
                       control_paint::fixed({k_transparent, k_transparent}),
                       {&list_text, 1u});
     }
@@ -1609,20 +1603,23 @@ namespace {
     const char* badge = reload_badge(r);
     lx::ui::child texts[3]{};
     unsigned n = 0;
-    texts[n++] = st_text(r.label, st_text_px(14.f), tok::text);
+    texts[n++] = st_text(r.label, st_text_px(13.f), tok::text);
     if (r.description)
         texts[n++] = st_text(r.description, st_text_px(12.f), tok::text_muted, false, true);
     if (badge)
         texts[n++] = st_text(badge, st_text_px(11.f), tok::text_muted, false, true);
     lx::ui::child label_block = st_box(
-        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)).justify_center(),
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)).gap(st_px16(2.f)),
         control_paint{}, {texts, n});
     lx::ui::child control_child = value_control(r, index, s);
     lx::ui::child kids[2] = {label_block, control_child};
     lx::ui::control_props row{};
-    row.layout = st_h_flex().flex_none().w_full()
+    // Top-aligned columns (Zed's rows): the control rides the label's first line, the
+    // ghost hover a rounded highlight over the whole row.
+    row.layout = st_h_flex().flex_none().w_full().items_start()
                      .min_h(st_px16((badge || r.description) ? k_badge_row_h : k_row_h))
-                     .px(st_px16(12.f)).gap(st_px16(12.f)).rounded(lx::ui::radius::sm);
+                     .px(st_px16(12.f)).py(st_px16(4.f)).gap(st_px16(12.f))
+                     .rounded(lx::ui::radius::sm);
     lx::ui::control_paint p{};
     p.rest = {k_transparent, k_transparent};
     p.hover = {paint(tok::ghost_element_hover), k_transparent};
@@ -1851,21 +1848,25 @@ namespace {
         lx::ui::child scale_kids[2] = {scale, scale_label};
         kids[n++] = st_box(st_h_flex().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
                            control_paint{}, {scale_kids, 2u});
-        // Transform.
+        // Transform: a dropdown like every other selector.
         static const char* const k_transforms[8] = {"normal",    "90",         "180",
                                                     "270",       "flipped",    "flipped-90",
                                                     "flipped-180", "flipped-270"};
+        const unsigned transform_now = [&] {
+            const std::string_view t = d.staged && !d.staged_transform.empty()
+                                           ? std::string_view(d.staged_transform)
+                                           : std::string_view(d.transform);
+            for (unsigned t2 = 0; t2 < 8; ++t2)
+                if (k_transforms[t2] == t)
+                    return t2;
+            return 0u;
+        }();
         lx::ui::child transform =
-            segmented(std::span<const char* const>{k_transforms, 8},
-                      [&] {
-                          const std::string_view t = d.staged && !d.staged_transform.empty()
-                                                         ? std::string_view(d.staged_transform)
-                                                         : std::string_view(d.transform);
-                          for (unsigned t2 = 0; t2 < 8; ++t2)
-                              if (k_transforms[t2] == t)
-                                  return static_cast<int>(t2);
-                          return 0;
-                      }())
+            drop_down(std::span<const char* const>{k_transforms, 8},
+                      static_cast<int>(transform_now))
+                .open(s->open_menu() == 0x4800u + i)
+                .on_open([s, i](int) { s->set_open_menu(0x4800u + i); })
+                .on_dismiss([s](int) { s->set_open_menu(session::k_no_row); })
                 .on_select([i](int v) {
                     static const char* const k[8] = {"normal",  "90",       "180",
                                                      "270",    "flipped",  "flipped-90",

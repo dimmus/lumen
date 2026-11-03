@@ -972,7 +972,7 @@ lx::ui::drop_down_builder::operator child() const {
     trigger.focus_ring = true;
     lx::ui::child word = text_block(lx_in_text(
         current ? current : (placeholder_ ? placeholder_ : ""),
-        lx_in_text_px(12.f),
+        lx_in_text_px(13.f),
         disabled_ ? tok::text_disabled : current ? tok::text : tok::text_placeholder, 1.f));
     // The dropdown glyph: the up and down chevrons stacked, Zed's `ChevronUpDown`.
     lx::ui::child chevrons_kids[2] = {
@@ -1056,8 +1056,7 @@ lx::ui::spinner_builder::operator child() const {
                                            disabled_ || at_min, "Decrease");
     text_input_builder field = text_input().buffer(*buffer_)
                                   .framed(false)
-                                  .layout(lx_in_h_flex().flex_grow(1.f).flex_shrink(1.f)
-                                              .min_w(lx::layout::px(0.f))
+                                  .layout(lx_in_h_flex().flex_none().min_w(lx::layout::px(0.f))
                                               .h(lx_in_px16(k_st_h)))
                                   .max_bytes(16)
                                   .on_submit(on_submit_)
@@ -1065,6 +1064,12 @@ lx::ui::spinner_builder::operator child() const {
                                   .tab_index(tab_index_)
                                   .name(name_);
     lx::ui::child field_child = field;
+    // The value centred between the rules: the field hugs its text, a growing container
+    // centres it (number_input.rs centres the value).
+    lx::ui::control_props centre{};
+    centre.layout = lx_in_h_flex().flex_grow(1.f).flex_shrink(1.f)
+                        .min_w(lx::layout::px(0.f)).justify_center();
+    lx::ui::child field_box = control(centre, {&field_child, 1u});
     lx::ui::child plus = lx_in_ghost_icon(lx::ui::icon::plus, 1, on_change_,
                                           disabled_ || at_max, "Increase");
     // The rules between the cells: 1 px, the variant border, 20 px tall, centred.
@@ -1073,9 +1078,9 @@ lx::ui::spinner_builder::operator child() const {
     rule.paint = control_paint::fixed({paint(tok::border_variant), k_transparent});
     lx::ui::child left_rule = control(rule, {});
     lx::ui::child right_rule = control(rule, {});
-    lx::ui::child kids[5] = {minus, left_rule, field_child, right_rule, plus};
+    lx::ui::child kids[5] = {minus, left_rule, field_box, right_rule, plus};
     lx::ui::control_props box{};
-    box.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(150.f)).h(lx_in_px16(k_st_h))
+    box.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(110.f)).h(lx_in_px16(k_st_h))
                      .rounded(radius::md);
     lx::ui::control_paint paint_{};
     paint_.rest = {paint(tok::element_background), paint(tok::border_variant)};
