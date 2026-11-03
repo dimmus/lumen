@@ -1,0 +1,17 @@
+- [Lumen host build/run environment](lumen-host-build-run-env.md) — vmwgfx VM, no Vulkan headers/ICD, GL path; fetch protocols, release preset, tty-smoke from SSH works
+- [Best-in-class bar for Lumen](lumen-best-in-class-bar.md) — state-of-the-art choices, compare to wlroots/KWin/Mutter/niri, measure efficiency
+- [GPU UI engine plan (ADR-010)](lumen-gpu-ui-engine-plan.md) — GPUI-style primitive renderer; plan in PR #31, Phases 0-1 in PR #37; Phase 2 text in PR #38; memory PR #39; Phase 3 in PR #48; Phase 4 in PR #54; next is Phase 5 (shell adoption)
+- [Shell first-paint WIP](lumen-shell-first-paint-wip.md) — font matches merged (PR #44); background cache + loop order still only in WIP c8d4499
+- [Malloc replacement measured](lumen-malloc-replacement-measured.md) — jemalloc/mimalloc/tcmalloc vs glibc 2026-10-27: no speedup, +10–31 MiB anon; glibc stays
+- [umbriel/scenefx review](lumen-umbriel-scenefx-review.md) — 2026-10-27: Vulkan full repaint, shared FP16 target thrash, partial opaque regions ignored; what to borrow
+- [No-degradation rule](lumen-no-degradation-rule.md) — every change must measure a gain, keep tests/pixels intact; no features that do not push Lumen forward
+- [Kernel features branch](lumen-kernel-features-branch.md) — claude/kernel-features 2026-10-28: PSI, fence deadlines, pidfd, fdinfo, CLOSEFB (sched reverted); merged to main b4550d3
+- [Raise-the-bar workflow run](lumen-raise-the-bar-run.md) — merged PR #63 2026-10-29: kept fd limit, Vk GPU timing, vkmark, springs, blur, colour mgmt; GL reset + rounded corners reverted
+- [Vulkan 1.3 floor](lumen-vulkan-13-floor.md) — 2026-10-28 D4 + host_image_copy/budget/priority merged as PR #57; merged tree untested; user benchmarks on HW
+- [app-smoke known noise](lumen-app-smoke-known-noise.md) — Z2–Z6 pass again on f42b085; PSI "critical pressure" WARN and T1/T3 flake are environmental; check DRM master first
+- [Tiling (ADR 012)](lumen-tiling-adr012.md) — master-stack per workspace, merged PR #58; all 11 default bindings kept by user's choice
+- [UI bench noise and G7 audit](lumen-ui-bench-noise-and-g7.md) — 2026-10-28: Phase 0–4 "regressions" are host drift (A/B); gate on p50; GL build-ahead rejected; clipboard #61, primary + DnD #62
+- [UI Phase 5](lumen-ui-phase5.md) — 2026-10-29 workflows on claude/ui-phase5; lx.ui.host, shell cpu tier ≤25 MB, lower_to_blits extended, egui+pacman ok
+- [Notebook test hardware](lumen-notebook-hw.md) — HP: HD 5500 (hasvk) + GTX 950M (NVK), 3200x1800@2, lis3lv02d; PRs #64-68 from its runs; vkmark after fixes
+- [Render scale (HiDPI supersampling)](lumen-render-scale.md) — merged PR #70; area filter kept by user choice
+- [PRIME offload in launcher](lumen-prime-offload.md) — PrefersNonDefaultGPU via switcheroo/DRI_PRIME, merged PR #71 2026-10-29; notebook check pending; lx.shell.cppm is CRLF
