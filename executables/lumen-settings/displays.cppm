@@ -225,16 +225,29 @@ void handle_head_finished(void* data, zwlr_output_head_v1* head) {
     dirty();
 }
 
+// physical_size, make, model and serial_number carry nothing the pane shows (the
+// description already holds the monitor string), but their slots must be non-NULL —
+// libwayland aborts the client on an event whose listener function is NULL.
+void handle_head_physical_size(void*, zwlr_output_head_v1*, int32_t, int32_t) {}
+void handle_head_make(void*, zwlr_output_head_v1*, const char*) {}
+void handle_head_model(void*, zwlr_output_head_v1*, const char*) {}
+void handle_head_serial_number(void*, zwlr_output_head_v1*, const char*) {}
+
+// In declaration order (the wire's opcode order) with every event covered.
 const zwlr_output_head_v1_listener k_head_listener = {
     .name = handle_head_name,
     .description = handle_head_description,
-    .enabled = handle_head_enabled,
+    .physical_size = handle_head_physical_size,
     .mode = handle_head_mode,
-    .scale = handle_head_scale,
+    .enabled = handle_head_enabled,
+    .current_mode = handle_head_current_mode,
     .position = handle_head_position,
     .transform = handle_head_transform,
-    .current_mode = handle_head_current_mode,
+    .scale = handle_head_scale,
     .finished = handle_head_finished,
+    .make = handle_head_make,
+    .model = handle_head_model,
+    .serial_number = handle_head_serial_number,
     .adaptive_sync = handle_head_adaptive_sync,
 };
 
