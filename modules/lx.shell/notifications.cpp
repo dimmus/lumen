@@ -468,7 +468,8 @@ void lx::shell::notification_center::add_to_history(notification& n, long long) 
     }
     if (!n.in_history) {
         n.in_history = true;
-        ++unread_;
+        if (!n.seen)
+            ++unread_;
     }
     // Bounded: the oldest go (an open one closes as expired).
     unsigned count = 0;
@@ -492,6 +493,10 @@ void lx::shell::notification_center::update_running(long long now) {
         notification& e = **it;
         bool run = false;
         if (e.in_popup && !e.invoking && !locked_) {
+            // The first max-visible of the popup entries are the ones on screen — seeing
+            // one there is what keeps it out of the unread count when it later closes.
+            if (shown_n < settings_.max_visible)
+                e.seen = true;
             run = shown_n < settings_.max_visible && !hover_ && e.timeout_ns > 0;
             ++shown_n;
         }

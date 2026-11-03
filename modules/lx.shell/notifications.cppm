@@ -151,6 +151,10 @@ struct notification {
     bool open = true;
     bool in_popup = false;
     bool in_history = false;
+    /// Displayed as a popup at least once: closing one of those is seeing it, so it does
+    /// not count towards the bell's unread badge — only one that closed unseen (arrived
+    /// under do-not-disturb) does.
+    bool seen = false;
     /// Arrived while locked (decided at unlock).
     bool queued_locked = false;
     /// An action is being invoked (the activation token is on its way): hidden, still open.

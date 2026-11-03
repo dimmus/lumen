@@ -164,6 +164,29 @@ namespace {
     return lx::ui::text_block(t, key);
 }
 
+/// A line of text centred vertically in and clipped to `r` (row-relative), ellipsized at
+/// its width — the canvas's `text` in a box: the indicator column, the shortcut (its
+/// caller right-aligns it), a submenu's arrow, and the label between them. A bare
+/// `menu_text` in the row's flow would stack after its neighbours instead.
+[[nodiscard]] lx::ui::child menu_text_at(lx::rect2i r, const char* text, std::uint32_t argb,
+                                         const lx::text::font_desc& font,
+                                         std::span<const lx::text::text_attr> attrs,
+                                         lx::ui::element_key text_key,
+                                         lx::ui::element_key box_key) {
+    lx::ui::text_block_props t{};
+    t.text = text;
+    t.font = font;
+    t.color = lx::shell::shell_color(argb);
+    t.wrap = lx::text::text_wrap::none;
+    t.ellipsize = true;
+    t.attrs = attrs;
+    t.context = lx::ui::active_ui_resources().text;
+    const lx::ui::child inside[1] = {lx::ui::text_block(t, text_key)};
+    lx::shell::shell_box_props box{};
+    box.control.layout = at(r).flex_row().items_center().overflow_hidden();
+    return lx::shell::shell_box(box, inside, box_key);
+}
+
 /// A label's mnemonic as the text_block's attrs: the letter underlined.
 [[nodiscard]] std::span<const lx::text::text_attr> mnemonic_attrs(std::string_view label, int mn,
                                                                   std::vector<lx::text::text_attr>& out) {
@@ -688,53 +711,61 @@ lx::ui::child lx::shell::menu_popup::build_ui(unsigned index) {
             continue;
         }
 
-        // The indicator column: a check, a radio, or the icon.
+        // The indicator column: a check, a radio, or the icon — centred in it (the canvas's
+        // {6, 0, 20, h}; an icon at its own 16-px square, 4 in from the row).
         if (e.toggle_kind == menu_entry::toggle::check && e.toggled) {
-            parts[p++] = menu_text("\xE2\x9C\x93", color, k_menu_font,
-                                   0x9101'0000u + index * 128 + i,
-                                   mnemonic_attrs("", -1, mnemonic_scratch_));
+            parts[p++] = menu_text_at({6, 0, k_menu_indicator - 8, r.height}, "\xE2\x9C\x93",
+                                      color, k_menu_font, mnemonic_attrs("", -1, mnemonic_scratch_),
+                                      0x9101'0000u + index * 128 + i, 0x9101'8000u + index * 128 + i);
         } else if (e.toggle_kind == menu_entry::toggle::radio) {
-            parts[p++] = menu_text(e.toggled ? "\xE2\x97\x8F" : "\xE2\x97\x8B", color,
-                                   k_menu_font, 0x9102'0000u + index * 128 + i,
-                                   mnemonic_attrs("", -1, mnemonic_scratch_));
+            parts[p++] = menu_text_at({6, 0, k_menu_indicator - 8, r.height},
+                                      e.toggled ? "\xE2\x97\x8F" : "\xE2\x97\x8B", color,
+                                      k_menu_font, mnemonic_attrs("", -1, mnemonic_scratch_),
+                                      0x9102'0000u + index * 128 + i, 0x9102'8000u + index * 128 + i);
         } else if (!e.icon_name.empty()) {
             if (const lx::gfx::atlas_tile_id tile = icon_tile(index, e.icon_name.c_str(), icon_px);
-                tile.valid())
-                parts[p++] = lx::ui::image(l.surface.atlas(), tile, {icon_px, icon_px},
-                                           0x9103'0000u + index * 128 + i);
+                tile.valid()) {
+                // The raster at the pixels it lands on (no clip: at a scale over 1 it is the
+                // square's own device pixels).
+                const lx::ui::child image[1] = {
+                    lx::ui::image(l.surface.atlas(), tile, {icon_px, icon_px},
+                                  0x9103'0000u + index * 128 + i)};
+                shell_box_props icon_at{};
+                icon_at.control.layout = at({4, (r.height - 16) / 2, 16, 16});
+                parts[p++] = shell_box(icon_at, image, 0x9103'8000u + index * 128 + i);
+            }
         }
 
-        // The label, its mnemonic underlined.
+        // The label between the indicator column and the shortcut, its mnemonic underlined;
+        // the shortcut right-aligned before the arrow room, and the label's right edge
+        // 16 past it — the canvas's own arithmetic.
+        int right = static_cast<int>(r.width) - (e.submenu ? k_menu_arrow : 8);
+        if (!e.shortcut.empty()) {
+            const int sw = menu_text_width(e.shortcut.c_str());
+            if (sw > 0 && right - sw > k_menu_indicator + 24) {
+                parts[p++] = menu_text_at({right - sw, 0, sw, r.height}, e.shortcut.c_str(),
+                                          k_menu_text_dim, k_menu_font,
+                                          mnemonic_attrs("", -1, mnemonic_scratch_),
+                                          0x9106'0000u + index * 128 + i,
+                                          0x9106'8000u + index * 128 + i);
+                right -= sw + 16;
+            }
+        }
         {
             int mn = -1;
             const std::string label = menu_label(e.label, &mn);
-            const int right = static_cast<int>(r.width) - (e.submenu ? k_menu_arrow : 8);
-            const lx::rect2i box{k_menu_indicator, 0, right - k_menu_indicator, r.height};
-            lx::ui::text_block_props t{};
-            t.text = label.c_str();
-            t.font = e.header ? k_menu_header_font : k_menu_font;
-            t.color = shell_color(color);
-            t.wrap = lx::text::text_wrap::none;
-            t.attrs = mnemonic_attrs(label, mn, mnemonic_scratch_);
-            t.context = lx::ui::active_ui_resources().text;
-            lx::ui::child label_child = lx::ui::text_block(t, 0x9104'0000u + index * 128 + i);
-            shell_box_props label_box{};
-            label_box.control.layout = at(box).overflow_hidden();
-            parts[p++] = shell_box(label_box, {&label_child, 1}, 0x9105'0000u + index * 128 + i);
-        }
-        // The shortcut, right-aligned before the arrow room.
-        if (!e.shortcut.empty()) {
-            const int sw = menu_text_width(e.shortcut.c_str());
-            const int room = static_cast<int>(r.width) - (e.submenu ? k_menu_arrow : 8);
-            if (sw > 0 && room - sw > k_menu_indicator + 24)
-                parts[p++] = menu_text(e.shortcut.c_str(), k_menu_text_dim, k_menu_font,
-                                       0x9106'0000u + index * 128 + i,
-                                       mnemonic_attrs("", -1, mnemonic_scratch_));
+            parts[p++] = menu_text_at(
+                {k_menu_indicator, 0, right - k_menu_indicator, r.height}, label.c_str(), color,
+                e.header ? k_menu_header_font : k_menu_font, mnemonic_attrs(label, mn, mnemonic_scratch_),
+                0x9104'0000u + index * 128 + i, 0x9104'8000u + index * 128 + i);
         }
         if (e.submenu)
-            parts[p++] = menu_text("\xE2\x96\xB8", color, k_menu_font,
-                                   0x9107'0000u + index * 128 + i,
-                                   mnemonic_attrs("", -1, mnemonic_scratch_));
+            parts[p++] = menu_text_at({static_cast<int>(r.width) - k_menu_arrow + 6, 0,
+                                       k_menu_arrow - 6, r.height},
+                                      "\xE2\x96\xB8", color, k_menu_font,
+                                      mnemonic_attrs("", -1, mnemonic_scratch_),
+                                      0x9107'0000u + index * 128 + i,
+                                      0x9107'8000u + index * 128 + i);
 
         // The row: the tree's interactive node; its selection the model's (hover paints
         // through the hover quad, the keyboard's selection through the rest quad).

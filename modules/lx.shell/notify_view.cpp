@@ -34,7 +34,7 @@ constexpr std::uint32_t k_summary_color = 0xFFF4F4F6u;
 constexpr std::uint32_t k_body_color = 0xFFC8C8CEu;
 constexpr std::uint32_t k_link_color = 0xFF8AB4F8u;
 constexpr std::uint32_t k_dim_color = 0xFF9A9AA2u;
-constexpr lx::text::font_desc k_summary_font{"Sans", 11.f, lx::text::weight::bold,
+constexpr lx::text::font_desc k_summary_font{"Sans", 10.f, lx::text::weight::normal,
                                              lx::text::style::normal};
 constexpr lx::text::font_desc k_body_font{"Sans", 10.f, lx::text::weight::normal,
                                           lx::text::style::normal};
