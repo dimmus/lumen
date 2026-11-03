@@ -107,6 +107,26 @@ namespace {
         .h(lx::layout::px(static_cast<float>(r.height)));
 }
 
+/// A line of text centred in and clipped to `r` — the canvas's `text` in a box: the
+/// summary in its row, vertically centred, left-aligned, ellipsized at the rect's width
+/// as the canvas's `fit_line` fitted it.
+[[nodiscard]] lx::ui::child notify_text_at(lx::rect2i r, const char* text, std::uint32_t argb,
+                                           const lx::text::font_desc& font,
+                                           lx::ui::element_key text_key,
+                                           lx::ui::element_key box_key) {
+    lx::ui::text_block_props t{};
+    t.text = text;
+    t.font = font;
+    t.color = lx::shell::shell_color(argb);
+    t.wrap = lx::text::text_wrap::none;
+    t.ellipsize = true;
+    t.context = lx::ui::active_ui_resources().text;
+    const lx::ui::child inside[1] = {lx::ui::text_block(t, text_key)};
+    lx::shell::shell_box_props box{};
+    box.control.layout = at(r).flex_row().items_center().overflow_hidden();
+    return lx::shell::shell_box(box, inside, box_key);
+}
+
 /// The markup spans as the text_block's attrs: a link's tag carries its colour.
 [[nodiscard]] std::span<const lx::text::text_attr> body_attrs(
     const lx::shell::rich_text& body, std::vector<lx::text::text_attr>& out) {
@@ -661,15 +681,22 @@ lx::ui::child lx::shell::notification_view::build_ui() {
                         static_cast<unsigned>(icon_px),
                         std::span<const std::uint8_t>{rgba,
                                                       static_cast<std::size_t>(icon_px * icon_px * 4)},
-                        static_cast<unsigned>(icon_px * 4)))
-                    parts[p++] = lx::ui::image(surface_.atlas(), tile.value(), {icon_px, icon_px},
-                                               0x6101'0000u + i);
+                        static_cast<unsigned>(icon_px * 4))) {
+                    // The icon at its rect, the raster at the pixels it lands on (no clip:
+                    // at a scale over 1 the raster is the rect's own device pixels).
+                    const lx::ui::child image[1] = {
+                        lx::ui::image(surface_.atlas(), tile.value(), {icon_px, icon_px},
+                                      0x6101'0000u + i)};
+                    lx::shell::shell_box_props icon_at{};
+                    icon_at.control.layout = at(c.icon);
+                    parts[p++] = lx::shell::shell_box(icon_at, image, 0x6101'1000u + i);
+                }
             }
         }
-        // The summary, one bold line.
+        // The summary, one bold line centred in its row, ellipsized at the card's width.
         if (c.summary.width > 0)
-            parts[p++] = notify_text(note->req.summary.c_str(), k_summary_color, k_summary_font,
-                                     0x6102'0000u + i);
+            parts[p++] = notify_text_at(c.summary, note->req.summary.c_str(), k_summary_color,
+                                        k_summary_font, 0x6102'0000u + i, 0x6102'1000u + i);
         // The close button: dim ×, brighter under the pointer (its disc is the hover quad).
         {
             refs[1] = {this, static_cast<int>(i), 1};
@@ -695,7 +722,8 @@ lx::ui::child lx::shell::notification_view::build_ui() {
                                                     k_close_font, 0x6103'0000u + i)};
             parts[p++] = lx::shell::shell_box(close, x, 0x6103'1000u + i);
         }
-        // The body: the markup as attrs, links coloured, wrapped to the card's lines.
+        // The body: the markup as attrs, links coloured, wrapped to the card's lines —
+        // at its rect, its wrap width the rect's own, clipped to it as `draw_wrapped` was.
         if (c.body.width > 0) {
             std::vector<lx::text::text_attr> attrs;
             lx::ui::text_block_props t{};
@@ -706,7 +734,10 @@ lx::ui::child lx::shell::notification_view::build_ui() {
             t.max_lines = k_card_body_lines;
             t.attrs = body_attrs(note->body, attrs);
             t.context = lx::ui::active_ui_resources().text;
-            parts[p++] = lx::ui::text_block(t, 0x6104'0000u + i);
+            const lx::ui::child wrapped[1] = {lx::ui::text_block(t, 0x6104'0000u + i)};
+            lx::shell::shell_box_props body_at{};
+            body_at.control.layout = at(c.body).overflow_hidden();
+            parts[p++] = lx::shell::shell_box(body_at, wrapped, 0x6104'1000u + i);
         }
         // The card's box: interactive (the body's clicks are its default action), its
         // background the engine's hover state.
