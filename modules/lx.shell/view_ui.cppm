@@ -2,9 +2,10 @@ module;
 
 // lx.shell:view_ui — what the shell's canvas views share as they move from the shm canvas
 // onto lx.ui (ADR-010 Phase 5 P5-7): a control whose boxes are the shell's own literal
-// colours rather than theme tokens — the switcher, the launcher and the notification stack
-// keep the exact palette the canvas drew, which the smoke suites pin pixel for pixel —
-// with control_node's layout, hover, press and pointer routing underneath. Also the
+// colours rather than theme tokens — the switcher and the notification stack keep the
+// exact palette the canvas drew, which the smoke suites pin pixel for pixel (the launcher
+// left this stance for the theme's tokens, a real text_input and icon rows) — with
+// control_node's layout, hover, press and pointer routing underneath. Also the
 // 0xAARRGGBB → lx::color spelling the views' constants always used.
 
 import lx.foundation;

@@ -11,6 +11,7 @@
 
 import std;
 import lx.foundation;
+import lx.ui;
 import lx.shell;
 
 namespace {
@@ -19,9 +20,8 @@ using lx::shell::launcher_key_result;
 using lx::shell::launcher_layout;
 using lx::shell::launcher_view;
 
-constexpr unsigned k_backspace = 0xff08, k_return = 0xff0d, k_escape = 0xff1b, k_down = 0xff54,
-                   k_up = 0xff52, k_page_down = 0xff56, k_end = 0xff57, k_home = 0xff50,
-                   k_tab = 0xff09, k_left_tab = 0xfe20, k_menu = 0xff67, k_f10 = 0xffc7;
+constexpr unsigned k_escape = 0xff1b, k_down = 0xff54, k_up = 0xff52, k_page_down = 0xff56,
+                   k_end = 0xff57, k_home = 0xff50, k_menu = 0xff67, k_f10 = 0xffc7;
 
 std::string g_root;
 
@@ -149,71 +149,62 @@ LUMEN_TEST(diff_repaints_only_what_changed) {
 
 LUMEN_TEST(model_typing_selection_and_keys) {
     auto& cat = catalog_of(20);
+    // The query is a text_buffer (the view's search field edits it); typing is its job.
+    char query_storage[lx::shell::launcher_model::k_max_query + 1];
+    lx::ui::text_buffer query{.storage = query_storage, .size = 0, .revision = 0};
+    query_storage[0] = '\0';
+    const auto type = [&query](const char* text) {
+        LUMEN_CHECK(query.assign(text));
+    };
     lx::shell::launcher_model m;
-    m.bind(&cat);
+    m.bind(&cat, &query);
     m.set_rows(4);
     m.reset();
     LUMEN_CHECK(m.count() == 22 && m.selection() == 0);
     LUMEN_CHECK(name_of(cat, m.selected_entry()) == "App 00"); // alphabetical
-    // Down past the page scrolls; End and Home; Page_Down by a page; Tab/Shift+Tab.
+    // Down past the page scrolls; End and Home; Page_Down by a page.
     for (int i = 0; i < 5; ++i)
-        LUMEN_CHECK(m.key(k_down, nullptr, false, false) == launcher_key_result::changed);
+        LUMEN_CHECK(m.key(k_down, false) == launcher_key_result::changed);
     LUMEN_CHECK(m.selection() == 5 && m.first() == 2);
-    (void)m.key(k_end, nullptr, false, false);
+    (void)m.key(k_end, false);
     LUMEN_CHECK(m.selection() == 21 && m.first() == 18);
-    (void)m.key(k_home, nullptr, false, false);
+    (void)m.key(k_home, false);
     LUMEN_CHECK(m.selection() == 0 && m.first() == 0);
-    (void)m.key(k_page_down, nullptr, false, false);
+    (void)m.key(k_page_down, false);
     LUMEN_CHECK(m.selection() == 4);
-    (void)m.key(k_tab, nullptr, false, false);
-    (void)m.key(k_left_tab, nullptr, false, true);
-    (void)m.key(k_tab, nullptr, false, true);
+    (void)m.key(k_up, false);
     LUMEN_CHECK(m.selection() == 3);
-    (void)m.key(k_up, nullptr, false, false);
-    LUMEN_CHECK(m.selection() == 2);
-    // Typing filters and puts the selection on the best match.
-    const unsigned rev = m.query_rev();
-    LUMEN_CHECK(m.key('f', "f", false, false) == launcher_key_result::changed);
+    // A query filters and puts the selection on the best match (sync_query re-ranks).
+    const unsigned rev = query.revision;
+    type("f");
+    m.sync_query();
     LUMEN_CHECK(m.query_rev() == rev + 1 && std::strcmp(m.query(), "f") == 0);
     LUMEN_CHECK(m.count() == 2 && m.selection() == 0);
-    (void)m.key('o', "o", false, false);
+    type("fo");
+    m.sync_query();
     // Foot by prefix first, then Firefox (which contains "fo").
     LUMEN_CHECK(m.count() == 2 && name_of(cat, m.selected_entry()) == "Foot");
-    LUMEN_CHECK(m.key(k_return, nullptr, false, false) == launcher_key_result::launch);
     // The selected application's menu: Menu, Shift+F10 (F10 alone is nothing).
-    LUMEN_CHECK(m.key(k_menu, nullptr, false, false) == launcher_key_result::menu);
-    LUMEN_CHECK(m.key(k_f10, nullptr, false, true) == launcher_key_result::menu);
-    LUMEN_CHECK(m.key(k_f10, nullptr, false, false) == launcher_key_result::ignored);
-    // Control characters and Ctrl+letters are not text.
-    LUMEN_CHECK(m.key('a', "\x01", false, false) == launcher_key_result::ignored);
-    LUMEN_CHECK(m.key('x', "x", true, false) == launcher_key_result::ignored);
-    // UTF-8: backspace removes a whole code point.
-    (void)m.key(0xe9, "\xc3\xa9", false, false);
-    LUMEN_CHECK(std::strcmp(m.query(), "fo\xc3\xa9") == 0);
-    (void)m.key(k_backspace, nullptr, false, false);
-    LUMEN_CHECK(std::strcmp(m.query(), "fo") == 0);
-    // Ctrl+BackSpace / Ctrl+W delete a word; Ctrl+U clears.
-    for (const char* t : {" ", "b", "a", "r"})
-        (void)m.key(static_cast<unsigned>(t[0]), t, false, false);
-    (void)m.key(k_backspace, nullptr, true, false);
-    LUMEN_CHECK(std::strcmp(m.query(), "fo ") == 0);
-    (void)m.key('w', "w", true, false);
-    LUMEN_CHECK(std::strcmp(m.query(), "") == 0);
-    (void)m.key('z', "z", false, false);
-    LUMEN_CHECK(m.count() == 0);
-    LUMEN_CHECK(m.key(k_return, nullptr, false, false) == launcher_key_result::ignored);
-    LUMEN_CHECK(m.key(k_menu, nullptr, false, false) == launcher_key_result::ignored);
-    (void)m.key('u', "u", true, false);
-    LUMEN_CHECK(m.query()[0] == '\0' && m.count() == 22);
-    // Escape: clears a query, closes when it is empty.
-    (void)m.key('a', "a", false, false);
-    LUMEN_CHECK(m.key(k_escape, nullptr, false, false) == launcher_key_result::changed);
-    LUMEN_CHECK(m.query()[0] == '\0');
-    LUMEN_CHECK(m.key(k_escape, nullptr, false, false) == launcher_key_result::close);
-    // The query is capped.
-    for (int i = 0; i < 200; ++i)
-        (void)m.key('a', "a", false, false);
-    LUMEN_CHECK(std::strlen(m.query()) == lx::shell::launcher_model::k_max_query);
+    LUMEN_CHECK(m.key(k_menu, false) == launcher_key_result::menu);
+    LUMEN_CHECK(m.key(k_f10, true) == launcher_key_result::menu);
+    LUMEN_CHECK(m.key(k_f10, false) == launcher_key_result::ignored);
+    // An empty query lists everything again.
+    type("");
+    m.sync_query();
+    LUMEN_CHECK(m.count() == 22 && m.query()[0] == '\0');
+    // Escape: clears a query (the view empties the buffer), closes when it is empty.
+    type("a");
+    m.sync_query();
+    LUMEN_CHECK(m.key(k_escape, false) == launcher_key_result::cleared);
+    LUMEN_CHECK(query.assign(""));
+    m.sync_query();
+    LUMEN_CHECK(m.key(k_escape, false) == launcher_key_result::close);
+    // The query is capped (the buffer's capacity is the model's k_max_query).
+    char too_long[lx::shell::launcher_model::k_max_query + 2];
+    for (std::size_t i = 0; i < sizeof(too_long) - 1; ++i)
+        too_long[i] = 'a';
+    too_long[sizeof(too_long) - 1] = '\0';
+    LUMEN_CHECK(!query.assign(too_long));
     // Wheel scrolling moves the page, not the selection.
     m.reset();
     m.scroll(3);

@@ -2306,7 +2306,11 @@ int lx::shell::shell_app::run() {
     apps_.set_outcome_handler(
         [](const launch_outcome& o, void* user) { static_cast<shell_app*>(user)->on_outcome(o); },
         this);
-    launcher_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
+    launcher_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr,
+                    .icons = [](const char* name, int px, void* user) {
+                        return static_cast<shell_app*>(user)->icons_.lookup(name, px);
+                    },
+                    .icons_user = this},
                    catalog_,
                    [](unsigned entry, unsigned serial, void* user) {
                        static_cast<shell_app*>(user)->launch_entry(entry, serial);
