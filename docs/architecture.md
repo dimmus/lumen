@@ -684,12 +684,15 @@ blits, the title and the × as coverage blits from the chrome atlas's R8 pages, 
 keeps as textures (`sync_atlas`) — every path draws the same frame. The snap preview and the
 fullscreen backdrop are solid draws. Damage is the frame's strips, never the client area.
 
-The hit test checks a window's surfaces first, then its frame's zones (close button, title,
-then resize bands that extend 8 px outside the visible border, corners within 20 px).
-Presses on the frame never reach a client: the title starts a move and the bands a resize
-through the same grab executor as `xdg_toplevel.move/resize` and the Super binding
-(`grab_source::decoration`), the close button sends `xdg_toplevel.close` on release over it,
-and a middle click on the title lowers the window. The pointer shape over a frame comes from
+The hit test checks a window's surfaces first, then its frame's zones (the title-bar buttons
+— minimize, maximize, close, rightmost — the title, then resize bands that extend 8 px
+outside the visible border, corners within 20 px). Presses on the frame never reach a
+client: the title starts a move and the bands a resize through the same grab executor as
+`xdg_toplevel.move/resize` and the Super binding (`grab_source::decoration`), each button
+clicks on release over it (close sends `xdg_toplevel.close`, minimize hides the window,
+maximize toggles `set_maximized`), and a middle click on the title lowers the window. The
+bar is the Zed title-bar look — 36 px, a regular-weight title, a flat − □ × glyph row whose
+hover / pressed circles are neutral greys. The pointer shape over a frame comes from
 the cursor manager's hover layer, between a grab's override and the client's own cursor. The
 window that owns the keyboard (after popup resolution) is drawn with the active colours.
 

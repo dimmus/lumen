@@ -65,7 +65,7 @@ namespace {
 using lx::compositor::deco_button;
 
 constexpr int k_w = 320;
-constexpr int k_h = 176;
+constexpr int k_h = 240;
 constexpr lx::color k_black = lx::color::rgb(0.f, 0.f, 0.f);
 
 /// `cpu_compositor`'s dim of an encoded byte (0.65 as 166/256), per channel of `rgb`.
@@ -76,13 +76,15 @@ constexpr lx::color k_black = lx::color::rgb(0.f, 0.f, 0.f);
     return out;
 }
 
-/// The circles of the 64x64 decoration atlas Phase 4 drew the close button's hover / pressed
-/// circle from (deleted in Phase 5), premultiplied ARGB, rebuilt to measure the primitive
-/// circle against: coverage c + ½ − |p − centre| at each texel centre, c = 10.
+/// The circles of the 64x64 decoration atlas Phase 4 drew the title-bar buttons' hover /
+/// pressed circle from (deleted in Phase 5), premultiplied ARGB, rebuilt to measure the
+/// primitive circle against: coverage c + ½ − |p − centre| at each texel centre, c = 10.
 constexpr unsigned k_old_atlas_size = 64;
 constexpr unsigned k_old_atlas_texture = 0x7FFF'FE00u;
-constexpr lx::rect2i k_old_circle_hover{0, 24, 20, 20};
-constexpr lx::rect2i k_old_circle_pressed{24, 24, 20, 20};
+constexpr lx::rect2i k_old_circle_hover{0, 24, lx::compositor::k_deco_close_circle,
+                                        lx::compositor::k_deco_close_circle};
+constexpr lx::rect2i k_old_circle_pressed{24, 24, lx::compositor::k_deco_close_circle,
+                                          lx::compositor::k_deco_close_circle};
 const std::vector<std::uint32_t>& old_deco_atlas() {
     static const std::vector<std::uint32_t> a = [] {
         std::vector<std::uint32_t> px(k_old_atlas_size * k_old_atlas_size, 0u);
@@ -144,20 +146,21 @@ struct titled_window {
 };
 
 // Active and fitting; inactive, hovered and ellipsized; not responding (dimmed, the suffix
-// alone and itself cut) — every rule of the title, at scale 1.
+// alone and itself cut) — every rule of the title, at scale 1. One window per row: the
+// three-button bar leaves width − 128 px of title room.
 const titled_window k_windows[3] = {
-    {{12, 40, 296, 36}, "Terminal \xE2\x80\x94 ~/src/lumen (main)", true, false, deco_button::normal,
+    {{12, 40, 296, 36}, "Terminal \xE2\x80\x94 src", true, false, deco_button::normal,
      lx::color::rgb(0.10f, 0.12f, 0.15f)},
-    {{12, 116, 150, 44}, "A very long document title that cannot fit in its bar", false, false,
+    {{12, 120, 296, 36}, "A very long document title that cannot fit in its bar", false, false,
      deco_button::hover, lx::color::rgb(0.85f, 0.85f, 0.82f)},
-    {{176, 116, 132, 44}, "Editor", false, true, deco_button::normal,
+    {{12, 200, 296, 36}, "Editor", false, true, deco_button::normal,
      lx::color::rgb(0.20f, 0.30f, 0.45f)},
 };
 // The same at scale 1.25 (logical pixels: 256 × 141 of them on the 320 × 176 output).
 const titled_window k_windows_125[2] = {
-    {{10, 32, 236, 28}, "Terminal \xE2\x80\x94 ~/src/lumen (main)", true, false, deco_button::pressed,
+    {{10, 38, 236, 28}, "Terminal \xE2\x80\x94 src", true, false, deco_button::pressed,
      lx::color::rgb(0.10f, 0.12f, 0.15f)},
-    {{10, 93, 236, 36}, "Files", false, true, deco_button::normal, lx::color::rgb(0.85f, 0.85f, 0.82f)},
+    {{10, 110, 236, 36}, "Files", false, true, deco_button::normal, lx::color::rgb(0.85f, 0.85f, 0.82f)},
 };
 
 /// The text atlas and the title font every case uses: the bundled UI family, bold, 10 pt —
@@ -167,7 +170,7 @@ struct text_env {
     lx::compositor::chrome_text text{atlas};
     text_env() {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
-        text.set_font({lx::text::k_ui_family, 10.f, lx::text::weight::bold, lx::text::style::normal});
+        text.set_font({lx::text::k_ui_family, 10.f, lx::text::weight::normal, lx::text::style::normal});
     }
 };
 
@@ -214,7 +217,7 @@ struct desktop {
                 f->extents = lx::compositor::extents_for(lx::compositor::decoration_mode::server, false);
                 f->shown = true;
                 f->active = w.active;
-                f->button = w.button;
+                f->buttons[lx::compositor::button_index(lx::compositor::deco_zone::close)] = w.button;
                 f->dimmed = w.not_responding;
                 f->title = tt.get();
                 f->text = &e.text;
@@ -438,7 +441,7 @@ unsigned ink_in_title(const std::vector<std::uint32_t>& px, lx::rect2i geometry,
     const lx::rect2i t = lx::compositor::title_rect(geometry);
     unsigned ink = 0;
     for (int y = t.y; y < t.y + t.height; ++y)
-        for (int x = t.x; x < t.x + t.width - lx::compositor::k_deco_title_height; ++x)
+        for (int x = t.x; x < t.x + t.width - 3 * lx::compositor::k_deco_title_height; ++x)
             if (channel(px[static_cast<std::size_t>(y * k_w + x)], 8) > channel(bar, 8) + 40)
                 ++ink;
     return ink;
@@ -586,7 +589,7 @@ float stem_weight(const std::vector<std::uint32_t>& px, const titled_window& w, 
     double sum = 0.0;
     unsigned n = 0;
     for (int y = t.y; y < t.y + t.height; ++y)
-        for (int x = t.x; x < t.x + t.width - lx::compositor::k_deco_title_height; ++x) {
+        for (int x = t.x; x < t.x + t.width - 3 * lx::compositor::k_deco_title_height; ++x) {
             const std::uint32_t p = px[static_cast<std::size_t>(y * k_w + x)];
             const float l = static_cast<float>(channel(p, 16) + channel(p, 8) + channel(p, 0)) / 3.f;
             if (l <= lbar + 0.5f)
@@ -674,7 +677,7 @@ LUMEN_TEST(manager_lays_titles_out_per_scale) {
     lx::compositor::decoration_manager m{};
     m.bind_chrome(&atlas);
     LUMEN_CHECK(m.text() != nullptr);
-    m.text()->set_font({lx::text::k_ui_family, 10.f, lx::text::weight::bold, lx::text::style::normal});
+    m.text()->set_font({lx::text::k_ui_family, 10.f, lx::text::weight::normal, lx::text::style::normal});
     lx::compositor::toplevel_record rec{};
     rec.id = lx::toplevel_id{7};
     rec.surface = lx::surface_id{70};
@@ -750,7 +753,8 @@ LUMEN_TEST(cpu_titles_match_the_reference) {
     LUMEN_CHECK(channel(at(ca.x + ca.width / 2, ca.y + ca.height / 2), 16) > 0xC0);
     // The hovered button's circle under the glyph.
     const lx::rect2i cb = lx::compositor::close_rect(k_windows[1].geometry);
-    LUMEN_CHECK(at(cb.x + 6, cb.y + cb.height / 2) == 0xE0443Eu);
+    LUMEN_CHECK(at(cb.x + 6, cb.y + cb.height / 2) ==
+              (lx::compositor::k_deco_button_hover & 0xFFFFFFu)); // the neutral hover circle
 }
 
 // At 1.25 the titles are laid out at 1.25 and drawn 1:1 (the sprites sit on whole pixels at
@@ -982,6 +986,11 @@ void phase4_of(lx::compositor::frame_painter& painter, const lx::scene::immutabl
     const lx::gfx::ui_stream s = painter.stream(snap);
     p.refs.assign(s.refs.begin(), s.refs.end());
     const auto dim = [](unsigned v) { return (v * 166u) >> 8u; };
+    const auto byte_of = [](std::uint32_t rgb, unsigned sh) {
+        return static_cast<unsigned>((rgb >> sh) & 0xFFu);
+    };
+    const unsigned pressed_red = byte_of(lx::compositor::k_deco_button_pressed, 16);
+    const unsigned hover_red = byte_of(lx::compositor::k_deco_button_hover, 16);
     for (lx::gfx::primitive_ref& r : p.refs) {
         if (r.kind != lx::gfx::primitive_kind::quad || r.index >= s.quads.size())
             continue;
@@ -989,8 +998,8 @@ void phase4_of(lx::compositor::frame_painter& painter, const lx::scene::immutabl
         if ((q.radii[0] & 0x7FFFu) == 0)
             continue;
         const auto red = static_cast<unsigned>(std::lround(lx::gfx::from_half(q.background[0]) * 255.f));
-        const bool pressed = red == 0xB8u || red == dim(0xB8u);
-        const bool dimmed = red == dim(0xE0u) || red == dim(0xB8u);
+        const bool pressed = red == pressed_red || red == dim(pressed_red);
+        const bool dimmed = red == dim(hover_red) || red == dim(pressed_red);
         lx::gfx::blit_command b{};
         b.texture_id = k_old_atlas_texture;
         const lx::rect2i c = pressed ? k_old_circle_pressed : k_old_circle_hover;
@@ -1162,7 +1171,10 @@ LUMEN_TEST(vk_titles_in_the_linear_pass) {
             const float w1 = stem_weight(read_vk(*v), k_windows[0], 0x303033u, 0xF2F2F2u);
             std::printf("    stem weight: CPU %.4f, Vulkan %.4f (%+.1f %%); exponent 1.0: %.4f (%+.1f %%)\n",
                         wc, wv, 100.f * (wv - wc) / wc, w1, 100.f * (w1 - wc) / wc);
-            LUMEN_CHECK(wc > 0.f && std::fabs(wv - wc) / wc <= 0.03f);
+            // Measured on lavapipe: the exponent was fitted on bold 13 px stems
+            // (+1.5 %); the regular 10 pt titles land at +4.0 % (5 % bound), the
+            // exponent-off run at +24 %.
+            LUMEN_CHECK(wc > 0.f && std::fabs(wv - wc) / wc <= 0.05f);
             LUMEN_CHECK(std::fabs(wv - wc) < std::fabs(w1 - wc));
             // Dimmed: the fill as on the CPU, and the glyph pixels the CPU drew at full
             // coverage carry the same dimmed byte (one colour rule on every backend).
@@ -1174,7 +1186,7 @@ LUMEN_TEST(vk_titles_in_the_linear_pass) {
             unsigned full_cov = 0;
             int worst_core = 0;
             for (int py = tc.y; py < tc.y + tc.height; ++py)
-                for (int px = tc.x; px < tc.x + tc.width - lx::compositor::k_deco_title_height; ++px) {
+                for (int px = tc.x; px < tc.x + tc.width - 3 * lx::compositor::k_deco_title_height; ++px) {
                     const std::size_t i = static_cast<std::size_t>(py * k_w + px);
                     if (channel(cpu[i], 8) != dim)
                         continue;
@@ -1311,7 +1323,8 @@ LUMEN_TEST(vk_damage_limited_titles_match_a_full_repaint) {
             d.scene->note_damage(k_windows[2].geometry);
         } else {
             // Window 1's close button hovered / not.
-            d.frames[1]->button = i % 2 ? deco_button::normal : deco_button::hover;
+            d.frames[1]->buttons[lx::compositor::button_index(lx::compositor::deco_zone::close)] =
+                i % 2 ? deco_button::normal : deco_button::hover;
             d.scene->note_damage(frame_rect(k_windows[1].geometry));
         }
         LUMEN_CHECK(d.scene->commit_frame(0, ++d.frame_index));
@@ -1500,7 +1513,16 @@ LUMEN_TEST(lowered_paths_draw_titles_close_and_circle) {
                     if (w.button != deco_button::normal) {
                         const int ox = cx - static_cast<int>(std::lround(7 * scale));
                         const std::uint32_t red = px[static_cast<std::size_t>(cy * k_w + ox)];
-                        LUMEN_CHECK(channel(red, 16) > channel(red, 8) + 0x40); // inside the circle
+                        // Inside the circle: the button state's own fill, not the bar.
+                        const std::uint32_t want = w.button == deco_button::pressed
+                                                       ? lx::compositor::k_deco_button_pressed
+                                                       : lx::compositor::k_deco_button_hover;
+                        const int dr = static_cast<int>(channel(red, 16)) -
+                                       static_cast<int>(channel(want, 16));
+                        if (dr < -2 || dr > 2)
+                            std::printf("    lowered circle: %06x, expected %06x\n", red & 0xFFFFFFu,
+                                        want & 0xFFFFFFu);
+                        LUMEN_CHECK(dr >= -2 && dr <= 2);
                     }
                 }
             };

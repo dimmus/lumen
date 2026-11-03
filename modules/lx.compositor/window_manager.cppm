@@ -932,10 +932,12 @@ private:
     fullscreen_backdrop backdrops_[output_manager::k_max]{};
     /// The frame zone with pointer focus (none: the focus, if any, is a client surface).
     deco_zone pointer_zone_ = deco_zone::none;
-    /// A close-button press waiting for its release (the click happens on release over it).
+    /// A title-bar button press waiting for its release (the click happens on release over
+    /// it).
     struct deco_press {
         lx::toplevel_id id{};
         unsigned button = 0;
+        deco_zone zone = deco_zone::close;
     } deco_press_{};
     /// The last left press on a title bar, for double-click detection.
     struct title_click {
@@ -1163,12 +1165,17 @@ constexpr unsigned k_key_esc = 1;
     return static_cast<int>(std::lround(d));
 }
 
-/// The point is on the close button of a mapped, server-side decorated window.
-[[nodiscard]] bool in_close(const lx::compositor::toplevel_record& rec, double x, double y) {
-    return rec.mapped && rec.decoration_current == lx::compositor::decoration_mode::server &&
-           lx::compositor::deco_hit(rec.geometry,
-                                    lx::compositor::window_manager::extents_of(rec), x, y) ==
-               lx::compositor::deco_zone::close;
+/// The point is on the `zone` button of a mapped, server-side decorated window.
+[[nodiscard]] bool in_button(const lx::compositor::toplevel_record& rec,
+                             lx::compositor::deco_zone zone, double x, double y) {
+    if (!rec.mapped || rec.decoration_current != lx::compositor::decoration_mode::server)
+        return false;
+    const unsigned i = lx::compositor::button_index(zone);
+    if (i >= 3)
+        return false;
+    const lx::rect2i r = lx::compositor::button_rect(rec.geometry, zone);
+    return x >= r.x && y >= r.y && x < static_cast<double>(r.x) + r.width &&
+           y < static_cast<double>(r.y) + r.height;
 }
 
 /// Double click on a title bar: within 400 ms and 4 px of the previous press.
@@ -3059,9 +3066,9 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     rec->demands_attention = false;
     sync_decoration(*rec); // not mapped: the frame goes (damaged) with the window
     if (deco_press_.id == id) {
-        deco_press_ = {};
         if (decorations_)
-            decorations_->set_button(id, deco_button::normal);
+            decorations_->set_button(id, deco_press_.zone, deco_button::normal);
+        deco_press_ = {};
     }
     if (shell_)
         shell_->emit_toplevel_destroyed(*rec);
@@ -3502,10 +3509,11 @@ void lx::compositor::window_manager::set_decoration_hover(lx::toplevel_id id, de
                                                                     : lx::toplevel_id{};
     if (decorations_) {
         if (old_id && !(old_id == id && zone != deco_zone::none))
-            decorations_->set_button(old_id, deco_button::normal);
+            decorations_->set_button(old_id, pointer_zone_, deco_button::normal);
         if (zone != deco_zone::none)
-            decorations_->set_button(id, zone == deco_zone::close ? deco_button::hover
-                                                                  : deco_button::normal);
+            decorations_->set_button(id, zone,
+                                     button_index(zone) < 3 ? deco_button::hover
+                                                            : deco_button::normal);
     }
     if (cursor_) {
         if (zone != deco_zone::none)
@@ -3646,12 +3654,14 @@ void lx::compositor::window_manager::on_pointer_motion(unsigned time_ms) {
         return;
     }
 
-    // A close-button press shows pressed only while the pointer is still over the button —
-    // releasing elsewhere cancels, and the look says so beforehand.
+    // A title-bar button press shows pressed only while the pointer is still over the
+    // button — releasing elsewhere cancels, and the look says so beforehand.
     if (deco_press_.id && decorations_) {
         const auto* rec = toplevels_->find(deco_press_.id);
-        const bool over = rec && in_close(*rec, px, py);
-        decorations_->set_button(deco_press_.id, over ? deco_button::pressed : deco_button::normal);
+        const bool over =
+            rec && in_button(*rec, deco_press_.zone, seat_->pointer_x(), seat_->pointer_y());
+        decorations_->set_button(deco_press_.id, deco_press_.zone,
+                                 over ? deco_button::pressed : deco_button::normal);
         return;
     }
 
@@ -3848,19 +3858,35 @@ void lx::compositor::window_manager::on_pointer_button(
             end_grab(grab_end_reason::release); // re-hit-tests once no button is held
             return;
         }
-        // The close button clicks on release, and only over the button it was pressed on.
+        // A title-bar button clicks on release, and only over the button it was pressed
+        // on; the release then flows on as any other does (the pointer focus refreshes).
         if (deco_press_.id && event.evdev_code == deco_press_.button) {
             const lx::toplevel_id id = deco_press_.id;
+            const deco_zone zone = deco_press_.zone;
             deco_press_ = {};
             const auto* rec = toplevels_->find(id);
-            const bool over = rec && in_close(*rec, seat_->pointer_x(), seat_->pointer_y());
+            const bool over = rec && in_button(*rec, zone, seat_->pointer_x(), seat_->pointer_y());
             if (decorations_)
-                decorations_->set_button(id, over ? deco_button::hover : deco_button::normal);
+                decorations_->set_button(id, zone, over ? deco_button::hover : deco_button::normal);
             if (over) {
-                if (log_deco.enabled(lx::trace::level::debug)) {
-                    log_deco.debug("decoration close id={}", id.id());
+                if (zone == deco_zone::close) {
+                    if (log_deco.enabled(lx::trace::level::debug)) {
+                        log_deco.debug("decoration close id={}", id.id());
+                    }
+                    request_close(id);
+                } else if (zone == deco_zone::minimize) {
+                    if (log_deco.enabled(lx::trace::level::debug)) {
+                        log_deco.debug("decoration minimize id={}", id.id());
+                    }
+                    set_minimized(id, true, "decoration");
+                } else if (zone == deco_zone::maximize) {
+                    const bool maximized = rec && (rec->desired.states & tl_maximized) != 0;
+                    if (log_deco.enabled(lx::trace::level::debug)) {
+                        log_deco.debug("decoration maximize id={} on={}", id.id(),
+                                       maximized ? 0 : 1);
+                    }
+                    set_maximized(id, !maximized, "decoration");
                 }
-                request_close(id);
             }
         }
         if (swallowed) {
@@ -4134,10 +4160,12 @@ void lx::compositor::window_manager::decoration_press(
         (void)begin_grab(id, grab_mode::move, 0, grab_source::decoration, event.evdev_code);
         return;
     }
+    case deco_zone::minimize:
+    case deco_zone::maximize:
     case deco_zone::close:
-        deco_press_ = {id, event.evdev_code};
+        deco_press_ = {id, event.evdev_code, zone};
         if (decorations_)
-            decorations_->set_button(id, deco_button::pressed);
+            decorations_->set_button(id, zone, deco_button::pressed);
         return;
     case deco_zone::none:
         return;
@@ -5019,9 +5047,9 @@ void lx::compositor::window_manager::apply_hidden(toplevel_record& rec, bool hid
         if (popups_)
             popups_->on_parent_unmapped(rec.surface, "parent-hidden");
         if (deco_press_.id == rec.id) {
-            deco_press_ = {};
             if (decorations_)
-                decorations_->set_button(rec.id, deco_button::normal);
+                decorations_->set_button(rec.id, deco_press_.zone, deco_button::normal);
+            deco_press_ = {};
         }
         if (pointer_focus_ == rec.id) {
             if (button_mask_ != 0)
@@ -6178,7 +6206,9 @@ lx::compositor::window_manager::make_ghost(const toplevel_record& rec) {
             f.extents = frame->extents;
             f.shown = frame->shown;
             f.active = frame->active;
-            f.button = deco_button::normal;
+            for (unsigned b = 0; b < 3; ++b)
+                f.buttons[b] = frame->buttons[b];
+            f.maximized = frame->maximized;
             f.text = frame->text;
             f.dimmed = frame->dimmed;
             if (frame->title) {

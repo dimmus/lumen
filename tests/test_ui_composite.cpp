@@ -196,14 +196,14 @@ LUMEN_TEST(decorated_frame_goes_through_the_cpu_primitive_renderer) {
     desktop d{true};
     const auto& snap = d.publish();
     LUMEN_CHECK(lx::compositor::frame_painter::has_primitives(snap));
-    LUMEN_CHECK(snap.draws().primitive_count() == 5);
+    LUMEN_CHECK(snap.draws().primitive_count() == 10);
     for (const lx::gfx::damage_region& region : {full_region(), two_rects()}) {
         image streamed{};
         auto s = painter.paint_cpu(comp, &ui, streamed.surface(), snap, region);
         LUMEN_CHECK(static_cast<bool>(s) && s->paint.stream && s->ui.primitives_skipped == 0);
         image lowered{};
         auto l = painter.paint_cpu(comp, nullptr, lowered.surface(), snap, region);
-        LUMEN_CHECK(static_cast<bool>(l) && !l->paint.stream && l->paint.lowered == 5 &&
+        LUMEN_CHECK(static_cast<bool>(l) && !l->paint.stream && l->paint.lowered == 10 &&
                     l->paint.dropped == 0);
         LUMEN_CHECK(streamed.px == lowered.px);
     }
@@ -307,7 +307,7 @@ LUMEN_TEST(turned_output_turns_primitives_with_their_draws) {
           lx::buffer_transform::flipped_270}) {
         desktop turned{true, t};
         const auto& snap = turned.publish();
-        LUMEN_CHECK(snap.draws().primitive_count() == 5);
+        LUMEN_CHECK(snap.draws().primitive_count() == 10);
         image out{};
         LUMEN_CHECK(static_cast<bool>(painter.paint_cpu(comp, &ui, out.surface(), snap, full_region())));
         // Every quad's stream bounds match its instance bounds, inside the output.

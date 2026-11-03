@@ -36,7 +36,9 @@ import :theme;
 //     slider(0.55, 0.1, 0.9).steps(80).on_change(set_ratio)   // on_change: the step index
 //     segmented(words, selected).on_select(set_word)          // on_select: the index
 //     select(words, selected).open(open).on_select(pick).on_open(show).on_dismiss(close)
+//     drop_down(words, selected).open(open).on_select(pick)   // Zed's dropdown look
 //     stepper(buffer, value).range(1, 64).on_change(apply)    // buttons pass +1 / -1
+//     spinner(buffer, value).range(1, 64).on_change(apply)    // Zed's number-input look
 //     swatch_row(swatches, selected).on_select(pick)
 //
 // Handlers are `handler`s (the engine's int currency): a slider reports the quantized step
@@ -239,6 +241,50 @@ private:
 
 [[nodiscard]] select_builder select(std::span<const char* const> options, int selected);
 
+// ── drop_down ─────────────────────────────────────────────────────────────────────────────
+
+/// Zed's dropdown (`dropdown.rs`): a bordered trigger — the current word and the stacked
+/// up / down chevrons — that opens a `popover_menu` of the options below it while `open`,
+/// the current one carrying its check mark at the row's right edge. The state and the
+/// handlers are `select`'s (`.on_open` on a click / space / enter, `.on_dismiss` when the
+/// popover closes for any other reason, `.on_select` with the chosen index); the look is
+/// the dropdown's: the trigger hugs its content to a `min_width` floor instead of filling
+/// the row. At most 64 entries render (a menu's cap).
+class drop_down_builder {
+public:
+    drop_down_builder(std::span<const char* const> options, int selected)
+        : options_{options}, selected_{selected} {}
+    drop_down_builder& open(bool on = true) { open_ = on; return *this; }
+    drop_down_builder& on_select(handler h) { on_select_ = h; return *this; }
+    drop_down_builder& on_open(handler h) { on_open_ = h; return *this; }
+    drop_down_builder& on_dismiss(handler h) { on_dismiss_ = h; return *this; }
+    /// Shown instead of the current word when no option is selected (index −1).
+    drop_down_builder& placeholder(const char* text) { placeholder_ = text; return *this; }
+    /// The trigger's width floor, px at the rem (default 150; the content can exceed it).
+    drop_down_builder& min_width(float px) { min_width_ = px; return *this; }
+    drop_down_builder& disabled(bool on = true) { disabled_ = on; return *this; }
+    drop_down_builder& tab_index(int i) { tab_index_ = static_cast<std::int16_t>(i); return *this; }
+    drop_down_builder& name(const char* a11y) { name_ = a11y; return *this; }
+    drop_down_builder& key(element_key k) { key_ = k; return *this; }
+    operator child() const; // NOLINT(google-explicit-constructor)
+
+private:
+    std::span<const char* const> options_{};
+    int selected_ = -1;
+    bool open_ = false;
+    handler on_select_{};
+    handler on_open_{};
+    handler on_dismiss_{};
+    const char* placeholder_ = nullptr;
+    float min_width_ = 150.f;
+    bool disabled_ = false;
+    std::int16_t tab_index_ = 0;
+    const char* name_ = nullptr;
+    element_key key_ = 0;
+};
+
+[[nodiscard]] drop_down_builder drop_down(std::span<const char* const> options, int selected);
+
 // ── stepper ───────────────────────────────────────────────────────────────────────────────
 
 /// A number field with − / + buttons: the minus and plus ghosts flank a 64 px text input on
@@ -248,7 +294,12 @@ private:
 class stepper_builder {
 public:
     stepper_builder(text_buffer& buffer, int value) : buffer_{&buffer}, value_{value} {}
-    stepper_builder& range(int min, int max) { min_ = min; max_ = max; return *this; }
+    stepper_builder& range(int min, int max) {
+        min_ = min;
+        max_ = max;
+        has_range_ = true;
+        return *this;
+    }
     stepper_builder& on_change(handler h) { on_change_ = h; return *this; }
     stepper_builder& on_submit(handler h) { on_submit_ = h; return *this; }
     stepper_builder& disabled(bool on = true) { disabled_ = on; return *this; }
@@ -272,6 +323,47 @@ private:
 };
 
 [[nodiscard]] stepper_builder stepper(text_buffer& buffer, int value);
+
+// ── spinner ───────────────────────────────────────────────────────────────────────────────
+
+/// Zed's number input (`number_input.rs`): one bordered box — the − button, a 1 px rule,
+/// the value on the app's `text_buffer` (a borderless, editable field), a rule, the +
+/// button. The buttons report `on_change(−1)` / `on_change(+1)` (the app rewrites the
+/// buffer and clamps); a submit reports `on_change(0)` (the app parses it). `range` only
+/// disables the buttons at the ends — the value's truth is the buffer's. The box hugs its
+/// content to a 150 px floor.
+class spinner_builder {
+public:
+    spinner_builder(text_buffer& buffer, int value) : buffer_{&buffer}, value_{value} {}
+    spinner_builder& range(int min, int max) {
+        min_ = min;
+        max_ = max;
+        has_range_ = true;
+        return *this;
+    }
+    spinner_builder& on_change(handler h) { on_change_ = h; return *this; }
+    spinner_builder& on_submit(handler h) { on_submit_ = h; return *this; }
+    spinner_builder& disabled(bool on = true) { disabled_ = on; return *this; }
+    spinner_builder& tab_index(int i) { tab_index_ = static_cast<std::int16_t>(i); return *this; }
+    spinner_builder& name(const char* a11y) { name_ = a11y; return *this; }
+    spinner_builder& key(element_key k) { key_ = k; return *this; }
+    operator child() const; // NOLINT(google-explicit-constructor)
+
+private:
+    text_buffer* buffer_ = nullptr;
+    int value_ = 0;
+    bool has_range_ = false;
+    int min_ = 0;
+    int max_ = 0;
+    handler on_change_{};
+    handler on_submit_{};
+    bool disabled_ = false;
+    std::int16_t tab_index_ = 0;
+    const char* name_ = nullptr;
+    element_key key_ = 0;
+};
+
+[[nodiscard]] spinner_builder spinner(text_buffer& buffer, int value);
 
 // ── swatch ────────────────────────────────────────────────────────────────────────────────
 
@@ -851,6 +943,80 @@ lx::ui::select_builder lx::ui::select(std::span<const char* const> options, int 
     return select_builder{options, selected};
 }
 
+// ── drop_down ──────────────────────────────────────────────────────────────────────────
+
+lx::ui::drop_down_builder::operator child() const {
+    const unsigned n = std::min<unsigned>(options_.size(), k_select_max_options);
+    const float rem = lx_in_rem();
+    const bool has_selection = selected_ >= 0 && static_cast<unsigned>(selected_) < n;
+    const char* current = has_selection ? options_[static_cast<unsigned>(selected_)] : nullptr;
+
+    // The trigger: a bordered box the content sizes (to the `min_width` floor), the word
+    // left and the stacked chevrons right.
+    lx::ui::control_props trigger{};
+    trigger.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(min_width_))
+                         .justify_between().h(lx_in_px16(26.f)).px(sp::b08).gap(sp::b04);
+    lx::ui::control_paint p{};
+    p.rest = {paint(tok::element_background), paint(tok::border_variant)};
+    p.hover = {paint(tok::element_background), paint(tok::border)};
+    p.active = {paint(tok::element_active), paint(tok::border_variant)};
+    trigger.paint = lx_in_rounded(lx_in_bordered(p, 1), radius::md);
+    trigger.on_activate = on_open_;
+    trigger.tab_index = disabled_ ? -1 : tab_index_;
+    trigger.role = lx::a11y::role::button;
+    trigger.name = name_ ? name_ : (current ? current : placeholder_);
+    trigger.a11y_state = open_ ? lx_in_a11y(lx::a11y::state_flag::expanded) : 0u;
+    trigger.interactive = !disabled_;
+    trigger.focusable = !disabled_;
+    trigger.disabled = disabled_;
+    trigger.focus_ring = true;
+    lx::ui::child word = text_block(lx_in_text(
+        current ? current : (placeholder_ ? placeholder_ : ""),
+        lx_in_text_px(12.f),
+        disabled_ ? tok::text_disabled : current ? tok::text : tok::text_placeholder, 1.f));
+    // The dropdown glyph: the up and down chevrons stacked, Zed's `ChevronUpDown`.
+    lx::ui::child chevrons_kids[2] = {
+        icon_view(lx::ui::icon::chevron_up, 9.f * rem / 16.f,
+                  disabled_ ? tok::icon_disabled : tok::icon_muted),
+        icon_view(lx::ui::icon::chevron_down, 9.f * rem / 16.f,
+                  disabled_ ? tok::icon_disabled : tok::icon_muted),
+    };
+    lx::ui::control_props chevrons{};
+    chevrons.layout = lx::ui::style{}.flex_none().flex_col().justify_center().items_center();
+    lx::ui::child chevrons_child = control(chevrons, {chevrons_kids, 2u});
+    lx::ui::child trigger_parts[2] = {word, chevrons_child};
+    lx::ui::child trigger_child = control(trigger, {trigger_parts, 2u});
+
+    if (n == 0)
+        return trigger_child;
+
+    // The dropdown: one entry per word, the check at the row's right edge, `on_select` with
+    // the index. The array lives on this describe's stack; the popover consumes it at once.
+    const unsigned listed = std::min<unsigned>(n, 64); // a menu's truncation cap
+    std::array<menu_entry, 64> entries{};
+    for (unsigned i = 0; i < listed; ++i) {
+        entries[i] = menu_item(options_[i], on_select_);
+        entries[i].toggle(static_cast<int>(i) == selected_);
+        entries[i].check_end();
+        entries[i].with_value(static_cast<int>(i));
+    }
+    popover_builder drop = popover_menu(trigger_child,
+                                        std::span<const menu_entry>{entries.data(), listed});
+    drop.open(open_ && !disabled_);
+    drop.on_dismiss(on_dismiss_);
+    drop.key(key_);
+    // The control, its trigger and its dropdown in one column so the popover tracks it.
+    lx::ui::control_props wrap{};
+    wrap.layout = lx::ui::style{}.flex_col().items_start().flex_none();
+    lx::ui::child drop_child = drop;
+    lx::ui::child kids[2] = {trigger_child, drop_child};
+    return control(wrap, {kids, 2u}, key_);
+}
+
+lx::ui::drop_down_builder lx::ui::drop_down(std::span<const char* const> options, int selected) {
+    return drop_down_builder{options, selected};
+}
+
 // ── stepper ────────────────────────────────────────────────────────────────────────────
 
 lx::ui::stepper_builder::operator child() const {
@@ -879,6 +1045,50 @@ lx::ui::stepper_builder::operator child() const {
 
 lx::ui::stepper_builder lx::ui::stepper(text_buffer& buffer, int value) {
     return stepper_builder{buffer, value};
+}
+
+// ── spinner ────────────────────────────────────────────────────────────────────────────
+
+lx::ui::spinner_builder::operator child() const {
+    const bool at_min = has_range_ && value_ <= min_;
+    const bool at_max = has_range_ && value_ >= max_;
+    lx::ui::child minus = lx_in_ghost_icon(lx::ui::icon::minus, -1, on_change_,
+                                           disabled_ || at_min, "Decrease");
+    text_input_builder field = text_input().buffer(*buffer_)
+                                  .framed(false)
+                                  .layout(lx_in_h_flex().flex_grow(1.f).flex_shrink(1.f)
+                                              .min_w(lx::layout::px(0.f))
+                                              .h(lx_in_px16(k_st_h)))
+                                  .max_bytes(16)
+                                  .on_submit(on_submit_)
+                                  .disabled(disabled_)
+                                  .tab_index(tab_index_)
+                                  .name(name_);
+    lx::ui::child field_child = field;
+    lx::ui::child plus = lx_in_ghost_icon(lx::ui::icon::plus, 1, on_change_,
+                                          disabled_ || at_max, "Increase");
+    // The rules between the cells: 1 px, the variant border, 20 px tall, centred.
+    lx::ui::control_props rule{};
+    rule.layout = lx::ui::style{}.flex_none().w(lx::layout::px(1.f)).h(lx_in_px16(20.f));
+    rule.paint = control_paint::fixed({paint(tok::border_variant), k_transparent});
+    lx::ui::child left_rule = control(rule, {});
+    lx::ui::child right_rule = control(rule, {});
+    lx::ui::child kids[5] = {minus, left_rule, field_child, right_rule, plus};
+    lx::ui::control_props box{};
+    box.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(150.f)).h(lx_in_px16(k_st_h))
+                     .rounded(radius::md);
+    lx::ui::control_paint paint_{};
+    paint_.rest = {paint(tok::element_background), paint(tok::border_variant)};
+    paint_.hover = paint_.active = paint_.rest;
+    box.paint = lx_in_rounded(lx_in_bordered(paint_, 1), radius::md);
+    box.role = lx::a11y::role::spin_button;
+    box.name = name_;
+    box.disabled = disabled_;
+    return control(box, {kids, 5u}, key_);
+}
+
+lx::ui::spinner_builder lx::ui::spinner(text_buffer& buffer, int value) {
+    return spinner_builder{buffer, value};
 }
 
 // ── swatch_node ────────────────────────────────────────────────────────────────────────

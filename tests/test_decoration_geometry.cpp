@@ -53,7 +53,12 @@ LUMEN_TEST(close_wins_over_title_and_title_spans_the_bar) {
     // Close button: the bar's right T x T.
     LUMEN_CHECK(hit(k_geom.x + k_geom.width - 1, ty) == deco_zone::close);
     LUMEN_CHECK(hit(k_geom.x + k_geom.width - T, ty + T - 1) == deco_zone::close);
-    LUMEN_CHECK(hit(k_geom.x + k_geom.width - T - 1, ty + 5) == deco_zone::title);
+    // Maximize beside it, minimize beside that (Zed's − □ × row); left of them, the title.
+    LUMEN_CHECK(hit(k_geom.x + k_geom.width - T - 1, ty + T - 1) == deco_zone::maximize);
+    LUMEN_CHECK(hit(k_geom.x + k_geom.width - 2 * T, ty + 5) == deco_zone::maximize);
+    LUMEN_CHECK(hit(k_geom.x + k_geom.width - 2 * T - 1, ty + 5) == deco_zone::minimize);
+    LUMEN_CHECK(hit(k_geom.x + k_geom.width - 3 * T, ty + 5) == deco_zone::minimize);
+    LUMEN_CHECK(hit(k_geom.x + k_geom.width - 3 * T - 1, ty + 5) == deco_zone::title);
     LUMEN_CHECK(hit(k_geom.x, ty) == deco_zone::title);
     LUMEN_CHECK(hit(k_geom.x + 200, k_geom.y - 1) == deco_zone::title);
     // The client area is nobody's (its surfaces are hit first).
@@ -130,7 +135,7 @@ LUMEN_TEST(zone_edges_and_cursors) {
 }
 
 LUMEN_TEST(title_room_and_rects) {
-    LUMEN_CHECK(title_text_room(400) == 400 - 2 * k_deco_title_padding - T);
+    LUMEN_CHECK(title_text_room(400) == 400 - 2 * k_deco_title_padding - 3 * T);
     const lx::rect2i t = title_rect(k_geom);
     LUMEN_CHECK(t.x == k_geom.x && t.y == k_geom.y - T && t.width == k_geom.width && t.height == T);
     const lx::rect2i c = close_rect(k_geom);
@@ -337,9 +342,9 @@ LUMEN_TEST(frame_draws_baked_colours_where_the_zones_are) {
     node.text = &chrome_env().text;
     lx::scene::draw_list list;
     node.emit_draws(list);
-    // Primitives only: four borders and the title fill as quads, the close glyph a mono
-    // sprite (no title laid out, no hover); no surface draw, no texture.
-    LUMEN_CHECK(list.primitive_count() == 6 && list.quad_instances().size() == 5);
+    // Primitives only: four borders, the title fill, the − stroke and the □ outline (4) as
+    // quads, the close glyph a mono sprite (no title laid out, no hover); no surface draw.
+    LUMEN_CHECK(list.primitive_count() == 11 && list.quad_instances().size() == 10);
     LUMEN_CHECK(list.sprite_instances().size() == 1);
     LUMEN_CHECK(list.size() == 0);
 
@@ -364,26 +369,26 @@ LUMEN_TEST(frame_draws_baked_colours_where_the_zones_are) {
     LUMEN_CHECK(i.at(g.x - 1, g.y + 20) == k_deco_border_inactive);
 
     node.active = true;
-    node.button = deco_button::hover;
+    node.buttons[button_index(deco_zone::close)] = deco_button::hover;
     lx::scene::draw_list hovered;
     node.emit_draws(hovered);
     // The circle: one more quad, its radius half its side.
-    LUMEN_CHECK(hovered.quad_instances().size() == 6 && hovered.size() == 0);
+    LUMEN_CHECK(hovered.quad_instances().size() == 11 && hovered.size() == 0);
     const lx::gfx::quad_instance& circle = hovered.quad_instances()[5];
     LUMEN_CHECK(circle.bounds[2] == k_deco_close_circle && circle.bounds[3] == k_deco_close_circle);
     for (const std::uint16_t r : circle.radii)
         LUMEN_CHECK(lx::gfx::from_half(r) == k_deco_close_circle / 2.f);
     const composited h = composite_frame(node, 160, 120);
-    // Inside the circle, off the glyph's strokes: the hover red; the button's corner (outside
-    // the circle) the title colour.
+    // Inside the circle, off the glyph's strokes: the neutral hover fill; the button's
+    // corner (outside the circle) the title colour.
     LUMEN_CHECK(h.at(c.x + 6, c.y + c.height / 2) == k_deco_button_hover);
     LUMEN_CHECK(h.at(c.x + 1, c.y + 1) == k_deco_title_active);
-    node.button = deco_button::pressed;
+    node.buttons[button_index(deco_zone::close)] = deco_button::pressed;
     const composited p = composite_frame(node, 160, 120);
     LUMEN_CHECK(p.at(c.x + 6, c.y + c.height / 2) == k_deco_button_pressed);
 
     // Maximized: no borders, the title bar directly above the client.
-    node.button = deco_button::normal;
+    node.buttons[button_index(deco_zone::close)] = deco_button::normal;
     node.extents = extents_for(decoration_mode::server, true);
     const composited m = composite_frame(node, 160, 120);
     LUMEN_CHECK(m.at(g.x - 1, g.y + 20) == 0u);
@@ -414,9 +419,14 @@ LUMEN_TEST(frame_quads_draw_the_pixels_the_swatch_blits_drew) {
                     const composited before = composite_frame_before(node, 200, 150, c);
                     const composited after = composite_frame(node, 200, 150, c);
                     unsigned diffs = 0;
+                    const lx::rect2i bar = title_rect(node.geometry);
+                    const int glyphs_from = node.geometry.x + node.geometry.width - 3 * T;
                     for (int y = 0; y < 150; ++y)
-                        for (int x = 0; x < 200; ++x)
+                        for (int x = 0; x < 200; ++x) {
+                            if (y >= bar.y && y < bar.y + bar.height && x >= glyphs_from)
+                                continue; // the button row: glyphs the swatch path never drew
                             diffs += before.at(x, y) != after.at(x, y) ? 1u : 0u;
+                        }
                     if (diffs != 0)
                         std::printf("    max=%d active=%d dimmed=%d scaled=%d: %u pixel(s) differ\n",
                                     maximized, active, dimmed, ctx != nullptr, diffs);
@@ -440,7 +450,7 @@ LUMEN_TEST(frame_draws_from_its_first_frame_and_nothing_when_hidden) {
     node.shown = true;
     lx::scene::draw_list list;
     node.emit_draws(list);
-    LUMEN_CHECK(list.quad_instances().size() == 5 && list.size() == 0);
+    LUMEN_CHECK(list.quad_instances().size() == 10 && list.size() == 0);
     lx::scene::draw_list hidden;
     node.shown = false;
     node.emit_draws(hidden);
@@ -508,7 +518,7 @@ LUMEN_TEST(managed_frame_draws_its_fills_and_close_from_the_first_snapshot) {
     lx::scene::scene_graph scene;
     (void)scene.root().add(const_cast<frame_node*>(n));
     const published first = publish(scene, 1.0, 1);
-    LUMEN_CHECK(first.quads == 5 && first.sprites == 1 && first.surfaces == 0);
+    LUMEN_CHECK(first.quads == 10 && first.sprites == 1 && first.surfaces == 0);
     LUMEN_CHECK(first.sprite_edge == k_deco_close_glyph);
     // On an output of scale 2 now: the × at 2 is there in the next snapshot, still no tick.
     LUMEN_CHECK(m.text()->find_close(2.0) == nullptr);
@@ -516,7 +526,7 @@ LUMEN_TEST(managed_frame_draws_its_fills_and_close_from_the_first_snapshot) {
     m.set_window_scales(rec.id, two);
     LUMEN_CHECK(m.text()->find_close(2.0) != nullptr);
     const published moved = publish(scene, 2.0, 2);
-    LUMEN_CHECK(moved.quads == 5 && moved.sprites == 1 && moved.sprite_edge == 2 * k_deco_close_glyph);
+    LUMEN_CHECK(moved.quads == 10 && moved.sprites == 1 && moved.sprite_edge == 2 * k_deco_close_glyph);
     (void)scene.root().remove(const_cast<frame_node*>(n));
     m.on_destroyed(rec.id, rec.surface);
 }
@@ -561,7 +571,7 @@ LUMEN_TEST(gles2_context_draws_the_circle_and_the_close_glyph) {
         lx::compositor::frame_painter painter;
         const lx::rect2i c = close_rect(node.geometry);
         for (const deco_button b : {deco_button::hover, deco_button::pressed}) {
-            node.button = b;
+            node.buttons[button_index(deco_zone::close)] = b;
             lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
             scene.note_full_damage_output(0);
             LUMEN_CHECK(scene.commit_frame(0, b == deco_button::hover ? 1u : 2u));
@@ -571,7 +581,7 @@ LUMEN_TEST(gles2_context_draws_the_circle_and_the_close_glyph) {
             full.full = true;
             auto p = painter.paint_gl(comp, nullptr, target->framebuffer(), W, H, snap, full,
                                       &chrome_env().atlas);
-            LUMEN_CHECK(p && !p->paint.stream && p->paint.dropped == 0 && p->paint.lowered == 7);
+            LUMEN_CHECK(p && !p->paint.stream && p->paint.dropped == 0 && p->paint.lowered == 12);
             LUMEN_CHECK(p && p->composite.draws_skipped == 0);
             if (p && p->composite.out_fence_fd >= 0)
                 ::close(p->composite.out_fence_fd);

@@ -120,8 +120,9 @@ struct scene_setup {
     const lx::scene::immutable_frame_snapshot& publish_hover() {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
         lx::compositor::frame_node& f = *frames[2];
-        f.button = f.button == lx::compositor::deco_button::normal ? lx::compositor::deco_button::hover
-                                                                    : lx::compositor::deco_button::normal;
+        auto& state = f.buttons[lx::compositor::button_index(lx::compositor::deco_zone::close)];
+        state = state == lx::compositor::deco_button::normal ? lx::compositor::deco_button::hover
+                                                             : lx::compositor::deco_button::normal;
         scene.note_damage(lx::compositor::close_rect(f.geometry));
         (void)scene.commit_frame(0, ++frame_index);
         lx::runtime::set_current_affinity(lx::runtime::affinity::render);

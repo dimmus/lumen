@@ -332,6 +332,140 @@ LUMEN_TEST(select_opens_picks_and_reports_the_dismissal) {
     LUMEN_CHECK(g_dismissed && g_pick == 1);
 }
 
+// ── drop_down ──
+
+int g_dd_pick = -1;
+bool g_dd_open = false;
+bool g_dd_dismissed = false;
+void on_dd_pick(int i) {
+    g_dd_pick = i;
+    g_dd_open = false;
+}
+void on_dd_open(int) { g_dd_open = true; }
+void on_dd_dismiss(int) { g_dd_dismissed = true; }
+const char* const k_dd_words[3] = {"Platform Default", "Close Window", "Keep Window Open"};
+
+child describe_drop_down(build_context&) {
+    const child kids[1] = {drop_down(k_dd_words, g_dd_pick < 0 ? 0 : g_dd_pick)
+                               .open(g_dd_open)
+                               .on_select(on_dd_pick)
+                               .on_open(on_dd_open)
+                               .on_dismiss(on_dd_dismiss)
+                               .name("close-mode")};
+    return div(style{}.flex_col().items_start().gap(sp::b08).p(sp::b08).w(px(280.f)), kids);
+}
+
+LUMEN_TEST(drop_down_hugs_opens_and_checks_the_current_entry) {
+    g_dd_pick = -1;
+    g_dd_open = false;
+    g_dd_dismissed = false;
+    harness h{describe_drop_down, {0, 0, 320, 300}};
+    ui_node* root = h.root.tree();
+
+    // Closed: the trigger carries the a11y name; no menu. It hugs its content (Zed's
+    // dropdown does not fill the row).
+    auto* trigger = find(root, lx::a11y::role::button, "close-mode");
+    LUMEN_CHECK(trigger);
+    LUMEN_CHECK(find(root, lx::a11y::role::menu_item, "Close Window") == nullptr);
+    LUMEN_CHECK(trigger->bounds().width < 280);
+
+    // Activating it asks the app to open; the entries appear.
+    LUMEN_CHECK(h.root.pointer_move(centre(*trigger)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+    LUMEN_CHECK(g_dd_open);
+    invalidate_layout(*root);
+    LUMEN_CHECK(h.tick());
+    auto* entry = find(root, lx::a11y::role::menu_item, "Close Window");
+    LUMEN_CHECK(entry);
+
+    // Picking reports the index and (the app's handler) closes.
+    LUMEN_CHECK(h.root.pointer_move(centre(*entry)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+    LUMEN_CHECK(g_dd_pick == 1 && !g_dd_open);
+    invalidate_layout(*root);
+    LUMEN_CHECK(h.tick());
+    LUMEN_CHECK(find(root, lx::a11y::role::menu_item, "Close Window") == nullptr);
+
+    // Re-open: the current entry carries the checked state — its check sits at the row's
+    // end (a menu_entry's check_end look).
+    g_dd_open = true;
+    invalidate_layout(*root);
+    LUMEN_CHECK(h.tick());
+    auto* current = find(root, lx::a11y::role::menu_item, "Close Window");
+    LUMEN_CHECK(current && current->accessibility_node().state &
+                               static_cast<unsigned>(lx::a11y::state_flag::checked));
+}
+
+// ── spinner ──
+
+int g_spin_delta = 0;
+bool g_spin_submitted = false;
+void on_spin(int d) { g_spin_delta = d; }
+void on_spin_submit(int) { g_spin_submitted = true; }
+
+child describe_spinner(build_context&) {
+    static char storage[32] = "1000";
+    static text_buffer buffer{.storage = storage, .size = 4, .revision = 1};
+    const child kids[1] = {spinner(buffer, 1000)
+                               .range(0, 2000)
+                               .on_change(on_spin)
+                               .on_submit(on_spin_submit)
+                               .name("history")};
+    return div(style{}.flex_col().items_start().gap(sp::b08).p(sp::b08).w(px(280.f)), kids);
+}
+
+LUMEN_TEST(spinner_steps_submits_and_holds_one_bordered_box) {
+    harness h{describe_spinner, {0, 0, 320, 120}};
+    ui_node* root = h.root.tree();
+
+    // The box: one spin_button carrying the widget's a11y name.
+    auto* box = find(root, lx::a11y::role::spin_button, "history");
+    LUMEN_CHECK(box);
+
+    auto* minus = find(root, lx::a11y::role::button, "Decrease");
+    auto* plus = find(root, lx::a11y::role::button, "Increase");
+    LUMEN_CHECK(minus && plus);
+    LUMEN_CHECK(h.root.pointer_move(centre(*plus)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+    LUMEN_CHECK(g_spin_delta == 1);
+    LUMEN_CHECK(h.root.pointer_move(centre(*minus)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+    LUMEN_CHECK(g_spin_delta == -1);
+
+    // A submit from the (borderless) field reports 0.
+    auto* field = find(root, lx::a11y::role::text_field, "history");
+    LUMEN_CHECK(field);
+    LUMEN_CHECK(h.root.pointer_move(centre(*field)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+    LUMEN_CHECK(h.root.focus().focused() == field);
+    LUMEN_CHECK(h.root.key(key_press(key::enter)));
+    LUMEN_CHECK(g_spin_submitted && g_spin_delta == -1);
+}
+
+child describe_spinner_capped(build_context&) {
+    static char storage[32] = "2000";
+    static text_buffer buffer{.storage = storage, .size = 4, .revision = 1};
+    const child kids[1] = {
+        spinner(buffer, 2000).range(0, 2000).on_change(on_spin).name("capped"),
+    };
+    return div(style{}.flex_col().items_start().gap(sp::b08).p(sp::b08).w(px(280.f)), kids);
+}
+
+LUMEN_TEST(spinner_disables_its_buttons_at_the_range_ends) {
+    harness h{describe_spinner_capped, {0, 0, 320, 120}};
+    auto* plus = find(h.root.tree(), lx::a11y::role::button, "Increase");
+    auto* minus = find(h.root.tree(), lx::a11y::role::button, "Decrease");
+    LUMEN_CHECK(plus != nullptr);
+    LUMEN_CHECK(plus && plus->has_flag(node_flag::disabled));
+    LUMEN_CHECK(minus && !minus->has_flag(node_flag::disabled));
+    LUMEN_CHECK(find(h.root.tree(), lx::a11y::role::spin_button, "capped") != nullptr);
+}
+
 // ── stepper ──
 
 int g_step_delta = 0;
