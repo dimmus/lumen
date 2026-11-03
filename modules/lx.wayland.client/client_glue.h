@@ -65,6 +65,15 @@ struct zxdg_output_v1;
 #define LX_WLC_LAYER 0
 #endif
 
+// xdg-toplevel-icon (xdg.cpp): a window's own taskbar icon, gated the same way — without
+// the glue, a toplevel asked for an icon quietly goes without one.
+#if LX_WLC_REAL && defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1)
+#define LX_WLC_TOPLEVEL_ICON 1
+#include "xdg-toplevel-icon-v1-client-protocol.h"
+#else
+#define LX_WLC_TOPLEVEL_ICON 0
+#endif
+
 #ifdef LUMEN_HAS_XKBCOMMON
 #include <xkbcommon/xkbcommon.h>
 #endif

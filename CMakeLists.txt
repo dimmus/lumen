@@ -312,7 +312,8 @@ lumen_link_platform(lumen-input-probe)
 # lumen-hello's window tree, a module of its own: test_app_window drives the same tree.
 add_library(lumen-hello-ui)
 target_sources(lumen-hello-ui PUBLIC FILE_SET CXX_MODULES TYPE CXX_MODULES
-    BASE_DIRS ${CMAKE_SOURCE_DIR} FILES executables/lumen-hello/hello_ui.cppm)
+    BASE_DIRS ${CMAKE_SOURCE_DIR} FILES executables/lumen-hello/hello_ui.cppm
+    executables/lumen-hello/icon.cppm)
 target_link_libraries(lumen-hello-ui PUBLIC lx.ui)
 lumen_apply_module_properties(lumen-hello-ui)
 add_executable(lumen-hello executables/lumen-hello/main.cpp)

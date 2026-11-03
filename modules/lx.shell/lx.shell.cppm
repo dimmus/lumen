@@ -216,6 +216,8 @@ private:
         t_tooltip,
         /// The launcher's first frame is painted ahead, once start-up has settled.
         t_prepare,
+        /// The clock's minute boundary (the panels' "HH:MM" refresh).
+        t_clock,
         t_count
     };
     enum class pointer_target : unsigned char { none, panel, launcher, switcher, notify, menu };
@@ -446,6 +448,13 @@ private:
     policy_bridge bridge_{};
     /// The workspace indicator's model (ext-workspace-v1, design-session-and-wm W.7).
     workspace_client workspaces_{};
+    /// The clock, formatted once per minute (the panels redraw at `t_clock`): the minute
+    /// it holds, its "HH:MM", the text's width in the panel's font, and its revision.
+    long long clock_minute_ = -1;
+    char clock_text_[6] = "";
+    int clock_width_ = 0;
+    unsigned clock_rev_ = 0;
+    [[nodiscard]] panel_clock clock_state();
     icon_theme icons_{};
     visual_bell bell_{};
     /// A window's own icon pixels resampled to the size the panel draws (per task slot).
@@ -1474,6 +1483,25 @@ void lx::shell::shell_app::output_ready(output_record& o) {
     outputs_moved();
 }
 
+lx::shell::panel_clock lx::shell::shell_app::clock_state() {
+    const long long minute = now_ns() / 60'000'000'000ll;
+    if (minute != clock_minute_) {
+        clock_minute_ = minute;
+        const std::time_t t = std::time(nullptr);
+        std::tm tm{};
+        localtime_r(&t, &tm);
+        std::snprintf(clock_text_, sizeof(clock_text_), "%02u:%02u",
+                      static_cast<unsigned>(tm.tm_hour), static_cast<unsigned>(tm.tm_min));
+        clock_width_ = panel_text_width(clock_text_, 1.f);
+        ++clock_rev_;
+    }
+    panel_clock c{};
+    std::snprintf(c.text, sizeof(c.text), "%s", clock_text_);
+    c.width = clock_width_;
+    c.rev = clock_rev_;
+    return c;
+}
+
 void lx::shell::shell_app::fill_workspace_cells(const output_record& o, panel_ws_input& in) const {
     in.count = 0;
     if (!o.output || !workspaces_.synced())
@@ -1683,6 +1711,14 @@ void lx::shell::shell_app::on_timer() {
     if (deadline_[t_tooltip] && deadline_[t_tooltip] <= now) {
         deadline_[t_tooltip] = 0;
         show_tooltip();
+    }
+    if (deadline_[t_clock] && deadline_[t_clock] <= now) {
+        deadline_[t_clock] = 0;
+        (void)clock_state(); // the new minute's text, width and revision
+        for (auto& o : outputs_)
+            if (o->bar)
+                o->bar->clock_changed();
+        set_timer(t_clock, ((now / 60'000'000'000ll) + 1) * 60'000'000'000ll);
     }
     if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
         deadline_[t_lock_blank] = 0;

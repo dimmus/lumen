@@ -128,6 +128,12 @@ lx::result<void> toplevel::create(display& d, surface& s, const toplevel_options
         xdg_toplevel_set_title(toplevel_, options.title);
     if (options.app_id)
         xdg_toplevel_set_app_id(toplevel_, options.app_id);
+    if (options.icon && options.icon_size > 0) {
+        // The icon never fails the toplevel: absent manager or glue, a bad size — logged
+        // once, the window simply goes without one.
+        if (auto icon = set_icon(d, options); !icon)
+            log_xdg.warn("toplevel icon: {}", icon.error().message);
+    }
     if (auto* m = static_cast<zxdg_decoration_manager_v1*>(d.native_global(global_kind::decoration))) {
         decoration_ = zxdg_decoration_manager_v1_get_toplevel_decoration(m, toplevel_);
         if (decoration_) {
@@ -145,8 +151,56 @@ lx::result<void> toplevel::create(display& d, surface& s, const toplevel_options
     return {};
 }
 
+lx::result<void> toplevel::set_icon(display& d, const toplevel_options& options) {
+#if LX_WLC_TOPLEVEL_ICON
+    if (options.icon_size > 256)
+        return lx::invalid_argument("over 256 px");
+    auto* m =
+        static_cast<xdg_toplevel_icon_manager_v1*>(d.bind_on_demand(global_kind::toplevel_icon));
+    if (!m)
+        return lx::invalid_argument("no xdg_toplevel_icon_manager_v1");
+    const std::size_t edge = static_cast<std::size_t>(options.icon_size);
+    const std::size_t bytes = edge * edge * 4u;
+    if (auto made = icon_pool_.create(d, bytes); !made)
+        return made;
+    std::memcpy(icon_pool_.data(), options.icon, bytes);
+    // Premultiplied 0xAARRGGBB words: the pool's bytes are exactly ARGB8888's little-endian
+    // layout. The buffer is never written again (the protocol freezes it at add_buffer).
+    icon_buffer_ = wl_shm_pool_create_buffer(
+        static_cast<wl_shm_pool*>(icon_pool_.native()), 0, static_cast<std::int32_t>(edge),
+        static_cast<std::int32_t>(edge), static_cast<std::int32_t>(edge * 4u),
+        WL_SHM_FORMAT_ARGB8888);
+    if (!icon_buffer_) {
+        icon_pool_.destroy();
+        return lx::make_error(lx::wayland_err::object_failed, "wl_shm_pool.create_buffer failed");
+    }
+    tag(icon_buffer_);
+    if (auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m)) {
+        tag(icon);
+        xdg_toplevel_icon_v1_add_buffer(icon, icon_buffer_, 1);
+        // Applied at the toplevel's next commit; the icon object itself may go now (the
+        // protocol says the set icon survives it). The buffer stays: it feeds the icon.
+        xdg_toplevel_icon_manager_v1_set_icon(m, toplevel_, icon);
+        xdg_toplevel_icon_v1_destroy(icon);
+        return {};
+    }
+    wl_buffer_destroy(icon_buffer_);
+    icon_buffer_ = nullptr;
+    icon_pool_.destroy();
+    return lx::make_error(lx::wayland_err::object_failed, "create_icon failed");
+#else
+    (void)d;
+    return lx::not_implemented("lx::wayland::toplevel icon: no protocol glue");
+#endif
+}
+
 void toplevel::destroy() {
-    // Children before parents: decoration, role, xdg_surface (protocol order).
+    // Children before parents: decoration, role, xdg_surface (protocol order). The icon's
+    // buffer and pool before the display's globals go.
+    if (icon_buffer_)
+        wl_buffer_destroy(icon_buffer_);
+    icon_buffer_ = nullptr;
+    icon_pool_.destroy();
     if (decoration_)
         zxdg_toplevel_decoration_v1_destroy(decoration_);
     decoration_ = nullptr;

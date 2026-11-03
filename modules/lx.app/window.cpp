@@ -54,6 +54,8 @@ lx::result<void> window::open(window_host& host, const window_options& options) 
     lx::wayland::toplevel_options to{};
     to.title = options.title;
     to.app_id = options.app_id;
+    to.icon = options.icon;
+    to.icon_size = options.icon_size;
     to.server_side_decorations = options.server_side_decorations;
     if (auto made = role_.create(surface_, to); !made) {
         close();

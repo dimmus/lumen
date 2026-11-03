@@ -10,6 +10,7 @@ struct xdg_surface;
 struct xdg_toplevel;
 struct xdg_popup;
 struct zxdg_toplevel_decoration_v1;
+struct wl_buffer;
 
 export module lx.wayland.client:xdg;
 
@@ -26,6 +27,12 @@ export namespace lx::wayland {
 struct toplevel_options {
     const char* title = nullptr;
     const char* app_id = nullptr;
+    /// The window's own taskbar icon (xdg_toplevel_icon_v1): `icon_size`² premultiplied
+    /// 0xAARRGGBB words, read (copied into a shm pool) once during create; null: none.
+    /// Square, 1..256 px. Quietly absent without the compositor's manager or the protocol
+    /// glue; a failure to set it never fails the toplevel.
+    const std::uint32_t* icon = nullptr;
+    int icon_size = 0;
     /// Ask for server-side decorations (zxdg_decoration_manager_v1): the compositor draws
     /// the frame. Client-side when false or when the compositor has no decoration manager.
     bool server_side_decorations = true;
@@ -94,11 +101,19 @@ public:
     void on_close();
 
 private:
+    /// The `icon` of `options` on this toplevel, over `d`'s manager. Fails soft: the
+    /// caller logs once and the window goes without an icon.
+    [[nodiscard]] lx::result<void> set_icon(display& d, const toplevel_options& options);
+
     display* display_ = nullptr;
     surface* surface_ = nullptr;
     xdg_surface* xdg_surface_ = nullptr;
     xdg_toplevel* toplevel_ = nullptr;
     zxdg_toplevel_decoration_v1* decoration_ = nullptr;
+    /// The icon's pixels, kept for the toplevel's life: the protocol pins the buffer for
+    /// as long as its icon object lives, and the set icon stays until the toplevel does.
+    shm_pool icon_pool_;
+    wl_buffer* icon_buffer_ = nullptr;
     toplevel_handler* handler_ = nullptr;
     toplevel_configure pending_{};
     toplevel_configure current_{};
