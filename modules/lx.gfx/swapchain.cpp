@@ -13,7 +13,7 @@ module;
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <xf86drm.h>
 #endif
 
@@ -121,7 +121,7 @@ lx::result<format_choice> choose_client_format(const client_feedback& feedback,
 bool same_drm_device(std::uint64_t a, std::uint64_t b) {
     if (a == b)
         return true;
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (!a || !b)
         return false;
     drmDevicePtr da = nullptr;
@@ -157,7 +157,7 @@ lx::result<render_node> open_render_node(std::uint64_t main_device) {
         copy_text(out.path, sizeof(out.path), path);
         return true;
     };
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (main_device) {
         drmDevicePtr dev = nullptr;
         if (drmGetDeviceFromDevId(static_cast<dev_t>(main_device), 0, &dev) == 0 && dev) {

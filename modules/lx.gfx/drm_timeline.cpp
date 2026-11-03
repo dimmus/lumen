@@ -7,7 +7,7 @@ module;
 
 #include <errno.h>
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <xf86drm.h>
 #include <sys/eventfd.h>
 #endif
@@ -33,7 +33,7 @@ lx::error timeline_error(const char* message) {
     return lx::make_error(lx::drm_err::timeline_failed, message);
 }
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 int fd_of(void* user) { return static_cast<int>(reinterpret_cast<long>(user)); }
 
 int real_fd_to_handle(void* user, int syncobj_fd, unsigned* handle) {
@@ -121,7 +121,7 @@ int real_handle_to_fd(void* user, unsigned handle, int* fd) {
 
 drm_timeline_ops drm_timeline_ops_for(int drm_fd) {
     drm_timeline_ops ops{};
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (drm_fd < 0)
         return ops;
     ops.fd_to_handle = &real_fd_to_handle;
@@ -140,7 +140,7 @@ drm_timeline_ops drm_timeline_ops_for(int drm_fd) {
 }
 
 bool drm_timeline_supported(int drm_fd) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (drm_fd < 0)
         return false;
     std::uint64_t cap = 0;

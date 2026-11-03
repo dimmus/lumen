@@ -15,7 +15,7 @@ module;
 // result: a mode the connector or link cannot carry fails the TEST_ONLY commit, as it should.
 // Pure, no allocation.
 
-#if defined(LUMEN_HAS_DISPLAY_INFO)
+#ifdef LUMEN_HAS_DISPLAY_INFO
 extern "C" {
 #include <libdisplay-info/cvt.h>
 }
@@ -231,7 +231,7 @@ lx::drm::kms_mode lx::drm::cvt_mode_builtin(unsigned width, unsigned height, uns
 
 bool lx::drm::cvt_mode_reference(unsigned width, unsigned height, unsigned refresh_mhz,
                                  cvt_blanking blanking, kms_mode& out) {
-#if defined(LUMEN_HAS_DISPLAY_INFO)
+#ifdef LUMEN_HAS_DISPLAY_INFO
     if (!size_ok(width, height, refresh_mhz))
         return false;
     di_cvt_options opt{};

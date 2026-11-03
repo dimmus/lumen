@@ -41,7 +41,7 @@
 
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
-#if defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
+#ifdef LUMEN_PROTOCOL_EXT_WORKSPACE_V1
 #include "ext-workspace-v1-client-protocol.h"
 #define PROBE_EXT_WORKSPACE 1
 #endif
@@ -71,7 +71,7 @@ struct probe {
     xdg_wm_base* wm = nullptr;
     wl_seat* seat = nullptr;
     std::vector<output_rec> outputs;
-#if defined(PROBE_EXT_WORKSPACE)
+#ifdef PROBE_EXT_WORKSPACE
     ext_workspace_manager_v1* manager = nullptr;
 #endif
     unsigned ws_global = 0;
@@ -155,7 +155,7 @@ bool pump_until(long long deadline_ms) {
     return true;
 }
 
-#if defined(PROBE_EXT_WORKSPACE)
+#ifdef PROBE_EXT_WORKSPACE
 
 // ── workspaces ──
 
@@ -612,7 +612,7 @@ int workspace_main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
     if (argc >= 2 && !std::strcmp(argv[1], "window"))
         return run_window(argc, argv);
-#if defined(PROBE_EXT_WORKSPACE)
+#ifdef PROBE_EXT_WORKSPACE
     return run_workspaces(argc, argv);
 #else
     std::printf("built without ext-workspace-v1\n");

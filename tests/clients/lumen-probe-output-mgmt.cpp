@@ -29,14 +29,14 @@
 #include <vector>
 
 #include <wayland-client.h>
-#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1
 #include "wlr-output-management-unstable-v1-client-protocol.h"
 #define PROBE_HAS_OUTPUT_MANAGEMENT 1
 #endif
 
 int output_mgmt_main(int argc, char** argv);
 
-#if !defined(PROBE_HAS_OUTPUT_MANAGEMENT)
+#ifndef PROBE_HAS_OUTPUT_MANAGEMENT
 
 int output_mgmt_main(int, char**) {
     std::fprintf(stderr, "output-mgmt: built without wlr-output-management glue\n");

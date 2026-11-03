@@ -12,7 +12,7 @@ module;
 // (`kms_device::probe_connectors`). An idle monitor costs nothing: its socket is readable
 // only when a drm uevent arrives.
 
-#if defined(LUMEN_HAS_UDEV)
+#ifdef LUMEN_HAS_UDEV
 #include <libudev.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
@@ -178,7 +178,7 @@ lx::drm::uevent_monitor& lx::drm::uevent_monitor::operator=(uevent_monitor&& oth
 }
 
 void lx::drm::uevent_monitor::release() {
-#if defined(LUMEN_HAS_UDEV)
+#ifdef LUMEN_HAS_UDEV
     if (monitor_)
         udev_monitor_unref(static_cast<udev_monitor*>(monitor_));
     if (udev_)
@@ -189,7 +189,7 @@ void lx::drm::uevent_monitor::release() {
 }
 
 lx::result<lx::drm::uevent_monitor> lx::drm::uevent_monitor::open(unsigned long long card) {
-#if defined(LUMEN_HAS_UDEV)
+#ifdef LUMEN_HAS_UDEV
     const auto fail = [](const char* why) {
         return lx::make_error(lx::drm_err::monitor_failed, why);
     };
@@ -220,7 +220,7 @@ lx::result<lx::drm::uevent_monitor> lx::drm::uevent_monitor::open(unsigned long 
 }
 
 int lx::drm::uevent_monitor::fd() const {
-#if defined(LUMEN_HAS_UDEV)
+#ifdef LUMEN_HAS_UDEV
     return monitor_ ? udev_monitor_get_fd(static_cast<udev_monitor*>(monitor_)) : -1;
 #else
     return -1;
@@ -229,7 +229,7 @@ int lx::drm::uevent_monitor::fd() const {
 
 lx::drm::hotplug_batch lx::drm::uevent_monitor::drain() {
     hotplug_batch batch{};
-#if defined(LUMEN_HAS_UDEV)
+#ifdef LUMEN_HAS_UDEV
     auto* mon = static_cast<udev_monitor*>(monitor_);
     if (!mon)
         return batch;

@@ -11,7 +11,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-server-protocol.h"
 // wayland-scanner names an argument `namespace`, a C++ keyword; renamed for this header
 // only (Wayfire does the same).
@@ -38,7 +38,7 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 
 namespace lx::compositor::wire {
 

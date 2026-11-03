@@ -41,7 +41,7 @@
 #include "ext-image-copy-capture-v1-client-protocol.h"
 #define LUMEN_TEST_SWAPCHAIN 1
 #endif
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -64,7 +64,7 @@ import lx.ui;
 
 // ── allocation accounting (client thread only, while `g_counting`) ──
 
-#if defined(__SANITIZE_ADDRESS__)
+#ifdef __SANITIZE_ADDRESS__
 #define LUMEN_TEST_SANITIZED 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
@@ -79,7 +79,7 @@ std::atomic<std::uint64_t> g_malloc_calls{0};
 std::atomic<std::uint64_t> g_free_calls{0};
 } // namespace
 
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);
@@ -161,7 +161,7 @@ void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::fre
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 #endif
 
-#if !defined(LUMEN_TEST_SWAPCHAIN)
+#ifndef LUMEN_TEST_SWAPCHAIN
 
 int main() {
     std::printf("SKIP: needs libwayland-client and the protocol glue\n");
@@ -466,7 +466,7 @@ received compositor_dmabuf(const char* app_id) {
     return out;
 }
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 /// A GL context of the test's own on the render node: imports a dma-buf the way the GL
 /// compositor does (EGL_EXT_image_dma_buf_import with the modifier) and reads it back.
 struct gl_reader {
@@ -1027,7 +1027,7 @@ void compositor_cases(lx::wayland::display& d, lx::gfx::client_gpu& gpu,
         w.destroy();
         return;
     }
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     gl_reader reader{};
     const bool have_reader = gpu.tier() != lx::gfx::client_tier::cpu && reader.init();
 #endif
@@ -1088,7 +1088,7 @@ void compositor_cases(lx::wayland::display& d, lx::gfx::client_gpu& gpu,
                 stride = static_cast<int>(got.desc.width);
                 how = "mapped";
             }
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
             else if (got.ok && have_reader && reader.read(got.desc, px)) {
                 stride = static_cast<int>(got.desc.width);
                 how = "EGL import";
@@ -1196,7 +1196,7 @@ void compositor_cases(lx::wayland::display& d, lx::gfx::client_gpu& gpu,
         measure(std::format("gl allocation: gbm path {} (2 gbm_bo_create_with_modifiers2, 1 "
                             "…_with_modifiers, 0 gbm_bo_create), modifier {:#x}, {} plane(s)",
                             chain.stats().gbm_path, format.modifiers[0], 1));
-#if defined(LUMEN_TEST_SANITIZED)
+#ifdef LUMEN_TEST_SANITIZED
     skip(std::format("{}: 0 allocations per steady present", tier).c_str(),
          "sanitizer build: allocation hooks are the sanitizer's");
 #else

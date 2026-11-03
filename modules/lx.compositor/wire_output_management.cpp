@@ -35,7 +35,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1
 #include "wlr-output-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_MANAGEMENT 1
 #endif
@@ -57,7 +57,7 @@ namespace lx::compositor::wire {
 
 namespace {
 
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
 
 constexpr lx::trace::category log_outputcfg{"compositor.outputcfg"};
 
@@ -634,7 +634,7 @@ const struct zwlr_output_manager_v1_interface manager_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
 void bind_output_manager(wayland::client_connection& client, unsigned id, int version) {
     auto* wc = static_cast<wl_client*>(client.native());
     wl_resource* r = wl_resource_create(wc, &zwlr_output_manager_v1_interface, version,
@@ -663,7 +663,7 @@ void bind_output_manager(wayland::client_connection& client, unsigned id, int ve
 
 
 void lx::compositor::output_heads_changed(protocol_context& ctx, const mgmt::head_set& heads) {
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
     using namespace wire;
     if (!g.current) {
         g.current = new (std::nothrow) mg::head_set{};
@@ -719,7 +719,7 @@ void lx::compositor::output_heads_changed(protocol_context& ctx, const mgmt::hea
 const lx::compositor::mgmt::head_set&
 lx::compositor::output_mgmt_heads(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
     return wire::heads_now();
 #else
     static const mg::head_set k_empty{};
@@ -729,7 +729,7 @@ lx::compositor::output_mgmt_heads(const protocol_context& ctx) {
 
 unsigned lx::compositor::output_mgmt_serial(const protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
     return wire::g.serial;
 #else
     return 0;
@@ -738,7 +738,7 @@ unsigned lx::compositor::output_mgmt_serial(const protocol_context& ctx) {
 
 lx::compositor::mgmt::job_queue& lx::compositor::output_mgmt_jobs(protocol_context& ctx) {
     (void)ctx;
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
     return wire::g.jobs;
 #else
     static mg::job_queue k_none{};
@@ -749,7 +749,7 @@ lx::compositor::mgmt::job_queue& lx::compositor::output_mgmt_jobs(protocol_conte
 void lx::compositor::output_mgmt_finish(protocol_context& ctx, unsigned long long token,
                                         mgmt_result result) {
     (void)ctx;
-#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+#ifdef LUMEN_HAS_OUTPUT_MANAGEMENT
     using namespace wire;
     if (!token)
         return;

@@ -33,7 +33,7 @@ module;
 #include <unistd.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_SECURITY_CONTEXT_V1)
+#ifdef LUMEN_PROTOCOL_SECURITY_CONTEXT_V1
 #include "security-context-v1-server-protocol.h"
 #define LUMEN_HAS_SECURITY_CONTEXT 1
 #endif
@@ -53,7 +53,7 @@ constexpr lx::trace::category log_wayland{"wayland"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_SECURITY_CONTEXT)
+#ifdef LUMEN_HAS_SECURITY_CONTEXT
 
 namespace lx::compositor::wire {
 

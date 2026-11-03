@@ -548,7 +548,6 @@ void lx::shell::switcher_view::init(switcher_globals g, switcher_icon_fn icons, 
     user_ = user;
 }
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 bool lx::shell::switcher_view::open(unsigned output_slot, int output_w, int output_h,
                                     const switcher_model& m) {
@@ -832,13 +831,5 @@ void lx::shell::switcher_view::after_dispatch(const switcher_model& m, const tas
     }
 }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-bool lx::shell::switcher_view::open(unsigned, int, int, const switcher_model&) { return false; }
-void lx::shell::switcher_view::close() {}
-void lx::shell::switcher_view::after_dispatch(const switcher_model&, const task_model&) {}
-lx::ui::child lx::shell::switcher_view::build_ui() { return nullptr; }
-
-#endif
 
 lx::shell::switcher_view::~switcher_view() { close(); }

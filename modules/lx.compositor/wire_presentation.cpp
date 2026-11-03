@@ -29,7 +29,7 @@ module;
 #include <time.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
+#ifdef LUMEN_PROTOCOL_PRESENTATION_TIME
 #include "presentation-time-server-protocol.h"
 #define LUMEN_HAS_PRESENTATION 1
 #endif
@@ -79,7 +79,7 @@ counters g_counts{};
 /// `sync_output` of what it presents.
 int g_flip_output = -1;
 
-#if defined(LUMEN_HAS_PRESENTATION)
+#ifdef LUMEN_HAS_PRESENTATION
 
 void send_sync_output(wl_resource* output, void* feedback) {
     wp_presentation_feedback_send_sync_output(static_cast<wl_resource*>(feedback), output);
@@ -118,14 +118,14 @@ void sink_discarded(void*, void* resource) {
 
 [[nodiscard]] lx::compositor::feedback_sink sink() {
     lx::compositor::feedback_sink k{};
-#if defined(LUMEN_HAS_PRESENTATION)
+#ifdef LUMEN_HAS_PRESENTATION
     k.presented = &sink_presented;
     k.discarded = &sink_discarded;
 #endif
     return k;
 }
 
-#if defined(LUMEN_HAS_PRESENTATION)
+#ifdef LUMEN_HAS_PRESENTATION
 
 /// The feedback object's destructor: a client that disconnects with feedback in flight.
 /// The user data is the table handle; the table ignores it once the slot is no longer this
@@ -181,7 +181,7 @@ const struct wp_presentation_interface presentation_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_PRESENTATION)
+#ifdef LUMEN_HAS_PRESENTATION
 
 void bind_presentation(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)

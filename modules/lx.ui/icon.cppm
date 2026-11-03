@@ -303,13 +303,13 @@ const char* lx::ui::icon_dir() {
         lx_ui_icon_copy(dir, sizeof(dir), env);
         return dir;
     }
-#if defined(LUMEN_ICON_DIR_BUILD)
+#ifdef LUMEN_ICON_DIR_BUILD
     if (lx_ui_icon_is_dir(LUMEN_ICON_DIR_BUILD)) {
         lx_ui_icon_copy(dir, sizeof(dir), LUMEN_ICON_DIR_BUILD);
         return dir;
     }
 #endif
-#if defined(LUMEN_ICON_DIR_INSTALL_RELATIVE)
+#ifdef LUMEN_ICON_DIR_INSTALL_RELATIVE
     {
         char exe[512]{};
         const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
@@ -328,7 +328,7 @@ const char* lx::ui::icon_dir() {
         }
     }
 #endif
-#if defined(LUMEN_ICON_DIR_INSTALL)
+#ifdef LUMEN_ICON_DIR_INSTALL
     if (lx_ui_icon_is_dir(LUMEN_ICON_DIR_INSTALL))
         lx_ui_icon_copy(dir, sizeof(dir), LUMEN_ICON_DIR_INSTALL);
 #endif

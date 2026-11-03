@@ -4,7 +4,7 @@ module;
 
 #include <unistd.h>
 
-#if defined(LUMEN_PORTAL_PNG)
+#ifdef LUMEN_PORTAL_PNG
 #include <png.h>
 #endif
 #include <setjmp.h>
@@ -19,7 +19,7 @@ import :png;
 
 namespace lx::portal {
 
-#if defined(LUMEN_PORTAL_PNG)
+#ifdef LUMEN_PORTAL_PNG
 
 namespace {
 

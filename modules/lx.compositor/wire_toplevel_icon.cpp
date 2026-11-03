@@ -52,7 +52,7 @@ constexpr lx::trace::category log_icon{"compositor.icon"};
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_TOPLEVEL_ICON)
+#ifdef LUMEN_HAS_TOPLEVEL_ICON
 
 namespace {
 

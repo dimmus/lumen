@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 #include <hb.h>
 #endif
 
@@ -346,7 +346,7 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
     counters_.entry_capacity = config_.entries;
     counters_.bytes_capacity = static_cast<std::uint64_t>(config_.glyph_capacity) * sizeof(shaped_glyph);
     counters_.text_bytes_capacity = config_.text_capacity;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     hb_buffer_t* buf = hb_buffer_create();
     if (buf && hb_buffer_allocation_successful(buf)) {
         (void)hb_buffer_pre_allocate(buf, config_.max_run_glyphs);
@@ -358,7 +358,7 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
 }
 
 lx::text::shape_cache::~shape_cache() {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (buffer_)
         hb_buffer_destroy(static_cast<hb_buffer_t*>(buffer_));
 #endif
@@ -639,7 +639,7 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::shape_locked(face_cache&
 lx::result<lx::text::shaped_run> lx::text::shape_cache::miss_locked(face_cache& faces,
                                                                     const shape_request& r,
                                                                     const key& k) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     ++counters_.misses;
     auto* buf = static_cast<hb_buffer_t*>(buffer_);
     if (!buf)

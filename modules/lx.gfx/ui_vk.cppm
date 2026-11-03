@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #include <errno.h>
 #include <stdio.h>
@@ -508,7 +508,7 @@ constexpr spirv k_modules[] = {
 
 #endif
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 
 /// Each slot's globals block (std140 `lx_globals`: vec2 target, vec2 pad), after the ring.
 constexpr std::size_t k_globals_stride = 256;
@@ -813,7 +813,7 @@ lx::gfx::ui_vk_target& lx::gfx::ui_vk_target::operator=(ui_vk_target&& other) no
 }
 
 void lx::gfx::ui_vk_target::destroy() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (auto dev = static_cast<VkDevice>(ctx_.device); dev) {
         if (view_)
             vkDestroyImageView(dev, static_cast<VkImageView>(view_), nullptr);
@@ -833,7 +833,7 @@ void lx::gfx::ui_vk_target::destroy() {
 lx::result<lx::gfx::ui_vk_target> lx::gfx::ui_vk_target::create(const vk_context& ctx,
                                                                 unsigned width, unsigned height,
                                                                 std::uint32_t format) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     using namespace ui_vk_detail;
     if (!ctx.valid())
         return lx::not_implemented("lx::gfx::ui_vk_target::create");
@@ -888,7 +888,7 @@ lx::result<lx::gfx::ui_vk_target> lx::gfx::ui_vk_target::create(const vk_context
 
 lx::result<void> lx::gfx::ui_vk_target::read_back(std::span<std::uint32_t> out, unsigned stride_px,
                                                   bool opaque) const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     using namespace ui_vk_detail;
     if (!valid())
         return lx::not_implemented("lx::gfx::ui_vk_target::read_back");
@@ -1314,7 +1314,7 @@ lx::result<void> lx::gfx::ui_vk_renderer::initialize(const vk_context& ctx,
 }
 
 void lx::gfx::ui_vk_renderer::wait_slots() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev)
         return;
@@ -1331,7 +1331,7 @@ void lx::gfx::ui_vk_renderer::wait_slots() {
 void lx::gfx::ui_vk_renderer::wait_idle() { wait_slots(); }
 
 void lx::gfx::ui_vk_renderer::shutdown() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (dev) {
         wait_slots();
@@ -1430,7 +1430,7 @@ void lx::gfx::ui_vk_renderer::shutdown() {
 }
 
 void lx::gfx::ui_vk_renderer::save_pipeline_cache() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev || !pipeline_cache_ || !caps_.pipeline_cache || !caps_.pipeline_cache_path[0])
         return;
@@ -1584,7 +1584,7 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
 // ── ui_vk_renderer: atlas pages ─────────────────────────────────────────────────
 
 void lx::gfx::ui_vk_renderer::destroy_page(page_image& p) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (auto dev = static_cast<VkDevice>(ctx_.device); dev) {
         if (p.view)
             vkDestroyImageView(dev, static_cast<VkImageView>(p.view), nullptr);
@@ -1598,7 +1598,7 @@ void lx::gfx::ui_vk_renderer::destroy_page(page_image& p) {
 }
 
 lx::result<void> lx::gfx::ui_vk_renderer::create_page(unsigned page, unsigned size, bool r8) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     page_image& p = pages_[page];
     if (p.image) {
         // A page that grew: the frames in flight may still sample the old image.
@@ -1630,7 +1630,7 @@ lx::result<void> lx::gfx::ui_vk_renderer::create_page(unsigned page, unsigned si
 }
 
 void lx::gfx::ui_vk_renderer::write_page_descriptors(unsigned slot) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     VkDescriptorImageInfo images[k_ui_vk_page_slots]{};
     for (unsigned i = 0; i < k_ui_vk_page_slots; ++i) {
         void* view = i < k_atlas_pages && pages_[i].view ? pages_[i].view : dummy_view_;
@@ -1653,7 +1653,7 @@ void lx::gfx::ui_vk_renderer::write_page_descriptors(unsigned slot) {
 }
 
 void lx::gfx::ui_vk_renderer::free_transient(unsigned slot) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     transient_buffer& t = transient_[slot];
     if (auto dev = static_cast<VkDevice>(ctx_.device); dev) {
         if (t.memory) {
@@ -1669,7 +1669,7 @@ void lx::gfx::ui_vk_renderer::free_transient(unsigned slot) {
 
 lx::result<void> lx::gfx::ui_vk_renderer::upload_atlas(atlas& a, void* command_buffer,
                                                        unsigned slot, ui_vk_draw_stats& stats) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     using namespace ui_vk_detail;
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
     // An atlas this renderer has not drawn from (in a submitted frame): every page it has
@@ -2318,7 +2318,7 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
 }
 
 lx::result<lx::gfx::ui_vk_gpu_time> lx::gfx::ui_vk_renderer::wait_gpu_time() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     using namespace ui_vk_detail;
     lx::runtime::assert_affinity(owner_);
     ui_vk_gpu_time out{};

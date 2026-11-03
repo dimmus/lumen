@@ -11,7 +11,6 @@ if(PkgConfig_FOUND)
     # server alone (lx.wayland.server, lx.compositor): a compositor is not a client.
     pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client)
     pkg_check_modules(WAYLAND_SERVER QUIET wayland-server)
-    pkg_check_modules(WAYLAND_SCANNER QUIET wayland-scanner)
     pkg_check_modules(LIBDRM QUIET libdrm)
     # libdisplay-info parses EDID into the make/model/serial a monitor is identified by
     # (wlroots, Mutter, Weston use it); lx.drm has a base-block fallback without it.
@@ -46,19 +45,18 @@ if(PkgConfig_FOUND)
     pkg_check_modules(LIBWEBP QUIET libwebp)
 endif()
 
-if(WAYLAND_SCANNER_FOUND)
+# wayland-scanner generates the protocol C glue the shell and the compositor's wire units
+# build on (the in-repo zlm protocols alone already give it work), so it is required with
+# the rest of the Wayland stack — not an optional extra.
+pkg_check_modules(WAYLAND_SCANNER REQUIRED wayland-scanner)
+if(NOT WAYLAND_SCANNER_EXE)
     pkg_get_variable(WAYLAND_SCANNER_EXE wayland-scanner wayland_scanner)
 endif()
 if(NOT WAYLAND_SCANNER_EXE)
     find_program(WAYLAND_SCANNER_EXE NAMES wayland-scanner)
 endif()
-if(WAYLAND_SCANNER_EXE)
-    set(LUMEN_HAS_WAYLAND_SCANNER TRUE)
-    message(STATUS "wayland-scanner: ${WAYLAND_SCANNER_EXE}")
-else()
-    set(LUMEN_HAS_WAYLAND_SCANNER FALSE)
-    message(STATUS "wayland-scanner not found — protocol C glue unavailable")
-endif()
+set(LUMEN_HAS_WAYLAND_SCANNER TRUE)
+message(STATUS "wayland-scanner: ${WAYLAND_SCANNER_EXE}")
 
 if(LIBSYSTEMD_FOUND)
     set(LUMEN_HAS_LOGIND TRUE)

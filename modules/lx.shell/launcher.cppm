@@ -6,9 +6,7 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#endif
 
 import lx.foundation;
 import lx.gfx;
@@ -1077,7 +1075,6 @@ void lx::shell::launcher::closed_by_itself(const char* why) {
         on_closed_(user_);
 }
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_fn on_launch,
                                closed_fn on_closed, void* user) {
@@ -1207,32 +1204,5 @@ void lx::shell::launcher::after_dispatch() {
     }
 }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_fn on_launch,
-                               closed_fn on_closed, void* user) {
-    g_ = g;
-    catalog_ = &catalog;
-    on_launch_ = on_launch;
-    on_closed_ = on_closed;
-    user_ = user;
-    query_buffer_.storage = {query_storage_, sizeof query_storage_};
-    model_.bind(&catalog, &query_buffer_);
-}
-bool lx::shell::launcher::open(int, int, int, unsigned) { return false; }
-void lx::shell::launcher::close() {}
-void lx::shell::launcher::prepare(int, int, int, unsigned) {}
-void lx::shell::launcher::after_dispatch() {}
-lx::ui::child lx::shell::launcher::build_ui() { return nullptr; }
-void lx::shell::launcher::on_root_key(const lx::ui::key_event&) {}
-void lx::shell::launcher::on_root_pointer(const lx::ui::pointer_event&) {}
-void lx::shell::launcher::on_row_event(const row_ref&, const lx::ui::pointer_event&) {}
-void lx::shell::launcher::on_row_hover(const row_ref&, bool) {}
-void lx::shell::launcher::on_keyboard_focus(bool) {}
-void lx::shell::launcher::launch_selected(unsigned) {}
-void lx::shell::launcher::menu_for(unsigned, unsigned) {}
-void lx::shell::launcher::closed_by_itself(const char*) {}
-
-#endif
 
 lx::shell::launcher::~launcher() { close(); }

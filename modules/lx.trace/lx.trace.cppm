@@ -3,7 +3,7 @@ module;
 #include <stdio.h>
 #include <time.h>
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -240,7 +240,7 @@ lx::trace::level level_from_env(const char* value) {
 
 lx::trace::level read_env_min_level() {
     if (const char* env = std::getenv("LUMEN_LOG")) return level_from_env(env);
-#if !defined(NDEBUG)
+#ifndef NDEBUG
     return lx::trace::level::debug;
 #else
     return lx::trace::level::info;
@@ -342,7 +342,7 @@ void lx::trace::logger::vlog(level lvl, const char* category, std::string_view f
 
 namespace {
 
-#if defined(__linux__)
+#ifdef __linux__
 struct tl_event {
     const char* category;
     const char* name;
@@ -414,7 +414,7 @@ void put_escaped(std::FILE* f, const char* s) {
 } // namespace
 
 bool lx::trace::timeline_enabled() noexcept {
-#if defined(__linux__)
+#ifdef __linux__
     return tl().on.load(std::memory_order_relaxed);
 #else
     return false;
@@ -422,7 +422,7 @@ bool lx::trace::timeline_enabled() noexcept {
 }
 
 void lx::trace::timeline_start_from_env() {
-#if defined(__linux__)
+#ifdef __linux__
     tl_state& s = tl();
     if (s.started.exchange(true))
         return;
@@ -450,7 +450,7 @@ void lx::trace::timeline_start_from_env() {
 }
 
 void lx::trace::name_thread(const char* name) {
-#if defined(__linux__)
+#ifdef __linux__
     if (!name)
         return;
     const int tid = current_tid();
@@ -480,7 +480,7 @@ void lx::trace::name_thread(const char* name) {
 }
 
 void lx::trace::timeline_counter(const char* name, long long value) {
-#if defined(__linux__)
+#ifdef __linux__
     if (timeline_enabled())
         tl_push(1, "counter", name, mono_ns(), 0, value);
 #else
@@ -490,7 +490,7 @@ void lx::trace::timeline_counter(const char* name, long long value) {
 }
 
 void lx::trace::timeline_instant(const char* category, const char* name) {
-#if defined(__linux__)
+#ifdef __linux__
     if (timeline_enabled())
         tl_push(2, category, name, mono_ns(), 0, 0);
 #else
@@ -500,7 +500,7 @@ void lx::trace::timeline_instant(const char* category, const char* name) {
 }
 
 bool lx::trace::timeline_flush() {
-#if defined(__linux__)
+#ifdef __linux__
     tl_state& s = tl();
     if (!s.on.exchange(false))
         return false;
@@ -572,7 +572,7 @@ bool lx::trace::timeline_flush() {
 
 lx::trace::scoped_span::scoped_span(const char* category, const char* name)
     : category_{category ? category : ""}, name_{name ? name : ""} {
-#if defined(__linux__)
+#ifdef __linux__
     if (timeline_enabled())
         start_ns_ = mono_ns();
 #endif
@@ -581,7 +581,7 @@ lx::trace::scoped_span::scoped_span(const char* category, const char* name)
 }
 
 lx::trace::scoped_span::~scoped_span() {
-#if defined(__linux__)
+#ifdef __linux__
     if (start_ns_ && timeline_enabled()) {
         const unsigned long long end = mono_ns();
         tl_push(0, category_, name_, start_ns_, end - start_ns_, 0);

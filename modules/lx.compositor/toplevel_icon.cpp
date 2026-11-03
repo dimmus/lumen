@@ -6,7 +6,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -121,7 +121,7 @@ bool toplevel_icon_table::add_image(unsigned id, const void* pixels, unsigned st
     const unsigned long long bytes = image_bytes(size);
     if (bytes > budget_left())
         return false;
-#if defined(__linux__)
+#ifdef __linux__
     const int fd = ::memfd_create("lumen-toplevel-icon", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0)
         return false;
@@ -179,7 +179,7 @@ void toplevel_icon_table::unref(unsigned id) {
         return;
     for (unsigned i = 0; i < e.count; ++i) {
         if (e.images[i].fd >= 0) {
-#if defined(__linux__)
+#ifdef __linux__
             ::close(e.images[i].fd);
 #endif
             bytes_ -= image_bytes(e.images[i].size);

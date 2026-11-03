@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <EGL/egl.h>
 #include <GLES3/gl31.h>
 #include <GLES2/gl2ext.h>
@@ -334,7 +334,7 @@ private:
 
 namespace lx::gfx::ui_gl_detail {
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 
 constexpr const char* k_header = R"(#version 310 es
 precision highp float;
@@ -574,7 +574,7 @@ lx::gfx::ui_gl_target& lx::gfx::ui_gl_target::operator=(ui_gl_target&& other) no
 }
 
 void lx::gfx::ui_gl_target::destroy() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (framebuffer_)
         glDeleteFramebuffers(1, &framebuffer_);
     if (renderbuffer_)
@@ -587,7 +587,7 @@ void lx::gfx::ui_gl_target::destroy() {
 }
 
 lx::result<lx::gfx::ui_gl_target> lx::gfx::ui_gl_target::create(unsigned width, unsigned height) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (width == 0 || height == 0 || width > 16384 || height > 16384)
         return lx::invalid_argument("ui_gl_target::create: bad size");
     ui_gl_target t;
@@ -615,7 +615,7 @@ lx::result<lx::gfx::ui_gl_target> lx::gfx::ui_gl_target::create(unsigned width, 
 
 lx::result<void> lx::gfx::ui_gl_target::read_back(std::span<std::uint32_t> out, unsigned stride_px,
                                                   bool opaque) const {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!valid())
         return lx::not_implemented("lx::gfx::ui_gl_target::read_back");
     if (stride_px == 0)
@@ -669,7 +669,7 @@ lx::gfx::ui_gl_renderer::program_index lx::gfx::ui_gl_renderer::program_for(prim
 }
 
 lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     using namespace ui_gl_detail;
     const program_source& src = k_programs[index];
     const char* fetch = caps_.fetch == ui_gl_fetch::attributes ? k_fetch_attributes : k_fetch_storage;
@@ -795,7 +795,7 @@ lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
 }
 
 lx::result<void> lx::gfx::ui_gl_renderer::initialize(const ui_gl_options& options) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     using namespace ui_gl_detail;
     shutdown();
     options_ = options;
@@ -936,7 +936,7 @@ lx::result<void> lx::gfx::ui_gl_renderer::initialize(const ui_gl_options& option
 }
 
 void lx::gfx::ui_gl_renderer::shutdown() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     for (void*& fence : fences_) {
         if (fence)
             glDeleteSync(static_cast<GLsync>(fence));
@@ -977,7 +977,7 @@ void lx::gfx::ui_gl_renderer::shutdown() {
 }
 
 lx::result<void> lx::gfx::ui_gl_renderer::upload_atlas(atlas& a, ui_gl_draw_stats& stats) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     // A different atlas than last frame: every page it has goes up whole.
     const bool fresh_atlas = atlas_seen_ != &a;
     atlas_seen_ = &a;
@@ -1071,7 +1071,7 @@ std::size_t lx::gfx::ui_gl_renderer::encode(const ui_stream& stream, const atlas
 lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
     unsigned framebuffer, unsigned width, unsigned height, const ui_stream& stream, atlas* atlas,
     const damage_region& damage, std::optional<lx::color> clear) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     lx::runtime::assert_affinity(owner_);
     if (!ready_)
         return lx::not_implemented("lx::gfx::ui_gl_renderer::draw");
@@ -1337,7 +1337,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
 }
 
 lx::result<lx::gfx::ui_gl_gpu_time> lx::gfx::ui_gl_renderer::wait_gpu_time() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     lx::runtime::assert_affinity(owner_);
     ui_gl_gpu_time out{};
     if (!ready_ || timed_slot_ < 0)

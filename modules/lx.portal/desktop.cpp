@@ -11,7 +11,7 @@ module;
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_PORTAL_WAYLAND)
+#ifdef LUMEN_PORTAL_WAYLAND
 #include <wayland-client.h>
 #include "cursor-shape-v1-client-protocol.h"
 #include "ext-foreign-toplevel-list-v1-client-protocol.h"
@@ -40,7 +40,7 @@ import :desktop;
 
 namespace lx::portal {
 
-#if defined(LUMEN_PORTAL_WAYLAND)
+#ifdef LUMEN_PORTAL_WAYLAND
 
 namespace {
 

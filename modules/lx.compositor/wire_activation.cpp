@@ -16,7 +16,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
+#ifdef LUMEN_PROTOCOL_XDG_ACTIVATION_V1
 #include "xdg-activation-v1-server-protocol.h"
 #define LUMEN_HAS_XDG_ACTIVATION 1
 #endif
@@ -51,7 +51,7 @@ void activation_surface_destroyed(lx::surface_id surface) {
         g_ctx->activation->forget_surface(surface);
 }
 
-#if defined(LUMEN_HAS_XDG_ACTIVATION)
+#ifdef LUMEN_HAS_XDG_ACTIVATION
 
 namespace {
 

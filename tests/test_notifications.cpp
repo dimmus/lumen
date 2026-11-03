@@ -6,7 +6,7 @@
 // CloseNotification's error, ActivationToken before ActionInvoked before NotificationClosed).
 #include "lumen_test.hpp"
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #include <sys/socket.h>
 #endif
@@ -398,7 +398,7 @@ LUMEN_TEST(popup_stack_layout) {
     LUMEN_CHECK(l.more == 2 && l.more_box.y == 0 && l.cards[0].box.y > l.cards[1].box.y);
 }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 namespace {
 

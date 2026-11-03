@@ -11,7 +11,7 @@ module;
 #include <sys/signalfd.h>
 #include <unistd.h>
 
-#if defined(LUMEN_PORTAL_DBUS)
+#ifdef LUMEN_PORTAL_DBUS
 #include <systemd/sd-bus.h>
 #include <systemd/sd-login.h>
 #endif
@@ -98,7 +98,7 @@ std::string save_screenshot(const image& img, bool interactive) {
 /// one. The session is seat0's active one when it is this user's (the portal itself runs
 /// as a user service, outside it), else logind's display session of the user.
 bool seat_session_locked() {
-#if defined(LUMEN_PORTAL_DBUS)
+#ifdef LUMEN_PORTAL_DBUS
     char* session = nullptr;
     uid_t uid = 0;
     if (sd_seat_get_active("seat0", &session, &uid) < 0 || uid != getuid()) {

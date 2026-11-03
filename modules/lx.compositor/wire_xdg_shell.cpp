@@ -11,7 +11,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-unstable-v1-server-protocol.h"
 #endif
@@ -39,7 +39,7 @@ constexpr lx::trace::category log_wm{"compositor.wm"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 
 namespace lx::compositor::wire {
 

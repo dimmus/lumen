@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #endif
 
@@ -43,7 +43,7 @@ void lx::gfx::timeline_semaphore_pool::set_device(void* vk_device) { device_ = v
 
 lx::result<lx::gfx::timeline_semaphore_handle>
 lx::gfx::timeline_semaphore_pool::acquire() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(device_);
     if (!dev)
         return lx::not_implemented("lx::gfx::timeline_semaphore_pool::acquire");
@@ -92,7 +92,7 @@ void lx::gfx::timeline_semaphore_pool::release(const timeline_semaphore_handle& 
 }
 
 void lx::gfx::timeline_semaphore_pool::reset() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(device_);
     if (dev) {
         for (unsigned i = 0; i < count_; ++i) {

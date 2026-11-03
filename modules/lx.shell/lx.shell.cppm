@@ -6,14 +6,13 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <poll.h>
 #include <sys/signalfd.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 #include <sys/mman.h>
 #include <xkbcommon/xkbcommon.h>
 #endif
@@ -23,7 +22,7 @@ module;
 #include "xdg-shell-client-protocol.h"
 #include "zlm_shell_v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
-#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
+#ifdef LUMEN_PROTOCOL_XDG_ACTIVATION_V1
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_SHELL_ACTIVATION 1
 #endif
@@ -31,12 +30,12 @@ module;
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_SHELL_FRACTIONAL 1
-#if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
+#ifdef LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1
 #include "single-pixel-buffer-v1-client-protocol.h"
 #define LUMEN_SHELL_SINGLE_PIXEL 1
 #endif
 #endif
-#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#ifdef LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1
 #include "ext-background-effect-v1-client-protocol.h"
 #define LUMEN_SHELL_BACKGROUND_EFFECT 1
 #endif
@@ -52,7 +51,6 @@ module;
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#endif
 
 import lx.foundation;
 import lx.shell.policy;
@@ -632,7 +630,7 @@ unsigned lx::shell::shell_app::client_slot(const output_record& o) const {
 
 // ── Keyboard (xkbcommon) ─────────────────────────────────────────────────────
 
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 
 bool lx::shell::xkb_keyboard::set_keymap(int fd, std::uint32_t size) {
     void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -730,7 +728,6 @@ long long lx::shell::shell_app::now_ns() {
     return static_cast<long long>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 namespace {
 
@@ -909,13 +906,13 @@ struct lx::shell::shell_app::events {
         self(data).xkb_.update_mods(dep, lat, lock, group);
     }
 
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
     // ── xdg_activation_token_v1 ──
     static void token_done(void* data, xdg_activation_token_v1* tok, const char* token);
 #endif
     // ── xdg_wm_base (menus and tooltips are its popups) ──
     static void wm_ping(void*, xdg_wm_base* base, uint32_t serial) { xdg_wm_base_pong(base, serial); }
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     // ── ext_idle_notification_v1, zwlr_output_power_v1 ──
     static void idled(void* data, ext_idle_notification_v1*);
     static void resumed(void* data, ext_idle_notification_v1*);
@@ -974,12 +971,12 @@ const wl_keyboard_listener k_keyboard_listener = {
     .modifiers = lx::shell::shell_app::events::kb_modifiers,
     .repeat_info = lx::shell::shell_app::events::kb_repeat,
 };
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
 const xdg_activation_token_v1_listener k_token_listener = {
     .done = lx::shell::shell_app::events::token_done,
 };
 #endif
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
 const ext_idle_notification_v1_listener k_idle_listener = {
     .idled = lx::shell::shell_app::events::idled,
     .resumed = lx::shell::shell_app::events::resumed,
@@ -1101,18 +1098,18 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         // Menus and tooltips: xdg_popups of the panel (layer-shell get_popup).
         a.wm_base_ = wl_registry_bind(reg, name, &xdg_wm_base_interface, min_version(version, 3));
         xdg_wm_base_add_listener(static_cast<xdg_wm_base*>(a.wm_base_), &k_wm_base_listener, &a);
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
     } else if (std::strcmp(iface, xdg_activation_v1_interface.name) == 0) {
         a.activation_ = wl_registry_bind(reg, name, &xdg_activation_v1_interface, 1);
 #endif
-#if defined(LUMEN_SHELL_FRACTIONAL)
+#ifdef LUMEN_SHELL_FRACTIONAL
     } else if (std::strcmp(iface, wp_viewporter_interface.name) == 0) {
         // With fractional scale: the panel and the launcher render at the output's pixel
         // density and show at their logical size (sharp at 1.25).
         a.viewporter_ = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
     } else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         a.fractional_ = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
-#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+#ifdef LUMEN_SHELL_BACKGROUND_EFFECT
     } else if (std::strcmp(iface, ext_background_effect_manager_v1_interface.name) == 0) {
         // The panels' blur (`[panel] blur`); what it offers comes with the bind.
         a.background_effect_ =
@@ -1131,13 +1128,13 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
             static_cast<ext_background_effect_manager_v1*>(a.background_effect_),
             &k_effect_listener, &a);
 #endif
-#if defined(LUMEN_SHELL_SINGLE_PIXEL)
+#ifdef LUMEN_SHELL_SINGLE_PIXEL
     } else if (std::strcmp(iface, wp_single_pixel_buffer_manager_v1_interface.name) == 0) {
         // A colour background is one pixel the viewport stretches: nothing to render or hold.
         a.single_pixel_ = wl_registry_bind(reg, name, &wp_single_pixel_buffer_manager_v1_interface, 1);
 #endif
 #endif
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     } else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0) {
         // v1 is enough: get_idle_notification obeys idle inhibitors, which blanking must.
         a.idle_notifier_ = wl_registry_bind(reg, name, &ext_idle_notifier_v1_interface, 1);
@@ -1177,7 +1174,7 @@ void lx::shell::shell_app::events::seat_caps(void* data, wl_seat* seat, uint32_t
     }
 }
 
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
 void lx::shell::shell_app::events::token_done(void* data, xdg_activation_token_v1* tok,
                                               const char* token) {
     auto& a = self(data);
@@ -1192,7 +1189,7 @@ void lx::shell::shell_app::events::token_done(void* data, xdg_activation_token_v
 
 // ── Idle policy ──
 
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
 void lx::shell::shell_app::events::idled(void* data, ext_idle_notification_v1*) {
     auto& a = self(data);
     switch (a.idle_.on_idled()) {
@@ -1252,7 +1249,7 @@ void lx::shell::shell_app::events::power_failed(void* data, zwlr_output_power_v1
 
 void lx::shell::shell_app::blank_outputs(const char* why) {
     set_timer(t_lock_blank, 0);
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     bool any = false;
     for (auto& o : outputs_)
         any = any || (o->power && !o->off);
@@ -1269,7 +1266,7 @@ void lx::shell::shell_app::blank_outputs(const char* why) {
 }
 
 void lx::shell::shell_app::update_locked_notification() {
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     const unsigned timeout_ms =
         idle_.locked_timeout_ms(idle_notifier_ != nullptr, power_manager_ != nullptr && power_enabled_);
     if (timeout_ms != 0 && !locked_notification_ && seat_) {
@@ -1293,7 +1290,7 @@ void lx::shell::shell_app::setup_idle() {
                       "swayidle + wlopm)");
         return;
     }
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     const unsigned timeout_ms = idle_.blank_timeout_ms(idle_notifier_ != nullptr,
                                                        power_manager_ != nullptr && !outputs_.empty());
     if (timeout_ms == 0) {
@@ -1322,7 +1319,7 @@ void lx::shell::shell_app::setup_idle() {
 }
 
 void lx::shell::shell_app::teardown_idle() {
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     if (locked_notification_)
         ext_idle_notification_v1_destroy(
             static_cast<ext_idle_notification_v1*>(locked_notification_));
@@ -1345,7 +1342,7 @@ void lx::shell::shell_app::teardown_idle() {
 }
 
 void lx::shell::shell_app::add_power(output_record& o) {
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     if (!power_enabled_ || !power_manager_ || o.power || !o.output)
         return;
     o.power = zwlr_output_power_manager_v1_get_output_power(
@@ -1535,7 +1532,7 @@ void lx::shell::shell_app::destroy_output(output_record& o) {
         o.bar->destroy();
     o.bar.reset();
     o.bg.reset();
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     if (o.power)
         zwlr_output_power_v1_destroy(static_cast<zwlr_output_power_v1*>(o.power));
 #endif
@@ -2059,7 +2056,7 @@ void lx::shell::shell_app::launch_terminal(unsigned serial) {
 
 bool lx::shell::shell_app::request_token(pending_token&& req, unsigned serial, void* surface,
                                          const char* app_id) {
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
     if (activation_ && seat_) {
         for (auto& t : tokens_) {
             if (t.token)
@@ -2114,7 +2111,7 @@ void lx::shell::shell_app::begin_launch(std::unique_ptr<prepared_launch> p, unsi
 }
 
 void lx::shell::shell_app::token_done(pending_token& t, const char* token) {
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
     xdg_activation_token_v1_destroy(static_cast<xdg_activation_token_v1*>(t.token));
 #endif
     t.token = nullptr;
@@ -2593,7 +2590,7 @@ void lx::shell::shell_app::teardown() {
     if (!d)
         return;
     for (auto& t : tokens_) {
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
         if (t.token)
             xdg_activation_token_v1_destroy(static_cast<xdg_activation_token_v1*>(t.token));
 #endif
@@ -2620,11 +2617,11 @@ void lx::shell::shell_app::teardown() {
         wp_cursor_shape_device_v1_destroy(static_cast<wp_cursor_shape_device_v1*>(cursor_device_));
     release_pointer(pointer_);
     release_keyboard(keyboard_);
-#if defined(LUMEN_SHELL_ACTIVATION)
+#ifdef LUMEN_SHELL_ACTIVATION
     if (activation_)
         xdg_activation_v1_destroy(static_cast<xdg_activation_v1*>(activation_));
 #endif
-#if defined(LUMEN_SHELL_FRACTIONAL)
+#ifdef LUMEN_SHELL_FRACTIONAL
     if (viewporter_)
         wp_viewporter_destroy(static_cast<wp_viewporter*>(viewporter_));
     if (fractional_)
@@ -2633,7 +2630,7 @@ void lx::shell::shell_app::teardown() {
 #endif
     if (cursor_shape_)
         wp_cursor_shape_manager_v1_destroy(static_cast<wp_cursor_shape_manager_v1*>(cursor_shape_));
-#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+#ifdef LUMEN_SHELL_BACKGROUND_EFFECT
     // The panels' effect objects stay valid without it (they go with the panels).
     if (background_effect_)
         ext_background_effect_manager_v1_destroy(
@@ -2842,7 +2839,7 @@ void lx::shell::shell_app::apply_ui() {
 }
 
 void lx::shell::shell_app::reconfigure_idle() {
-#if defined(LUMEN_SHELL_IDLE)
+#ifdef LUMEN_SHELL_IDLE
     if (locked_notification_)
         ext_idle_notification_v1_destroy(
             static_cast<ext_idle_notification_v1*>(locked_notification_));
@@ -3102,41 +3099,3 @@ void lx::shell::shell_app::quick_switch(std::string_view action) {
     finish_switch(true, action.data());
 }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-struct lx::shell::shell_app::events {};
-
-int lx::shell::shell_app::fail(const char* what) {
-    log_shell.error("{}", what);
-    return 1;
-}
-
-int lx::shell::shell_app::run() {
-    log_shell.error(lx::not_implemented("lx::shell::shell_app::run"));
-    return 1;
-}
-
-void lx::shell::shell_app::teardown() {}
-void lx::shell::shell_app::setup_idle() {}
-void lx::shell::shell_app::teardown_idle() {}
-void lx::shell::shell_app::blank_outputs(const char*) {}
-void lx::shell::shell_app::on_lock_state(unsigned) {}
-void lx::shell::shell_app::on_lock_requested(unsigned) {}
-void lx::shell::shell_app::launch_locker(const char*) {}
-void lx::shell::shell_app::update_locked_notification() {}
-void lx::shell::shell_app::on_config(std::string_view, unsigned) {}
-void lx::shell::shell_app::on_config_done(unsigned, bool, unsigned, unsigned,
-                                          std::span<const policy_bridge::config_line>) {}
-void lx::shell::shell_app::on_action(const char*, const char*, unsigned) {}
-void lx::shell::shell_app::on_hold_begin(const char*, unsigned) {}
-void lx::shell::shell_app::on_hold_key(unsigned, unsigned, const char*) {}
-void lx::shell::shell_app::finish_switch(bool, const char*) {}
-void lx::shell::shell_app::open_switcher() {}
-void lx::shell::shell_app::quick_switch(std::string_view) {}
-lx::shell::switcher_options lx::shell::shell_app::switcher_settings() const { return {}; }
-void lx::shell::shell_app::apply_config(const lx::config::config_snapshot&) {}
-void lx::shell::shell_app::apply_ui() {}
-void lx::shell::shell_app::reconfigure_idle() {}
-void lx::shell::shell_app::rebuild_backgrounds() {}
-
-#endif

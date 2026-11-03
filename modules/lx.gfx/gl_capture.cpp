@@ -2,7 +2,7 @@ module;
 
 // Bodies of `lx.gfx:gl_capture`. See gl_capture.cppm for the model.
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -24,7 +24,7 @@ namespace lx::gfx {
 
 namespace {
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 lx::error capture_error(const char* message) {
     return lx::make_error(lx::gl_err::draw_failed, message);
 }
@@ -64,7 +64,7 @@ unsigned rects_of(const damage_region& r, unsigned width, unsigned height, lx::r
 gl_capture::~gl_capture() { shutdown(); }
 
 lx::result<void> gl_capture::initialize(egl_device& device) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!device.valid())
         return lx::not_implemented("lx::gfx::gl_capture::initialize");
     const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
@@ -97,7 +97,7 @@ void gl_capture::shutdown() {
 }
 
 void gl_capture::destroy(dmabuf_target& t) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (t.framebuffer)
         glDeleteFramebuffers(1, &t.framebuffer);
     if (t.renderbuffer)
@@ -113,7 +113,7 @@ void gl_capture::destroy(dmabuf_target& t) {
 }
 
 void gl_capture::destroy(owner_objects& o) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (o.framebuffer)
         glDeleteFramebuffers(1, &o.framebuffer);
     if (o.renderbuffer)
@@ -153,7 +153,7 @@ lx::result<unsigned> gl_capture::dmabuf_framebuffer(unsigned key, int fd, unsign
                                                     unsigned stride, unsigned width,
                                                     unsigned height, lx::fourcc format,
                                                     unsigned long long modifier) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready_ || !device_)
         return lx::not_implemented("lx::gfx::gl_capture::dmabuf_framebuffer");
     for (auto& t : targets_) {
@@ -257,7 +257,7 @@ void gl_capture::forget_dmabuf(unsigned key) {
 
 lx::result<unsigned> gl_capture::offscreen_framebuffer(unsigned id, unsigned width,
                                                        unsigned height) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready_)
         return lx::not_implemented("lx::gfx::gl_capture::offscreen_framebuffer");
     owner_objects* o = owner(id, true);
@@ -349,7 +349,7 @@ void* gl_capture::offscreen_bo(unsigned id) {
 bool gl_capture::read_bo(void* bo, unsigned width, unsigned height, const damage_region& rects,
                          unsigned char* dst, unsigned dst_stride, int dx, int dy,
                          unsigned dst_width, unsigned dst_height, bool opaque) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!bo || !dst)
         return false;
     lx::rect2i r[k_damage_rects];
@@ -429,7 +429,7 @@ void gl_capture::forget_owner(unsigned id) {
 
 lx::result<void> gl_capture::blit(unsigned src, unsigned dst, unsigned width, unsigned height,
                                   const damage_region& rects, int dx, int dy) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready_ || src == 0 || dst == 0)
         return lx::not_implemented("lx::gfx::gl_capture::blit");
     lx::rect2i r[k_damage_rects];
@@ -462,7 +462,7 @@ lx::result<void> gl_capture::blit(unsigned src, unsigned dst, unsigned width, un
 
 lx::result<void> gl_capture::clear(unsigned dst, unsigned width, unsigned height,
                                    lx::color colour) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready_ || dst == 0)
         return lx::not_implemented("lx::gfx::gl_capture::clear");
     glBindFramebuffer(GL_FRAMEBUFFER, dst);
@@ -485,7 +485,7 @@ lx::result<void> gl_capture::clear(unsigned dst, unsigned width, unsigned height
 
 lx::result<void> gl_capture::read_async(unsigned id, unsigned src, unsigned width,
                                         unsigned height, const damage_region& rects) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready_ || src == 0)
         return lx::not_implemented("lx::gfx::gl_capture::read_async");
     owner_objects* o = owner(id, true);
@@ -534,7 +534,7 @@ lx::result<void> gl_capture::finish_read(unsigned id, unsigned char* dst, unsign
                                          unsigned width, unsigned height,
                                          const damage_region& rects, int dx, int dy,
                                          unsigned dst_width, unsigned dst_height) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     owner_objects* o = owner(id, false);
     if (!ready_ || !o || !o->pbo || !dst || o->pbo_bytes != width * height * 4u)
         return lx::invalid_argument("capture read-back finished without a read");
@@ -613,7 +613,7 @@ lx::result<void> gl_capture::finish_read(unsigned id, unsigned char* dst, unsign
 }
 
 int gl_capture::fence() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready_ || !device_)
         return -1;
     if (device_->supports_native_fence()) {

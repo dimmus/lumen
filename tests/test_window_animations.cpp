@@ -29,7 +29,7 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-client-protocol.h"
 #define LUMEN_TEST_WM_ANIM 1
 #endif
@@ -519,7 +519,7 @@ LUMEN_TEST(lifecycle_keeps_a_ghosts_dmabuf_until_it_lets_go) {
 
 // ── in-process: a real compositor ────────────────────────────────────────────
 
-#if !defined(LUMEN_TEST_WM_ANIM)
+#ifndef LUMEN_TEST_WM_ANIM
 
 int run_wm_cases() {
     std::printf("SKIP: window-manager cases need libwayland and the xdg-shell glue\n");

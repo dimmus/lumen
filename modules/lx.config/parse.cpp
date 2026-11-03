@@ -6,7 +6,7 @@ module;
 #include <math.h>
 #include <stdarg.h>
 
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 #include <xkbcommon/xkbcommon.h>
 #endif
 
@@ -955,7 +955,7 @@ void format_value(const key_desc& key, const config_snapshot& c, char* out, std:
 }
 
 namespace {
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 struct xkb_capture {
     char first[160]{};
 };
@@ -974,7 +974,7 @@ void xkb_log(struct xkb_context* ctx, enum xkb_log_level level, const char* form
 } // namespace
 
 bool check_keymap(const keyboard_settings& k, diagnostics& diag) {
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     xkb_capture cap{};
     xkb_context* ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!ctx)

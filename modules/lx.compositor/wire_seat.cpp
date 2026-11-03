@@ -158,7 +158,7 @@ const struct wl_seat_interface seat_impl = {
             wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
                 if (g_ctx && g_ctx->input)
                     g_ctx->input->remove(r);
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
                 shape_devices_drop_pointer(r);
 #endif
             });

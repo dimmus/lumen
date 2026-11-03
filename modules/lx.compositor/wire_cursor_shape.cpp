@@ -10,7 +10,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "cursor-shape-v1-server-protocol.h"
 #endif
 
@@ -29,7 +29,7 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 
 namespace lx::compositor::wire {
 

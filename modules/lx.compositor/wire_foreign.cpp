@@ -135,13 +135,13 @@ void undo_children(imported_obj* i, lx::toplevel_id parent) {
 }
 
 void send_destroyed(imported_obj* i) {
-#if defined(LUMEN_HAS_FOREIGN_V2)
+#ifdef LUMEN_HAS_FOREIGN_V2
     if (i->v2) {
         zxdg_imported_v2_send_destroyed(i->resource);
         return;
     }
 #endif
-#if defined(LUMEN_HAS_FOREIGN_V1)
+#ifdef LUMEN_HAS_FOREIGN_V1
     if (!i->v2)
         zxdg_imported_v1_send_destroyed(i->resource);
 #endif
@@ -281,7 +281,7 @@ bool do_set_parent_of(imported_obj* i, wl_resource* surface_res) {
 
 // ── v2 ──
 
-#if defined(LUMEN_HAS_FOREIGN_V2)
+#ifdef LUMEN_HAS_FOREIGN_V2
 
 const struct zxdg_exported_v2_interface exported_v2_impl = {
     .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
@@ -326,7 +326,7 @@ const struct zxdg_importer_v2_interface importer_v2_impl = {
 
 // ── v1 ──
 
-#if defined(LUMEN_HAS_FOREIGN_V1)
+#ifdef LUMEN_HAS_FOREIGN_V1
 
 const struct zxdg_exported_v1_interface exported_v1_impl = {
     .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
@@ -365,7 +365,7 @@ const struct zxdg_importer_v1_interface importer_v1_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_FOREIGN_V2)
+#ifdef LUMEN_HAS_FOREIGN_V2
 void bind_exporter_v2(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -381,7 +381,7 @@ void bind_importer_v2(wayland::client_connection& client, unsigned id, int versi
         res.set_implementation(&importer_v2_impl, g_ctx, nullptr);
 }
 #endif
-#if defined(LUMEN_HAS_FOREIGN_V1)
+#ifdef LUMEN_HAS_FOREIGN_V1
 void bind_exporter_v1(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;

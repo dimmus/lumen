@@ -5,11 +5,11 @@ module;
 #include <poll.h>
 #include <unistd.h>
 
-#if defined(__GLIBC__)
+#ifdef __GLIBC__
 #include <malloc.h>
 #endif
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <dirent.h>
 #include <linux/sync_file.h>
 #include <sys/ioctl.h>
@@ -1876,7 +1876,7 @@ private:
 /// CLOCK_MONOTONIC microseconds at which every fence in a sync_file signalled, or 0 when
 /// that is unknown (not signalled, an error, or more fences than this reads).
 unsigned long long sync_file_signal_us(int fd) {
-#if defined(__linux__)
+#ifdef __linux__
     sync_fence_info fences[4]{};
     sync_file_info info{};
     info.num_fences = 4;
@@ -3028,7 +3028,7 @@ void compositor_impl::settle_frame_clocks(std::uint32_t served, std::uint32_t qu
 /// the render node of the KMS card when it has one, else the card itself; 0 without DRM.
 /// Startup-only sysfs I/O.
 [[nodiscard]] static unsigned long long dmabuf_main_device(int card_fd) {
-#if defined(__linux__)
+#ifdef __linux__
     struct stat st {};
     if (card_fd < 0 || ::fstat(card_fd, &st) != 0 || !S_ISCHR(st.st_mode))
         return 0;
@@ -9531,7 +9531,7 @@ lx::result<void> compositor::start() {
         impl_->graphics.syncobj().set_drm_fd(impl_->kms.card_fd());
         log_gfx.info("Vulkan device released (unused on the GL path)");
     }
-#if defined(__GLIBC__)
+#ifdef __GLIBC__
     // Start-up frees a lot (instance probing, a released device, driver set-up), and glibc
     // keeps freed heap pages resident until told otherwise. Once, here — never per frame.
     (void)::malloc_trim(0);

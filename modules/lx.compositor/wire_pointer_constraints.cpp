@@ -39,7 +39,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_POINTER_CONSTRAINTS_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_POINTER_CONSTRAINTS_UNSTABLE_V1
 #include "pointer-constraints-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_POINTER_CONSTRAINTS 1
 #endif
@@ -64,7 +64,7 @@ import :wire;
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_POINTER_CONSTRAINTS)
+#ifdef LUMEN_HAS_POINTER_CONSTRAINTS
 
 namespace {
 

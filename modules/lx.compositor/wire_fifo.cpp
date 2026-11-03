@@ -29,11 +29,11 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_FIFO_V1)
+#ifdef LUMEN_PROTOCOL_FIFO_V1
 #include "fifo-v1-server-protocol.h"
 #define LUMEN_HAS_FIFO 1
 #endif
-#if defined(LUMEN_PROTOCOL_COMMIT_TIMING_V1)
+#ifdef LUMEN_PROTOCOL_COMMIT_TIMING_V1
 #include "commit-timing-v1-server-protocol.h"
 #define LUMEN_HAS_COMMIT_TIMING 1
 #endif
@@ -98,7 +98,7 @@ namespace {
 
 void addon_destroy_plain(wl_resource* r) { addon_free(addon_from(r)); }
 
-#if defined(LUMEN_HAS_FIFO)
+#ifdef LUMEN_HAS_FIFO
 
 // ── wp_fifo_v1 ──────────────────────────────────────────────────────────────
 
@@ -147,7 +147,7 @@ const struct wp_fifo_manager_v1_interface fifo_manager_impl = {
 
 #endif
 
-#if defined(LUMEN_HAS_COMMIT_TIMING)
+#ifdef LUMEN_HAS_COMMIT_TIMING
 
 // ── wp_commit_timer_v1 ──────────────────────────────────────────────────────
 
@@ -205,7 +205,7 @@ const struct wp_commit_timing_manager_v1_interface timing_manager_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_FIFO)
+#ifdef LUMEN_HAS_FIFO
 void bind_fifo_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -215,7 +215,7 @@ void bind_fifo_manager(wayland::client_connection& client, unsigned id, int vers
 }
 #endif
 
-#if defined(LUMEN_HAS_COMMIT_TIMING)
+#ifdef LUMEN_HAS_COMMIT_TIMING
 void bind_commit_timing_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;

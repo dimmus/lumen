@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -355,7 +355,7 @@ void copy_cut(char* dst, std::size_t cap, const char* src) {
     dst[n] = '\0';
 }
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 bool is_dir(const char* path) {
     struct stat st{};
     return path && path[0] && ::stat(path, &st) == 0 && S_ISDIR(st.st_mode);
@@ -397,7 +397,7 @@ lx::text::face_cache::~face_cache() {
     std::lock_guard lock{mutex_};
     for (auto& s : slots_)
         release_locked(s);
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (library_) {
         FT_Done_FreeType(static_cast<FT_Library>(library_));
         library_ = nullptr;
@@ -416,7 +416,7 @@ bool lx::text::face_cache::init_ft_locked() {
     if (ft_attempted_)
         return library_ != nullptr;
     ft_attempted_ = true;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     FT_Library lib = nullptr;
     if (FT_Init_FreeType(&lib) != 0)
         return false;
@@ -430,11 +430,11 @@ bool lx::text::face_cache::init_ft_locked() {
     } else if (const char* env = ::getenv("LUMEN_FONT_DIR"); env && env[0]) {
         copy_cut(candidate, k_face_path_bytes, env);
     } else {
-#if defined(LUMEN_FONT_DIR_BUILD)
+#ifdef LUMEN_FONT_DIR_BUILD
         if (is_dir(LUMEN_FONT_DIR_BUILD))
             copy_cut(candidate, k_face_path_bytes, LUMEN_FONT_DIR_BUILD);
 #endif
-#if defined(LUMEN_FONT_DIR_INSTALL_RELATIVE)
+#ifdef LUMEN_FONT_DIR_INSTALL_RELATIVE
         if (!candidate[0]) {
             char exe[k_face_path_bytes]{};
             const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
@@ -452,7 +452,7 @@ bool lx::text::face_cache::init_ft_locked() {
             }
         }
 #endif
-#if defined(LUMEN_FONT_DIR_INSTALL)
+#ifdef LUMEN_FONT_DIR_INSTALL
         if (!candidate[0] && is_dir(LUMEN_FONT_DIR_INSTALL))
             copy_cut(candidate, k_face_path_bytes, LUMEN_FONT_DIR_INSTALL);
 #endif
@@ -469,7 +469,7 @@ bool lx::text::face_cache::init_locked() {
     if (!init_ft_locked())
         return false;
     init_attempted_ = true;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     FcConfig* config = FcInitLoadConfigAndFonts();
     if (!config)
         return false;
@@ -485,7 +485,7 @@ bool lx::text::face_cache::init_locked() {
 }
 
 void lx::text::face_cache::release_locked(slot& s) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (s.hb)
         hb_font_destroy(static_cast<hb_font_t*>(s.hb));
     if (s.ft)
@@ -534,7 +534,7 @@ lx::text::face_id lx::text::face_cache::resolve_locked(const char* family_in, we
             return {e.id};
         }
     }
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     // A persisted answer needs FreeType only; one whose file no longer loads (it went between
     // the check and now) is asked of fontconfig after all.
     if (!init_ft_locked()) {
@@ -606,7 +606,7 @@ lx::text::face_cache::slot* lx::text::face_cache::load_locked(unsigned victim, s
                                                               const char* file, int face_index,
                                                               const char* matched_family, weight w,
                                                               style st, bool fallback) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     FT_Face face = nullptr;
     if (FT_New_Face(static_cast<FT_Library>(library_), file, face_index, &face) != 0 || !face)
         return nullptr;
@@ -676,7 +676,7 @@ bool lx::text::face_cache::has_char_locked(face_id id, char32_t codepoint) {
     if (!s)
         return false;
     s->used = ++clock_;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     return FT_Get_Char_Index(static_cast<FT_Face>(s->ft), static_cast<FT_ULong>(codepoint)) != 0;
 #else
     (void)codepoint;
@@ -688,7 +688,7 @@ lx::text::face_id lx::text::face_cache::fallback_locked(face_id primary, char32_
     const slot* p = find_locked(primary);
     if (!p)
         return {};
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (!init_locked())
         return {};
     ++stats_.fallback_searches;
@@ -791,7 +791,7 @@ lx::text::face_cache::handles lx::text::face_cache::use_locked(face_id id, std::
     slot* s = find_locked(id);
     if (!s || size_26_6 <= 0)
         return {};
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (s->size_26_6 != size_26_6) {
         FT_Set_Char_Size(static_cast<FT_Face>(s->ft), 0, size_26_6, 72, 72);
         hb_ft_font_changed(static_cast<hb_font_t*>(s->hb));
@@ -805,7 +805,7 @@ lx::text::face_cache::handles lx::text::face_cache::use_locked(face_id id, std::
 
 lx::result<lx::text::face_metrics> lx::text::face_cache::metrics_locked(face_id id,
                                                                         std::int32_t size_26_6) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     const handles h = use_locked(id, size_26_6);
     if (!h.ft_face)
         return lx::make_error(lx::io_err::not_found, "face not loaded");
@@ -882,7 +882,7 @@ lx::text::face_cache_stats lx::text::face_cache::stats() {
 
 bool lx::text::face_cache::add_font_dir(const char* dir) {
     std::lock_guard lock{mutex_};
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (!is_dir(dir) || !init_locked())
         return false;
     // fontconfig answers with the directory from here on; the persisted answers were
@@ -1044,7 +1044,7 @@ void lx::text::face_cache::persist_matches(const char* path) {
         return;
     }
     store_path_.clear();
-#if defined(__GLIBC__)
+#ifdef __GLIBC__
     const char* program = program_invocation_short_name;
 #else
     const char* program = "lumen";
@@ -1062,7 +1062,7 @@ std::uint64_t lx::text::face_cache::store_inputs_locked() const {
             h = (h ^ static_cast<unsigned char>(c)) * k_fnv_prime;
         h = (h ^ 0xFFu) * k_fnv_prime; // separator: ("ab","c") is not ("a","bc")
     };
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     char version[16];
     std::snprintf(version, sizeof version, "%d", FcGetVersion());
     mix(version);
@@ -1071,7 +1071,7 @@ std::uint64_t lx::text::face_cache::store_inputs_locked() const {
         for (const char* f : fallback_families(family))
             mix(f);
 #endif
-#if defined(__GLIBC__)
+#ifdef __GLIBC__
     mix(program_invocation_short_name); // configurations may match on the program
 #endif
     mix(candidate_dir_);
@@ -1101,7 +1101,7 @@ const lx::text::font_match* lx::text::face_cache::stored_locked(const char* fami
 
 void lx::text::face_cache::remember_locked(const char* family, weight w, style s, const char* file,
                                            int index, const char* matched_family) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (!store_read_) {
         // Answers of earlier runs that are still valid are kept beside this one.
         store_read_ = true;

@@ -2,7 +2,7 @@ module;
 
 // Bodies of lx.ui.host:input.
 
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 #include <xkbcommon/xkbcommon.h>
 #endif
 
@@ -125,7 +125,7 @@ constexpr std::uint32_t k_xk_space = 0x20;
     char32_t cp = first_codepoint(e.utf8, e.utf8_len);
     if (cp >= 0x20 && cp != 0x7f)
         return cp;
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     cp = xkb_keysym_to_utf32(e.keysym);
 #else
     // Latin-1 keysyms are their code points, Unicode keysyms carry theirs.

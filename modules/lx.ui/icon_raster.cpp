@@ -3,7 +3,7 @@
 
 module;
 
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
 #include <cairo.h>
 #include <dlfcn.h>
 #include <librsvg/rsvg.h>
@@ -24,7 +24,7 @@ constexpr lx::trace::category log_icon{"ui.icon"};
 
 namespace {
 
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
 /// librsvg, cairo and GLib entry points, from one dlopen'd handle (see lx.shell:svg for why
 /// it is not linked).
 struct lx_ui_rsvg_api {
@@ -74,7 +74,7 @@ const lx_ui_rsvg_api& lx_ui_rsvg() {
 } // namespace
 
 bool lx::ui::icons_available() {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     struct stat st{};
     const char* dir = icon_dir();
     return lx_ui_rsvg().ok && dir[0] && ::stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
@@ -88,7 +88,7 @@ lx::result<void> lx::ui::rasterize_icon(const char* path, unsigned size_px,
     if (!path || size_px == 0 || size_px > icon_cache::k_max_px ||
         coverage.size() < std::size_t{size_px} * size_px)
         return lx::invalid_argument("rasterize_icon: bad size or buffer");
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     const lx_ui_rsvg_api& a = lx_ui_rsvg();
     if (!a.ok)
         return lx::make_error(lx::ui_err::icon_raster, "rasterize_icon: librsvg unavailable");

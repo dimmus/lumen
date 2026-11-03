@@ -30,7 +30,6 @@ module;
 #include <stdint.h>
 #include <string.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -40,20 +39,19 @@ module;
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_BG_FRACTIONAL 1
-#if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
+#ifdef LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1
 #include "single-pixel-buffer-v1-client-protocol.h"
 #define LUMEN_BG_SINGLE_PIXEL 1
 #endif
 #endif
-#endif
 
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
 #include <png.h>
 #endif
-#if defined(LUMEN_HAS_JPEG)
+#ifdef LUMEN_HAS_JPEG
 #include <turbojpeg.h>
 #endif
-#if defined(LUMEN_HAS_WEBP)
+#ifdef LUMEN_HAS_WEBP
 #include <webp/decode.h>
 #endif
 import lx.foundation;
@@ -417,7 +415,7 @@ void fit_size(int iw, int ih, int w, int h, lx::shell::background_fit fit, int& 
     }
 }
 
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
 bool decode_png(const std::vector<unsigned char>& file, std::vector<std::uint32_t>& out, int& w, int& h) {
     png_image img{};
     img.version = PNG_IMAGE_VERSION;
@@ -439,7 +437,7 @@ bool decode_png(const std::vector<unsigned char>& file, std::vector<std::uint32_
 }
 #endif
 
-#if defined(LUMEN_HAS_JPEG)
+#ifdef LUMEN_HAS_JPEG
 bool decode_jpeg(const std::vector<unsigned char>& file, int want_w, int want_h,
                  std::vector<std::uint32_t>& out, int& w, int& h) {
     tjhandle tj = tj3Init(TJINIT_DECOMPRESS);
@@ -478,7 +476,7 @@ bool decode_jpeg(const std::vector<unsigned char>& file, int want_w, int want_h,
 }
 #endif
 
-#if defined(LUMEN_HAS_WEBP)
+#ifdef LUMEN_HAS_WEBP
 bool decode_webp(const std::vector<unsigned char>& file, std::vector<std::uint32_t>& out, int& w, int& h) {
     if (!WebPGetInfo(file.data(), file.size(), &w, &h) || w <= 0 || h <= 0 ||
         static_cast<std::size_t>(w) * h > k_max_pixels)
@@ -492,7 +490,7 @@ bool decode_webp(const std::vector<unsigned char>& file, std::vector<std::uint32
 }
 #endif
 
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
 bool render_svg(const std::string& path, int w, int h, lx::shell::background_fit fit,
                 std::vector<std::uint32_t>& out, int& ow, int& oh) {
     lx::shell::svg_document svg;
@@ -696,11 +694,11 @@ bool lx::shell::decode_background(const std::string& path, int w, int h, backgro
     bool ok = false;
     const unsigned char* m = file.data();
     if (m[0] == 0x89 && m[1] == 'P' && m[2] == 'N' && m[3] == 'G') {
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
         ok = decode_png(file, raw, iw, ih);
 #endif
     } else if (m[0] == 0xFF && m[1] == 0xD8) {
-#if defined(LUMEN_HAS_JPEG)
+#ifdef LUMEN_HAS_JPEG
         // What the shown size needs, so the DCT can skip the rest.
         int iw0 = 0, ih0 = 0;
         if (tjhandle tj = tj3Init(TJINIT_DECOMPRESS)) {
@@ -716,11 +714,11 @@ bool lx::shell::decode_background(const std::string& path, int w, int h, backgro
         ok = decode_jpeg(file, want_w, want_h, raw, iw, ih);
 #endif
     } else if (std::memcmp(m, "RIFF", 4) == 0 && std::memcmp(m + 8, "WEBP", 4) == 0) {
-#if defined(LUMEN_HAS_WEBP)
+#ifdef LUMEN_HAS_WEBP
         ok = decode_webp(file, raw, iw, ih);
 #endif
     } else {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
         // SVG (or anything else librsvg reads): rendered at the size it is shown.
         return render_svg(path, w, h, fit, out, out_w, out_h);
 #endif
@@ -742,16 +740,16 @@ bool lx::shell::decode_background(const std::string& path, int w, int h, backgro
 
 lx::shell::background_decoders lx::shell::background_formats() {
     background_decoders d{};
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
     d.png = true;
 #endif
-#if defined(LUMEN_HAS_JPEG)
+#ifdef LUMEN_HAS_JPEG
     d.jpeg = true;
 #endif
-#if defined(LUMEN_HAS_WEBP)
+#ifdef LUMEN_HAS_WEBP
     d.webp = true;
 #endif
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     d.svg = true;
 #endif
     return d;
@@ -785,7 +783,6 @@ bool lx::shell::render_background(const background_spec& spec, std::uint32_t* px
 
 // ── the surface ───────────────────────────────────────────────────────────────
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 struct lx::shell::background::events {
     static background& self(void* data) { return *static_cast<background*>(data); }
@@ -795,7 +792,7 @@ struct lx::shell::background::events {
         wl_buffer_destroy(buffer);
     }
 
-#if defined(LUMEN_BG_FRACTIONAL)
+#ifdef LUMEN_BG_FRACTIONAL
     static void preferred_scale(void* data, wp_fractional_scale_v1*, uint32_t scale) {
         auto& b = self(data);
         if (scale != 0 && scale != b.scale120_) {
@@ -811,7 +808,7 @@ namespace {
 const wl_buffer_listener k_bg_buffer_listener = {
     .release = lx::shell::background::events::buffer_release,
 };
-#if defined(LUMEN_BG_FRACTIONAL)
+#ifdef LUMEN_BG_FRACTIONAL
 const wp_fractional_scale_v1_listener k_bg_fractional_listener = {
     .preferred_scale = lx::shell::background::events::preferred_scale,
 };
@@ -853,7 +850,7 @@ lx::result<void> lx::shell::background::create(background_globals globals, const
     wl_layer_.set_handler(this);
     surface_ = wl_surface_.native();
     auto* surface = static_cast<wl_surface*>(surface_);
-#if defined(LUMEN_BG_FRACTIONAL)
+#ifdef LUMEN_BG_FRACTIONAL
     if (g_.viewporter) {
         viewport_ = wp_viewporter_get_viewport(static_cast<wp_viewporter*>(g_.viewporter), surface);
         if (g_.fractional) {
@@ -899,7 +896,7 @@ void lx::shell::background::cancel_job() {
 
 void lx::shell::background::destroy() {
     cancel_job();
-#if defined(LUMEN_BG_FRACTIONAL)
+#ifdef LUMEN_BG_FRACTIONAL
     if (fractional_)
         wp_fractional_scale_v1_destroy(static_cast<wp_fractional_scale_v1*>(fractional_));
     if (viewport_)
@@ -913,7 +910,7 @@ void lx::shell::background::destroy() {
 }
 
 void lx::shell::background::show_color() {
-#if defined(LUMEN_BG_SINGLE_PIXEL)
+#ifdef LUMEN_BG_SINGLE_PIXEL
     // One pixel, stretched by the viewport: nothing to render and nothing to hold.
     const auto ch = [](std::uint32_t c, unsigned shift) {
         return static_cast<std::uint32_t>(((c >> shift) & 0xFFu) * 0x01010101u);
@@ -975,7 +972,7 @@ void lx::shell::background::start_render() {
         const auto t0 = std::chrono::steady_clock::now();
         // Every page is written: fault them in with one call (Linux 5.14) rather than one
         // trap per 4 KiB page as the render reaches it. Older kernels: EINVAL, the same as before.
-#if defined(MADV_POPULATE_WRITE)
+#ifdef MADV_POPULATE_WRITE
         (void)::madvise(j->data, j->size, MADV_POPULATE_WRITE);
 #endif
         j->ok = render_background(spec, static_cast<std::uint32_t*>(j->data), j->pw, j->ph, j->pw);
@@ -996,7 +993,7 @@ void lx::shell::background::finish_render() {
     munmap(j.data, j.size);
     j.data = nullptr;
     auto* surface = static_cast<wl_surface*>(surface_);
-#if defined(LUMEN_BG_FRACTIONAL)
+#ifdef LUMEN_BG_FRACTIONAL
     if (viewport_)
         wp_viewport_set_destination(static_cast<wp_viewport*>(viewport_), width_, height_);
 #endif
@@ -1040,19 +1037,3 @@ void lx::shell::background::after_dispatch() {
     }
 }
 
-#else
-
-lx::shell::background::~background() = default;
-void lx::shell::background::on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure&) {}
-void lx::shell::background::on_closed(lx::wayland::layer_surface&) {}
-lx::result<void> lx::shell::background::create(background_globals, const background_spec*, unsigned, int) {
-    return lx::not_implemented("lx::shell::background::create");
-}
-void lx::shell::background::destroy() {}
-void lx::shell::background::after_dispatch() {}
-void lx::shell::background::start_render() {}
-void lx::shell::background::finish_render() {}
-void lx::shell::background::show_color() {}
-void lx::shell::background::cancel_job() {}
-
-#endif

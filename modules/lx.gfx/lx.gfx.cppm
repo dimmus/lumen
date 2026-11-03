@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #endif
 #include <stdlib.h>
@@ -202,7 +202,7 @@ public:
     [[nodiscard]] device_memory_budget memory_budget() const;
 
 private:
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     void destroy_vulkan();
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
@@ -272,7 +272,7 @@ private:
 
 module :private;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 void lx::gfx::device::destroy_vulkan() {
     if (vk_device_ != VK_NULL_HANDLE) {
         if (command_pool_ != VK_NULL_HANDLE) {
@@ -292,7 +292,7 @@ void lx::gfx::device::destroy_vulkan() {
 #endif
 
 lx::gfx::device::~device() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     destroy_vulkan();
 #endif
 }
@@ -300,7 +300,7 @@ lx::gfx::device::~device() {
 lx::gfx::device::device(device&& other) noexcept
     : queue_family_{other.queue_family_}, info_{other.info_}, dmabuf_{other.dmabuf_},
       exporter_{other.exporter_}, syncobj_{other.syncobj_} {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     instance_ = other.instance_;
     physical_ = other.physical_;
     vk_device_ = other.vk_device_;
@@ -326,7 +326,7 @@ lx::gfx::device::device(device&& other) noexcept
 lx::gfx::device& lx::gfx::device::operator=(device&& other) noexcept {
     if (this == &other)
         return *this;
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     destroy_vulkan();
     instance_ = other.instance_;
     physical_ = other.physical_;
@@ -356,7 +356,7 @@ lx::gfx::device& lx::gfx::device::operator=(device&& other) noexcept {
     return *this;
 }
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 namespace {
 
 /// Prefer a graphics+transfer family; queue family 0 is not guaranteed to be one.
@@ -480,7 +480,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
     device d;
     d.info_ = info;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (info.supports_dmabuf_import) {
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -712,7 +712,7 @@ lx::gfx::syncobj_bridge& lx::gfx::device::syncobj() { return syncobj_; }
 
 unsigned lx::gfx::device::queue_family() const { return queue_family_; }
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 void* lx::gfx::device::vk_device() const { return static_cast<void*>(vk_device_); }
 void* lx::gfx::device::vk_physical_device() const { return static_cast<void*>(physical_); }
 void* lx::gfx::device::vk_queue() const { return static_cast<void*>(queue_); }
@@ -740,7 +740,7 @@ lx::gfx::vk_context lx::gfx::device::context() const {
 
 lx::gfx::device_memory_budget lx::gfx::device::memory_budget() const {
     device_memory_budget b{};
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!physical_ || !info_.supports_memory_budget)
         return b;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
@@ -763,7 +763,7 @@ lx::gfx::device_memory_budget lx::gfx::device::memory_budget() const {
 lx::result<lx::gfx::device> lx::gfx::device_selector::select_best(drm_node card) {
     device_info info{};
     info.card = card;
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     info.device_name = "vulkan";
     info.supports_dmabuf_import = true;
     if (auto vulkan = device::create(info); vulkan)
@@ -791,7 +791,7 @@ lx::gfx::hardware_probe_scope::~hardware_probe_scope() {
 
 lx::gfx::physical_device_list lx::gfx::device_selector::probe_devices() {
     physical_device_list list{};
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "lumen";
@@ -819,7 +819,7 @@ lx::gfx::gpu_tier lx::gfx::device_selector::probe_tier(const physical_device_lis
 lx::gfx::device_recovery::device_recovery(device& dev) : device_{&dev} {}
 
 lx::result<void> lx::gfx::device_recovery::handle_device_lost() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     needs_recovery_ = true;
     if (auto next = device_selector::select_best(device_->info().card); next) {
         *device_ = std::move(next).value();

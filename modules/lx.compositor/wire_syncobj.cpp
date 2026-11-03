@@ -36,7 +36,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1)
+#ifdef LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1
 #include "linux-drm-syncobj-v1-server-protocol.h"
 #define LUMEN_HAS_SYNCOBJ 1
 #endif
@@ -133,7 +133,7 @@ void syncobj_point_settle(unsigned timeline, unsigned long long point, bool sign
         sync_point_drop(p);
 }
 
-#if defined(LUMEN_HAS_SYNCOBJ)
+#ifdef LUMEN_HAS_SYNCOBJ
 
 namespace {
 

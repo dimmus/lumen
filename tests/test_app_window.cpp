@@ -34,12 +34,12 @@
 
 #include <png.h>
 
-#if defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
+#ifdef LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2
 #include <wayland-client.h>
 #include "input-method-unstable-v2-client-protocol.h"
 #define LUMEN_TEST_IM 1
 #endif
-#if defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
+#ifdef LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1
 #include <wayland-client.h>
 #include "ext-data-control-v1-client-protocol.h"
 #define LUMEN_TEST_DC 1
@@ -64,7 +64,7 @@ import lumen.hello.ui;
 
 // ── allocation accounting (the UI thread only, while `g_counting`) ──
 
-#if defined(__SANITIZE_ADDRESS__)
+#ifdef __SANITIZE_ADDRESS__
 #define LUMEN_TEST_SANITIZED 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
@@ -78,7 +78,7 @@ std::atomic<std::uint64_t> g_new_calls{0};
 std::atomic<std::uint64_t> g_malloc_calls{0};
 } // namespace
 
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);
@@ -219,7 +219,7 @@ record_view find_record() {
 
 // ── the input method: a raw libwayland client of the parent's, as fcitx5 would be ──
 
-#if defined(LUMEN_TEST_IM)
+#ifdef LUMEN_TEST_IM
 struct ime_client {
     wl_display* display = nullptr;
     wl_registry* registry = nullptr;
@@ -292,7 +292,7 @@ void ime_pump() {
 // It sees the seat's selection without keyboard focus — what the child copies — and sets
 // one for the child to paste, the way a clipboard manager restores a selection.
 
-#if defined(LUMEN_TEST_DC)
+#ifdef LUMEN_TEST_DC
 struct dc_client {
     wl_display* display = nullptr;
     wl_registry* registry = nullptr;
@@ -428,7 +428,7 @@ std::string serve(const std::string& line) {
     std::istringstream in{line};
     std::string cmd;
     in >> cmd;
-#if defined(LUMEN_TEST_IM)
+#ifdef LUMEN_TEST_IM
     // The input method's view current before it answers or commits: a commit carrying a
     // stale done count is dropped by the compositor (the protocol's rule). Outside the lock:
     // the pump thread dispatches the server side of the roundtrip.
@@ -475,14 +475,14 @@ std::string serve(const std::string& line) {
         in >> on;
         g_comp->windows().set_fullscreen(rec.id, on != 0, -1, "test");
     } else if (cmd == "ime") {
-#if defined(LUMEN_TEST_IM)
+#ifdef LUMEN_TEST_IM
         reply = std::format("ok {} {} {} {}|{}", g_ime.im ? 1 : 0, g_ime.activates, g_ime.dones,
                             g_ime.cursor, g_ime.surrounding);
 #else
         reply = "fail no input method";
 #endif
     } else if (cmd == "ime_preedit" || cmd == "ime_commit") {
-#if defined(LUMEN_TEST_IM)
+#ifdef LUMEN_TEST_IM
         std::string text;
         in >> text;
         if (cmd == "ime_preedit")
@@ -506,7 +506,7 @@ std::string serve(const std::string& line) {
         g_comp->inject_pointer_button(b);
     } else if (cmd == "dc_selection" || cmd == "dc_read" || cmd == "dc_result" ||
                cmd == "dc_result_sum" || cmd == "dc_set") {
-#if defined(LUMEN_TEST_DC)
+#ifdef LUMEN_TEST_DC
         if (!g_dc.device) {
             reply = "fail no data control";
         } else if (cmd == "dc_selection") {
@@ -621,10 +621,10 @@ int run_child(const char* tier) {
             last_tick = now_ms();
             tick();
         }
-#if defined(LUMEN_TEST_IM)
+#ifdef LUMEN_TEST_IM
         ime_pump();
 #endif
-#if defined(LUMEN_TEST_DC)
+#ifdef LUMEN_TEST_DC
         dc_pump();
 #endif
     }
@@ -1457,7 +1457,7 @@ int client_main(const char* tier_name, int fd) {
         const std::uint64_t frames = w.stats().frames - frames0;
         const std::uint64_t news = g_new_calls.load() - new0;
         const std::uint64_t mallocs = g_malloc_calls.load() - malloc0;
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
         check("G5: 0 operator new over steady hover frames (event, frame loop, tick, render, commit)",
               frames >= 10 && news == 0,
               std::format("{} frames, {} operator new, {} malloc ({:.1f} per frame: libwayland's "
@@ -1624,11 +1624,11 @@ int main(int argc, char** argv) {
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     tick();
-#if defined(LUMEN_TEST_IM)
+#ifdef LUMEN_TEST_IM
     if (!ime_connect(g_ime))
         std::printf("  SKIP  no zwp_input_method_manager_v2: text-input-v3 is not driven\n");
 #endif
-#if defined(LUMEN_TEST_DC)
+#ifdef LUMEN_TEST_DC
     if (!dc_connect(g_dc))
         std::printf("  SKIP  no ext_data_control_manager_v1: the clipboard is not driven\n");
 #endif

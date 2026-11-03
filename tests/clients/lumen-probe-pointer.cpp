@@ -40,7 +40,7 @@
 
 int pointer_main(int argc, char** argv);
 
-#if !defined(PROBE_HAS_POINTER)
+#ifndef PROBE_HAS_POINTER
 
 int pointer_main(int, char**) {
     std::fprintf(stderr, "lumen-probe: built without the pointer protocol glue\n");

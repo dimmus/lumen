@@ -14,7 +14,7 @@ module;
 #include <time.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #include <systemd/sd-login.h>
 #endif
@@ -243,7 +243,7 @@ private:
     session_listener listener_{};
     /// The sleep delay inhibitor's fd (-1: none held).
     int sleep_fd_ = -1;
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     sd_bus* bus_ = nullptr;
     char session_path_[256]{};
     char seat_path_[256]{};
@@ -295,7 +295,7 @@ lx::session::logind_session& lx::session::logind_session::operator=(logind_sessi
     listener_ = other.listener_;
     sleep_fd_ = other.sleep_fd_;
     other.sleep_fd_ = -1;
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     bus_ = other.bus_;
     other.bus_ = nullptr;
     std::memcpy(session_path_, other.session_path_, sizeof(session_path_));
@@ -332,7 +332,7 @@ lx::session::logind_session& lx::session::logind_session::operator=(logind_sessi
 }
 
 void lx::session::logind_session::release() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     // The matches go first: nothing may call back into an object being torn down.
     for (sd_bus_slot** s : {&pause_slot_, &resume_slot_, &props_slot_, &lock_slot_,
                             &unlock_slot_, &sleep_slot_, &inhibit_call_}) {
@@ -414,7 +414,7 @@ lx::session::session_choice lx::session::discover_session(const session_discover
 
 lx::session::session_discovery lx::session::system_session_discovery() {
     session_discovery d{};
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     d.uid = static_cast<unsigned>(::getuid());
     d.env_session_id = std::getenv("XDG_SESSION_ID");
     d.pid_session = [](void*, char* out, std::size_t size) {
@@ -469,7 +469,7 @@ lx::session::session_discovery lx::session::system_session_discovery() {
 }
 
 void lx::session::logind_session::set_type(const char* type) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_ || !has_control_ || session_path_[0] == '\0' || !type)
         return;
     (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
@@ -482,7 +482,7 @@ void lx::session::logind_session::set_type(const char* type) {
 }
 
 lx::result<lx::session::logind_session> lx::session::logind_session::open() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     logind_session s{};
     const session_choice choice = discover_session(system_session_discovery());
     if (!choice.found()) {
@@ -621,7 +621,7 @@ bool lx::session::logind_session::holds_device(unsigned major, unsigned minor) c
 
 lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned major, unsigned minor,
                                                                     bool* inactive) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (bus_ && has_control_ && session_path_[0] != '\0') {
         sd_bus_error err = SD_BUS_ERROR_NULL;
         sd_bus_message* reply = nullptr;
@@ -694,7 +694,7 @@ void lx::session::logind_session::release_device(unsigned major, unsigned minor)
 }
 
 void lx::session::logind_session::send_release(unsigned major, unsigned minor) {
-#if !defined(LUMEN_HAS_LOGIND)
+#ifndef LUMEN_HAS_LOGIND
     (void)major;
     (void)minor;
 #else
@@ -717,7 +717,7 @@ void lx::session::logind_session::release_device_fd(int fd) {
 }
 
 void lx::session::logind_session::complete_pause(unsigned major, unsigned minor) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_ || !has_control_ || session_path_[0] == '\0')
         return;
     (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
@@ -733,7 +733,7 @@ void lx::session::logind_session::complete_pause(unsigned major, unsigned minor)
 lx::result<void> lx::session::logind_session::switch_vt(unsigned vt) {
     if (vt == 0 || vt > 63)
         return lx::invalid_argument("VT number out of range");
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_ || seat_path_[0] == '\0')
         return lx::make_error(lx::io_err::not_found, "no logind seat to switch VTs on");
     if (!can_tty_)
@@ -758,7 +758,7 @@ void lx::session::logind_session::fire_active(bool active) {
         listener_.active_changed(active, listener_.user);
 }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 int lx::session::logind_session::on_pause_device(sd_bus_message* m, void* user, sd_bus_error*) {
     auto* self = static_cast<logind_session*>(user);
@@ -907,7 +907,7 @@ int lx::session::logind_session::on_switch_reply(sd_bus_message* m, void* user, 
 
 lx::result<void> lx::session::logind_session::set_listener(session_listener listener) {
     listener_ = listener;
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_ || session_path_[0] == '\0')
         return lx::make_error(lx::io_err::not_found, "no logind session to listen on");
     if (pause_slot_)
@@ -944,7 +944,7 @@ lx::result<void> lx::session::logind_session::set_listener(session_listener list
 }
 
 void lx::session::logind_session::set_locked_hint(bool locked) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_ || session_path_[0] == '\0')
         return;
     (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
@@ -957,7 +957,7 @@ void lx::session::logind_session::set_locked_hint(bool locked) {
 }
 
 void lx::session::logind_session::take_sleep_inhibitor() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_ || sleep_fd_ >= 0 || inhibit_call_)
         return;
     (void)sd_bus_call_method_async(bus_, &inhibit_call_, "org.freedesktop.login1",
@@ -976,7 +976,7 @@ void lx::session::logind_session::release_sleep_inhibitor() {
 }
 
 void lx::session::logind_session::dispatch() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!bus_)
         return;
     while (sd_bus_process(bus_, nullptr) > 0) {
@@ -985,7 +985,7 @@ void lx::session::logind_session::dispatch() {
 }
 
 long long lx::session::logind_session::dispatch_timeout_ns() const {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     std::uint64_t at_us = 0;
     if (!bus_ || sd_bus_get_timeout(bus_, &at_us) <= 0 || at_us == UINT64_MAX)
         return -1;
@@ -1002,7 +1002,7 @@ long long lx::session::logind_session::dispatch_timeout_ns() const {
 }
 
 int lx::session::logind_session::bus_fd() const {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     return bus_ ? sd_bus_get_fd(bus_) : -1;
 #else
     return -1;

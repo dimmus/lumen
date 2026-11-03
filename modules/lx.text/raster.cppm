@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
@@ -474,7 +474,7 @@ lx::text::glyph_cache_counters lx::text::glyph_cache::counters() const { return 
 
 lx::result<void> lx::text::glyph_cache::rasterize_locked(face_cache& faces, const glyph_key& key,
                                                          glyph_entry& out, bool& color_out) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     const face_cache::handles h = faces.use_locked(key.face, key.size_26_6);
     auto* face = static_cast<FT_Face>(h.ft_face);
     if (!face)

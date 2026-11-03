@@ -70,7 +70,7 @@
 
 int window_main(int argc, char** argv);
 
-#if !defined(PROBE_HAS_WINDOW)
+#ifndef PROBE_HAS_WINDOW
 
 int window_main(int, char**) {
     std::fprintf(stderr, "lumen-probe: built without the window/session protocol glue\n");

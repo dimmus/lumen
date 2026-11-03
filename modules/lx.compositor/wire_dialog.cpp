@@ -37,7 +37,7 @@ import lx.wayland.server;
 import :toplevel;
 import :wire;
 
-#if defined(LUMEN_HAS_XDG_DIALOG)
+#ifdef LUMEN_HAS_XDG_DIALOG
 
 namespace lx::compositor::wire {
 

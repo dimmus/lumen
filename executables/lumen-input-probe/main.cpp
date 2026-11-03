@@ -274,7 +274,7 @@ int main(int argc, char* argv[]) {
     std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
     log_probe.info("lumen-input-probe  {}  listening {}s  log={}", stamp, seconds, log_path);
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     log_probe.info("built with LUMEN_HAS_INPUT: yes");
 #else
     // Without this the module is stubs and nothing can ever arrive, which looks identical

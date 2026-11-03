@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 #include <errno.h>
 #include <fcntl.h>
 #include <libinput.h>
@@ -363,7 +363,7 @@ void lx::input::seat::note_key(unsigned evdev_keycode, bool pressed) {
         pressed_.try_push_back(evdev_keycode); // dropped when full
 }
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 
 namespace {
 
@@ -434,7 +434,7 @@ const libinput_interface k_interface = {
 lx::input::input_manager::~input_manager() { destroy(); }
 
 void lx::input::input_manager::release_devices() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     for (const device_entry& e : devices_)
         libinput_device_unref(static_cast<libinput_device*>(e.device));
 #endif
@@ -443,7 +443,7 @@ void lx::input::input_manager::release_devices() {
 
 void lx::input::input_manager::destroy() {
     release_devices();
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     // Order matters: unref closes every device libinput still holds, and each close goes
     // back through the provider. Releasing the provider first would free it out from under
     // those callbacks.
@@ -499,7 +499,7 @@ lx::result<lx::input::input_manager> lx::input::input_manager::open(device_provi
                                                                     keymap_config keymap,
                                                                     bool num_lock,
                                                                     keyboard_keymap* compiled) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     input_manager mgr;
     mgr.provider_ = std::make_unique<device_provider>(provider);
 
@@ -550,7 +550,7 @@ lx::result<lx::input::input_manager> lx::input::input_manager::open(device_provi
 }
 
 int lx::input::input_manager::fd() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!libinput_)
         return -1;
     return libinput_get_fd(static_cast<struct libinput*>(libinput_));
@@ -560,7 +560,7 @@ int lx::input::input_manager::fd() const {
 }
 
 void lx::input::input_manager::suspend() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (libinput_ && !suspended_) {
         auto* li = static_cast<struct libinput*>(libinput_);
         libinput_suspend(li);
@@ -573,7 +573,7 @@ void lx::input::input_manager::suspend() {
 }
 
 lx::result<void> lx::input::input_manager::resume() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!libinput_ || !suspended_)
         return {};
     if (libinput_resume(static_cast<struct libinput*>(libinput_)) != 0)
@@ -585,7 +585,7 @@ lx::result<void> lx::input::input_manager::resume() {
 #endif
 }
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 
 void lx::input::input_manager::handle_event(void* raw) {
     auto* ev = static_cast<libinput_event*>(raw);
@@ -859,7 +859,7 @@ void lx::input::input_manager::handle_event(void* raw) {
 
 #endif // LUMEN_HAS_INPUT
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 namespace {
 
 libinput_device* li(void* d) { return static_cast<libinput_device*>(d); }
@@ -886,7 +886,7 @@ const lx::input::device_ops k_libinput_ops = {
             (void)libinput_device_config_tap_set_drag_lock_enabled(
                 li(d), on ? LIBINPUT_CONFIG_DRAG_LOCK_ENABLED : LIBINPUT_CONFIG_DRAG_LOCK_DISABLED);
         },
-#if defined(LUMEN_HAS_LIBINPUT_3FG_DRAG)
+#ifdef LUMEN_HAS_LIBINPUT_3FG_DRAG
     .three_finger_drag_fingers =
         [](void* d) { return static_cast<int>(libinput_device_config_3fg_drag_get_finger_count(li(d))); },
     .set_three_finger_drag =
@@ -964,7 +964,7 @@ const lx::input::device_ops k_libinput_ops = {
 #endif
 
 const lx::input::device_ops& lx::input::input_manager::libinput_ops() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     return k_libinput_ops;
 #else
     static const device_ops none{};
@@ -973,7 +973,7 @@ const lx::input::device_ops& lx::input::input_manager::libinput_ops() {
 }
 
 void lx::input::input_manager::configure_device(device_entry& e) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!device_config_ || e.kind == device_class::other)
         return;
     const char* name = libinput_device_get_name(li(e.device));
@@ -996,7 +996,7 @@ void lx::input::input_manager::reapply_device_config() {
 }
 
 void lx::input::input_manager::update_leds() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     const unsigned leds = seat_.keymap().led_mask();
     if (leds == leds_)
         return;
@@ -1008,7 +1008,7 @@ void lx::input::input_manager::update_leds() {
 }
 
 unsigned lx::input::input_manager::drain() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     auto* li = static_cast<struct libinput*>(libinput_);
     if (!li)
         return 0;
@@ -1051,7 +1051,7 @@ unsigned lx::input::input_manager::drain() {
 }
 
 unsigned lx::input::input_manager::dispatch() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!libinput_)
         return 0;
     auto* li = static_cast<struct libinput*>(libinput_);

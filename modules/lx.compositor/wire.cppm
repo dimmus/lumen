@@ -823,7 +823,7 @@ void bind_subcompositor(wayland::client_connection& client, unsigned id, int ver
 //    wire_dmabuf.cpp, wire_cursor_shape.cpp (protocol glue) ─────────────────
 
 wl_resource* wm_base_resource(const xdg_surface_obj* xs);
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 xdg_toplevel_obj* toplevel_of(wl_resource* resource);
 lx::compositor::toplevel_record* record_of(xdg_toplevel_obj* t);
 xdg_surface_obj* xdg_surface_from(wl_resource* resource);

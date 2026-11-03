@@ -59,7 +59,7 @@
 #include <wayland-client.h>
 
 #include "xdg-shell-client-protocol.h"
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
 #include "cursor-shape-v1-client-protocol.h"
 #endif
 
@@ -107,7 +107,7 @@ struct app {
     xdg_wm_base* wm_base = nullptr;
     wl_seat* seat = nullptr;
     wl_pointer* pointer = nullptr;
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     wp_cursor_shape_manager_v1* cursor_manager = nullptr;
     wp_cursor_shape_device_v1* cursor_device = nullptr;
 #endif
@@ -462,7 +462,7 @@ const xdg_wm_base_listener wm_base_listener = {wm_base_ping};
 // ── pointer ─────────────────────────────────────────────────────────────────
 
 void update_cursor(app& a) {
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     if (!a.cursor_device || !a.pointer_inside)
         return;
     const uint32_t edges = edges_at(a, a.pointer_x, a.pointer_y);
@@ -579,7 +579,7 @@ constexpr wl_pointer_listener make_pointer_listener() {
 const wl_pointer_listener pointer_listener = make_pointer_listener();
 
 void attach_cursor_device(app& a) {
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     if (a.cursor_manager && a.pointer && !a.cursor_device)
         a.cursor_device = wp_cursor_shape_manager_v1_get_pointer(a.cursor_manager, a.pointer);
 #else
@@ -588,7 +588,7 @@ void attach_cursor_device(app& a) {
 }
 
 void release_pointer(app& a) {
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     if (a.cursor_device) {
         wp_cursor_shape_device_v1_destroy(a.cursor_device);
         a.cursor_device = nullptr;
@@ -639,7 +639,7 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
         a.seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 5u)));
         wl_seat_add_listener(a.seat, &seat_listener, &a);
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     } else if (std::strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         a.cursor_manager = static_cast<wp_cursor_shape_manager_v1*>(
             wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1));
@@ -665,7 +665,7 @@ void destroy_app(app& a) {
     for (auto& s : a.slots)
         destroy_slot(s);
     release_pointer(a);
-#if defined(LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+#ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     if (a.cursor_manager)
         wp_cursor_shape_manager_v1_destroy(a.cursor_manager);
 #endif

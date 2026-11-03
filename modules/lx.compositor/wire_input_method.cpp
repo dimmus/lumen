@@ -42,11 +42,11 @@ module;
 #include <unistd.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
+#ifdef LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2
 #include "input-method-unstable-v2-server-protocol.h"
 #define LUMEN_HAS_INPUT_METHOD 1
 #endif
-#if defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1
 #include "virtual-keyboard-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_VIRTUAL_KEYBOARD 1
 #endif
@@ -107,7 +107,7 @@ namespace {
 
 } // namespace
 
-#if defined(LUMEN_HAS_INPUT_METHOD)
+#ifdef LUMEN_HAS_INPUT_METHOD
 
 namespace {
 
@@ -485,13 +485,13 @@ void bind_input_method_manager(wayland::client_connection& client, unsigned id, 
 
 #endif // LUMEN_HAS_INPUT_METHOD
 
-#if defined(LUMEN_HAS_VIRTUAL_KEYBOARD)
+#ifdef LUMEN_HAS_VIRTUAL_KEYBOARD
 
 namespace {
 
 /// The wire value of zwp_virtual_keyboard_v1.error.invalid_keymap_format (wlroots main; the
 /// tagged XML Lumen generates from predates the entry).
-#if defined(ZWP_VIRTUAL_KEYBOARD_V1_ERROR_INVALID_KEYMAP_FORMAT)
+#ifdef ZWP_VIRTUAL_KEYBOARD_V1_ERROR_INVALID_KEYMAP_FORMAT
 constexpr uint32_t k_vk_invalid_keymap_format = ZWP_VIRTUAL_KEYBOARD_V1_ERROR_INVALID_KEYMAP_FORMAT;
 #else
 constexpr uint32_t k_vk_invalid_keymap_format = 1;
@@ -713,7 +713,7 @@ void install_text_input(protocol_context& ctx) {
     lx::compositor::text_input_sink sink{};
     sink.user = &ctx;
     text_input_sink_events(sink);
-#if defined(LUMEN_HAS_INPUT_METHOD)
+#ifdef LUMEN_HAS_INPUT_METHOD
     sink.im_activate = &ev_activate;
     sink.im_deactivate = &ev_deactivate;
     sink.im_surrounding = &ev_surrounding;

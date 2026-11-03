@@ -31,11 +31,11 @@
 
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
-#if defined(LUMEN_PROTOCOL_RELATIVE_POINTER_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_RELATIVE_POINTER_UNSTABLE_V1
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #define PROBE_INPUT_RELATIVE 1
 #endif
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 #include <xkbcommon/xkbcommon.h>
 #endif
 
@@ -51,10 +51,10 @@ struct globals {
     wl_shm* shm = nullptr;
     wl_seat* seat = nullptr;
     xdg_wm_base* wm = nullptr;
-#if defined(PROBE_INPUT_RELATIVE)
+#ifdef PROBE_INPUT_RELATIVE
     zwp_relative_pointer_manager_v1* relative = nullptr;
 #endif
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     xkb_context* xkb = nullptr;
     xkb_keymap* keymap = nullptr;
     xkb_state* state = nullptr;
@@ -70,7 +70,7 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
         g.seat = static_cast<wl_seat*>(wl_registry_bind(r, name, &wl_seat_interface, version < 7 ? version : 7));
     else if (!std::strcmp(iface, xdg_wm_base_interface.name))
         g.wm = static_cast<xdg_wm_base*>(wl_registry_bind(r, name, &xdg_wm_base_interface, 1));
-#if defined(PROBE_INPUT_RELATIVE)
+#ifdef PROBE_INPUT_RELATIVE
     else if (!std::strcmp(iface, zwp_relative_pointer_manager_v1_interface.name))
         g.relative = static_cast<zwp_relative_pointer_manager_v1*>(
             wl_registry_bind(r, name, &zwp_relative_pointer_manager_v1_interface, 1));
@@ -135,7 +135,7 @@ wl_buffer* solid_buffer(int w, int h, uint32_t argb) {
 void kb_keymap(void*, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size) {
     std::string names;
     unsigned layouts = 0;
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
         void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (map != MAP_FAILED) {
@@ -173,7 +173,7 @@ void kb_key(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t stat
     char sym[64] = "?";
     char utf8[32] = "";
     unsigned layout = 0;
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (g.state) {
         const xkb_keysym_t s = xkb_state_key_get_one_sym(g.state, key + 8);
         xkb_keysym_get_name(s, sym, sizeof(sym));
@@ -189,7 +189,7 @@ void kb_key(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t stat
 
 void kb_modifiers(void*, wl_keyboard*, uint32_t, uint32_t depressed, uint32_t latched,
                   uint32_t locked, uint32_t group) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (g.state)
         xkb_state_update_mask(g.state, depressed, latched, locked, 0, 0, group);
 #endif
@@ -265,7 +265,7 @@ int input_main(int argc, char** argv) {
     wl_keyboard_add_listener(wl_seat_get_keyboard(g.seat), &keyboard_listener, nullptr);
     wl_pointer* pointer = wl_seat_get_pointer(g.seat);
     wl_pointer_add_listener(pointer, &pointer_listener, nullptr);
-#if defined(PROBE_INPUT_RELATIVE)
+#ifdef PROBE_INPUT_RELATIVE
     if (g.relative) {
         static const zwp_relative_pointer_v1_listener rl = {
             [](void*, zwp_relative_pointer_v1*, uint32_t, uint32_t, wl_fixed_t dx, wl_fixed_t dy,

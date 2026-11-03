@@ -48,7 +48,7 @@ import lx.wayland.client;
 
 // ── allocation accounting (the UI thread only, while `g_counting`) ──
 
-#if defined(__SANITIZE_ADDRESS__)
+#ifdef __SANITIZE_ADDRESS__
 #define LUMEN_TEST_SANITIZED 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
@@ -62,7 +62,7 @@ std::atomic<std::uint64_t> g_new_calls{0};
 std::atomic<std::uint64_t> g_malloc_calls{0};
 } // namespace
 
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);
@@ -869,7 +869,7 @@ int client_main(const char* tier_name, int fd) {
         const std::uint64_t frames = (a.surface.stats().frames - fa) + (b.surface.stats().frames - fb);
         a.surface.set_continuous(false);
         b.surface.set_continuous(false);
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
         check("G5: 0 operator new over 300 steady frames per surface (two surfaces drawn together)",
               ran && news == 0,
               std::format("{} frames, {} operator new, {} malloc ({:.1f} per frame: libwayland's "

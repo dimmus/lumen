@@ -231,7 +231,7 @@ void seat::release() {
     caps_ = 0;
     update_devices();
     free_keymap();
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (xkb_)
         xkb_context_unref(xkb_);
 #endif
@@ -485,7 +485,7 @@ void seat::forget_surface(const surface* s) {
 // Keyboard.
 
 void seat::free_keymap() {
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (state_)
         xkb_state_unref(state_);
     if (keymap_)
@@ -499,7 +499,7 @@ void seat::free_keymap() {
 }
 
 void seat::on_keymap(std::uint32_t format, int fd, std::uint32_t size) {
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
         ::close(fd);
         free_keymap();
@@ -545,7 +545,7 @@ void seat::on_keymap(std::uint32_t format, int fd, std::uint32_t size) {
 
 std::uint32_t seat::effective_modifiers() const {
     std::uint32_t m = 0;
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (!state_)
         return 0;
     for (unsigned i = 0; i < 6; ++i)
@@ -580,11 +580,11 @@ void seat::on_key(std::uint32_t serial, std::uint32_t time, std::uint32_t key, s
     e.time_ms = time;
     e.key = key;
     e.state = state == WL_KEYBOARD_KEY_STATE_PRESSED ? key_state::pressed
-#if defined(WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION)
+#ifdef WL_KEYBOARD_KEY_STATE_REPEATED_SINCE_VERSION
               : state == WL_KEYBOARD_KEY_STATE_REPEATED ? key_state::repeated
 #endif
                                                         : key_state::released;
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (state_) {
         const xkb_keycode_t code = key + 8;
         e.keysym = xkb_state_key_get_one_sym(state_, code);
@@ -603,7 +603,7 @@ void seat::on_key(std::uint32_t serial, std::uint32_t time, std::uint32_t key, s
 void seat::on_modifiers(std::uint32_t serial, std::uint32_t depressed, std::uint32_t latched,
                         std::uint32_t locked, std::uint32_t group) {
     (void)serial;
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (state_)
         (void)xkb_state_update_mask(state_, depressed, latched, locked, 0, 0, group);
 #else

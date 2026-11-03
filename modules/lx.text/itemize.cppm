@@ -1,12 +1,12 @@
 module;
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 #include <hb.h>
 #endif
-#if defined(LUMEN_HAS_FRIBIDI)
+#ifdef LUMEN_HAS_FRIBIDI
 #include <fribidi.h>
 #endif
-#if defined(LUMEN_HAS_UNIBREAK)
+#ifdef LUMEN_HAS_UNIBREAK
 #include <graphemebreak.h>
 #include <linebreak.h>
 #endif
@@ -161,14 +161,14 @@ struct itemizer_counters {
 
 /// Built with fribidi (UAX #9 levels) / libunibreak (UAX #14, UAX #29).
 [[nodiscard]] constexpr bool bidi_available() {
-#if defined(LUMEN_HAS_FRIBIDI)
+#ifdef LUMEN_HAS_FRIBIDI
     return true;
 #else
     return false;
 #endif
 }
 [[nodiscard]] constexpr bool segmentation_available() {
-#if defined(LUMEN_HAS_UNIBREAK)
+#ifdef LUMEN_HAS_UNIBREAK
     return true;
 #else
     return false;
@@ -282,7 +282,7 @@ constexpr bool hard_break(char32_t c) {
     return c == 0x0B || c == 0x0C || c == 0x85 || c == 0x2028;
 }
 
-#if defined(LUMEN_HAS_UNIBREAK)
+#ifdef LUMEN_HAS_UNIBREAK
 void init_unibreak_once() {
     static std::once_flag once;
     std::call_once(once, [] {
@@ -319,7 +319,7 @@ lx::text::itemizer::itemizer(itemizer_config config) : config_{config} {
     if (!cps_ || !offsets_ || !flags_ || !levels_ || !scripts_ || !types_ || !btypes_ ||
         !breaks_ || !runs_)
         release(); // out of memory at construction: every call reports it
-#if defined(LUMEN_HAS_UNIBREAK)
+#ifdef LUMEN_HAS_UNIBREAK
     init_unibreak_once();
 #endif
 }
@@ -419,7 +419,7 @@ void lx::text::itemizer::analyse(std::uint32_t n, text_direction direction, cons
     std::uint8_t base = direction == text_direction::rtl ? 1 : 0;
     for (std::uint32_t i = 0; i < n; ++i)
         levels_[i] = base;
-#if defined(LUMEN_HAS_FRIBIDI)
+#ifdef LUMEN_HAS_FRIBIDI
     static_assert(sizeof(FriBidiChar) == sizeof(char32_t));
     static_assert(sizeof(FriBidiCharType) == sizeof(std::uint32_t));
     static_assert(sizeof(FriBidiBracketType) == sizeof(std::uint32_t));
@@ -453,7 +453,7 @@ void lx::text::itemizer::analyse(std::uint32_t n, text_direction direction, cons
     base_level_ = base;
 
     // ── Scripts and per-character properties ──
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     hb_unicode_funcs_t* uf = hb_unicode_funcs_get_default();
 #endif
     std::uint32_t last = 0; // the last resolved real script
@@ -465,7 +465,7 @@ void lx::text::itemizer::analyse(std::uint32_t n, text_direction direction, cons
         if (hangs(c))
             f |= k_char_whitespace;
         std::uint32_t sc = 0;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
         const hb_unicode_general_category_t gc = hb_unicode_general_category(uf, c);
         if (gc == HB_UNICODE_GENERAL_CATEGORY_FORMAT || gc == HB_UNICODE_GENERAL_CATEGORY_CONTROL ||
             variation_selector(c))
@@ -492,14 +492,14 @@ void lx::text::itemizer::analyse(std::uint32_t n, text_direction direction, cons
         scripts_[i] = sc;
         flags_[i] = f;
     }
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     if (!any_resolved)
         for (std::uint32_t k = 0; k < n; ++k)
             scripts_[k] = static_cast<std::uint32_t>(HB_SCRIPT_COMMON);
 #endif
 
     // ── Grapheme clusters (UAX #29) and line breaks (UAX #14) ──
-#if defined(LUMEN_HAS_UNIBREAK)
+#ifdef LUMEN_HAS_UNIBREAK
     static_assert(sizeof(utf32_t) == sizeof(char32_t));
     const auto* u32 = reinterpret_cast<const utf32_t*>(cps_);
     set_graphemebreaks_utf32(u32, n, language, breaks_);
@@ -520,7 +520,7 @@ void lx::text::itemizer::analyse(std::uint32_t n, text_direction direction, cons
         const char32_t next = i + 1 < n ? cps_[i + 1] : 0;
         bool joins = false;
         if (i + 1 < n) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
             const auto gc = hb_unicode_general_category(uf, next);
             joins = gc == HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK ||
                     gc == HB_UNICODE_GENERAL_CATEGORY_SPACING_MARK ||

@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #endif
 #include <unistd.h>
@@ -67,7 +67,7 @@ public:
     [[nodiscard]] bool is_hardware() const { return device_ != nullptr; }
 
 private:
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     [[nodiscard]] lx::result<imported_image> import_vulkan(const dmabuf_desc& desc);
 #endif
 
@@ -123,7 +123,7 @@ bool lx::gfx::dmabuf_importer::can_import(const dmabuf_desc& desc) const {
     return std::ranges::contains(allowed_modifiers_, desc.planes[0].modifier);
 }
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 namespace {
 
 VkFormat fourcc_to_vk_format(lx::fourcc fmt) {
@@ -295,7 +295,7 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import(const dmabu
         return lx::make_error(lx::vulkan_err::import_failed, "invalid dmabuf desc");
     }
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (device_)
         return import_vulkan(desc);
 #endif
@@ -313,7 +313,7 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import(const dmabu
 }
 
 void lx::gfx::dmabuf_importer::release(imported_image& img) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (device_ && img.vk_image) {
         auto* vkdev = static_cast<VkDevice>(device_);
         vkDestroyImage(vkdev, static_cast<VkImage>(img.vk_image), nullptr);
@@ -338,7 +338,7 @@ lx::gfx::dmabuf_exporter::dmabuf_exporter(void* dev, void* phys)
 
 lx::result<lx::gfx::exported_dmabuf> lx::gfx::dmabuf_exporter::export_image(
     const imported_image& image) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto* vkdev = static_cast<VkDevice>(device_);
     if (!vkdev || !image.vk_memory || !image.vk_image) {
         return lx::not_implemented("lx::gfx::dmabuf_exporter::export_image");

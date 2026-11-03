@@ -44,7 +44,7 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <gbm.h>
 #include <linux/dma-buf.h>
 #endif
@@ -63,7 +63,7 @@
 
 int capture_main(int argc, char** argv);
 
-#if !defined(PROBE_HAS_CAPTURE)
+#ifndef PROBE_HAS_CAPTURE
 
 int capture_main(int, char**) {
     std::fprintf(stderr, "lumen-probe: built without the capture protocol glue\n");
@@ -281,7 +281,7 @@ struct capture_buffer {
     std::size_t size = 0;
     unsigned stride = 0;
     int dmabuf_fd = -1;
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     gbm_bo* bo = nullptr;
 #endif
     /// What changed since this buffer was last captured (bounding boxes, buffer pixels).
@@ -395,7 +395,7 @@ bool make_shm(capture_buffer& b) {
     return b.pixels != MAP_FAILED && b.buffer;
 }
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 gbm_device* g_gbm = nullptr;
 
 bool open_gbm() {
@@ -456,7 +456,7 @@ void destroy_buffer(capture_buffer& b) {
         wl_buffer_destroy(b.buffer);
     if (b.pixels && b.dmabuf_fd < 0)
         munmap(b.pixels, b.size);
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (b.bo)
         gbm_bo_destroy(b.bo);
 #endif
@@ -466,7 +466,7 @@ void destroy_buffer(capture_buffer& b) {
 }
 
 /// The pixels of `b` for reading (a dma-buf is mapped and synced for the read).
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 void* g_map_data = nullptr;
 #endif
 
@@ -474,7 +474,7 @@ const unsigned char* read_pixels(capture_buffer& b, bool& unmap_after) {
     unmap_after = false;
     if (b.dmabuf_fd < 0)
         return b.pixels;
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (b.bo) {
         // GBM's map (a driver may not support mmap of the dma-buf fd itself).
         uint32_t stride = 0;
@@ -491,7 +491,7 @@ const unsigned char* read_pixels(capture_buffer& b, bool& unmap_after) {
     void* p = mmap(nullptr, b.size, PROT_READ, MAP_SHARED, b.dmabuf_fd, 0);
     if (p == MAP_FAILED)
         return nullptr;
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     dma_buf_sync sync{DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
     (void)ioctl(b.dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
 #endif
@@ -502,14 +502,14 @@ const unsigned char* read_pixels(capture_buffer& b, bool& unmap_after) {
 void done_reading(capture_buffer& b, const unsigned char* p, bool unmap_after) {
     if (!unmap_after)
         return;
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (b.bo && g_map_data) {
         gbm_bo_unmap(b.bo, g_map_data);
         g_map_data = nullptr;
         return;
     }
 #endif
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     dma_buf_sync sync{DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
     (void)ioctl(b.dmabuf_fd, DMA_BUF_IOCTL_SYNC, &sync);
 #endif
@@ -616,7 +616,7 @@ int capture_main_impl(int argc, char** argv) {
         capture_buffer& b = buffers[static_cast<std::size_t>(n % nbuffers)];
         if (!b.buffer) {
             bool ok = false;
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
             if (dmabuf)
                 ok = make_dmabuf(b);
 #endif

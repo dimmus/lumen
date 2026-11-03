@@ -26,7 +26,7 @@ module;
 // semaphore the acquire submit waits on. Without those ioctls (kernel < 6.0) the release
 // waits for its fence on the CPU (logged once).
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #endif
 #include <errno.h>
@@ -63,7 +63,7 @@ constexpr lx::trace::category log_swapchain_vk{"gfx.swapchain"};
            static_cast<std::uint64_t>(ts.tv_nsec);
 }
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 enum vk_fn : unsigned {
     fn_get_memory_fd,
     fn_get_semaphore_fd,
@@ -114,7 +114,7 @@ vk_context client_gpu::vulkan_context() const {
 }
 
 lx::result<void> client_gpu::try_vulkan(bool forced, bool allow_software) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     // A software device is refused before it is created where possible: lavapipe's device
     // costs ~28 MB of heap and its JIT. `probe_devices` makes an instance only.
     if (!(forced && allow_software)) {
@@ -180,7 +180,7 @@ lx::result<void> client_gpu::try_vulkan(bool forced, bool allow_software) {
 // ── client_swapchain, Vulkan ─────────────────────────────────────────────────────
 
 lx::result<void> client_swapchain::make_vk_pool() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     const vk_context ctx = gpu_->vulkan_context();
     if (!ctx.valid())
         return lx::not_implemented("lx::gfx::client_swapchain::make_vk_pool");
@@ -294,7 +294,7 @@ lx::result<void> client_swapchain::make_vk_pool() {
 }
 
 void client_swapchain::destroy_vk_pool() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (vk_pool_ && gpu_) {
         const vk_context ctx = gpu_->vulkan_context();
         if (ctx.device)
@@ -306,7 +306,7 @@ void client_swapchain::destroy_vk_pool() {
 }
 
 void client_swapchain::vk_wait_device() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!gpu_)
         return;
     const vk_context ctx = gpu_->vulkan_context();
@@ -316,7 +316,7 @@ void client_swapchain::vk_wait_device() {
 }
 
 bool client_swapchain::vk_idle(const slot& s) const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!s.vk_submitted || !s.vk_fence)
         return true;
     const vk_context ctx = gpu_->vulkan_context();
@@ -329,7 +329,7 @@ bool client_swapchain::vk_idle(const slot& s) const {
 }
 
 lx::result<void> client_swapchain::make_vk(slot& s) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     const vk_context ctx = gpu_->vulkan_context();
     auto dev = static_cast<VkDevice>(ctx.device);
     auto phys = static_cast<VkPhysicalDevice>(ctx.physical_device);
@@ -597,7 +597,7 @@ lx::result<void> client_swapchain::make_vk(slot& s) {
 }
 
 void client_swapchain::destroy_vk(slot& s) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     const vk_context ctx = gpu_ ? gpu_->vulkan_context() : vk_context{};
     auto dev = static_cast<VkDevice>(ctx.device);
     if (dev) {
@@ -633,7 +633,7 @@ void client_swapchain::destroy_vk(slot& s) {
 }
 
 lx::result<void> client_swapchain::acquire_vk(slot& s) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (s.vk_owned)
         return {}; // a cancelled frame left it ours
     const vk_context ctx = gpu_->vulkan_context();
@@ -682,7 +682,7 @@ lx::result<void> client_swapchain::acquire_vk(slot& s) {
 }
 
 lx::result<void> client_swapchain::present_vk(slot& s) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     const vk_context ctx = gpu_->vulkan_context();
     auto dev = static_cast<VkDevice>(ctx.device);
     auto fence = static_cast<VkFence>(s.vk_fence);
@@ -755,7 +755,7 @@ lx::result<void> client_swapchain::present_vk(slot& s) {
 }
 
 lx::result<std::uint64_t> client_swapchain::wait_vk() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!last_presented_)
         return std::uint64_t{0};
     const slot& s = slots_[last_presented_->slot];

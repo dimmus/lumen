@@ -28,7 +28,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1
 #include "wlr-output-power-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_POWER 1
 #endif
@@ -54,7 +54,7 @@ namespace lx::compositor::wire {
 
 namespace {
 
-#if defined(LUMEN_HAS_OUTPUT_POWER)
+#ifdef LUMEN_HAS_OUTPUT_POWER
 
 /// One zwlr_output_power_v1. Inert (`live` false) after `failed`.
 struct power_obj {
@@ -181,7 +181,7 @@ const struct zwlr_output_power_manager_v1_interface power_manager_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_OUTPUT_POWER)
+#ifdef LUMEN_HAS_OUTPUT_POWER
 void bind_output_power_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -194,7 +194,7 @@ void bind_output_power_manager(wayland::client_connection& client, unsigned id, 
 #endif
 
 void output_power_outputs_changed() {
-#if defined(LUMEN_HAS_OUTPUT_POWER)
+#ifdef LUMEN_HAS_OUTPUT_POWER
     for (power_obj* o = g_power_objects; o; o = o->next)
         if (o->live && !slot_live(o->slot))
             make_failed(o);
@@ -206,7 +206,7 @@ void output_power_outputs_changed() {
 
 void lx::compositor::notify_output_power(protocol_context& ctx, unsigned slot, bool on) {
     (void)ctx;
-#if defined(LUMEN_HAS_OUTPUT_POWER)
+#ifdef LUMEN_HAS_OUTPUT_POWER
     for (wire::power_obj* o = wire::g_power_objects; o; o = o->next) {
         if (!o->live || wire::client_dying(wl_resource_get_client(o->resource)))
             continue;

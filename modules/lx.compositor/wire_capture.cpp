@@ -50,7 +50,7 @@ module;
 #include "ext-image-capture-source-v1-server-protocol.h"
 #include "ext-image-copy-capture-v1-server-protocol.h"
 #define LUMEN_HAS_IMAGE_CAPTURE 1
-#if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1
 #include "wlr-screencopy-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_SCREENCOPY 1
 #endif
@@ -105,7 +105,7 @@ capture_session_table g_sessions{};
 
 } // namespace
 
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
 
 namespace {
 
@@ -235,7 +235,7 @@ void buffer_unwatch(frame_obj* f) {
 void send_failed(frame_obj* f, capture_failure reason) {
     if (!f || f->state == frame_state::done)
         return;
-#if defined(LUMEN_HAS_SCREENCOPY)
+#ifdef LUMEN_HAS_SCREENCOPY
     if (f->screencopy)
         zwlr_screencopy_frame_v1_send_failed(f->resource);
     else
@@ -603,7 +603,7 @@ void send_ready(frame_obj* f, const capture_completion& meta) {
     }
     if (when == 0)
         when = mono_ns();
-#if defined(LUMEN_HAS_SCREENCOPY)
+#ifdef LUMEN_HAS_SCREENCOPY
     if (f->screencopy) {
         // flags, damage (copy_with_damage), ready.
         zwlr_screencopy_frame_v1_send_flags(f->resource, 0);
@@ -1026,7 +1026,7 @@ const struct ext_image_copy_capture_manager_v1_interface manager_impl = {
 
 // ── wlr-screencopy-unstable-v1 v3 (WS1) ──────────────────────────────────────
 
-#if defined(LUMEN_HAS_SCREENCOPY)
+#ifdef LUMEN_HAS_SCREENCOPY
 
 /// The output pixels of a logical region of output `o` (floor / ceil of the scaled box, then
 /// the output's transform), clipped to its mode.
@@ -1215,7 +1215,7 @@ void bind_toplevel_capture_source_manager(wayland::client_connection& client, un
         res.set_implementation(&toplevel_source_manager_impl, g_ctx, nullptr);
 }
 
-#if defined(LUMEN_HAS_SCREENCOPY)
+#ifdef LUMEN_HAS_SCREENCOPY
 void bind_screencopy_manager(wayland::client_connection& client, unsigned id, int version) {
     auto res = wayland::resource::create(client, &zwlr_screencopy_manager_v1_interface, version, id);
     if (res)
@@ -1253,7 +1253,7 @@ bool capture_source_of(wl_resource* source, capture_source_kind& kind, unsigned&
 // ── the compositor's entry points ────────────────────────────────────────────
 
 void capture_toplevel_unmapped(lx::toplevel_id id) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     g_sessions.for_each([&](unsigned handle, capture_session& cs) {
         if (cs.kind == capture_source_kind::toplevel && cs.toplevel == id)
             stop_session(session_of(handle), "window unmapped");
@@ -1265,7 +1265,7 @@ void capture_toplevel_unmapped(lx::toplevel_id id) {
 }
 
 void capture_fence_signalled(unsigned key, unsigned serial) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     if (key < k_poll_base)
         return;
     session_obj* so = session_of(key - k_poll_base);
@@ -1317,7 +1317,7 @@ void bind_capture_guards(protocol_context& ctx) {
 }
 
 bool capture_paces_surface(lx::surface_id surface) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     if (g_toplevel_views == 0 || !g_ctx || !g_ctx->tree || !g_ctx->toplevels)
         return false;
     const lx::surface_id root = g_ctx->tree->root_of(surface);
@@ -1341,7 +1341,7 @@ bool capture_paces_surface(lx::surface_id surface) {
 } // namespace lx::compositor::wire
 
 void lx::compositor::capture_complete(protocol_context& ctx) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     using namespace lx::compositor::wire;
     capture_host* h = ctx.capture;
     if (!h || !h->channel || !h->channel->has_completions())
@@ -1429,7 +1429,7 @@ void lx::compositor::capture_complete(protocol_context& ctx) {
 }
 
 void lx::compositor::capture_tick(protocol_context& ctx, unsigned frame, bool publish) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     using namespace lx::compositor::wire;
     capture_host* h = ctx.capture;
     if (!h)
@@ -1493,7 +1493,7 @@ void lx::compositor::capture_tick(protocol_context& ctx, unsigned frame, bool pu
 }
 
 void lx::compositor::capture_lock_check(protocol_context& ctx) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     using namespace lx::compositor::wire;
     capture_host* h = ctx.capture;
     const lock_state now = ctx.lock ? ctx.lock->state() : lock_state::unlocked;
@@ -1525,7 +1525,7 @@ void lx::compositor::capture_lock_check(protocol_context& ctx) {
 }
 
 long long lx::compositor::capture_view_floor(const protocol_context& ctx) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     using namespace lx::compositor::wire;
     if (!ctx.capture || g_toplevel_views == 0)
         return -1;
@@ -1548,7 +1548,7 @@ long long lx::compositor::capture_view_floor(const protocol_context& ctx) {
 }
 
 std::uint32_t lx::compositor::capture_wanted_outputs(const protocol_context& ctx) {
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
     using namespace lx::compositor::wire;
     const capture_host* h = ctx.capture;
     if (!h || !h->scene || g_toplevel_views == 0)
