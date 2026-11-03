@@ -704,7 +704,9 @@ LUMEN_TEST(manager_lays_titles_out_per_scale) {
     m.set_window_scales(rec.id, two);
     m.on_tick();
     LUMEN_CHECK(runs() == 2 && n->title->for_scale(1.5)->scale == 1.5);
-    LUMEN_CHECK(m.text()->find_close(1.5) != nullptr && m.text()->find_close(1.5)->size == 15);
+    LUMEN_CHECK(m.text()->find_close(1.5) != nullptr &&
+                m.text()->find_close(1.5)->size ==
+                    static_cast<int>(std::lround(lx::compositor::k_deco_close_glyph * 1.5)));
     // A move (same width) and a focus change lay nothing out: the glyph storage is untouched.
     const lx::compositor::title_glyph* before = n->title->for_scale(1.0)->glyphs.data();
     rec.geometry.x += 25;
@@ -753,7 +755,7 @@ LUMEN_TEST(cpu_titles_match_the_reference) {
     LUMEN_CHECK(channel(at(ca.x + ca.width / 2, ca.y + ca.height / 2), 16) > 0xC0);
     // The hovered button's circle under the glyph.
     const lx::rect2i cb = lx::compositor::close_rect(k_windows[1].geometry);
-    LUMEN_CHECK(at(cb.x + 6, cb.y + cb.height / 2) ==
+    LUMEN_CHECK(at(cb.x + 10, cb.y + cb.height / 2) ==
               (lx::compositor::k_deco_button_hover & 0xFFFFFFu)); // the neutral hover circle
 }
 

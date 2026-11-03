@@ -707,3 +707,15 @@ The settings tests still find controls by role and element key (unchanged keys);
 precondition — occluded windows carry visibility rects the crop path does not move) with
 the three-button geometry regolded. 134/134 test targets green (`test_ui_inputs` now runs
 8 cases; the gallery grew a dropdown-and-spinner row, both themes regolded).
+
+A follow-up pass against Zed's own settings panes: **every** enumeration picks through the
+dropdown (the two- and three-word selectors like focus mode and the acceleration profile
+too — never segmented; the Displays transform likewise), the rows top-align their controls
+with the label's first line (13 px labels, 12 px descriptions, the value columns 2 px
+under the row's top padding), the spinner centres its value and hugs at a 110 px floor,
+and the rounded hover highlights stay (Zed's rounded selection rows). The title bar's
+glyphs and hover disc came down (9/10 px glyphs, a 20 px disc, the ×'s coverage drawn from
+the glyph's own box so any size stays symmetric), and the stuck-hover bug is fixed:
+`set_decoration_hover` now resets every button unless the pointer is moving onto one —
+leaving a button for the title of the same window had left it lit forever (the per-button
+state made the old single-field clear a no-op for non-button zones).

@@ -35,11 +35,12 @@ inline constexpr int k_deco_corner = 20;
 inline constexpr int k_deco_title_padding = 10;
 
 /// The close glyph's edge at scale 1 (its tile in the compositor's text atlas).
-inline constexpr int k_deco_close_glyph = 10;
-/// A hover / pressed button's circle: its diameter at scale 1, centred in the button.
-inline constexpr int k_deco_close_circle = 24;
+inline constexpr int k_deco_close_glyph = 9;
+/// A hover / pressed button's rounded highlight: its diameter at scale 1, centred in the
+/// button (Zed's: a small quiet disc well inside the 36 px button).
+inline constexpr int k_deco_close_circle = 20;
 /// The minimize / maximize glyph's box at scale 1 (strokes of `k_deco_glyph_stroke`).
-inline constexpr int k_deco_glyph_box = 12;
+inline constexpr int k_deco_glyph_box = 10;
 /// The stroke of the minimize / maximize glyphs (logical px; the project scales it).
 inline constexpr int k_deco_glyph_stroke = 1;
 
@@ -117,9 +118,10 @@ enum class deco_zone : unsigned char {
 
 // ── Close glyph ────────────────────────────────────────────────────────────
 
-/// The close glyph's coverage at `scale` (`size` = round(10 × scale) texels square, R8, `size`
-/// bytes per row): an "×" — two diagonals from (1.5, 1.5) to (8.5, 8.5) of the 10 px box, a
-/// 1.5 px stroke, analytic anti-aliasing — drawn for that scale rather than resampled.
+/// The close glyph's coverage at `scale` (`size` = round(k_deco_close_glyph × scale)
+/// texels square, R8, `size` bytes per row): an "×" — two diagonals corner to corner,
+/// 1.5 px inside the box, a 1.5 px stroke, analytic anti-aliasing — drawn for that scale
+/// rather than resampled.
 void build_close_coverage(double scale, int size, std::uint8_t* out);
 
 // ── Title text (ADR-010 §4.11) ─────────────────────────────────────────────
@@ -416,11 +418,12 @@ constexpr lx::trace::category log_deco{"compositor.deco"};
 }
 
 /// The close glyph's coverage at pixel (x, y) of its box at `scale`: two diagonals from
-/// (1.5, 1.5) to (8.5, 8.5) of a 10 px box, a 1.5 px stroke, all scaled; a 1 px linear ramp at
-/// the edge (half stroke + half pixel − distance). Unclamped.
+/// 1.5 px inside the box's corners to 1.5 px inside its opposite corners, a 1.5 px
+/// stroke, all scaled; a 1 px linear ramp at the edge (half stroke + half pixel −
+/// distance). Unclamped.
 [[nodiscard]] double close_coverage(double scale, int x, int y) {
     const double px = x + 0.5, py = y + 0.5;
-    const double lo = 1.5 * scale, hi = 8.5 * scale;
+    const double lo = 1.5 * scale, hi = (lx::compositor::k_deco_close_glyph - 1.5) * scale;
     const double d1 = segment_distance(px, py, lo, lo, hi, hi);
     const double d2 = segment_distance(px, py, hi, lo, lo, hi);
     const double d = d1 < d2 ? d1 : d2;

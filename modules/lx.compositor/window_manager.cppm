@@ -3508,12 +3508,25 @@ void lx::compositor::window_manager::set_decoration_hover(lx::toplevel_id id, de
     const lx::toplevel_id old_id = pointer_zone_ != deco_zone::none ? pointer_focus_
                                                                     : lx::toplevel_id{};
     if (decorations_) {
-        if (old_id && !(old_id == id && zone != deco_zone::none))
-            decorations_->set_button(old_id, pointer_zone_, deco_button::normal);
-        if (zone != deco_zone::none)
-            decorations_->set_button(id, zone,
-                                     button_index(zone) < 3 ? deco_button::hover
-                                                            : deco_button::normal);
+        // The buttons reset unless the pointer is moving onto one of them: leaving a
+        // button for the title or a band of the same window must clear it too (the
+        // per-button state, not one field, is what changed with the three-button bar).
+        const auto clear_buttons = [&](lx::toplevel_id w) {
+            for (const deco_zone b : {deco_zone::minimize, deco_zone::maximize,
+                                      deco_zone::close})
+                decorations_->set_button(w, b, deco_button::normal);
+        };
+        if (old_id && old_id != id)
+            clear_buttons(old_id);
+        if (zone == deco_zone::none) {
+            if (old_id && old_id == id)
+                clear_buttons(old_id);
+        } else if (button_index(zone) < 3) {
+            clear_buttons(id);
+            decorations_->set_button(id, zone, deco_button::hover);
+        } else if (old_id == id) {
+            clear_buttons(id); // onto the title or a band of the same window
+        }
     }
     if (cursor_) {
         if (zone != deco_zone::none)
