@@ -18,10 +18,10 @@ module;
 // The sd-event loop needs any libsystemd (the user bus attaches to it); the Varlink server
 // needs sd-varlink and sd-json, public since systemd 257 (LUMEN_HAS_VARLINK). Without them
 // the loop still runs and the socket is not_implemented.
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-event.h>
 #endif
-#if defined(LUMEN_HAS_VARLINK)
+#ifdef LUMEN_HAS_VARLINK
 #include <systemd/sd-json.h>
 #include <systemd/sd-varlink-idl.h>
 #include <systemd/sd-varlink.h>
@@ -191,7 +191,7 @@ error SessionLocked (action: string)
 error TooManySubscribers ()
 )IDL";
 
-#if defined(LUMEN_HAS_VARLINK)
+#ifdef LUMEN_HAS_VARLINK
 
 constexpr lx::trace::category log_control{"compositor.control"};
 
@@ -371,7 +371,7 @@ constexpr const char* k_err_subscribers = "io.lumen.Compositor.TooManySubscriber
 
 const char* control_interface_idl() { return k_idl; }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 int control_server::fd() const {
     return event_ ? sd_event_get_fd(static_cast<sd_event*>(event_)) : -1;
@@ -394,7 +394,7 @@ void run_event_loop(void* event) {
 
 #endif
 
-#if defined(LUMEN_HAS_VARLINK)
+#ifdef LUMEN_HAS_VARLINK
 
 struct control_server::impl {
     static control_server* self(sd_varlink* link) {
@@ -954,7 +954,7 @@ void control_server::close() {
 struct control_server::impl {};
 
 control_server::~control_server() { close(); }
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 // libsystemd < 257: the sd-event loop alone, for the user bus (the session environment).
 lx::result<void> control_server::open(control_host host) {
     if (event_)

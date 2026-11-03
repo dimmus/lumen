@@ -3,9 +3,7 @@ module;
 // The notification popups (`:notify_view`). See the partition.
 
 #include <stdint.h>
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#endif
 
 module lx.shell;
 
@@ -348,7 +346,6 @@ void lx::shell::notification_view::set_position(notify_position p) {
     close(); // made again where it now belongs at the next update
 }
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 void lx::shell::notification_view::update(const notification_center& c, unsigned output_slot) {
     center_ = &c;
@@ -830,14 +827,5 @@ void lx::shell::notification_view::after_dispatch() {
     }
 }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-void lx::shell::notification_view::update(const notification_center&, unsigned) {}
-void lx::shell::notification_view::close() {}
-void lx::shell::notification_view::after_dispatch() {}
-lx::ui::child lx::shell::notification_view::build_ui() { return nullptr; }
-void lx::shell::notification_view::on_layer_closed() {}
-
-#endif
 
 lx::shell::notification_view::~notification_view() { close(); }

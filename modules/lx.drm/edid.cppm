@@ -8,7 +8,7 @@ module;
 // string or number — the same strings libdisplay-info falls back to, minus the vendor
 // table.
 
-#if defined(LUMEN_HAS_DISPLAY_INFO)
+#ifdef LUMEN_HAS_DISPLAY_INFO
 // A C library whose headers carry no `extern "C"` of their own.
 extern "C" {
 #include <libdisplay-info/info.h>
@@ -99,7 +99,7 @@ bool lx::drm::parse_edid_base_block(const unsigned char* d, unsigned size, edid_
 }
 
 bool lx::drm::parse_edid_identity(const unsigned char* data, unsigned size, edid_identity& out) {
-#if defined(LUMEN_HAS_DISPLAY_INFO)
+#ifdef LUMEN_HAS_DISPLAY_INFO
     out = {};
     if (!data || size < 128)
         return false;

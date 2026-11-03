@@ -20,7 +20,7 @@ module;
 #include <syslog.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #include <systemd/sd-journal.h>
 #endif
@@ -902,7 +902,7 @@ void lx::shell::app_launcher::start_fork(const prepared_launch& p, std::string_v
         go[0] = go[1] = -1; // not held: launched like the plain fallback
     const int devnull = open("/dev/null", O_RDWR | O_CLOEXEC);
     int out_fd = -1;
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     out_fd = sd_journal_stream_fd(p.id, LOG_INFO, 0);
     if (out_fd >= 0)
         (void)fcntl(out_fd, F_SETFD, FD_CLOEXEC);
@@ -1020,7 +1020,7 @@ void lx::shell::app_launcher::run_deadlines() {
 
 unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeout_ms) const {
     unsigned n = 0;
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     auto add_bus = [&](void* b) {
         if (!b || n >= cap)
             return;
@@ -1067,7 +1067,7 @@ unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeo
 }
 
 void lx::shell::app_launcher::dispatch(std::span<const pollfd> fds) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (bus_ && !shared_bus_) {
         // The bus is processed every time: its timeouts (a call's reply deadline) are due
         // even without fd activity. (A shared bus is its owner's to process.)
@@ -1133,7 +1133,7 @@ void lx::shell::app_launcher::dispatch(std::span<const pollfd> fds) {
     run_deadlines();
 }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 struct lx::shell::app_launcher::events {
     static int job_removed(sd_bus_message* m, void* data, sd_bus_error*) {

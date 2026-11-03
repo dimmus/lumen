@@ -27,11 +27,11 @@ module;
 #include <unistd.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
+#ifdef LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1
 #include "ext-data-control-v1-server-protocol.h"
 #define LUMEN_HAS_EXT_DATA_CONTROL 1
 #endif
-#if defined(LUMEN_PROTOCOL_WLR_DATA_CONTROL_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_DATA_CONTROL_UNSTABLE_V1
 #include "wlr-data-control-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_WLR_DATA_CONTROL 1
 #endif
@@ -183,7 +183,7 @@ void create_device(wl_client* client, wl_resource* manager, uint32_t id, const d
 
 // ── ext-data-control-v1 ──
 
-#if defined(LUMEN_HAS_EXT_DATA_CONTROL)
+#ifdef LUMEN_HAS_EXT_DATA_CONTROL
 
 extern const dc_protocol ext_proto;
 
@@ -252,7 +252,7 @@ const dc_protocol ext_proto = make_ext();
 
 // ── zwlr-data-control-unstable-v1 ──
 
-#if defined(LUMEN_HAS_WLR_DATA_CONTROL)
+#ifdef LUMEN_HAS_WLR_DATA_CONTROL
 
 extern const dc_protocol wlr_proto;
 
@@ -321,7 +321,7 @@ const dc_protocol wlr_proto = make_wlr();
 
 } // namespace
 
-#if defined(LUMEN_HAS_EXT_DATA_CONTROL)
+#ifdef LUMEN_HAS_EXT_DATA_CONTROL
 void bind_ext_data_control_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -331,7 +331,7 @@ void bind_ext_data_control_manager(wayland::client_connection& client, unsigned 
 }
 #endif
 
-#if defined(LUMEN_HAS_WLR_DATA_CONTROL)
+#ifdef LUMEN_HAS_WLR_DATA_CONTROL
 void bind_wlr_data_control_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;

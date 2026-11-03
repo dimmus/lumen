@@ -25,7 +25,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3)
+#ifdef LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3
 #include "text-input-unstable-v3-server-protocol.h"
 #define LUMEN_HAS_TEXT_INPUT 1
 #endif
@@ -50,7 +50,7 @@ constexpr lx::trace::category log_ime{"compositor.ime"};
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_TEXT_INPUT)
+#ifdef LUMEN_HAS_TEXT_INPUT
 
 namespace {
 

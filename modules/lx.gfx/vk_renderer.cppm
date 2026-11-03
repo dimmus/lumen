@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #endif
 #include <stdint.h>
@@ -705,7 +705,7 @@ private:
 
 } // namespace lx::gfx
 
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
 
 namespace {
 
@@ -1170,7 +1170,7 @@ VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_lay
 
 bool lx::gfx::host_image_copier::init(const vk_context& ctx, unsigned vk_format) {
     *this = {};
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ctx.valid() || !ctx.supports_host_image_copy)
         return false;
     auto dev = static_cast<VkDevice>(ctx.device);
@@ -1234,7 +1234,7 @@ bool lx::gfx::host_image_copier::init(const vk_context& ctx, unsigned vk_format)
 }
 
 unsigned lx::gfx::host_image_copier::usage() const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     return usable() ? static_cast<unsigned>(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) : 0u;
 #else
     return 0u;
@@ -1242,7 +1242,7 @@ unsigned lx::gfx::host_image_copier::usage() const {
 }
 
 lx::result<void> lx::gfx::host_image_copier::prepare(void* image) const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!usable() || !image)
         return lx::not_implemented("lx::gfx::host_image_copier::prepare");
     VkHostImageLayoutTransitionInfoEXT t{};
@@ -1266,7 +1266,7 @@ lx::result<void> lx::gfx::host_image_copier::prepare(void* image) const {
 lx::result<void> lx::gfx::host_image_copier::copy(void* image, const void* pixels,
                                                   unsigned row_texels,
                                                   lx::rect2i region) const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!usable() || !image || !pixels)
         return lx::not_implemented("lx::gfx::host_image_copier::copy");
     if (region.width <= 0 || region.height <= 0 || region.x < 0 || region.y < 0)
@@ -1331,7 +1331,7 @@ lx::gfx::render_target& lx::gfx::render_target::operator=(render_target&& other)
 }
 
 void lx::gfx::render_target::destroy() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (dev) {
         if (view_)
@@ -1353,7 +1353,7 @@ lx::result<lx::gfx::render_target> lx::gfx::render_target::create(const vk_conte
                                                                   unsigned width,
                                                                   unsigned height,
                                                                   lx::pixel_format format) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ctx.valid() || width == 0 || height == 0)
         return lx::not_implemented("lx::gfx::render_target::create");
 
@@ -1452,7 +1452,7 @@ lx::result<lx::gfx::render_target> lx::gfx::render_target::create(const vk_conte
 }
 
 lx::result<lx::gfx::exported_dmabuf> lx::gfx::render_target::export_dmabuf() const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!image_ || !memory_)
         return lx::not_implemented("lx::gfx::render_target::export_dmabuf");
 
@@ -1497,7 +1497,7 @@ int lx::gfx::vulkan_compositor::alloc_texture(unsigned id) {
 }
 
 void lx::gfx::vulkan_compositor::destroy_texture(texture_slot& slot) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (dev) {
         // Uploads are submitted without waiting, so a queued command buffer may still
@@ -1521,7 +1521,7 @@ void lx::gfx::vulkan_compositor::destroy_texture(texture_slot& slot) {
 }
 
 void lx::gfx::vulkan_compositor::wait_all_slots_idle() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev)
         return;
@@ -1539,7 +1539,7 @@ void lx::gfx::vulkan_compositor::wait_all_slots_idle() {
 void lx::gfx::vulkan_compositor::begin_timing(void* command_buffer) {
     const unsigned slot = submit_slot_;
     slot_timed_[slot] = timing_ && query_pool_ != nullptr;
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!slot_timed_[slot])
         return;
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
@@ -1552,7 +1552,7 @@ void lx::gfx::vulkan_compositor::begin_timing(void* command_buffer) {
 }
 
 void lx::gfx::vulkan_compositor::write_timestamp(void* command_buffer, unsigned which) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     const unsigned slot = submit_slot_;
     if (!slot_timed_[slot])
         return;
@@ -1569,7 +1569,7 @@ void lx::gfx::vulkan_compositor::write_timestamp(void* command_buffer, unsigned 
 void lx::gfx::vulkan_compositor::read_timing(unsigned slot) {
     const std::uint64_t serial = slot_serial_[slot];
     slot_serial_[slot] = 0;
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     std::uint64_t ticks[k_timestamps]{};
     // No WAIT bit: the slot's fence has signalled, so the results are available; anything
     // else (VK_NOT_READY, a lost device) drops this frame's time rather than blocking.
@@ -1597,7 +1597,7 @@ void lx::gfx::vulkan_compositor::read_timing(unsigned slot) {
 }
 
 unsigned lx::gfx::vulkan_compositor::take_gpu_times(composite_gpu_time* out, unsigned capacity) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     // Slots whose frame has finished, oldest first. A fence still unsignalled is left for a
     // later call: nothing here waits.
     auto dev = static_cast<VkDevice>(ctx_.device);
@@ -1887,7 +1887,7 @@ void lx::gfx::vulkan_compositor::shutdown() {
     linear_cb_ = nullptr;
     linear_target_ = nullptr;
     linear_pass_open_ = false;
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (dev) {
         vkDeviceWaitIdle(dev);
@@ -2014,7 +2014,7 @@ void lx::gfx::vulkan_compositor::shutdown() {
 }
 
 lx::result<void> lx::gfx::vulkan_compositor::create_descriptor(texture_slot& slot) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     auto layout = static_cast<VkDescriptorSetLayout>(descriptor_layout_);
     if (!dev || !layout || !descriptor_pool_ || !slot.view)
@@ -2053,7 +2053,7 @@ lx::result<void> lx::gfx::vulkan_compositor::create_descriptor(texture_slot& slo
 }
 
 lx::result<void> lx::gfx::vulkan_compositor::bind_imported(const imported_image& image) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::bind_imported");
     if (!image.vk_image || image.image_id == 0) {
@@ -2116,7 +2116,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
                                                           const unsigned char* rgba,
                                                           lx::rect2i region,
                                                           std::span<const lx::rect2i> rects) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::upload_rgba");
     if (texture_id == 0 || width == 0 || height == 0 || !rgba) {
@@ -2370,7 +2370,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
 }
 
 lx::result<void> lx::gfx::vulkan_compositor::sync_atlas(atlas& a) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::sync_atlas");
     const bool fresh_atlas = atlas_seen_ != &a;
@@ -2401,7 +2401,7 @@ lx::result<void> lx::gfx::vulkan_compositor::sync_atlas(atlas& a) {
 lx::result<void> lx::gfx::vulkan_compositor::upload_coverage(unsigned texture_id,
                                                              const atlas_page_view& view,
                                                              std::span<const lx::rect2i> rects) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
     // Every frame that may sample the page is complete before it is written (and the staging
@@ -2554,7 +2554,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_coverage(unsigned texture_id
 }
 
 lx::result<void> lx::gfx::vulkan_compositor::ensure_staging_ring(unsigned need_bytes) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (staging_buffer_ && staging_capacity_ >= need_bytes)
         return {};
     auto dev = static_cast<VkDevice>(ctx_.device);
@@ -2623,7 +2623,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_staging_ring(unsigned need_b
 
 lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_completion,
                                                                  int* out_fence_fd) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     auto queue = static_cast<VkQueue>(ctx_.queue);
     const unsigned slot = submit_slot_;
@@ -2693,7 +2693,7 @@ lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_c
 }
 
 void lx::gfx::vulkan_compositor::destroy_encode_pipeline() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev)
         return;
@@ -2839,7 +2839,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
 }
 
 void lx::gfx::vulkan_compositor::destroy_linear_target(linear_target& t) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev)
         return;
@@ -2863,7 +2863,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
                                                                   unsigned height,
                                                                   const void* previous,
                                                                   bool chained) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev || !pipeline_ || width == 0 || height == 0)
         return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_linear_target");
@@ -3494,7 +3494,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
 }
 
 void lx::gfx::vulkan_compositor::record_acquires(void* command_buffer) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
     acquired_count_ = 0;
     // Acquire freshly imported client images. A dma-buf written by another device has no
@@ -3841,7 +3841,7 @@ bool lx::gfx::vulkan_compositor::begin_blur_frame(unsigned output,
 }
 
 void lx::gfx::vulkan_compositor::destroy_blur_entry(blur_entry& e) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     for (blur_level& l : e.levels) {
         if (dev) {
@@ -4391,7 +4391,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
 }
 
 void lx::gfx::vulkan_compositor::abandon_linear_frame() {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (linear_cb_) {
         auto cb = static_cast<VkCommandBuffer>(linear_cb_);
         if (linear_pass_open_)
@@ -4408,7 +4408,7 @@ void lx::gfx::vulkan_compositor::abandon_linear_frame() {
 lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& target,
                                                         unsigned char* rgba,
                                                         unsigned capacity) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ready() || !target.valid())
         return lx::not_implemented("lx::gfx::vulkan_compositor::read_back");
     const unsigned needed = target.width() * target.height() * 4u;
@@ -4525,7 +4525,7 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
                                                               const render_target& target,
                                                               const lx::rect2i* rects,
                                                               unsigned count) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (!ready() || !target.valid() || slot >= k_readback_slots)
         return lx::not_implemented("lx::gfx::vulkan_compositor::read_back_async");
     auto dev = static_cast<VkDevice>(ctx_.device);
@@ -4721,7 +4721,7 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
 
 const unsigned char* lx::gfx::vulkan_compositor::read_back_wait(
     unsigned slot, unsigned long long timeout_ns) const {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (slot >= k_readback_slots)
         return nullptr;
     const readback_slot& rb = readbacks_[slot];
@@ -4740,7 +4740,7 @@ const unsigned char* lx::gfx::vulkan_compositor::read_back_wait(
 }
 
 void lx::gfx::vulkan_compositor::read_back_free(unsigned slot) {
-#if defined(LUMEN_HAS_VULKAN)
+#ifdef LUMEN_HAS_VULKAN
     if (slot >= k_readback_slots)
         return;
     readback_slot& rb = readbacks_[slot];

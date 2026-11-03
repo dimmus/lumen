@@ -5,7 +5,7 @@ module;
 
 #include <errno.h>
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <sys/epoll.h>
 #include <unistd.h>
 #endif
@@ -183,7 +183,7 @@ bool cu_ready(const cu_record& r, bool fences_clear, const cu_conditions& c) {
 // ── readiness_poller ───────────────────────────────────────────────────────
 
 readiness_poller::~readiness_poller() {
-#if defined(__linux__)
+#ifdef __linux__
     for (unsigned i = 0; i < k_max; ++i)
         if (entries_[i].fd >= 0)
             ::close(entries_[i].fd);
@@ -193,7 +193,7 @@ readiness_poller::~readiness_poller() {
 }
 
 lx::result<void> readiness_poller::open() {
-#if defined(__linux__)
+#ifdef __linux__
     if (epfd_ >= 0)
         return {};
     epfd_ = ::epoll_create1(EPOLL_CLOEXEC);
@@ -206,7 +206,7 @@ lx::result<void> readiness_poller::open() {
 }
 
 bool readiness_poller::add(int fd, unsigned cu, unsigned generation, bool reserved) {
-#if defined(__linux__)
+#ifdef __linux__
     if (fd < 0)
         return false;
     if (epfd_ < 0 || available(reserved) == 0) {
@@ -245,7 +245,7 @@ bool readiness_poller::add(int fd, unsigned cu, unsigned generation, bool reserv
 }
 
 void readiness_poller::remove(unsigned index) {
-#if defined(__linux__)
+#ifdef __linux__
     entry& e = entries_[index];
     if (e.fd < 0)
         return;
@@ -273,7 +273,7 @@ unsigned readiness_poller::drop(unsigned cu) {
 }
 
 unsigned readiness_poller::drain(wake* out, unsigned cap) {
-#if defined(__linux__)
+#ifdef __linux__
     if (epfd_ < 0 || used_ == 0 || cap == 0)
         return 0;
     epoll_event events[32];

@@ -20,7 +20,7 @@ import lx.scheduler;
 import lx.compositor;
 import lx.wayland.client;
 
-#if defined(LUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1
 #error "this unit is compiled with the layer-shell protocol macro undefined"
 #endif
 static_assert(LX_WLC_LAYER == 0, "no layer-shell glue: the layer gate is closed");

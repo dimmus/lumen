@@ -156,7 +156,7 @@ lx::result<void> context::start(lx::wayland::display& display, lx::runtime::even
 
     // The worker: icon rasters and theme reloads (the only work posted to it here).
     bool watch = false;
-#if !defined(NDEBUG)
+#ifndef NDEBUG
     watch = true;
 #endif
     if (options.watch_theme >= 0)

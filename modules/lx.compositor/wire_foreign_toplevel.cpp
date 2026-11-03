@@ -21,12 +21,12 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <sys/random.h>
 #endif
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1)
+#ifdef LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1
 #include "ext-foreign-toplevel-list-v1-server-protocol.h"
 #define LUMEN_HAS_FOREIGN_TOPLEVEL_LIST 1
 #endif
@@ -61,7 +61,7 @@ unsigned long long text_hash(const char* s) {
 void make_identifier(char (&out)[33]) {
     unsigned char bytes[16]{};
     std::size_t got = 0;
-#if defined(__linux__)
+#ifdef __linux__
     while (got < sizeof(bytes)) {
         const ssize_t n = ::getrandom(bytes + got, sizeof(bytes) - got, 0);
         if (n <= 0)
@@ -87,7 +87,7 @@ void make_identifier(char (&out)[33]) {
 
 } // namespace
 
-#if defined(LUMEN_HAS_FOREIGN_TOPLEVEL_LIST)
+#ifdef LUMEN_HAS_FOREIGN_TOPLEVEL_LIST
 
 namespace {
 
@@ -267,14 +267,14 @@ namespace {
 
 void observe_mapped(void*, toplevel_record& rec) {
     make_identifier(rec.foreign_identifier);
-#if defined(LUMEN_HAS_FOREIGN_TOPLEVEL_LIST)
+#ifdef LUMEN_HAS_FOREIGN_TOPLEVEL_LIST
     for (list_obj* l = g_lists; l; l = l->next)
         announce(l, rec);
 #endif
 }
 
 void observe_unmapped(void*, toplevel_record& rec) {
-#if defined(LUMEN_HAS_FOREIGN_TOPLEVEL_LIST)
+#ifdef LUMEN_HAS_FOREIGN_TOPLEVEL_LIST
     for (handle_obj* h = g_handles; h; h = h->next) {
         if (h->toplevel != rec.id)
             continue;
@@ -288,7 +288,7 @@ void observe_unmapped(void*, toplevel_record& rec) {
 }
 
 void observe_changed(void*, const toplevel_record& rec) {
-#if defined(LUMEN_HAS_FOREIGN_TOPLEVEL_LIST)
+#ifdef LUMEN_HAS_FOREIGN_TOPLEVEL_LIST
     if (!rec.mapped)
         return;
     for (handle_obj* h = g_handles; h; h = h->next)

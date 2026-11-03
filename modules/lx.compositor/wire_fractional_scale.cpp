@@ -24,7 +24,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
+#ifdef LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1
 #include "fractional-scale-v1-server-protocol.h"
 #define LUMEN_HAS_FRACTIONAL_SCALE 1
 #endif
@@ -48,7 +48,7 @@ constexpr lx::trace::category log_scale{"compositor.scale"};
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_FRACTIONAL_SCALE)
+#ifdef LUMEN_HAS_FRACTIONAL_SCALE
 
 namespace {
 

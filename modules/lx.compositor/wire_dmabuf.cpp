@@ -10,10 +10,10 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <drm_fourcc.h>
 #endif
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "linux-dmabuf-v1-server-protocol.h"
 #endif
 
@@ -21,7 +21,7 @@ module;
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if !defined(DRM_FORMAT_ARGB8888)
+#ifndef DRM_FORMAT_ARGB8888
 #define DRM_FORMAT_ARGB8888 0x34325241u
 #define DRM_FORMAT_XRGB8888 0x34325258u
 #endif
@@ -41,7 +41,7 @@ import :toplevel;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 
 namespace lx::compositor::wire {
 

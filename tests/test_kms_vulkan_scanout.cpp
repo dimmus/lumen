@@ -5,7 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -26,7 +26,7 @@ bool env_enabled() {
 /// Asks each card for its driver name. Probing the sysfs `device/driver` symlink instead
 /// is unreliable: kernels that register vkms on the faux bus report `faux_driver` there.
 const char* find_vkms_card_path(char* out, std::size_t out_len) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     DIR* d = opendir("/dev/dri");
     if (!d)
         return nullptr;
@@ -65,7 +65,7 @@ int main() {
         return 0;
     }
 
-#if !defined(LUMEN_HAS_DRM)
+#ifndef LUMEN_HAS_DRM
     std::printf("SKIP: LUMEN_HAS_DRM not set\n");
     return 0;
 #else

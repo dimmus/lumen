@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #endif
@@ -191,7 +191,7 @@ using span_color_fn = raster_color (*)(int span, std::uint16_t tag, void* user);
 } // namespace lx::text
 
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 namespace lx::text::detail {
 
 /// Shapes `utf8` with face `id` at `size` (26.6 px) through the shared shape cache. The
@@ -233,7 +233,7 @@ lx::text::font_stack& lx::text::font_stack::shared() {
 void lx::text::font_stack::load_default() { load({}); }
 
 void lx::text::font_stack::load(font_desc desc) {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     (void)face_cache::shared().resolve(desc);
 #else
     (void)desc;
@@ -241,7 +241,7 @@ void lx::text::font_stack::load(font_desc desc) {
 }
 
 bool lx::text::font_stack::has_face() const {
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     return face_cache::shared().resolve(font_desc{}).valid();
 #else
     return false;
@@ -251,7 +251,7 @@ bool lx::text::font_stack::has_face() const {
 lx::text::glyph_run lx::text::font_stack::shape(const char* utf8, font_desc desc) const {
     if (!utf8 || utf8[0] == '\0')
         return {};
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     auto& faces = face_cache::shared();
     auto lock = faces.lock();
     const face_id id = faces.resolve_locked(desc.family, desc.weight, desc.style);
@@ -275,7 +275,7 @@ float lx::text::font_stack::measure_width(const char* utf8, font_desc desc) cons
 
 // ── Single-line rasterization ─────────────────────────────────────────────────
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 namespace lx::text::detail {
 
 /// Grayscale glyph coverage, keyed by (face id, size, glyph index). A fixed table and a
@@ -439,7 +439,7 @@ lx::result<void> lx::text::shape_line(const char* utf8, font_desc font, shaped_l
     out.ascent_px = 0;
     out.descent_px = 0;
     out.font = font;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     auto& faces = face_cache::shared();
     auto lock = faces.lock();
     const face_id id = faces.resolve_locked(font.family, font.weight, font.style);
@@ -484,7 +484,7 @@ lx::text::line_fit lx::text::fit_line(const shaped_line& line, int max_width_px)
         return {};
     if (line.width_px <= max_width_px)
         return {line.count, line.width_px, false};
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     auto& faces = face_cache::shared();
     auto lock = faces.lock();
     const face_id id = faces.resolve_locked(line.font.family, line.font.weight, line.font.style);
@@ -523,7 +523,7 @@ lx::result<void> lx::text::render_line(const shaped_line& line, line_fit fit, ra
     if (!target.pixels || target.width <= 0 || target.height <= 0 ||
         target.stride_px < target.width)
         return lx::invalid_argument("render_line: bad target");
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     auto& faces = face_cache::shared();
     auto lock = faces.lock();
     const face_id id = faces.resolve_locked(line.font.family, line.font.weight, line.font.style);
@@ -637,7 +637,7 @@ bool is_space(std::uint32_t c) { return c == ' ' || c == '\t'; }
 
 } // namespace
 
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
 namespace {
 
 /// The layout in progress: lines and pieces into `out`.
@@ -858,7 +858,7 @@ lx::result<void> lx::text::wrap_text(std::string_view text, std::span<const text
     out.piece_count = 0;
     out.truncated = false;
     out.width_px = 0;
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     // Per thread, reused: the shaping scratch is 10 KiB, never allocated per call.
     static thread_local wrap_state s{};
     if (!lx::text::shape_line("", base, s.scratch))
@@ -948,7 +948,7 @@ lx::result<void> lx::text::render_wrapped(std::string_view text, std::span<const
     if (!target.pixels || target.width <= 0 || target.height <= 0 ||
         target.stride_px < target.width)
         return lx::invalid_argument("render_wrapped: bad target");
-#if defined(LUMEN_HAS_TEXT)
+#ifdef LUMEN_HAS_TEXT
     static thread_local shaped_line line_storage{};
     shaped_line* line = &line_storage;
     char buf[k_max_wrap_piece_bytes + 1];

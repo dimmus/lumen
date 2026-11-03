@@ -26,7 +26,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
+#ifdef LUMEN_PROTOCOL_EXT_WORKSPACE_V1
 #include "ext-workspace-v1-server-protocol.h"
 #define LUMEN_HAS_EXT_WORKSPACE 1
 #endif
@@ -49,7 +49,7 @@ import :wire;
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_EXT_WORKSPACE)
+#ifdef LUMEN_HAS_EXT_WORKSPACE
 
 namespace {
 

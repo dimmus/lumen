@@ -23,7 +23,7 @@ module;
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
 #include <png.h>
 #endif
 import lx.foundation;
@@ -368,7 +368,7 @@ void lx::shell::resample_icon(const std::uint32_t* src, int ss, std::uint32_t* d
 }
 
 bool lx::shell::icon_theme::can_png() {
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
     return true;
 #else
     return false;
@@ -376,7 +376,7 @@ bool lx::shell::icon_theme::can_png() {
 }
 
 bool lx::shell::icon_theme::can_svg() {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     return true;
 #else
     return false;
@@ -757,7 +757,7 @@ bool lx::shell::icon_theme::decode(const std::string& path, int px, std::vector<
             icon_cache_write(dir, file, key, px, out);
         return ok;
     }
-#if defined(LUMEN_HAS_PNG)
+#ifdef LUMEN_HAS_PNG
     png_image img{};
     img.version = PNG_IMAGE_VERSION;
     if (!png_image_begin_read_from_file(&img, path.c_str()))

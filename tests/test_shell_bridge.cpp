@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-client-protocol.h"
 #include "zlm_shell_v1-client-protocol.h"
 #pragma clang diagnostic push
@@ -31,7 +31,7 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
+#ifdef LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
 #endif
@@ -59,7 +59,7 @@ import lx.config;
 // From wayland-server.h, which cannot share a translation unit with the client headers.
 extern "C" struct wl_client* wl_resource_get_client(struct wl_resource* resource);
 
-#if !defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifndef LUMEN_HAS_PROTOCOL_GLUE
 
 int main() {
     std::printf("SKIP: needs libwayland and the generated protocol glue\n");
@@ -93,7 +93,7 @@ struct conn {
     zlm_shell_v1* shell = nullptr;
     lx::shell::policy_bridge* bridge = nullptr; // observes zlm_shell_v1 at bind
     bool want_seat = false;
-#if defined(LUMEN_TEST_SESSION_LOCK)
+#ifdef LUMEN_TEST_SESSION_LOCK
     ext_session_lock_manager_v1* lock_manager = nullptr;
 #endif
 };
@@ -155,7 +155,7 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
             r, name, &zlm_shell_v1_interface, g_zlm_version < version ? g_zlm_version : version));
         (void)c->bridge->observe(c->shell);
     }
-#if defined(LUMEN_TEST_SESSION_LOCK)
+#ifdef LUMEN_TEST_SESSION_LOCK
     else if (std::strcmp(iface, ext_session_lock_manager_v1_interface.name) == 0)
         c->lock_manager = static_cast<ext_session_lock_manager_v1*>(
             wl_registry_bind(r, name, &ext_session_lock_manager_v1_interface, 1));
@@ -528,7 +528,7 @@ int main() {
     // The compositor's own chord is not the shell's: Ctrl+Alt+BackSpace would log out here,
     // which this test does not want; its refusal above is the check.
 
-#if defined(LUMEN_TEST_SESSION_LOCK)
+#ifdef LUMEN_TEST_SESSION_LOCK
     // ── Version 5: the session lock ──
     {
         static unsigned states[16];
@@ -582,7 +582,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_V6)
+#ifdef LUMEN_TEST_V6
     // ── Version 6: icons (memfds), parents and modal dialogs, the bell, non-inhibitable
     //    grabs ──
     {

@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 // GLES 3 headers (a superset of 2): `copy_region` blits when the context is ES 3.0.
@@ -498,7 +498,7 @@ private:
 
 namespace lx::gfx::detail {
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 
 /// Ends a frame's GL work: a native fence's sync_file when the device exports one (the
 /// caller owns it), else `glFinish` and -1.
@@ -669,7 +669,7 @@ void main() {
     // source rect.
     vec4 texel = use_solid > 0.5 ? solid_texel : sample_source(uv);
     texel.a = max(texel.a, alpha_one);
-#if defined(LUMEN_COLOR)
+#ifdef LUMEN_COLOR
     vec3 straight = texel.a > 0.0 ? texel.rgb / texel.a : texel.rgb;
     vec3 e = srgb_to_linear(straight);
     if (transfer == 0)
@@ -900,7 +900,7 @@ lx::gfx::egl_device& lx::gfx::egl_device::operator=(egl_device&& other) noexcept
 }
 
 void lx::gfx::egl_device::destroy() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (display_) {
         auto dpy = static_cast<EGLDisplay>(display_);
         eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -921,7 +921,7 @@ void lx::gfx::egl_device::destroy() {
 }
 
 lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd, bool gles2) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (drm_fd < 0) {
         return lx::invalid_argument("egl_device::create needs an open DRM fd");
     }
@@ -1012,7 +1012,7 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd, bool gle
 }
 
 lx::result<void> lx::gfx::egl_device::make_current() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!display_ || !context_)
         return lx::not_implemented("lx::gfx::egl_device::make_current");
     if (!eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE,
@@ -1043,7 +1043,7 @@ lx::result<void> lx::gfx::egl_device::make_current() {
 }
 
 void lx::gfx::egl_device::release_current() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (display_)
         eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE,
                        EGL_NO_CONTEXT);
@@ -1082,7 +1082,7 @@ lx::gfx::gl_scanout_target& lx::gfx::gl_scanout_target::operator=(
 }
 
 void lx::gfx::gl_scanout_target::destroy() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (framebuffer_)
         glDeleteFramebuffers(1, &framebuffer_);
     if (renderbuffer_)
@@ -1108,7 +1108,7 @@ lx::result<lx::gfx::gl_scanout_target> lx::gfx::gl_scanout_target::create(const 
                                                                           unsigned width,
                                                                           unsigned height,
                                                                           lx::fourcc format) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!device.valid() || width == 0 || height == 0) {
         return lx::invalid_argument("gl_scanout_target::create: invalid parameters");
     }
@@ -1166,7 +1166,7 @@ lx::result<lx::gfx::gl_scanout_target> lx::gfx::gl_scanout_target::create(const 
 }
 
 lx::result<lx::gfx::gl_scanout_dmabuf> lx::gfx::gl_scanout_target::export_dmabuf() const {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!bo_)
         return lx::not_implemented("lx::gfx::gl_scanout_target::export_dmabuf");
 
@@ -1223,7 +1223,7 @@ int lx::gfx::gl_compositor::alloc(unsigned texture_id) {
 }
 
 void lx::gfx::gl_compositor::destroy_slot(texture_slot& slot) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     for (unsigned& name : slot.names) {
         if (name)
             glDeleteTextures(1, &name);
@@ -1246,7 +1246,7 @@ void lx::gfx::gl_compositor::forget_texture(unsigned texture_id) {
 }
 
 lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!device.valid())
         return lx::not_implemented("lx::gfx::gl_compositor::initialize");
     device_ = &device;
@@ -1329,7 +1329,7 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
 }
 
 void lx::gfx::gl_compositor::shutdown() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     for (unsigned o = 0; o < k_blur_outputs; ++o)
         release_blur(o);
     for (blur_program& p : blur_programs_)
@@ -1383,7 +1383,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
                         static_cast<unsigned>(region.height) == height);
     if (whole)
         return upload_rgba(texture_id, width, height, rgba, 0);
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready() || !rgba || width == 0 || height == 0 || region.x < 0 || region.y < 0 ||
         static_cast<unsigned>(region.x + region.width) > width ||
         static_cast<unsigned>(region.y + region.height) > height)
@@ -1450,7 +1450,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_regions(
     unsigned texture_id, unsigned width, unsigned height, lx::rect2i region,
     std::span<const lx::rect2i> parts, const unsigned char* pixels, unsigned stride,
     bool opaque) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready() || !supports_client_upload() || !pixels || width == 0 || height == 0 ||
         stride % 4u != 0)
         return lx::invalid_argument("gl client upload: bad arguments");
@@ -1552,7 +1552,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_regions(
 lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsigned width,
                                                      unsigned height, const unsigned char* rgba,
                                                      unsigned stride) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready() || !rgba || width == 0 || height == 0)
         return lx::invalid_argument("gl upload: bad arguments");
     if (stride != 0 && stride != width * 4u) {
@@ -1628,7 +1628,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
 
 lx::result<void> lx::gfx::gl_compositor::import_dmabuf(unsigned texture_id,
                                                        const dmabuf_desc& desc) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready() || !device_)
         return lx::not_implemented("lx::gfx::gl_compositor::import_dmabuf");
     if (!device_->supports_dmabuf_import()) {
@@ -1757,7 +1757,7 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     unsigned framebuffer, unsigned width_px, unsigned height_px, lx::color clear,
     const blit_command* cmds, unsigned count, const lx::rect2i* rects, unsigned rect_count,
     bool clear_first, bool fence, bool flush) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready())
         return lx::not_implemented("lx::gfx::gl_compositor::composite");
 
@@ -2246,7 +2246,7 @@ void lx::gfx::gl_compositor::end_blur_frame() {
 }
 
 void lx::gfx::gl_compositor::destroy_blur_entry(blur_entry& e) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     for (blur_level& l : e.levels) {
         if (l.framebuffer)
             glDeleteFramebuffers(1, &l.framebuffer);
@@ -2272,7 +2272,7 @@ void lx::gfx::gl_compositor::release_blur(unsigned output) {
 }
 
 bool lx::gfx::gl_compositor::ensure_color_program() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (color_program_.id)
         return true;
     if (color_failed_)
@@ -2330,7 +2330,7 @@ bool lx::gfx::gl_compositor::ensure_color_program() {
 }
 
 bool lx::gfx::gl_compositor::ensure_shape_program() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (shape_program_.id)
         return true;
     if (shape_failed_)
@@ -2383,7 +2383,7 @@ bool lx::gfx::gl_compositor::ensure_shape_program() {
 
 lx::gfx::gl_compositor::composite_program*
 lx::gfx::gl_compositor::ensure_downsample_program(unsigned variant) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (variant >= 3)
         return nullptr;
     composite_program& p = downsample_programs_[variant];
@@ -2458,7 +2458,7 @@ lx::gfx::gl_compositor::ensure_downsample_program(unsigned variant) {
 }
 
 lx::result<void> lx::gfx::gl_compositor::sync_atlas(atlas& a) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready())
         return lx::not_implemented("lx::gfx::gl_compositor::sync_atlas");
     const bool fresh_atlas = atlas_seen_ != &a;
@@ -2550,7 +2550,7 @@ lx::result<void> lx::gfx::gl_compositor::sync_atlas(atlas& a) {
 }
 
 bool lx::gfx::gl_compositor::ensure_blur_programs() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (blur_programs_[0].id && blur_programs_[1].id)
         return true;
     if (blur_programs_failed_)
@@ -2604,7 +2604,7 @@ bool lx::gfx::gl_compositor::ensure_blur_programs() {
 }
 
 bool lx::gfx::gl_compositor::ensure_blur_levels(blur_entry& e, lx::rect2i footprint) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     for (unsigned k = 0; k < k_blur_levels; ++k) {
         const lx::size2i want = blur_level_size(footprint, k);
         if (want.width <= 0 || want.height <= 0)
@@ -2650,7 +2650,7 @@ bool lx::gfx::gl_compositor::ensure_blur_levels(blur_entry& e, lx::rect2i footpr
 
 void lx::gfx::gl_compositor::run_blur(const blur_entry& e, unsigned framebuffer,
                                       lx::rect2i footprint) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     // Level 0: the footprint halved by the blit's linear filter — at an exact 2:1 each
@@ -2736,7 +2736,7 @@ lx::gfx::gl_compositor::blur_draw(const blit_command& cmd, unsigned framebuffer,
 }
 
 lx::result<int> lx::gfx::gl_compositor::fence_frame() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!ready())
         return lx::not_implemented("lx::gfx::gl_compositor::fence_frame");
     const int fd = detail::gl_frame_fence(device_);
@@ -2751,7 +2751,7 @@ lx::result<int> lx::gfx::gl_compositor::fence_frame() {
 #endif
 }
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 int lx::gfx::detail::gl_frame_fence(egl_device* device) {
     int out_fence_fd = -1;
     // The KMS flip that follows reads this buffer from outside GL, and nothing synchronises
@@ -2792,7 +2792,7 @@ int lx::gfx::detail::gl_frame_fence(egl_device* device) {
 lx::result<void> lx::gfx::gl_compositor::copy_region(const gl_scanout_target& src,
                                                      gl_scanout_target& dst,
                                                      const damage_region& region) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!target_copy_ || !src.valid() || !dst.valid())
         return lx::not_implemented("lx::gfx::gl_compositor::copy_region");
     if (src.width() != dst.width() || src.height() != dst.height())
@@ -2830,7 +2830,7 @@ lx::result<void> lx::gfx::gl_compositor::copy_region(const gl_scanout_target& sr
 
 lx::result<void> lx::gfx::gl_compositor::read_back(const gl_scanout_target& target,
                                                    unsigned char* rgba, unsigned capacity) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!target.valid() || !rgba)
         return lx::not_implemented("lx::gfx::gl_compositor::read_back");
     const unsigned needed = target.width() * target.height() * 4u;

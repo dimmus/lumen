@@ -2,7 +2,7 @@ module;
 
 // Bodies of `:foreign_registry`. See foreign_registry.cppm.
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <sys/random.h>
 #endif
 #include <stdio.h>
@@ -18,7 +18,7 @@ namespace lx::compositor {
 
 bool foreign_registry::make_handle(char (&out)[k_foreign_handle_bytes]) {
     unsigned char bytes[16]{};
-#if defined(__linux__)
+#ifdef __linux__
     std::size_t got = 0;
     while (got < sizeof(bytes)) {
         const ssize_t n = ::getrandom(bytes + got, sizeof(bytes) - got, 0);

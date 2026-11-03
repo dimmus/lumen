@@ -25,11 +25,11 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
+#ifdef LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1
 #include "single-pixel-buffer-v1-server-protocol.h"
 #define LUMEN_HAS_SINGLE_PIXEL 1
 #endif
-#if defined(LUMEN_PROTOCOL_ALPHA_MODIFIER_V1)
+#ifdef LUMEN_PROTOCOL_ALPHA_MODIFIER_V1
 #include "alpha-modifier-v1-server-protocol.h"
 #define LUMEN_HAS_ALPHA_MODIFIER 1
 #endif
@@ -48,7 +48,7 @@ namespace lx::compositor::wire {
 
 namespace {
 
-#if defined(LUMEN_HAS_SINGLE_PIXEL)
+#ifdef LUMEN_HAS_SINGLE_PIXEL
 
 [[nodiscard]] float channel(uint32_t v) {
     return static_cast<float>(static_cast<double>(v) / 4294967295.0);
@@ -84,7 +84,7 @@ const struct wp_single_pixel_buffer_manager_v1_interface single_pixel_impl = {
 
 #endif
 
-#if defined(LUMEN_HAS_ALPHA_MODIFIER)
+#ifdef LUMEN_HAS_ALPHA_MODIFIER
 
 void alpha_destroy_resource(wl_resource* r) {
     surface_addon* a = addon_from(r);
@@ -130,7 +130,7 @@ const struct wp_alpha_modifier_v1_interface alpha_manager_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_SINGLE_PIXEL)
+#ifdef LUMEN_HAS_SINGLE_PIXEL
 void bind_single_pixel_buffer_manager(wayland::client_connection& client, unsigned id,
                                       int version) {
     if (!g_ctx)
@@ -142,7 +142,7 @@ void bind_single_pixel_buffer_manager(wayland::client_connection& client, unsign
 }
 #endif
 
-#if defined(LUMEN_HAS_ALPHA_MODIFIER)
+#ifdef LUMEN_HAS_ALPHA_MODIFIER
 void bind_alpha_modifier(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;

@@ -142,7 +142,7 @@ const struct wl_data_device_manager_interface data_device_manager_impl = {
             (void)xfer_create_device(client, xfer_family::clipboard, &wl_data_device_interface,
                                      &data_device_impl, wl_resource_get_version(resource), id);
         },
-#if defined(WL_DATA_DEVICE_MANAGER_RELEASE_SINCE_VERSION)
+#ifdef WL_DATA_DEVICE_MANAGER_RELEASE_SINCE_VERSION
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
 #endif

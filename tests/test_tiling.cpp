@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-client-protocol.h"
 #define LUMEN_TEST_TILING 1
 #endif
@@ -28,7 +28,7 @@ import lx.scheduler;
 import lx.input;
 import lx.compositor;
 
-#if !defined(LUMEN_TEST_TILING)
+#ifndef LUMEN_TEST_TILING
 
 int main() {
     std::printf("SKIP: needs libwayland and the xdg-shell glue\n");

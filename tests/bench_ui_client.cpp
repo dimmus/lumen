@@ -118,7 +118,7 @@ std::uint64_t bench_thread_new_calls() noexcept;
 // included) on the calling thread, so a window's UI thread can be told from its worker, the
 // libwayland reader and a driver's threads. Initial-exec TLS: no allocation on first touch.
 
-#if defined(__SANITIZE_ADDRESS__)
+#ifdef __SANITIZE_ADDRESS__
 #define LUMEN_BENCH_SANITIZED 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
@@ -130,7 +130,7 @@ namespace {
 __attribute__((tls_model("initial-exec"))) thread_local std::uint64_t t_malloc_calls = 0;
 } // namespace
 
-#if !defined(LUMEN_BENCH_SANITIZED)
+#ifndef LUMEN_BENCH_SANITIZED
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);

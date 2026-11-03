@@ -2,12 +2,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#if defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
+#ifdef LUMEN_PROTOCOL_EXT_WORKSPACE_V1
 #include "ext-workspace-v1-client-protocol.h"
 #define LUMEN_SHELL_EXT_WORKSPACE 1
-#endif
 #endif
 
 import lx.foundation;
@@ -338,7 +336,7 @@ bool lx::shell::workspace_view::take_changed() {
 
 // ── workspace_client ───────────────────────────────────────────────────────
 
-#if defined(LUMEN_SHELL_EXT_WORKSPACE)
+#ifdef LUMEN_SHELL_EXT_WORKSPACE
 
 namespace {
 

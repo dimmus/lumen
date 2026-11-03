@@ -297,7 +297,6 @@ void lx::shell::layout_menu(const std::vector<menu_entry>& items,
         out.row[i].width = width - 2 * k_menu_pad;
 }
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 bool lx::shell::menu_popup::open(lx::ui::host::layer_role& layer, lx::rect2i anchor,
                                  std::vector<menu_entry> items, unsigned serial,
@@ -932,47 +931,3 @@ void lx::shell::tooltip_popup::close() {
 
 lx::shell::tooltip_popup::~tooltip_popup() { close(); }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-void lx::shell::menu_popup::init(menu_globals g, menu_icon_fn icons, void* user) {
-    g_ = g;
-    icons_ = icons;
-    icons_user_ = user;
-}
-bool lx::shell::menu_popup::open(lx::ui::host::layer_role&, lx::rect2i, std::vector<menu_entry>,
-                                 unsigned, activate_fn, closed_fn, submenu_fn, void*,
-                                 const char*) {
-    return false;
-}
-void lx::shell::menu_popup::close() {}
-void lx::shell::menu_popup::close_from(unsigned) {}
-void lx::shell::menu_popup::replace_items(std::vector<menu_entry>) {}
-void lx::shell::menu_popup::after_dispatch() {}
-lx::ui::child lx::shell::menu_popup::build_ui(unsigned) { return nullptr; }
-void lx::shell::menu_popup::describe_level(unsigned) {}
-bool lx::shell::menu_popup::open_level(unsigned, lx::ui::host::popup_role*,
-                                       lx::ui::host::layer_role*, lx::rect2i,
-                                       std::vector<menu_entry>*, unsigned, bool) {
-    return false;
-}
-void lx::shell::menu_popup::activate(unsigned, int, unsigned) {}
-void lx::shell::menu_popup::select(unsigned, int) {}
-int lx::shell::menu_popup::step(const level&, int, int) const { return -1; }
-void lx::shell::menu_popup::key(unsigned, unsigned, const char*, unsigned) {}
-lx::gfx::atlas_tile_id lx::shell::menu_popup::icon_tile(unsigned, const char*, int) { return {}; }
-void lx::shell::menu_popup::on_row_hover(const row_ref&, bool) {}
-void lx::shell::menu_popup::on_row_event(const row_ref&, const lx::ui::pointer_event&) {}
-void lx::shell::menu_popup::on_root_key(unsigned, const lx::ui::key_event&) {}
-void lx::shell::menu_popup::on_level_key_focus(unsigned, bool) {}
-lx::shell::menu_popup::~menu_popup() = default;
-bool lx::shell::tooltip_popup::open(lx::ui::host::layer_role&, lx::rect2i, std::string_view,
-                                    std::string_view) {
-    return false;
-}
-void lx::shell::tooltip_popup::close() {}
-lx::ui::child lx::shell::tooltip_popup::build_ui() { return nullptr; }
-void lx::shell::tooltip_popup::request_draw() {}
-void lx::shell::tooltip_popup::after_dispatch() {}
-lx::shell::tooltip_popup::~tooltip_popup() = default;
-
-#endif

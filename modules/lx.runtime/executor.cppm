@@ -264,7 +264,7 @@ lx::runtime::strand& lx::runtime::executor::render_strand() { return render_; }
 lx::runtime::strand& lx::runtime::executor::worker_strand() { return worker_; }
 
 void lx::runtime::assert_affinity(affinity expected) {
-#if !defined(NDEBUG)
+#ifndef NDEBUG
     if (current_affinity() != expected && expected != affinity::any) {
         // Avoid heap/IO on the hot path beyond a single stderr write.
         const char* want = affinity_name(expected);

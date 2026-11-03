@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -489,7 +489,7 @@ void lx::drm::kms_device::release() {
 }
 
 lx::result<void> lx::drm::kms_device::init_from_fd() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = card_fd_.get();
     if (fd < 0)
         return lx::make_error(lx::drm_err::open_failed, "invalid card fd");
@@ -523,7 +523,7 @@ lx::result<void> lx::drm::kms_device::init_from_fd() {
 }
 
 lx::result<lx::drm::kms_device> lx::drm::kms_device::open(const char* device_path) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const char* path = device_path ? device_path : "/dev/dri/card0";
     const int fd = ::open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0)
@@ -536,7 +536,7 @@ lx::result<lx::drm::kms_device> lx::drm::kms_device::open(const char* device_pat
 }
 
 lx::result<lx::drm::kms_device> lx::drm::kms_device::open_fd(lx::unique_fd card_fd) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     kms_device dev{};
     dev.card_fd_ = std::move(card_fd);
     if (auto init = dev.init_from_fd(); !init)
@@ -548,7 +548,7 @@ lx::result<lx::drm::kms_device> lx::drm::kms_device::open_fd(lx::unique_fd card_
 #endif
 }
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 namespace {
 
 /// Value of property `name` of an object, false when it has none.
@@ -672,7 +672,7 @@ void probe_one(int fd, uint32_t connector_id, lx::drm::connector_probe& e) {
 #endif
 
 lx::result<void> lx::drm::kms_device::enumerate_resources() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = card_fd_.get();
     if (fd < 0)
         return lx::make_error(lx::drm_err::open_failed, "no card fd");
@@ -739,7 +739,7 @@ int lx::drm::kms_device::crtc_index_of(unsigned crtc_id) const {
 
 lx::result<void> lx::drm::kms_device::probe_connectors(unsigned hint_connector_id,
                                                        connector_scan& out, bool record) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = card_fd_.get();
     if (fd < 0)
         return lx::make_error(lx::drm_err::open_failed, "no card fd");
@@ -854,7 +854,7 @@ bool lx::drm::kms_device::supports_async_flip() const {
 }
 
 bool lx::drm::kms_device::is_master() const {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = card_fd_.get();
     if (fd < 0)
         return false;
@@ -867,7 +867,7 @@ bool lx::drm::kms_device::is_master() const {
 }
 
 lx::result<lx::unique_fd> lx::drm::kms_device::open_render_node() const {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     // Prefer renderD128; fall back to renderD129 for dual-GPU hosts.
     static const char* paths[] = {"/dev/dri/renderD128", "/dev/dri/renderD129"};
     for (const char* p : paths) {
@@ -922,7 +922,7 @@ lx::drm::flip_cookie& lx::drm::kms_device::next_combined_cookie() {
 }
 
 void lx::drm::kms_device::dispatch_events() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = card_fd_.get();
     if (fd < 0)
         return;
@@ -980,7 +980,7 @@ lx::drm::kms_framebuffer& lx::drm::kms_framebuffer::operator=(kms_framebuffer&& 
 bool lx::drm::closefb_unsupported(int err) { return err == EINVAL || err == ENOTTY; }
 
 lx::drm::fb_released lx::drm::release_framebuffer(int card_fd, unsigned fb_id, fb_release how) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (card_fd < 0 || fb_id == 0)
         return fb_released::failed;
     if (how == fb_release::close) {
@@ -1002,7 +1002,7 @@ lx::drm::fb_released lx::drm::release_framebuffer(int card_fd, unsigned fb_id, f
 
 lx::drm::fb_released lx::drm::kms_framebuffer::release(fb_release how) {
     fb_released done = fb_released::failed;
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (card_fd_ >= 0) {
         if (fb_id_ != 0)
             done = release_framebuffer(card_fd_, fb_id_, how);
@@ -1024,7 +1024,7 @@ lx::drm::fb_released lx::drm::kms_framebuffer::release(fb_release how) {
 lx::result<lx::drm::kms_framebuffer> lx::drm::kms_framebuffer::import_dmabuf(
     const kms_device& device, int dmabuf_fd, unsigned width, unsigned height, unsigned stride,
     unsigned offset, lx::fourcc format, unsigned long long modifier) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = device.card_fd();
     if (fd < 0 || dmabuf_fd < 0 || width == 0 || height == 0 || stride == 0) {
         return lx::make_error(lx::drm_err::open_failed, "invalid dmabuf framebuffer parameters");
@@ -1107,7 +1107,7 @@ lx::drm::kms_dumb_framebuffer& lx::drm::kms_dumb_framebuffer::operator=(
 
 lx::drm::fb_released lx::drm::kms_dumb_framebuffer::release(fb_release how) {
     fb_released done = fb_released::failed;
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (pixels_ && size_ > 0)
         munmap(pixels_, size_);
     if (card_fd_ >= 0 && fb_id_ != 0)
@@ -1131,7 +1131,7 @@ lx::drm::fb_released lx::drm::kms_dumb_framebuffer::release(fb_release how) {
 
 lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
     const kms_device& device, unsigned width, unsigned height, lx::fourcc format) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = device.card_fd();
     if (fd < 0 || width == 0 || height == 0) {
         return lx::make_error(lx::drm_err::open_failed, "invalid dumb framebuffer parameters");
@@ -1236,7 +1236,7 @@ bool lx::drm::neutral_property_value(const kms_property_shape& p, neutral_rule r
     return false;
 }
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 namespace {
 /// What a modeset resets (`commit_modeset`): state a previous master — the
 /// console, KWin with HDR or night light, Mutter on a rotated monitor — can leave behind
@@ -1303,7 +1303,7 @@ unsigned find_object_prop(int fd, unsigned object_id, unsigned object_type, cons
 
 void lx::drm::kms_pipeline::resolve_neutral(int fd, unsigned object, unsigned object_type,
                                                 bool cursor_plane) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     drmModeObjectProperties* props = drmModeObjectGetProperties(fd, object, object_type);
     if (!props)
         return;
@@ -1388,7 +1388,7 @@ void lx::drm::kms_pipeline::leave_registry() {
 }
 
 lx::drm::kms_pipeline::~kms_pipeline() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = device_ ? device_->card_fd() : -1;
     if (fd >= 0) {
         // Without master (exiting while another VT is in front) the restore can only fail;
@@ -1431,7 +1431,7 @@ void lx::drm::kms_pipeline::set_mode(const kms_mode& mode) {
 void lx::drm::kms_pipeline::set_framebuffer(unsigned fb_id) { framebuffer_id_ = fb_id; }
 
 void lx::drm::kms_pipeline::forget_saved_state() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (saved_crtc_)
         drmModeFreeCrtc(static_cast<drmModeCrtc*>(saved_crtc_));
 #endif
@@ -1440,7 +1440,7 @@ void lx::drm::kms_pipeline::forget_saved_state() {
 }
 
 void lx::drm::kms_pipeline::set_failure(int commit_errno) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     last_rejected_state_ = commit_errno == EINVAL || commit_errno == ERANGE || commit_errno == ENOSPC;
     last_lost_master_ = commit_errno == EACCES || commit_errno == EPERM;
 #else
@@ -1509,7 +1509,7 @@ void lx::drm::kms_pipeline::prepare_resume() {
 }
 
 lx::result<void> lx::drm::kms_pipeline::ensure_props() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (props_ready_ || !device_)
         return {};
     const int fd = device_->card_fd();
@@ -1565,7 +1565,7 @@ lx::result<void> lx::drm::kms_pipeline::ensure_props() {
 }
 
 bool lx::drm::kms_pipeline::ensure_modeset_props(int fd) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (!modeset_props_ready_) {
         prop_crtc_mode_ = find_object_prop(fd, desc_.crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
         prop_crtc_active_ = find_object_prop(fd, desc_.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
@@ -1589,7 +1589,7 @@ bool lx::drm::kms_pipeline::ensure_modeset_props(int fd) {
 }
 
 lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& request) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (!device_)
         return lx::make_error(lx::drm_err::page_flip_failed, "null kms device");
     const int fd = device_->card_fd();
@@ -1732,7 +1732,7 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
 }
 
 lx::result<void> lx::drm::kms_pipeline::commit_power_off(kms_cursor_plane* cursor) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = device_ ? device_->card_fd() : -1;
     const unsigned crtc = desc_.crtc_id;
     const unsigned plane = desc_.primary_plane_id;
@@ -1796,7 +1796,7 @@ bool lx::drm::kms_pipeline::flip_pending() const {
 }
 
 void lx::drm::kms_pipeline::build_damage_blob(const kms_damage_region& region) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (!device_ || !atomic_damage_)
         return;
     const int fd = device_->card_fd();
@@ -1852,7 +1852,7 @@ void lx::drm::kms_pipeline::build_damage_blob(const kms_damage_region& region) {
 
 lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry* entries,
                                          unsigned count, bool test_only) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     const int fd = device.card_fd();
     if (fd < 0 || !entries || count == 0 || count > k_max_pipelines)
         return lx::make_error(lx::drm_err::mode_invalid, "modeset: nothing to commit");

@@ -6,7 +6,7 @@
 // the host reading an item's properties (GetAll answered by the other end).
 #include "lumen_test.hpp"
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #include <sys/socket.h>
 #endif
@@ -110,7 +110,7 @@ LUMEN_TEST(menu_labels_and_layout) {
     LUMEN_CHECK(rows.height == 2 * k_menu_pad + 2 * k_menu_row_h + k_menu_separator_h);
 }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 namespace {
 

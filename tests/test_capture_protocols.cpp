@@ -44,7 +44,7 @@ import lx.runtime;
 import lx.scheduler;
 import lx.compositor;
 
-#if !defined(LUMEN_TEST_CAPTURE)
+#ifndef LUMEN_TEST_CAPTURE
 
 int main() {
     std::printf("SKIP: needs libwayland and the capture protocols' glue\n");

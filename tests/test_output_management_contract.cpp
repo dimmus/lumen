@@ -23,9 +23,9 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-output-unstable-v1-client-protocol.h"
-#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1
 #include "wlr-output-management-unstable-v1-client-protocol.h"
 #define LUMEN_HAS_OUTPUT_MANAGEMENT 1
 #endif

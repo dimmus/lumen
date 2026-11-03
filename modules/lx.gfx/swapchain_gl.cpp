@@ -9,7 +9,7 @@ module;
 // Implicit sync: glFlush — the driver attaches the frame's fence to the dma-buf's
 // reservation, which the compositor's import waits on — and wl_buffer.release.
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
@@ -53,7 +53,7 @@ constexpr lx::trace::category log_swapchain_gl{"gfx.swapchain"};
     dst[n] = '\0';
 }
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 [[nodiscard]] bool has_extension(const char* list, const char* name) {
     if (!list || !name)
         return false;
@@ -70,7 +70,7 @@ enum gl_fn : unsigned { fn_create_sync, fn_destroy_sync, fn_dup_fence, fn_count 
 } // namespace
 
 lx::result<void> client_gpu::try_gl(bool forced, bool allow_software) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     auto dev = egl_device::create(node_.fd.get());
     if (!dev) {
         refuse(client_tier::gl, "EGL on GBM failed");
@@ -117,7 +117,7 @@ lx::result<void> client_swapchain::make_timeline(slot& s) {
 }
 
 lx::result<void> client_swapchain::make_gl(slot& s) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     egl_device* egl = gpu_ ? gpu_->egl() : nullptr;
     if (!egl || !egl->valid())
         return lx::not_implemented("lx::gfx::client_swapchain::make_gl");
@@ -283,7 +283,7 @@ lx::result<void> client_swapchain::make_gl(slot& s) {
 }
 
 void client_swapchain::destroy_gl(slot& s) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     egl_device* egl = gpu_ ? gpu_->egl() : nullptr;
     if (egl && (s.framebuffer || s.renderbuffer || s.egl_image))
         (void)acquire_gl(s);
@@ -307,7 +307,7 @@ void client_swapchain::destroy_gl(slot& s) {
 }
 
 lx::result<void> client_swapchain::acquire_gl(slot&) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     egl_device* egl = gpu_ ? gpu_->egl() : nullptr;
     if (!egl)
         return lx::not_implemented("lx::gfx::client_swapchain::acquire_gl");
@@ -324,7 +324,7 @@ lx::result<void> client_swapchain::acquire_gl(slot&) {
 }
 
 lx::result<void> client_swapchain::present_gl(slot& s) {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     if (!explicit_) {
         // Implicit sync: submitted is enough — the driver fences the dma-buf.
         glFlush();
@@ -370,7 +370,7 @@ lx::result<void> client_swapchain::present_gl(slot& s) {
 }
 
 lx::result<std::uint64_t> client_swapchain::wait_gl() {
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     slot dummy{};
     if (auto current = acquire_gl(dummy); !current)
         return current.get_error();

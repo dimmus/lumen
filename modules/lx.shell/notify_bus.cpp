@@ -8,7 +8,7 @@ module;
 #include <errno.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #endif
 
@@ -50,7 +50,7 @@ std::string bounded(const char* s, std::size_t cap) {
 
 } // namespace
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 struct lx::shell::notification_server::events {
     static notification_server& self(void* data) { return *static_cast<notification_server*>(data); }

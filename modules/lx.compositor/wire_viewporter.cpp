@@ -26,7 +26,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_VIEWPORTER)
+#ifdef LUMEN_PROTOCOL_VIEWPORTER
 #include "viewporter-server-protocol.h"
 #define LUMEN_HAS_VIEWPORTER 1
 #endif
@@ -45,7 +45,7 @@ import :wire;
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_VIEWPORTER)
+#ifdef LUMEN_HAS_VIEWPORTER
 
 namespace {
 

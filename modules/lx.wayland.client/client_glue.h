@@ -65,7 +65,7 @@ struct zxdg_output_v1;
 #define LX_WLC_LAYER 0
 #endif
 
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 #include <xkbcommon/xkbcommon.h>
 #endif
 

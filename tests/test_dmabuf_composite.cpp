@@ -11,7 +11,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <drm_fourcc.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -93,7 +93,7 @@ bool setup_gpu(gpu_fixture& fixture) {
     return true;
 }
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 
 /// A dumb KMS buffer exported as a dma-buf: the closest stand-in for a client buffer that
 /// does not require a live Wayland client.
@@ -351,7 +351,7 @@ LUMEN_TEST(shm_upload_oversized_and_partial_regions) {
 
 // The one that matters: a real dma-buf, imported through the real importer.
 LUMEN_TEST(dmabuf_import_reaches_composited_output) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     gpu_fixture gpu{};
     if (!setup_gpu(gpu))
         return;
@@ -417,7 +417,7 @@ LUMEN_TEST(dmabuf_import_reaches_composited_output) {
 // XRGB's fourth byte is undefined: a client may leave it zero. Sampled as alpha, a blended
 // draw would add the clear colour under it; it must read as one, as on GL and CPU.
 LUMEN_TEST(xrgb_dmabuf_ignores_its_x_byte) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     gpu_fixture gpu{};
     if (!setup_gpu(gpu))
         return;

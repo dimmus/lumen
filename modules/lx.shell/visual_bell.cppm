@@ -18,15 +18,13 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_PROTOCOL_VIEWPORTER)
+#ifdef LUMEN_PROTOCOL_VIEWPORTER
 #include "viewporter-client-protocol.h"
 #define LUMEN_BELL_VIEWPORT 1
-#endif
 #endif
 
 import lx.foundation;
@@ -96,7 +94,7 @@ private:
 
 } // namespace lx::shell
 
-#if defined(LUMEN_SHELL_WAYLAND) && defined(LUMEN_BELL_VIEWPORT)
+#ifdef LUMEN_BELL_VIEWPORT
 
 struct lx::shell::visual_bell::events {};
 

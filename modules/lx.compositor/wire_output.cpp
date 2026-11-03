@@ -23,7 +23,7 @@ module;
 #include <time.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-output-unstable-v1-server-protocol.h"
 #endif
 
@@ -154,7 +154,7 @@ void send_output_done(wl_resource* res) {
         wl_output_send_done(res);
 }
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 /// The logical rect: the mode divided by the scale, rounded (wlroots' effective
 /// resolution); they coincide at scale 1.
 lx::rect2i logical_rect(const lx::compositor::output_state& o) { return o.logical_rect(); }
@@ -229,7 +229,7 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
     const int scale = lx::compositor::preferred_buffer_scale(*om, mask, render);
     const unsigned transform = lx::compositor::preferred_buffer_transform(*om, primary);
     bool changed = false;
-#if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
+#ifdef WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION
     if (scale != s->pref_scale) {
         s->pref_scale = scale;
         wl_surface_send_preferred_buffer_scale(s->resource, scale);
@@ -295,7 +295,7 @@ const struct wl_output_interface output_impl = {
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
 };
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 
 // ── zxdg_output_manager_v1 ─────────────────────────────────────────────────
 
@@ -466,7 +466,7 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
     }
 }
 
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 void bind_xdg_output_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -580,7 +580,7 @@ void outputs_changed() {
             if (r->slot != g.slot || r->id != g.id || client_dying(r->client))
                 continue;
             send_output_state(r->resource, st, false);
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
             for (xdg_output_res* x = xdg_output_resources; x; x = x->next)
                 if (x->output == r)
                     send_xdg_output_state(x->resource, st, false);

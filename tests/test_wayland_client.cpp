@@ -31,7 +31,7 @@
 #include <wayland-client.h>
 #include "input-method-unstable-v2-client-protocol.h"
 #define LUMEN_TEST_WLC 1
-#if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #define LUMEN_TEST_SCREENCOPY 1
 #endif
@@ -52,7 +52,7 @@ import lx.wayland.client;
 
 // ── allocation accounting (client thread only, while `g_counting`) ──
 
-#if defined(__SANITIZE_ADDRESS__)
+#ifdef __SANITIZE_ADDRESS__
 #define LUMEN_TEST_SANITIZED 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
@@ -67,7 +67,7 @@ std::atomic<std::uint64_t> g_malloc_calls{0};
 std::atomic<std::uint64_t> g_free_calls{0};
 } // namespace
 
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
 extern "C" {
 void* __libc_malloc(size_t);
 void* __libc_calloc(size_t, size_t);
@@ -97,7 +97,7 @@ void free(void* p) noexcept {
 }
 #endif
 
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
 namespace {
 void* counted_new(std::size_t n) noexcept {
     if (g_counting)
@@ -151,7 +151,7 @@ void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::fre
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 #endif
 
-#if !defined(LUMEN_TEST_WLC)
+#ifndef LUMEN_TEST_WLC
 
 int main() {
     std::printf("SKIP: needs libwayland-client and the protocol glue\n");
@@ -411,7 +411,7 @@ void click_at(double x, double y) {
     inject_left(false);
 }
 
-#if defined(LUMEN_TEST_SCREENCOPY)
+#ifdef LUMEN_TEST_SCREENCOPY
 // ── output read-back: a raw libwayland client on wlr-screencopy (the composite on the CPU) ──
 
 struct screen_reader {
@@ -1068,7 +1068,7 @@ void run_cases() {
         tick();
         made = made && d.roundtrip().ok() && !d.failed();
         const auto g = record(app_id).geometry;
-#if defined(LUMEN_TEST_SCREENCOPY)
+#ifdef LUMEN_TEST_SCREENCOPY
         screen_reader reader{};
         const bool reading = screen_connect(reader);
         int sw = 0, sh = 0;
@@ -1604,12 +1604,12 @@ void run_cases() {
         const std::uint64_t news = g_new_calls.load() - new0;
         const std::uint64_t mallocs = g_malloc_calls.load() - mal0;
         const std::uint64_t frees = g_free_calls.load() - free0;
-#if defined(LUMEN_TEST_SANITIZED)
+#ifdef LUMEN_TEST_SANITIZED
         const char* malloc_note = "malloc not interposed under a sanitizer";
 #else
         const char* malloc_note = "libwayland's own";
 #endif
-#if defined(LUMEN_TEST_SANITIZED)
+#ifdef LUMEN_TEST_SANITIZED
         std::printf("  note  G5 is not counted under a sanitizer (its allocator is not replaced)\n");
         const bool counted = false;
 #else
@@ -1622,7 +1622,7 @@ void run_cases() {
                           "{:.2f} ms per tick+dispatch",
                           done, news, mallocs, frees, double(mallocs) / k_frames,
                           double(frees) / k_frames, malloc_note, frame_ms_sum / k_frames));
-#if !defined(LUMEN_TEST_SANITIZED)
+#ifndef LUMEN_TEST_SANITIZED
         check("G5: what libwayland mallocs per frame it frees in the same frame (net 0)",
               mallocs == frees, std::format("net {}", std::int64_t(mallocs) - std::int64_t(frees)));
 #endif

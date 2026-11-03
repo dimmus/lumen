@@ -35,7 +35,7 @@ import lx.runtime;
 import lx.input;
 import lx.compositor;
 
-#if !defined(LUMEN_TEST_PART_C)
+#ifndef LUMEN_TEST_PART_C
 
 int main() {
     std::printf("SKIP: needs libwayland and the pointer protocols' glue\n");

@@ -57,7 +57,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1)
+#ifdef LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1
 #include "color-management-v1-server-protocol.h"
 #define LUMEN_HAS_COLOR_MANAGEMENT 1
 #endif
@@ -74,7 +74,7 @@ import :surface;
 import :output;
 import :wire;
 
-#if defined(LUMEN_HAS_COLOR_MANAGEMENT)
+#ifdef LUMEN_HAS_COLOR_MANAGEMENT
 
 namespace lx::compositor::wire {
 

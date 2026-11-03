@@ -8,7 +8,7 @@ module;
 // Wayland-free; keysym names come from xkbcommon when it is there, else from a small table
 // of the common ones.
 
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
 #include <xkbcommon/xkbcommon.h>
 #endif
 
@@ -152,7 +152,7 @@ unsigned lx::config::keysym_from_name(std::string_view name) {
     char buf[64];
     std::memcpy(buf, name.data(), name.size());
     buf[name.size()] = '\0';
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     xkb_keysym_t sym = xkb_keysym_from_name(buf, XKB_KEYSYM_NO_FLAGS);
     if (sym == XKB_KEY_NoSymbol)
         sym = xkb_keysym_from_name(buf, XKB_KEYSYM_CASE_INSENSITIVE);
@@ -194,7 +194,7 @@ void lx::config::keysym_name(unsigned sym, char* out, std::size_t cap) {
         std::snprintf(out, cap, "%s", sym == 0xff55 ? "Page_Up" : "Page_Down");
         return;
     }
-#if defined(LUMEN_HAS_XKBCOMMON)
+#ifdef LUMEN_HAS_XKBCOMMON
     if (xkb_keysym_get_name(sym, out, cap) < 0)
         out[0] = '\0';
 #else

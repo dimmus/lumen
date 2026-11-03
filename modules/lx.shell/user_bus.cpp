@@ -6,7 +6,7 @@ module;
 #include <poll.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #endif
 
@@ -22,7 +22,7 @@ constexpr lx::trace::category log_bus{"shell.bus"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 struct lx::shell::user_bus::events {
     static user_bus& self(void* data) { return *static_cast<user_bus*>(data); }

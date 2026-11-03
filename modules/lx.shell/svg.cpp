@@ -1,6 +1,6 @@
 module;
 
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
 #include <cairo.h>
 #include <dlfcn.h>
 #include <librsvg/rsvg.h>
@@ -19,7 +19,7 @@ constexpr lx::trace::category log_shell{"shell"};
 } // namespace
 
 namespace {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
 /// The librsvg, cairo and GLib entry points the shell uses, from one dlopen'd handle
 /// (dlsym searches the library's own dependencies too, which is where cairo and GLib are).
 struct rsvg_api {
@@ -71,7 +71,7 @@ const rsvg_api& api() {
 
 bool lx::shell::svg_document::open(const char* path) {
     reset();
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     const rsvg_api& a = api();
     if (!a.ok || !path)
         return false;
@@ -87,7 +87,7 @@ bool lx::shell::svg_document::open(const char* path) {
 }
 
 bool lx::shell::svg_document::intrinsic_size(double& width, double& height) const {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     if (!handle_)
         return false;
     width = height = 0.0;
@@ -102,7 +102,7 @@ bool lx::shell::svg_document::intrinsic_size(double& width, double& height) cons
 
 bool lx::shell::svg_document::render(unsigned char* pixels, int width, int height, int stride,
                                      lx::rect2f viewport) const {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     if (!handle_ || !pixels || width <= 0 || height <= 0)
         return false;
     const rsvg_api& a = api();
@@ -129,7 +129,7 @@ bool lx::shell::svg_document::render(unsigned char* pixels, int width, int heigh
 }
 
 void lx::shell::svg_document::reset() {
-#if defined(LUMEN_HAS_RSVG)
+#ifdef LUMEN_HAS_RSVG
     if (handle_)
         api().object_unref(handle_);
 #endif

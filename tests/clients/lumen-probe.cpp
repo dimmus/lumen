@@ -263,19 +263,19 @@
 #include <wayland-client.h>
 
 #include "xdg-shell-client-protocol.h"
-#if defined(LUMEN_PROTOCOL_XDG_OUTPUT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_XDG_OUTPUT_UNSTABLE_V1
 #include "xdg-output-unstable-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_XDG_OUTPUT 1
 #endif
-#if defined(LUMEN_PROTOCOL_XDG_DECORATION_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_XDG_DECORATION_UNSTABLE_V1
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_DECORATION 1
 #endif
-#if defined(LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1
 #include "primary-selection-unstable-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_PRIMARY_SELECTION 1
 #endif
-#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
+#ifdef LUMEN_PROTOCOL_XDG_ACTIVATION_V1
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_ACTIVATION 1
 #endif
@@ -284,23 +284,23 @@
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_SCALE 1
 #endif
-#if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
+#ifdef LUMEN_PROTOCOL_PRESENTATION_TIME
 #include "presentation-time-client-protocol.h"
 #define LUMEN_PROBE_HAS_PRESENTATION 1
 #endif
-#if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1)
+#ifdef LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1
 #include "ext-idle-notify-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_IDLE_NOTIFY 1
 #endif
-#if defined(LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1
 #include "idle-inhibit-unstable-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_IDLE_INHIBIT 1
 #endif
-#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1
 #include "wlr-output-power-management-unstable-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_OUTPUT_POWER 1
 #endif
-#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
+#ifdef LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_SESSION_LOCK 1
 #endif
@@ -312,7 +312,7 @@
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_IME 1
 #endif
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
 // wayland-scanner names an argument `namespace`, a C++ keyword (Wayfire renames it the same
 // way).
 #pragma clang diagnostic push
@@ -459,7 +459,7 @@ struct probe_output {
     uint32_t global = 0;
     uint32_t version = 0;
     wl_output* out = nullptr;
-#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+#ifdef LUMEN_PROBE_HAS_XDG_OUTPUT
     zxdg_output_v1* xo = nullptr;
 #endif
     bool gone = false;
@@ -472,7 +472,7 @@ struct probe_output {
     bool xo_seen = false;
     /// Lock mode with --all-outputs: this output's lock surface.
     surface_state lock_surf{};
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
     ext_session_lock_surface_v1* lock_surface = nullptr;
 #endif
 };
@@ -493,7 +493,7 @@ struct app {
     uint32_t enter_serial = 0;
     bool closed = false;
     double reposition_at = 0.0;
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
     zwlr_layer_shell_v1* layer_shell = nullptr;
     zwlr_layer_surface_v1* layer = nullptr;
 #endif
@@ -503,7 +503,7 @@ struct app {
     wl_data_device_manager* ddm = nullptr;
     wl_data_device* data_device = nullptr;
     wl_data_offer* offer = nullptr;
-#if defined(LUMEN_PROBE_HAS_PRIMARY_SELECTION)
+#ifdef LUMEN_PROBE_HAS_PRIMARY_SELECTION
     zwp_primary_selection_device_manager_v1* psm = nullptr;
     zwp_primary_selection_device_v1* primary_device = nullptr;
     zwp_primary_selection_offer_v1* primary_offer = nullptr;
@@ -539,25 +539,25 @@ struct app {
     /// Every wl_output global advertised, in order (outputs come and go: hotplug).
     probe_output outs[k_max_outputs]{};
     unsigned out_count = 0;
-#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+#ifdef LUMEN_PROBE_HAS_XDG_OUTPUT
     zxdg_output_manager_v1* xom = nullptr;
 #endif
     // liveness
     double ignore_until = 0.0;
     uint32_t deferred_ping = 0;
     double freeze_at = 0.0;
-#if defined(LUMEN_PROBE_HAS_DECORATION)
+#ifdef LUMEN_PROBE_HAS_DECORATION
     zxdg_decoration_manager_v1* deco_manager = nullptr;
     zxdg_toplevel_decoration_v1* deco = nullptr;
 #endif
     // activation
-#if defined(LUMEN_PROBE_HAS_ACTIVATION)
+#ifdef LUMEN_PROBE_HAS_ACTIVATION
     xdg_activation_v1* activation = nullptr;
 #endif
     bool activated = false;     // the target presented its token
     bool token_requested = false;
     // scale mode
-#if defined(LUMEN_PROBE_HAS_SCALE)
+#ifdef LUMEN_PROBE_HAS_SCALE
     wp_viewporter* viewporter = nullptr;
     wp_fractional_scale_manager_v1* fractional_manager = nullptr;
     wp_viewport* viewport = nullptr;
@@ -567,19 +567,19 @@ struct app {
     int preferred_buffer_scale = 1;
     int last_w = 0, last_h = 0;
     // presentation mode
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
     wp_presentation* presentation = nullptr;
 #endif
     // idle / inhibit / power modes
-#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_PROBE_HAS_IDLE_NOTIFY
     ext_idle_notifier_v1* idle_notifier = nullptr;
     ext_idle_notification_v1* idle_notification = nullptr;
 #endif
-#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+#ifdef LUMEN_PROBE_HAS_IDLE_INHIBIT
     zwp_idle_inhibit_manager_v1* inhibit_manager = nullptr;
     zwp_idle_inhibitor_v1* inhibitor = nullptr;
 #endif
-#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+#ifdef LUMEN_PROBE_HAS_OUTPUT_POWER
     zwlr_output_power_manager_v1* power_manager = nullptr;
     zwlr_output_power_v1* power = nullptr;
 #endif
@@ -590,7 +590,7 @@ struct app {
     double power_set_at = 0.0;
     double power_then_at = 0.0;
     // lock mode
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
     ext_session_lock_manager_v1* lock_manager = nullptr;
     ext_session_lock_v1* lock = nullptr;
     ext_session_lock_surface_v1* lock_surface = nullptr;
@@ -670,7 +670,7 @@ wl_buffer* make_buffer(int w, int h, uint32_t colour) {
 }
 
 void draw_scaled(int w, int h);
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
 void present_configure(int w, int h);
 #endif
 
@@ -681,7 +681,7 @@ void draw(surface_state& s, int w, int h) {
         draw_scaled(w, h);
         return;
     }
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
     if (g.opt.presentation_mode && &s == &g.top) {
         present_configure(w, h);
         return;
@@ -771,7 +771,7 @@ void draw_scaled(int w, int h) {
     wl_surface_set_buffer_scale(g.top.surface, bs);
     wl_surface_set_buffer_transform(g.top.surface, o.transform);
     int dw = 0, dh = 0;
-#if defined(LUMEN_PROBE_HAS_SCALE)
+#ifdef LUMEN_PROBE_HAS_SCALE
     if (g.viewport) {
         if (o.crop)
             wp_viewport_set_source(g.viewport, wl_fixed_from_double(o.crop_x),
@@ -792,7 +792,7 @@ void draw_scaled(int w, int h) {
                 g.scale120, bs);
 }
 
-#if defined(LUMEN_PROBE_HAS_SCALE)
+#ifdef LUMEN_PROBE_HAS_SCALE
 void on_preferred_scale(void*, wp_fractional_scale_v1*, uint32_t scale) {
     std::printf("preferred-scale %u\n", scale);
     const bool changed = scale != g.scale120;
@@ -806,7 +806,7 @@ const wp_fractional_scale_v1_listener fractional_listener = {on_preferred_scale}
 
 // ── presentation mode: wp_presentation feedback per commit ──
 
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
 
 /// One shm buffer of the animation, reused once released.
 struct anim_buffer {
@@ -1061,7 +1061,7 @@ void present_configure(int w, int h) {
 #endif
 
 // ── idle mode: ext_idle_notification_v1 ──
-#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_PROBE_HAS_IDLE_NOTIFY
 void on_idled(void*, ext_idle_notification_v1*) {
     const double now = now_s();
     std::printf("idled t=%.3f at=%.3f\n", now - g.idle_created_at, now);
@@ -1076,7 +1076,7 @@ const ext_idle_notification_v1_listener idle_listener = {on_idled, on_resumed};
 #endif
 
 // ── power mode: zwlr_output_power_v1 ──
-#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+#ifdef LUMEN_PROBE_HAS_OUTPUT_POWER
 void power_request(int mode) {
     if (!g.power || mode < 0)
         return;
@@ -1102,7 +1102,7 @@ const zwlr_output_power_v1_listener power_listener = {on_power_mode, on_power_fa
 #endif
 
 // ── lock mode: ext-session-lock-v1 ──
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
 void lock_unlock(const char* why) {
     if (!g.lock || g.lock_done)
         return;
@@ -1285,7 +1285,7 @@ const wl_output_listener output_listener = {on_output_geometry, on_output_mode,
                                             on_output_done,     on_output_scale,
                                             on_output_name,     on_output_description};
 
-#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+#ifdef LUMEN_PROBE_HAS_XDG_OUTPUT
 void on_xo_position(void* data, zxdg_output_v1*, int32_t x, int32_t y) {
     auto* o = static_cast<probe_output*>(data);
     o->xo_x = x;
@@ -1317,7 +1317,7 @@ void bind_one_output(probe_output& o) {
     std::printf("wl_output bind version=%u\n", v);
     o.out = static_cast<wl_output*>(wl_registry_bind(g.registry, o.global, &wl_output_interface, v));
     wl_output_add_listener(o.out, &output_listener, &o);
-#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+#ifdef LUMEN_PROBE_HAS_XDG_OUTPUT
     if (g.xom) {
         o.xo = zxdg_output_manager_v1_get_xdg_output(g.xom, o.out);
         zxdg_output_v1_add_listener(o.xo, &xdg_output_listener, &o);
@@ -1345,7 +1345,7 @@ void bind_outputs() {
     }
 }
 
-#if defined(LUMEN_PROBE_HAS_DECORATION)
+#ifdef LUMEN_PROBE_HAS_DECORATION
 void on_deco_configure(void*, zxdg_toplevel_decoration_v1*, uint32_t mode) {
     std::printf("decoration configure mode=%u\n", mode);
 }
@@ -1504,7 +1504,7 @@ void open_popup(xdg_surface* parent, uint32_t press_serial) {
     s.popup = xdg_surface_get_popup(s.xdg, parent, pos);
     xdg_positioner_destroy(pos);
     xdg_popup_add_listener(s.popup, &popup_listener, &s);
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
     // A layer surface's popup: created without a parent, adopted before its initial commit.
     if (index == 0 && g.layer)
         zwlr_layer_surface_v1_get_popup(g.layer, s.popup);
@@ -1542,7 +1542,7 @@ const wl_data_source_listener source_listener = {on_source_target, on_source_sen
                                                  on_source_cancelled, on_source_drop,
                                                  on_source_finished, on_source_action};
 
-#if defined(LUMEN_PROBE_HAS_PRIMARY_SELECTION)
+#ifdef LUMEN_PROBE_HAS_PRIMARY_SELECTION
 void on_psource_send(void*, zwp_primary_selection_source_v1*, const char* mime, int32_t fd) {
     sel_send(mime, fd);
 }
@@ -1563,7 +1563,7 @@ void set_selection(uint32_t serial) {
         serial = 1;
     char list[512];
     std::snprintf(list, sizeof(list), "%s", g.opt.mimes);
-#if defined(LUMEN_PROBE_HAS_PRIMARY_SELECTION)
+#ifdef LUMEN_PROBE_HAS_PRIMARY_SELECTION
     if (g.opt.primary) {
         if (!g.primary_device)
             return;
@@ -1715,7 +1715,7 @@ const wl_data_device_listener data_device_listener = {on_dd_data_offer, on_dd_en
                                                       on_dd_leave, on_dd_motion, on_dd_drop,
                                                       on_dd_selection};
 
-#if defined(LUMEN_PROBE_HAS_PRIMARY_SELECTION)
+#ifdef LUMEN_PROBE_HAS_PRIMARY_SELECTION
 void on_poffer_offer(void*, zwp_primary_selection_offer_v1*, const char* mime) {
     note_offer_mime(mime);
 }
@@ -1782,7 +1782,7 @@ void create_selection_devices() {
         g.data_device = wl_data_device_manager_get_data_device(g.ddm, g.seat);
         wl_data_device_add_listener(g.data_device, &data_device_listener, nullptr);
     }
-#if defined(LUMEN_PROBE_HAS_PRIMARY_SELECTION)
+#ifdef LUMEN_PROBE_HAS_PRIMARY_SELECTION
     if (g.psm && !g.primary_device) {
         g.primary_device = zwp_primary_selection_device_manager_v1_get_device(g.psm, g.seat);
         zwp_primary_selection_device_v1_add_listener(g.primary_device,
@@ -1871,7 +1871,7 @@ unsigned action_bits(const char* list) {
 
 // ── xdg-activation ──
 
-#if defined(LUMEN_PROBE_HAS_ACTIVATION)
+#ifdef LUMEN_PROBE_HAS_ACTIVATION
 void on_token_done(void*, xdg_activation_token_v1* t, const char* token) {
     xdg_activation_token_v1_destroy(t);
     if (g.opt.token_file) {
@@ -1890,7 +1890,7 @@ const xdg_activation_token_v1_listener token_listener = {on_token_done};
 
 /// The issuer: a token for the press with `serial`.
 void request_token(uint32_t serial) {
-#if defined(LUMEN_PROBE_HAS_ACTIVATION)
+#ifdef LUMEN_PROBE_HAS_ACTIVATION
     if (!g.activation)
         return;
     xdg_activation_token_v1* t = xdg_activation_v1_get_activation_token(g.activation);
@@ -1911,7 +1911,7 @@ void request_token(uint32_t serial) {
 
 /// The target: presents its token once it has one (--token, or the file once it exists).
 void try_activate(bool mapped) {
-#if defined(LUMEN_PROBE_HAS_ACTIVATION)
+#ifdef LUMEN_PROBE_HAS_ACTIVATION
     if (g.activated || !g.activation || !g.opt.activation_target)
         return;
     char buf[256]{};
@@ -2035,7 +2035,7 @@ void on_key_enter(void*, wl_keyboard*, uint32_t serial, wl_surface* surface, wl_
 void on_key_leave(void*, wl_keyboard*, uint32_t, wl_surface*) { std::printf("keyboard leave\n"); }
 void on_key(void*, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key, uint32_t state) {
     std::printf("key code=%u state=%u\n", key, state);
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
     if (g.opt.lock_mode && state == WL_KEYBOARD_KEY_STATE_PRESSED)
         lock_key(key);
 #endif
@@ -2054,7 +2054,7 @@ const wl_keyboard_listener keyboard_listener = {on_keymap, on_key_enter, on_key_
 
 // ── text-input and input-method modes ──────────────────────────────────────
 
-#if defined(LUMEN_PROBE_HAS_IME)
+#ifdef LUMEN_PROBE_HAS_IME
 
 constexpr unsigned k_text = 4000;
 
@@ -2383,7 +2383,7 @@ void on_caps(void*, wl_seat* seat, uint32_t caps) {
 void on_seat_name(void*, wl_seat*, const char*) {}
 const wl_seat_listener seat_listener = {on_caps, on_seat_name};
 
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
 void bind_layer_shell(wl_registry* r, uint32_t name, const char* iface, uint32_t version);
 #endif
 
@@ -2395,7 +2395,7 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
         g.compositor = static_cast<wl_compositor*>(
             wl_registry_bind(r, name, &wl_compositor_interface, version < want ? version : want));
     }
-#if defined(LUMEN_PROBE_HAS_SCALE)
+#ifdef LUMEN_PROBE_HAS_SCALE
     else if (std::strcmp(iface, wp_viewporter_interface.name) == 0)
         g.viewporter = static_cast<wp_viewporter*>(
             wl_registry_bind(r, name, &wp_viewporter_interface, 1));
@@ -2403,34 +2403,34 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
         g.fractional_manager = static_cast<wp_fractional_scale_manager_v1*>(
             wl_registry_bind(r, name, &wp_fractional_scale_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
     else if (std::strcmp(iface, wp_presentation_interface.name) == 0) {
         g.presentation = static_cast<wp_presentation*>(
             wl_registry_bind(r, name, &wp_presentation_interface, version < 2 ? version : 2));
         wp_presentation_add_listener(g.presentation, &presentation_listener, nullptr);
     }
 #endif
-#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_PROBE_HAS_IDLE_NOTIFY
     else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0)
         g.idle_notifier = static_cast<ext_idle_notifier_v1*>(
             wl_registry_bind(r, name, &ext_idle_notifier_v1_interface, version < 2 ? version : 2));
 #endif
-#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+#ifdef LUMEN_PROBE_HAS_IDLE_INHIBIT
     else if (std::strcmp(iface, zwp_idle_inhibit_manager_v1_interface.name) == 0)
         g.inhibit_manager = static_cast<zwp_idle_inhibit_manager_v1*>(
             wl_registry_bind(r, name, &zwp_idle_inhibit_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+#ifdef LUMEN_PROBE_HAS_OUTPUT_POWER
     else if (std::strcmp(iface, zwlr_output_power_manager_v1_interface.name) == 0)
         g.power_manager = static_cast<zwlr_output_power_manager_v1*>(
             wl_registry_bind(r, name, &zwlr_output_power_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
     else if (std::strcmp(iface, ext_session_lock_manager_v1_interface.name) == 0)
         g.lock_manager = static_cast<ext_session_lock_manager_v1*>(
             wl_registry_bind(r, name, &ext_session_lock_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_PROBE_HAS_IME)
+#ifdef LUMEN_PROBE_HAS_IME
     else if (std::strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
         gi.ti_version = version < 2 ? version : 2;
         gi.ti_manager = static_cast<zwp_text_input_manager_v3*>(
@@ -2453,7 +2453,7 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
     else if (std::strcmp(iface, wl_data_device_manager_interface.name) == 0)
         g.ddm = static_cast<wl_data_device_manager*>(
             wl_registry_bind(r, name, &wl_data_device_manager_interface, version < 3 ? version : 3));
-#if defined(LUMEN_PROBE_HAS_PRIMARY_SELECTION)
+#ifdef LUMEN_PROBE_HAS_PRIMARY_SELECTION
     else if (std::strcmp(iface, zwp_primary_selection_device_manager_v1_interface.name) == 0)
         g.psm = static_cast<zwp_primary_selection_device_manager_v1*>(
             wl_registry_bind(r, name, &zwp_primary_selection_device_manager_v1_interface, 1));
@@ -2472,34 +2472,34 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
             if ((g.opt.outputs_mode || (g.opt.lock_mode && g.opt.all_outputs)) && g.output) {
                 std::printf("wl_output added global=%u\n", name);
                 bind_one_output(o);
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
                 if (g.opt.lock_mode && g.lock_surface)
                     lock_add_output_surface(o);
 #endif
             }
         }
     }
-#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+#ifdef LUMEN_PROBE_HAS_XDG_OUTPUT
     else if (std::strcmp(iface, zxdg_output_manager_v1_interface.name) == 0)
         g.xom = static_cast<zxdg_output_manager_v1*>(
             wl_registry_bind(r, name, &zxdg_output_manager_v1_interface, version < 3 ? version : 3));
 #endif
-#if defined(LUMEN_PROBE_HAS_ACTIVATION)
+#ifdef LUMEN_PROBE_HAS_ACTIVATION
     else if (std::strcmp(iface, xdg_activation_v1_interface.name) == 0)
         g.activation = static_cast<xdg_activation_v1*>(
             wl_registry_bind(r, name, &xdg_activation_v1_interface, 1));
 #endif
-#if defined(LUMEN_PROBE_HAS_DECORATION)
+#ifdef LUMEN_PROBE_HAS_DECORATION
     else if (std::strcmp(iface, zxdg_decoration_manager_v1_interface.name) == 0)
         g.deco_manager = static_cast<zxdg_decoration_manager_v1*>(
             wl_registry_bind(r, name, &zxdg_decoration_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
     else
         bind_layer_shell(r, name, iface, version);
 #endif
 }
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
 void bind_layer_shell(wl_registry* r, uint32_t name, const char* iface, uint32_t version) {
     if (std::strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0)
         g.layer_shell = static_cast<zwlr_layer_shell_v1*>(
@@ -2562,7 +2562,7 @@ void on_global_remove(void*, wl_registry*, uint32_t name) {
             continue;
         o.gone = true;
         std::printf("wl_output removed name=%s\n", o.name[0] ? o.name : "?");
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
         // Its lock surface goes with it (the compositor already dropped it).
         if (o.lock_surface) {
             ext_session_lock_surface_v1_destroy(o.lock_surface);
@@ -2572,7 +2572,7 @@ void on_global_remove(void*, wl_registry*, uint32_t name) {
             o.lock_surf.surface = nullptr;
         }
 #endif
-#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+#ifdef LUMEN_PROBE_HAS_XDG_OUTPUT
         if (o.xo)
             zxdg_output_v1_destroy(o.xo);
         o.xo = nullptr;
@@ -2754,7 +2754,7 @@ int main(int argc, char** argv) {
     o.im_mode = std::strcmp(argv[1], "im") == 0;
     if (o.dnd_source_mode || o.dnd_target_mode)
         o.mimes = "text/plain;charset=utf-8,text/plain";
-#if !defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifndef LUMEN_PROBE_HAS_LAYER_SHELL
     if (o.layer_mode) {
         std::fprintf(stderr, "lumen-probe: built without wlr-layer-shell\n");
         return 2;
@@ -2768,7 +2768,7 @@ int main(int argc, char** argv) {
             o.layer_popup = true;
             ++i;
         }
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
         else if (!std::strcmp(a, "--layer") && v) { o.layer = layer_value(v); ++i; }
         else if (o.layer_mode && !std::strcmp(a, "--anchor") && v) { o.layer_anchor = anchor_bits(v); ++i; }
         else if (!std::strcmp(a, "--zone") && v) { o.zone = std::atoi(v); ++i; }
@@ -2901,7 +2901,7 @@ int main(int argc, char** argv) {
     create_selection_devices();
 
     g.top.colour = 0xff5060a0;
-#if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
+#ifdef LUMEN_PROBE_HAS_LAYER_SHELL
     if (o.layer_mode) {
         if (!g.layer_shell) {
             std::fprintf(stderr, "lumen-probe: no zwlr_layer_shell_v1\n");
@@ -2933,7 +2933,7 @@ int main(int argc, char** argv) {
 #endif
     if (o.outputs_mode && o.late_output <= 0.0)
         bind_outputs();
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
     if (o.presentation_mode) {
         if (!g.presentation) {
             std::fprintf(stderr, "lumen-probe: no wp_presentation\n");
@@ -2947,7 +2947,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 #endif
-#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_PROBE_HAS_IDLE_NOTIFY
     if (o.idle_mode) {
         if (!g.idle_notifier) {
             std::fprintf(stderr, "lumen-probe: no ext_idle_notifier_v1\n");
@@ -2974,7 +2974,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 #endif
-#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+#ifdef LUMEN_PROBE_HAS_OUTPUT_POWER
     if (o.power_mode) {
         bind_outputs();
         if (!g.power_manager || !g.output) {
@@ -2990,7 +2990,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 #endif
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
     if (o.lock_mode) {
         bind_outputs();
         if (!g.lock_manager || !g.output) {
@@ -3015,7 +3015,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 #endif
-#if defined(LUMEN_PROBE_HAS_IME)
+#ifdef LUMEN_PROBE_HAS_IME
     if (o.im_mode && !im_start())
         return 1;
 #else
@@ -3026,7 +3026,7 @@ int main(int argc, char** argv) {
 #endif
     if (!o.layer_mode && !o.idle_mode && !o.power_mode && !o.lock_mode && !o.im_mode) {
         g.top.surface = wl_compositor_create_surface(g.compositor);
-#if defined(LUMEN_PROBE_HAS_IME)
+#ifdef LUMEN_PROBE_HAS_IME
         if (o.text_input_mode) {
             if (!gi.ti_manager) {
                 std::fprintf(stderr, "lumen-probe: no zwp_text_input_manager_v3\n");
@@ -3037,7 +3037,7 @@ int main(int argc, char** argv) {
             std::printf("ti created version=%u\n", gi.ti_version);
         }
 #endif
-#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+#ifdef LUMEN_PROBE_HAS_IDLE_INHIBIT
         if (o.inhibit_mode) {
             if (!g.inhibit_manager) {
                 std::fprintf(stderr, "lumen-probe: no zwp_idle_inhibit_manager_v1\n");
@@ -3057,7 +3057,7 @@ int main(int argc, char** argv) {
 #endif
         if (o.outputs_mode || o.scale_mode)
             wl_surface_add_listener(g.top.surface, &surface_listener, nullptr);
-#if defined(LUMEN_PROBE_HAS_SCALE)
+#ifdef LUMEN_PROBE_HAS_SCALE
         if (o.scale_mode) {
             if (!g.viewporter || !g.fractional_manager) {
                 std::fprintf(stderr, "lumen-probe: no wp_viewporter / wp_fractional_scale\n");
@@ -3090,7 +3090,7 @@ int main(int argc, char** argv) {
             if (o.unfullscreen_after > 0.0)
                 g.unfullscreen_at = now_s() + o.unfullscreen_after;
         }
-#if defined(LUMEN_PROBE_HAS_DECORATION)
+#ifdef LUMEN_PROBE_HAS_DECORATION
         if (o.ssd && g.deco_manager) {
             // Before the initial commit: the first configure then carries the mode.
             g.deco = zxdg_decoration_manager_v1_get_toplevel_decoration(g.deco_manager,
@@ -3137,7 +3137,7 @@ int main(int argc, char** argv) {
         }
         if (o.activation_target && !o.early && g.top.configured)
             try_activate(true);
-#if defined(LUMEN_PROBE_HAS_IME)
+#ifdef LUMEN_PROBE_HAS_IME
         if (gi.disable_at > 0.0 && now_s() >= gi.disable_at) {
             gi.disable_at = 0.0;
             ti_disable_now();
@@ -3147,7 +3147,7 @@ int main(int argc, char** argv) {
             ti_enable_now();
         }
 #endif
-#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+#ifdef LUMEN_PROBE_HAS_IDLE_INHIBIT
         if (g.destroy_inhibitor_at > 0.0 && now_s() >= g.destroy_inhibitor_at && g.inhibitor) {
             g.destroy_inhibitor_at = 0.0;
             zwp_idle_inhibitor_v1_destroy(g.inhibitor);
@@ -3155,7 +3155,7 @@ int main(int argc, char** argv) {
             std::printf("inhibitor destroyed\n");
         }
 #endif
-#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+#ifdef LUMEN_PROBE_HAS_SESSION_LOCK
         if (g.lock_surface_at > 0.0 && now_s() >= g.lock_surface_at) {
             g.lock_surface_at = 0.0;
             lock_make_surface();
@@ -3172,7 +3172,7 @@ int main(int argc, char** argv) {
             _exit(0);
         }
 #endif
-#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+#ifdef LUMEN_PROBE_HAS_OUTPUT_POWER
         if (g.power_set_at > 0.0 && now_s() >= g.power_set_at) {
             g.power_set_at = 0.0;
             power_request(o.power_set);
@@ -3184,7 +3184,7 @@ int main(int argc, char** argv) {
             power_request(o.power_then);
         }
 #endif
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
         if (o.presentation_mode && g_pres.finished &&
             (feedback_pending() == 0 || now_s() >= g_pres.finish_deadline)) {
             present_summary();
@@ -3251,7 +3251,7 @@ int main(int argc, char** argv) {
             break;
         }
     }
-#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+#ifdef LUMEN_PROBE_HAS_PRESENTATION
     if (o.presentation_mode && !g_pres.summarized)
         present_summary(); // stopped early (signal, --exit-after, closed)
 #endif

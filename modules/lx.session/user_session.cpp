@@ -4,7 +4,7 @@ module;
 #include <sys/resource.h>
 #include <time.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-event.h>
@@ -25,7 +25,7 @@ bool service_notifier::listening() {
 }
 
 namespace {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 void notify_with_status(const char* head, const char* status) {
     char msg[320];
     if (status && *status)
@@ -38,7 +38,7 @@ void notify_with_status(const char* head, const char* status) {
 } // namespace
 
 void service_notifier::ready(const char* status) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     notify_with_status("READY=1", status);
 #else
     (void)status;
@@ -46,7 +46,7 @@ void service_notifier::ready(const char* status) {
 }
 
 void service_notifier::reloading(const char* status) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     // Type=notify-reload: RELOADING=1 must carry the CLOCK_MONOTONIC time of the reload,
     // so the manager can tell this reload's READY from an earlier one.
     timespec ts{};
@@ -62,7 +62,7 @@ void service_notifier::reloading(const char* status) {
 }
 
 void service_notifier::stopping(const char* status) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     notify_with_status("STOPPING=1", status);
 #else
     (void)status;
@@ -70,7 +70,7 @@ void service_notifier::stopping(const char* status) {
 }
 
 void service_notifier::status(const char* status) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (!status)
         return;
     char msg[288];
@@ -82,7 +82,7 @@ void service_notifier::status(const char* status) {
 }
 
 unsigned long long service_notifier::watchdog_usec() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     std::uint64_t usec = 0;
     if (sd_watchdog_enabled(0, &usec) > 0)
         return usec;
@@ -91,7 +91,7 @@ unsigned long long service_notifier::watchdog_usec() {
 }
 
 void service_notifier::watchdog_ping() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     (void)sd_notify(0, "WATCHDOG=1");
 #endif
 }
@@ -132,7 +132,7 @@ void fd_limit::restore_in_child() noexcept {
 
 user_environment::~user_environment() { close(); }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 namespace {
 
 int on_set_reply(sd_bus_message* m, void* user, sd_bus_error*) {
@@ -149,7 +149,7 @@ int on_activation_reply(sd_bus_message* m, void* user, sd_bus_error*) {
 #endif
 
 lx::result<void> user_environment::open(void* event) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     if (bus_)
         return {};
     sd_bus* bus = nullptr;
@@ -170,7 +170,7 @@ lx::result<void> user_environment::open(void* event) {
 lx::result<void> user_environment::export_async(std::span<const std::string_view> assignments,
                                                 unsigned timeout_ms,
                                                 void (*done)(void* user, bool ok), void* user) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     auto* bus = static_cast<sd_bus*>(bus_);
     if (!bus)
         return lx::make_error(lx::io_err::not_found, "user bus not open");
@@ -250,7 +250,7 @@ lx::result<void> user_environment::export_async(std::span<const std::string_view
 }
 
 void user_environment::reply_arrived(bool manager, bool ok) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     // The slot fired; drop our reference (sd-bus already disconnected it from the call).
     void*& slot = manager ? set_slot_ : activation_slot_;
     if (slot) {
@@ -268,7 +268,7 @@ void user_environment::reply_arrived(bool manager, bool ok) {
 }
 
 void user_environment::unset_now(unsigned timeout_ms) {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     auto* bus = static_cast<sd_bus*>(bus_);
     if (!bus || names_.empty())
         return;
@@ -297,7 +297,7 @@ void user_environment::unset_now(unsigned timeout_ms) {
 }
 
 void user_environment::close() {
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
     for (void** s : {&set_slot_, &activation_slot_}) {
         if (*s)
             sd_bus_slot_unref(static_cast<sd_bus_slot*>(*s));

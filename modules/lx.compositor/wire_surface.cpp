@@ -13,7 +13,7 @@ module;
 #include <stdint.h>
 #include <time.h>
 
-#if defined(__linux__)
+#ifdef __linux__
 #include <linux/dma-buf.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -21,7 +21,7 @@ module;
 #endif
 
 #include <wayland-server.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-server-protocol.h"
 #include "xdg-decoration-unstable-v1-server-protocol.h"
 // wayland-scanner names an argument `namespace`, a C++ keyword; renamed for this header
@@ -505,7 +505,7 @@ void surface_attach(struct wl_client*, struct wl_resource* resource, struct wl_r
                                "attach with a non-zero offset (use wl_surface.offset)");
         return;
     }
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
     // xdg-decoration v1: "any attempts by a client to attach or manipulate a buffer prior to
     // the first xdg_toplevel_decoration.configure event must also be treated as errors".
     if (buffer && s->toplevel && s->ctx && s->ctx->toplevels) {
@@ -1889,7 +1889,7 @@ void log_implicit_off(int err) {
 /// wait on). `lost`: it has not signalled and no eventfd could be armed. The query carries
 /// the deadline hint.
 int acquire_wait_fd(const sync_point& p, bool& lost, fence_deadline_of& deadline) {
-#if defined(__linux__)
+#ifdef __linux__
     lx::gfx::drm_timeline_table* tl = syncobj_timelines();
     if (!p.timeline || !tl)
         return -1;
@@ -1924,7 +1924,7 @@ unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigne
     if (!st.buffer_set || !st.buffer)
         return 0;
     unsigned n = 0;
-#if defined(__linux__)
+#ifdef __linux__
     if (st.acquire.timeline) {
         if (cap == 0) {
             bool unused = false;
@@ -2560,7 +2560,7 @@ const struct wl_surface_interface surface_impl = {
     .set_buffer_scale = surface_set_buffer_scale,
     .damage_buffer = surface_damage_buffer,
     .offset = surface_offset,
-#if defined(WL_SURFACE_GET_RELEASE_SINCE_VERSION)
+#ifdef WL_SURFACE_GET_RELEASE_SINCE_VERSION
     .get_release =
         [](struct wl_client* client, struct wl_resource*, uint32_t callback) {
             // Optional v7 release callback — create and immediately complete unused.
@@ -2642,7 +2642,7 @@ void compositor_create_region(struct wl_client* client, struct wl_resource* reso
 const struct wl_compositor_interface compositor_impl = {
     .create_surface = compositor_create_surface,
     .create_region = compositor_create_region,
-#if defined(WL_COMPOSITOR_RELEASE_SINCE_VERSION)
+#ifdef WL_COMPOSITOR_RELEASE_SINCE_VERSION
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
 #endif

@@ -30,11 +30,11 @@ module;
 #include <time.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1)
+#ifdef LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1
 #include "ext-idle-notify-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_NOTIFY 1
 #endif
-#if defined(LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1
 #include "idle-inhibit-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_INHIBIT 1
 #endif
@@ -78,7 +78,7 @@ void changed() {
 bool g_warned_notify_full = false;
 bool g_warned_inhibit_full = false;
 
-#if defined(LUMEN_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_HAS_IDLE_NOTIFY
 
 void send_idled(void*, void* resource) {
     auto* r = static_cast<wl_resource*>(resource);
@@ -104,14 +104,14 @@ void send_resumed(void*, void* resource) {
 
 [[nodiscard]] lx::compositor::idle_sink sink() {
     lx::compositor::idle_sink k{};
-#if defined(LUMEN_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_HAS_IDLE_NOTIFY
     k.idled = &send_idled;
     k.resumed = &send_resumed;
 #endif
     return k;
 }
 
-#if defined(LUMEN_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_HAS_IDLE_NOTIFY
 
 /// The notification's destructor: destroy request or client teardown. A removal only moves
 /// deadlines later, so the lazily armed timer needs nothing (it fires early, once, at most).
@@ -173,7 +173,7 @@ const struct ext_idle_notifier_v1_interface notifier_impl = {
 
 #endif
 
-#if defined(LUMEN_HAS_IDLE_INHIBIT)
+#ifdef LUMEN_HAS_IDLE_INHIBIT
 
 void inhibitor_destroy_resource(wl_resource* r) {
     if (g_ctx && g_ctx->inhibitors) {
@@ -232,7 +232,7 @@ const struct zwp_idle_inhibit_manager_v1_interface inhibit_manager_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_IDLE_NOTIFY)
+#ifdef LUMEN_HAS_IDLE_NOTIFY
 void bind_idle_notifier(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -243,7 +243,7 @@ void bind_idle_notifier(wayland::client_connection& client, unsigned id, int ver
 }
 #endif
 
-#if defined(LUMEN_HAS_IDLE_INHIBIT)
+#ifdef LUMEN_HAS_IDLE_INHIBIT
 void bind_idle_inhibit_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;

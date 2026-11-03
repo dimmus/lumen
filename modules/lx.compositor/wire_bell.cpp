@@ -17,7 +17,7 @@ module;
 #endif
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1)
+#ifdef LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1
 #include "xdg-system-bell-v1-server-protocol.h"
 #define LUMEN_HAS_SYSTEM_BELL 1
 #endif
@@ -42,7 +42,7 @@ constexpr lx::trace::category log_bell{"compositor.bell"};
 
 } // namespace
 
-#if defined(LUMEN_HAS_SYSTEM_BELL)
+#ifdef LUMEN_HAS_SYSTEM_BELL
 
 namespace lx::compositor::wire {
 

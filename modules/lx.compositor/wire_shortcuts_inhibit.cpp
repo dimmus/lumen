@@ -31,7 +31,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_KEYBOARD_SHORTCUTS_INHIBIT_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_KEYBOARD_SHORTCUTS_INHIBIT_UNSTABLE_V1
 #include "keyboard-shortcuts-inhibit-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_SHORTCUTS_INHIBIT 1
 #endif
@@ -49,7 +49,7 @@ import :wire;
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_SHORTCUTS_INHIBIT)
+#ifdef LUMEN_HAS_SHORTCUTS_INHIBIT
 
 namespace {
 

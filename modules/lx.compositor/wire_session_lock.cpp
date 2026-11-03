@@ -38,7 +38,7 @@ module;
 #include <time.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
+#ifdef LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1
 #include "ext-session-lock-v1-server-protocol.h"
 #define LUMEN_HAS_SESSION_LOCK 1
 #endif
@@ -126,7 +126,7 @@ struct lock_obj {
 
 } // namespace
 
-#if defined(LUMEN_HAS_SESSION_LOCK)
+#ifdef LUMEN_HAS_SESSION_LOCK
 
 namespace {
 

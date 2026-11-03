@@ -43,7 +43,7 @@
 
 #include <systemd/sd-bus.h>
 
-#if defined(LUMEN_PROBE_HAS_PIPEWIRE)
+#ifdef LUMEN_PROBE_HAS_PIPEWIRE
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wc99-extensions"
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -316,7 +316,7 @@ int screenshot_main(sd_bus* bus, bool interactive, unsigned target, bool backend
     return 0;
 }
 
-#if defined(LUMEN_PROBE_HAS_PIPEWIRE)
+#ifdef LUMEN_PROBE_HAS_PIPEWIRE
 
 struct cast_state {
     pw_main_loop* loop = nullptr;
@@ -603,7 +603,7 @@ int screencast_main(sd_bus* bus, unsigned types, unsigned cursor_mode, double se
         close_session();
         return 1;
     }
-#if defined(LUMEN_PROBE_HAS_PIPEWIRE)
+#ifdef LUMEN_PROBE_HAS_PIPEWIRE
     cast_state s;
     s.want_dmabuf = dmabuf;
     if (expect && std::sscanf(expect, "%d,%d,%d@%d,%d", &s.er, &s.eg, &s.eb, &s.ex, &s.ey) == 5)

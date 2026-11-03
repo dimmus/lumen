@@ -20,7 +20,7 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#ifdef LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1
 #include "ext-background-effect-v1-server-protocol.h"
 #define LUMEN_HAS_BACKGROUND_EFFECT 1
 #endif
@@ -34,7 +34,7 @@ import lx.wayland.server;
 import :surface;
 import :wire;
 
-#if defined(LUMEN_HAS_BACKGROUND_EFFECT)
+#ifdef LUMEN_HAS_BACKGROUND_EFFECT
 
 namespace lx::compositor::wire {
 

@@ -9,7 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <GLES2/gl2.h>
 #endif
 
@@ -199,7 +199,7 @@ LUMEN_TEST(gl_composite_scanout_memory_row_0_is_the_top) {
     const pixel rb_top = at(out, W, W / 2, 2);
     LUMEN_CHECK(near(rb_top.r, 255) && near(rb_top.g, 0));
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
     // Independent of read_back, which a matching flip would make agree with a wrong
     // composite. Raw glReadPixels on this framebuffer object returns window y = 0 first,
     // and that is the order the display shows: with the old y-negating shader the screen

@@ -2,7 +2,7 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 #include <drm_fourcc.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
@@ -176,7 +176,7 @@ lx::drm::kms_cursor_plane& lx::drm::kms_cursor_plane::operator=(kms_cursor_plane
 }
 
 void lx::drm::kms_cursor_plane::release() {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     // Removing a framebuffer the plane still scans out makes the kernel disable the plane,
     // so tearing down here also takes the pointer off the screen. RMFB, not the exit's
     // CLOSEFB: a pointer frozen where it was would sit over the console or the next master's
@@ -194,7 +194,7 @@ void lx::drm::kms_cursor_plane::release() {
     fd_ = -1;
 }
 
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
 namespace {
 
 /// One entry of a SIZE_HINTS blob (uapi `struct drm_plane_size_hint`, which older libdrm
@@ -242,7 +242,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
                                                                         unsigned max_image_w,
                                                                         unsigned max_image_h,
                                                                         unsigned want_plane) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (fd < 0 || crtc_id == 0 || crtc_index >= 32) {
         return lx::make_error(lx::drm_err::mode_invalid, "cursor plane: no CRTC");
     }
@@ -387,7 +387,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
 lx::result<void> lx::drm::kms_cursor_plane::stage_image(const std::uint32_t* argb, unsigned w,
                                                         unsigned h, unsigned stride_px, int hot_x,
                                                         int hot_y) {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     if (!valid() || !argb || w == 0 || h == 0 || w > caps_.width || h > caps_.height ||
         stride_px < w) {
         return lx::invalid_argument("cursor image does not fit the cursor plane");
@@ -440,7 +440,7 @@ bool lx::drm::kms_cursor_plane::dirty() const {
 }
 
 void lx::drm::kms_cursor_plane::append_props(void* drm_atomic_req) const {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     auto* req = static_cast<drmModeAtomicReq*>(drm_atomic_req);
     if (!req || !valid())
         return;
@@ -475,7 +475,7 @@ void lx::drm::kms_cursor_plane::append_props(void* drm_atomic_req) const {
 }
 
 void lx::drm::kms_cursor_plane::append_off_props(void* drm_atomic_req) const {
-#if defined(LUMEN_HAS_DRM)
+#ifdef LUMEN_HAS_DRM
     auto* req = static_cast<drmModeAtomicReq*>(drm_atomic_req);
     if (!req || !valid())
         return;

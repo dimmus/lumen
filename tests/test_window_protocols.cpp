@@ -46,7 +46,7 @@ import lx.runtime;
 import lx.input;
 import lx.compositor;
 
-#if !defined(LUMEN_TEST_PART_B)
+#ifndef LUMEN_TEST_PART_B
 
 int main() {
     std::printf("SKIP: needs libwayland and the Part B protocols' glue\n");

@@ -2,7 +2,7 @@ module;
 
 #include <stdlib.h>
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -177,7 +177,7 @@ inline constexpr unsigned long k_max_client_keymap = 4ul << 20;
 } // namespace lx::input
 
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 
 namespace {
 
@@ -217,7 +217,7 @@ namespace {
 lx::input::keyboard_keymap::~keyboard_keymap() { destroy(); }
 
 void lx::input::keyboard_keymap::destroy() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (state_)
         xkb_state_unref(static_cast<xkb_state*>(state_));
     if (keymap_)
@@ -256,7 +256,7 @@ lx::input::keyboard_keymap& lx::input::keyboard_keymap::operator=(
     return *this;
 }
 
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
 namespace {
 constexpr lx::trace::category log_input{"input"};
 
@@ -288,7 +288,7 @@ void capture_xkb_log(struct xkb_context* ctx, enum xkb_log_level level, const ch
 
 lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config, char* error,
                                                      unsigned error_cap) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     destroy();
     if (error && error_cap)
         error[0] = '\0';
@@ -336,7 +336,7 @@ lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config, char*
 
 void lx::input::keyboard_keymap::adopt_state(const keyboard_keymap& old, const unsigned* held,
                                              unsigned held_count) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_ || !keymap_)
         return;
     auto* st = static_cast<xkb_state*>(state_);
@@ -368,7 +368,7 @@ void lx::input::keyboard_keymap::adopt_state(const keyboard_keymap& old, const u
 }
 
 bool lx::input::keyboard_keymap::set_num_lock(bool on) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_ || !keymap_)
         return false;
     const xkb_mod_index_t i =
@@ -386,7 +386,7 @@ bool lx::input::keyboard_keymap::set_num_lock(bool on) {
 }
 
 unsigned lx::input::keyboard_keymap::layout_count() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     return keymap_ ? xkb_keymap_num_layouts(static_cast<xkb_keymap*>(keymap_)) : 0u;
 #else
     return 0;
@@ -394,7 +394,7 @@ unsigned lx::input::keyboard_keymap::layout_count() const {
 }
 
 bool lx::input::keyboard_keymap::cycle_layout(int step) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     const unsigned n = layout_count();
     if (!state_ || n < 2)
         return false;
@@ -418,7 +418,7 @@ bool lx::input::keyboard_keymap::cycle_layout(int step) {
 }
 
 const char* lx::input::keyboard_keymap::layout_name(unsigned layout) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     const char* n = keymap_ ? xkb_keymap_layout_get_name(static_cast<xkb_keymap*>(keymap_), layout)
                             : nullptr;
     return n ? n : "";
@@ -429,7 +429,7 @@ const char* lx::input::keyboard_keymap::layout_name(unsigned layout) const {
 }
 
 bool lx::input::keyboard_keymap::update_key(unsigned evdev_keycode, bool pressed) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return false;
     xkb_state_update_key(static_cast<xkb_state*>(state_), to_xkb(evdev_keycode),
@@ -446,7 +446,7 @@ bool lx::input::keyboard_keymap::update_key(unsigned evdev_keycode, bool pressed
 }
 
 bool lx::input::keyboard_keymap::update_mask(modifier_state mods) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return false;
     xkb_state_update_mask(static_cast<xkb_state*>(state_), mods.depressed, mods.latched,
@@ -462,7 +462,7 @@ bool lx::input::keyboard_keymap::update_mask(modifier_state mods) {
 }
 
 lx::input::modifier_state lx::input::keyboard_keymap::modifiers() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return {};
     auto* st = static_cast<xkb_state*>(state_);
@@ -478,7 +478,7 @@ lx::input::modifier_state lx::input::keyboard_keymap::modifiers() const {
 }
 
 lx::input::named_modifiers lx::input::keyboard_keymap::named() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return {};
     auto* st = static_cast<xkb_state*>(state_);
@@ -496,7 +496,7 @@ lx::input::named_modifiers lx::input::keyboard_keymap::named() const {
 }
 
 unsigned lx::input::keyboard_keymap::keysym(unsigned evdev_keycode) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return 0;
     return xkb_state_key_get_one_sym(static_cast<xkb_state*>(state_), to_xkb(evdev_keycode));
@@ -508,7 +508,7 @@ unsigned lx::input::keyboard_keymap::keysym(unsigned evdev_keycode) const {
 
 unsigned lx::input::keyboard_keymap::utf8(unsigned evdev_keycode, char* out,
                                           unsigned capacity) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_ || !out || capacity == 0)
         return 0;
     const int n = xkb_state_key_get_utf8(static_cast<xkb_state*>(state_),
@@ -524,7 +524,7 @@ unsigned lx::input::keyboard_keymap::utf8(unsigned evdev_keycode, char* out,
 
 unsigned lx::input::keyboard_keymap::level1_keysym(unsigned evdev_keycode,
                                                    unsigned layout) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!keymap_)
         return 0;
     const xkb_keysym_t* syms = nullptr;
@@ -539,7 +539,7 @@ unsigned lx::input::keyboard_keymap::level1_keysym(unsigned evdev_keycode,
 }
 
 unsigned lx::input::keyboard_keymap::active_layout() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return 0;
     return xkb_state_serialize_layout(static_cast<xkb_state*>(state_), XKB_STATE_LAYOUT_EFFECTIVE);
@@ -549,7 +549,7 @@ unsigned lx::input::keyboard_keymap::active_layout() const {
 }
 
 bool lx::input::keyboard_keymap::layout_has_keysym(unsigned keysym, unsigned layout) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!keymap_ || keysym == 0)
         return false;
     auto* map = static_cast<xkb_keymap*>(keymap_);
@@ -571,7 +571,7 @@ bool lx::input::keyboard_keymap::layout_has_keysym(unsigned keysym, unsigned lay
 }
 
 bool lx::input::keyboard_keymap::reset_depressed() {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_ || !keymap_)
         return false;
     auto* old = static_cast<xkb_state*>(state_);
@@ -594,7 +594,7 @@ bool lx::input::keyboard_keymap::reset_depressed() {
 }
 
 unsigned lx::input::keyboard_keymap::led_mask() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!state_)
         return 0;
     auto* st = static_cast<xkb_state*>(state_);
@@ -612,7 +612,7 @@ unsigned lx::input::keyboard_keymap::led_mask() const {
 }
 
 bool lx::input::keyboard_keymap::repeats(unsigned evdev_keycode) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!keymap_)
         return false;
     return xkb_keymap_key_repeats(static_cast<xkb_keymap*>(keymap_), to_xkb(evdev_keycode)) > 0;
@@ -623,7 +623,7 @@ bool lx::input::keyboard_keymap::repeats(unsigned evdev_keycode) const {
 }
 
 char* lx::input::keyboard_keymap::keymap_string() const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (!keymap_)
         return nullptr;
     return xkb_keymap_get_as_string(static_cast<xkb_keymap*>(keymap_),
@@ -634,7 +634,7 @@ char* lx::input::keyboard_keymap::keymap_string() const {
 }
 
 void lx::input::keyboard_keymap::free_keymap_string(char* s) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     if (s)
         ::free(s);
 #else
@@ -643,7 +643,7 @@ void lx::input::keyboard_keymap::free_keymap_string(char* s) {
 }
 
 lx::result<lx::unique_fd> lx::input::keyboard_keymap::keymap_fd(unsigned& size_out) const {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     size_out = 0;
     char* text = keymap_string();
     if (!text)
@@ -662,7 +662,7 @@ lx::result<lx::unique_fd> lx::input::keyboard_keymap::keymap_fd(unsigned& size_o
 
 lx::result<lx::unique_fd> lx::input::normalize_keymap(const char* text, unsigned long len,
                                                      unsigned& size_out) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     size_out = 0;
     while (text && len > 0 && text[len - 1] == '\0')
         --len;
@@ -696,7 +696,7 @@ lx::result<lx::unique_fd> lx::input::normalize_keymap(const char* text, unsigned
 
 lx::result<lx::unique_fd> lx::input::normalize_keymap_fd(int fd, unsigned long size,
                                                         unsigned& size_out) {
-#if defined(LUMEN_HAS_INPUT)
+#ifdef LUMEN_HAS_INPUT
     size_out = 0;
     if (fd < 0 || size == 0 || size > k_max_client_keymap)
         return lx::invalid_argument("keymap size");

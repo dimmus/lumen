@@ -5,10 +5,8 @@ module;
 #include <sys/mman.h>
 #include <unistd.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
 #include "zlm_shell_v1-client-protocol.h"
-#endif
 #include <time.h>
 
 import lx.foundation;
@@ -245,7 +243,6 @@ constexpr lx::trace::category log_bridge{"shell.bridge"};
 
 } // namespace
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 namespace {
 
@@ -841,43 +838,6 @@ void lx::shell::policy_bridge::destroy_key_grabs() {
 
 lx::shell::policy_bridge::~policy_bridge() { detach(); }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-struct lx::shell::policy_bridge::events {};
-bool lx::shell::policy_bridge::has_v6() const { return false; }
-bool lx::shell::policy_bridge::has_v7() const { return false; }
-
-lx::result<void> lx::shell::policy_bridge::observe(void*) {
-    return lx::not_implemented("lx::shell::policy_bridge::observe");
-}
-lx::result<void> lx::shell::policy_bridge::attach(void*) {
-    return lx::not_implemented("lx::shell::policy_bridge::attach");
-}
-void lx::shell::policy_bridge::detach() {}
-void* lx::shell::policy_bridge::proxy_of(task_handle) const { return nullptr; }
-void lx::shell::policy_bridge::request_activate(task_handle) {}
-void lx::shell::policy_bridge::request_raise(task_handle) {}
-void lx::shell::policy_bridge::request_lower(task_handle) {}
-void lx::shell::policy_bridge::request_close(task_handle) {}
-void lx::shell::policy_bridge::request_maximize(task_handle) {}
-void lx::shell::policy_bridge::request_unmaximize(task_handle) {}
-void lx::shell::policy_bridge::request_minimize(task_handle) {}
-void lx::shell::policy_bridge::end_hold() {}
-bool lx::shell::policy_bridge::can_logout() const { return false; }
-void lx::shell::policy_bridge::request_logout() {}
-bool lx::shell::policy_bridge::can_grab_keys() const { return false; }
-bool lx::shell::policy_bridge::has_lock_state() const { return false; }
-lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned, unsigned, unsigned, key_grab_fn,
-                                                        void*) {
-    return lx::not_implemented("lx::shell::policy_bridge::grab_key");
-}
-void lx::shell::policy_bridge::ungrab_key(unsigned) {}
-unsigned lx::shell::policy_bridge::key_grab_refusal(unsigned) const { return 0; }
-unsigned lx::shell::policy_bridge::key_grab_activations(unsigned) const { return 0; }
-void lx::shell::policy_bridge::destroy_key_grabs() {}
-lx::shell::policy_bridge::~policy_bridge() = default;
-
-#endif
 
 void lx::shell::policy_bridge::unmap_icons(icon_maps& m) {
     for (unsigned i = 0; i < m.count; ++i)

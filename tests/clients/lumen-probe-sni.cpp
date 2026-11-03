@@ -38,13 +38,13 @@
 
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #endif
 
 int sni_main(int argc, char** argv);
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 namespace {
 

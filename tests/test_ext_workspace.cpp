@@ -28,7 +28,7 @@ import lx.foundation;
 import lx.runtime;
 import lx.compositor;
 
-#if !defined(LUMEN_TEST_EXT_WORKSPACE)
+#ifndef LUMEN_TEST_EXT_WORKSPACE
 
 int main() {
     std::printf("SKIP: needs libwayland and ext-workspace-v1's glue\n");

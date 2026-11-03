@@ -9,7 +9,7 @@ module;
 #include <time.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #endif
 
@@ -35,7 +35,7 @@ constexpr unsigned k_menu_max_depth = 8;
 
 } // namespace
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 // ── com.canonical.dbusmenu layouts ───────────────────────────────────────────
 

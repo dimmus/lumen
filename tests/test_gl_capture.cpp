@@ -14,7 +14,7 @@
 #include <poll.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_EGL)
+#ifdef LUMEN_HAS_EGL
 #include <gbm.h>
 #endif
 
@@ -23,7 +23,7 @@ import lx.foundation;
 import lx.gfx;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_EGL)
+#ifndef LUMEN_HAS_EGL
 
 int main() {
     std::printf("SKIP: built without EGL\n");

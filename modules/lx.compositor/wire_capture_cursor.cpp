@@ -54,7 +54,7 @@ import :wire;
 
 namespace lx::compositor::wire {
 
-#if defined(LUMEN_HAS_IMAGE_CAPTURE)
+#ifdef LUMEN_HAS_IMAGE_CAPTURE
 
 namespace {
 

@@ -61,7 +61,7 @@
 
 int compat_main(int argc, char** argv);
 
-#if !defined(PROBE_HAS_COMPAT)
+#ifndef PROBE_HAS_COMPAT
 
 int compat_main(int, char**) {
     std::fprintf(stderr, "lumen-probe: built without the commit-path protocol glue\n");
@@ -88,7 +88,7 @@ struct globals {
     wp_tearing_control_manager_v1* tearing = nullptr;
     wp_viewporter* viewporter = nullptr;
     wl_subcompositor* subcompositor = nullptr;
-#if defined(PROBE_HAS_BLUR)
+#ifdef PROBE_HAS_BLUR
     ext_background_effect_manager_v1* effect = nullptr;
     uint32_t effect_caps = 0;
 #endif
@@ -136,7 +136,7 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
         g.viewporter = bind<wp_viewporter>(r, name, &wp_viewporter_interface, 1);
     else if (!std::strcmp(iface, wl_subcompositor_interface.name))
         g.subcompositor = bind<wl_subcompositor>(r, name, &wl_subcompositor_interface, 1);
-#if defined(PROBE_HAS_BLUR)
+#ifdef PROBE_HAS_BLUR
     else if (!std::strcmp(iface, ext_background_effect_manager_v1_interface.name)) {
         static const ext_background_effect_manager_v1_listener l = {
             [](void*, ext_background_effect_manager_v1*, uint32_t caps) { g.effect_caps = caps; }};
@@ -492,7 +492,7 @@ int run_solid(const options& o, bool tearing_mode) {
     return 0;
 }
 
-#if defined(PROBE_HAS_BLUR)
+#ifdef PROBE_HAS_BLUR
 /// One shm buffer of `w` × `h` in `format`, filled by `px(x, y)`.
 template <typename Fn>
 wl_buffer* shm_image(int w, int h, uint32_t format, Fn px) {
@@ -619,7 +619,7 @@ int compat_main(int argc, char** argv) {
         rc = run_solid(o, false);
     else if (!std::strcmp(mode, "tearing"))
         rc = run_solid(o, true);
-#if defined(PROBE_HAS_BLUR)
+#ifdef PROBE_HAS_BLUR
     else if (!std::strcmp(mode, "blur"))
         rc = run_blur(o);
 #endif

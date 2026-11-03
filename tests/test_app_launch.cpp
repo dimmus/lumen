@@ -17,7 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 #include <systemd/sd-bus.h>
 #endif
 
@@ -527,7 +527,7 @@ LUMEN_TEST(systemd_scope_holds_the_process_until_it_is_in_its_scope) {
     (void)std::system(("rm -rf '" + g_root + "'").c_str());
 }
 
-#if defined(LUMEN_HAS_LOGIND)
+#ifdef LUMEN_HAS_LOGIND
 
 namespace {
 

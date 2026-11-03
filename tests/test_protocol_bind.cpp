@@ -2,7 +2,7 @@
 #include <stdio.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
@@ -58,7 +58,7 @@ const wl_interface* lookup_interface(const std::string& name) {
         return &wl_data_device_manager_interface;
     if (name == "wl_shm")
         return &wl_shm_interface;
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
     if (name == "xdg_wm_base")
         return &xdg_wm_base_interface;
     if (name == "zwp_linux_dmabuf_v1")

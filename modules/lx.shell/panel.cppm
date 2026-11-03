@@ -6,12 +6,10 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#ifdef LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1
 #include "ext-background-effect-v1-client-protocol.h"
 #define LUMEN_SHELL_BACKGROUND_EFFECT 1
-#endif
 #endif
 
 import lx.foundation;
@@ -1865,7 +1863,6 @@ void lx::shell::panel::set_blur(void* manager) {
         log_panel.warn("panel blur changed after create: it applies to the next panel");
 }
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge,
                                           unsigned output_slot) {
@@ -1909,7 +1906,7 @@ lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& 
             log_panel.warn("layer surface closed by the compositor");
         },
         this);
-#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+#ifdef LUMEN_SHELL_BACKGROUND_EFFECT
     if (blur) {
         // Translucent over a blur of everything behind it: no opaque region, the whole
         // surface the blur region (the compositor clips it).
@@ -2021,7 +2018,7 @@ void lx::shell::panel::after_dispatch(unsigned changes) {
 }
 
 void lx::shell::panel::destroy() {
-#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+#ifdef LUMEN_SHELL_BACKGROUND_EFFECT
     if (effect_)
         ext_background_effect_surface_v1_destroy(
             static_cast<ext_background_effect_surface_v1*>(effect_));
@@ -2032,17 +2029,5 @@ void lx::shell::panel::destroy() {
     bridge_ = nullptr;
 }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-lx::result<void> lx::shell::panel::create(panel_globals, policy_bridge&, unsigned) {
-    return lx::not_implemented("lx::shell::panel::create");
-}
-void lx::shell::panel::destroy() {}
-void lx::shell::panel::set_menu_keyboard(bool) {}
-void lx::shell::panel::set_blur(void*) {}
-void lx::shell::panel::after_dispatch() {}
-void lx::shell::panel::after_dispatch(unsigned) {}
-
-#endif
 
 lx::shell::panel::~panel() { destroy(); }

@@ -23,11 +23,11 @@ module;
 #include <stdint.h>
 
 #include <wayland-server.h>
-#if defined(LUMEN_PROTOCOL_TEARING_CONTROL_V1)
+#ifdef LUMEN_PROTOCOL_TEARING_CONTROL_V1
 #include "tearing-control-v1-server-protocol.h"
 #define LUMEN_HAS_TEARING_CONTROL 1
 #endif
-#if defined(LUMEN_PROTOCOL_CONTENT_TYPE_V1)
+#ifdef LUMEN_PROTOCOL_CONTENT_TYPE_V1
 #include "content-type-v1-server-protocol.h"
 #define LUMEN_HAS_CONTENT_TYPE 1
 #endif
@@ -46,7 +46,7 @@ namespace lx::compositor::wire {
 
 namespace {
 
-#if defined(LUMEN_HAS_TEARING_CONTROL)
+#ifdef LUMEN_HAS_TEARING_CONTROL
 
 /// "Destroy this surface tearing object and revert the presentation hint to vsync. The
 /// change will be applied on the next wl_surface.commit."
@@ -92,7 +92,7 @@ const struct wp_tearing_control_manager_v1_interface tearing_manager_impl = {
 
 #endif
 
-#if defined(LUMEN_HAS_CONTENT_TYPE)
+#ifdef LUMEN_HAS_CONTENT_TYPE
 
 /// Destroying the object resets the type to none at the next commit (wlroots, Mutter).
 void content_type_destroy_resource(wl_resource* r) {
@@ -137,7 +137,7 @@ const struct wp_content_type_manager_v1_interface content_type_manager_impl = {
 
 } // namespace
 
-#if defined(LUMEN_HAS_TEARING_CONTROL)
+#ifdef LUMEN_HAS_TEARING_CONTROL
 void bind_tearing_control_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
@@ -148,7 +148,7 @@ void bind_tearing_control_manager(wayland::client_connection& client, unsigned i
 }
 #endif
 
-#if defined(LUMEN_HAS_CONTENT_TYPE)
+#ifdef LUMEN_HAS_CONTENT_TYPE
 void bind_content_type_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;

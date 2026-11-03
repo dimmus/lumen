@@ -1082,13 +1082,13 @@ const char* lx::ui::theme_dir() {
         lx_ui_copy_cut(dir, sizeof(dir), env);
         return dir;
     }
-#if defined(LUMEN_THEME_DIR_BUILD)
+#ifdef LUMEN_THEME_DIR_BUILD
     if (lx_ui_is_dir(LUMEN_THEME_DIR_BUILD)) {
         lx_ui_copy_cut(dir, sizeof(dir), LUMEN_THEME_DIR_BUILD);
         return dir;
     }
 #endif
-#if defined(LUMEN_THEME_DIR_INSTALL_RELATIVE)
+#ifdef LUMEN_THEME_DIR_INSTALL_RELATIVE
     {
         char exe[512]{};
         const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
@@ -1107,7 +1107,7 @@ const char* lx::ui::theme_dir() {
         }
     }
 #endif
-#if defined(LUMEN_THEME_DIR_INSTALL)
+#ifdef LUMEN_THEME_DIR_INSTALL
     if (lx_ui_is_dir(LUMEN_THEME_DIR_INSTALL))
         lx_ui_copy_cut(dir, sizeof(dir), LUMEN_THEME_DIR_INSTALL);
 #endif

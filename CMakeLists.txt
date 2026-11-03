@@ -189,10 +189,9 @@ lumen_add_module_library(lx.compositor modules/lx.compositor
 lumen_add_module_library(lx.shell modules/lx.shell
     DEPENDS lx.shell.policy lx.text lx.trace lx.config lx.wayland.client lx.runtime lx.ui.host)
 lumen_link_platform_parts(lx.shell wayland_client xkb text systemd)
-if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
-    target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
-    target_compile_definitions(lx.shell PRIVATE LUMEN_SHELL_WAYLAND=1)
-endif()
+# The glue is always there (wayland-scanner is required), so the shell speaks its protocols
+# unconditionally — no LUMEN_SHELL_WAYLAND: the shell outside Wayland is nothing.
+target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
 # Icon decoding for the panel (lx.shell:icon_theme) and background images
 # (lx.shell:background), each optional.
 if(LIBPNG_FOUND)

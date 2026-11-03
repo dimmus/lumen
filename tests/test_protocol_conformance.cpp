@@ -15,7 +15,7 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifdef LUMEN_HAS_PROTOCOL_GLUE
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "zlm_shell_v1-client-protocol.h"
@@ -27,11 +27,11 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#if defined(LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1)
+#ifdef LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1
 #include "primary-selection-unstable-v1-client-protocol.h"
 #define LUMEN_TEST_PRIMARY_SELECTION 1
 #endif
-#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
+#ifdef LUMEN_PROTOCOL_XDG_ACTIVATION_V1
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_TEST_ACTIVATION 1
 #endif
@@ -40,7 +40,7 @@
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_TEST_VIEWPORTER 1
 #endif
-#if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
+#ifdef LUMEN_PROTOCOL_PRESENTATION_TIME
 #include "presentation-time-client-protocol.h"
 #define LUMEN_TEST_PRESENTATION 1
 #endif
@@ -63,15 +63,15 @@
 #include "alpha-modifier-v1-client-protocol.h"
 #define LUMEN_TEST_COMMIT_PATH 1
 #endif
-#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
+#ifdef LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
 #endif
-#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#ifdef LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1
 #include "ext-background-effect-v1-client-protocol.h"
 #define LUMEN_TEST_BACKGROUND_EFFECT 1
 #endif
-#if defined(LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1)
+#ifdef LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1
 #include "color-management-v1-client-protocol.h"
 #define LUMEN_TEST_COLOR_MANAGEMENT 1
 #endif
@@ -96,7 +96,7 @@ import lx.input;
 import lx.gfx;
 import lx.compositor;
 
-#if !defined(LUMEN_HAS_PROTOCOL_GLUE)
+#ifndef LUMEN_HAS_PROTOCOL_GLUE
 
 int main() {
     std::printf("SKIP: needs libwayland and the generated protocol glue\n");
@@ -126,30 +126,30 @@ struct client {
     /// The wl_output global (not bound by `connect`).
     uint32_t output_name = 0;
     uint32_t output_version = 0;
-#if defined(LUMEN_TEST_PRIMARY_SELECTION)
+#ifdef LUMEN_TEST_PRIMARY_SELECTION
     zwp_primary_selection_device_manager_v1* psm = nullptr;
 #endif
-#if defined(LUMEN_TEST_ACTIVATION)
+#ifdef LUMEN_TEST_ACTIVATION
     xdg_activation_v1* activation = nullptr;
 #endif
-#if defined(LUMEN_TEST_VIEWPORTER)
+#ifdef LUMEN_TEST_VIEWPORTER
     wp_viewporter* viewporter = nullptr;
     wp_fractional_scale_manager_v1* fractional = nullptr;
 #endif
-#if defined(LUMEN_TEST_PRESENTATION)
+#ifdef LUMEN_TEST_PRESENTATION
     wp_presentation* presentation = nullptr;
     /// wp_presentation.clock_id as received (~0u: none yet).
     uint32_t clock_id = ~0u;
 #endif
-#if defined(LUMEN_TEST_IDLE)
+#ifdef LUMEN_TEST_IDLE
     ext_idle_notifier_v1* idle_notifier = nullptr;
     zwp_idle_inhibit_manager_v1* inhibit_manager = nullptr;
     zwlr_output_power_manager_v1* power_manager = nullptr;
 #endif
-#if defined(LUMEN_TEST_SESSION_LOCK)
+#ifdef LUMEN_TEST_SESSION_LOCK
     ext_session_lock_manager_v1* lock_manager = nullptr;
 #endif
-#if defined(LUMEN_TEST_IME)
+#ifdef LUMEN_TEST_IME
     zwp_text_input_manager_v3* ti_manager = nullptr;
     uint32_t ti_version = 0;
     zwp_input_method_manager_v2* im_manager = nullptr;
@@ -194,17 +194,17 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
         c->output_name = name;
         c->output_version = version;
     }
-#if defined(LUMEN_TEST_PRIMARY_SELECTION)
+#ifdef LUMEN_TEST_PRIMARY_SELECTION
     else if (std::strcmp(iface, zwp_primary_selection_device_manager_v1_interface.name) == 0)
         c->psm = static_cast<zwp_primary_selection_device_manager_v1*>(wl_registry_bind(
             registry, name, &zwp_primary_selection_device_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_TEST_ACTIVATION)
+#ifdef LUMEN_TEST_ACTIVATION
     else if (std::strcmp(iface, xdg_activation_v1_interface.name) == 0)
         c->activation = static_cast<xdg_activation_v1*>(
             wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1));
 #endif
-#if defined(LUMEN_TEST_VIEWPORTER)
+#ifdef LUMEN_TEST_VIEWPORTER
     else if (std::strcmp(iface, wp_viewporter_interface.name) == 0)
         c->viewporter = static_cast<wp_viewporter*>(
             wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
@@ -212,7 +212,7 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
         c->fractional = static_cast<wp_fractional_scale_manager_v1*>(
             wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_TEST_PRESENTATION)
+#ifdef LUMEN_TEST_PRESENTATION
     else if (std::strcmp(iface, wp_presentation_interface.name) == 0) {
         static const wp_presentation_listener presentation_listener = {
             [](void* data, wp_presentation*, uint32_t clk) {
@@ -223,7 +223,7 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
         wp_presentation_add_listener(c->presentation, &presentation_listener, c);
     }
 #endif
-#if defined(LUMEN_TEST_IDLE)
+#ifdef LUMEN_TEST_IDLE
     else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0)
         c->idle_notifier = static_cast<ext_idle_notifier_v1*>(
             wl_registry_bind(registry, name, &ext_idle_notifier_v1_interface, version < 2 ? version : 2));
@@ -234,12 +234,12 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
         c->power_manager = static_cast<zwlr_output_power_manager_v1*>(
             wl_registry_bind(registry, name, &zwlr_output_power_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_TEST_SESSION_LOCK)
+#ifdef LUMEN_TEST_SESSION_LOCK
     else if (std::strcmp(iface, ext_session_lock_manager_v1_interface.name) == 0)
         c->lock_manager = static_cast<ext_session_lock_manager_v1*>(
             wl_registry_bind(registry, name, &ext_session_lock_manager_v1_interface, 1));
 #endif
-#if defined(LUMEN_TEST_IME)
+#ifdef LUMEN_TEST_IME
     else if (std::strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
         c->ti_version = version < 2 ? version : 2;
         c->ti_manager = static_cast<zwp_text_input_manager_v3*>(
@@ -474,7 +474,7 @@ struct clip {
     std::vector<std::string> offer_mimes;
     wl_data_source* source = nullptr;
     bool cancelled = false;
-#if defined(LUMEN_TEST_PRIMARY_SELECTION)
+#ifdef LUMEN_TEST_PRIMARY_SELECTION
     zwp_primary_selection_device_v1* pd = nullptr;
     zwp_primary_selection_offer_v1* poffer = nullptr;
     std::vector<std::string> poffer_mimes;
@@ -548,7 +548,7 @@ const wl_data_source_listener src_listener = {src_target, src_send, src_cancelle
                                               src_dnd_drop_performed, src_dnd_finished,
                                               src_action};
 
-#if defined(LUMEN_TEST_PRIMARY_SELECTION)
+#ifdef LUMEN_TEST_PRIMARY_SELECTION
 void poffer_offer(void* data, zwp_primary_selection_offer_v1*, const char* mime) {
     static_cast<clip*>(data)->events.push_back(std::string("poffer:") + mime);
     g_pending_mimes.emplace_back(mime);
@@ -590,7 +590,7 @@ bool clip_connect(clip& k) {
     wl_keyboard_add_listener(k.kb, &kb_listener, &k);
     k.dd = wl_data_device_manager_get_data_device(k.c.ddm, k.c.seat);
     wl_data_device_add_listener(k.dd, &dd_listener, &k);
-#if defined(LUMEN_TEST_PRIMARY_SELECTION)
+#ifdef LUMEN_TEST_PRIMARY_SELECTION
     if (k.c.psm) {
         k.pd = zwp_primary_selection_device_manager_v1_get_device(k.c.psm, k.c.seat);
         zwp_primary_selection_device_v1_add_listener(k.pd, &pd_listener, &k);
@@ -878,7 +878,7 @@ bool in_order(const std::vector<std::string>& v, std::initializer_list<const cha
     return true;
 }
 
-#if defined(LUMEN_TEST_ACTIVATION)
+#ifdef LUMEN_TEST_ACTIVATION
 // ── helpers for the xdg-activation cases ──
 
 void act_done(void* data, xdg_activation_token_v1*, const char* token) {
@@ -1092,7 +1092,7 @@ int main() {
                }
            });
 
-#if defined(LUMEN_TEST_VIEWPORTER)
+#ifdef LUMEN_TEST_VIEWPORTER
     // ── wp_viewporter ──
     expect("viewporter: second viewport for a surface", "wp_viewporter",
            WP_VIEWPORTER_ERROR_VIEWPORT_EXISTS, [](client& c) {
@@ -1287,7 +1287,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_PRESENTATION)
+#ifdef LUMEN_TEST_PRESENTATION
     // ── wp_presentation ──
     // No request can raise an error; what matters is the clock and which feedback is
     // discarded. Presented feedback needs a flip (KMS), covered by the presentation probe
@@ -2118,7 +2118,7 @@ int main() {
         clip_disconnect(k);
     }
 
-#if defined(LUMEN_TEST_PRIMARY_SELECTION)
+#ifdef LUMEN_TEST_PRIMARY_SELECTION
     // ── Primary selection: the same model ──
     {
         clip a{}, b{};
@@ -2391,7 +2391,7 @@ int main() {
             wl_display_disconnect(b.c.display);
     }
 
-#if defined(LUMEN_TEST_ACTIVATION)
+#ifdef LUMEN_TEST_ACTIVATION
     // ── xdg-activation ──
     expect("activation: xdg_activation_token_v1.commit twice", "xdg_activation_token_v1",
            XDG_ACTIVATION_TOKEN_V1_ERROR_ALREADY_USED, [](client& c) {
@@ -2633,7 +2633,7 @@ int main() {
         client hoarder{};
         bool up = connect(hoarder) && hoarder.seat && hoarder.ddm && hoarder.output_name;
         if (up) {
-#if defined(LUMEN_TEST_ACTIVATION)
+#ifdef LUMEN_TEST_ACTIVATION
             if (hoarder.activation)
                 for (int i = 0; i < 64; ++i)
                     (void)xdg_activation_v1_get_activation_token(hoarder.activation);
@@ -2655,7 +2655,7 @@ int main() {
             unsigned dones = 0;
         } od{};
         if (up) {
-#if defined(LUMEN_TEST_ACTIVATION)
+#ifdef LUMEN_TEST_ACTIVATION
             if (victim.activation)
                 token = issue_token(victim, 0);
 #endif
@@ -2733,7 +2733,7 @@ int main() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-#if defined(LUMEN_TEST_IDLE)
+#ifdef LUMEN_TEST_IDLE
     // ── ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1, zwlr_output_power_manager_v1 ──
     // Neither idle protocol defines an error; what matters is the event order. Timers need
     // the event loop (live: app-smoke group K), so the timing here uses a 0 ms notification,
@@ -2860,7 +2860,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_SESSION_LOCK)
+#ifdef LUMEN_TEST_SESSION_LOCK
     // ── ext_session_lock_v1: every error, and the lock's life ──
     // `locked` needs a locked frame on the output: this compositor never lit its CRTC (no
     // render loop runs here), so nothing of the session is visible and a lock with a lock
@@ -3177,7 +3177,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_IME)
+#ifdef LUMEN_TEST_IME
     // ── text-input-v3, input-method-v2, virtual-keyboard-v1: every error, and the relay ──
     {
         static const zwp_input_method_v2_listener quiet_im = {
@@ -3555,7 +3555,7 @@ int main() {
             // physical key reaches it (below, once the input method is inactive).
             const unsigned keymaps_seat = al.keymaps;
             bool other_layout = false;
-#if defined(LUMEN_TEST_XKB)
+#ifdef LUMEN_TEST_XKB
             if (ok) {
                 xkb_context* xc = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
                 xkb_rule_names names{};
@@ -3648,7 +3648,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_COMMIT_PATH)
+#ifdef LUMEN_TEST_COMMIT_PATH
     // ── commit-path protocols (fifo, commit-timing, tearing, content-type, single-pixel,
     //    alpha-modifier): every global at its version, every error ──
     {
@@ -3809,7 +3809,7 @@ int main() {
         client c{};
         bool ok = connect(c);
         std::string detail;
-#if defined(LUMEN_TEST_VIEWPORTER)
+#ifdef LUMEN_TEST_VIEWPORTER
         auto* spb = ok ? static_cast<wp_single_pixel_buffer_manager_v1*>(
                              bind_global(c, &wp_single_pixel_buffer_manager_v1_interface, 1))
                        : nullptr;
@@ -3870,7 +3870,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_BACKGROUND_EFFECT)
+#ifdef LUMEN_TEST_BACKGROUND_EFFECT
     // ── ext-background-effect-v1: the global, its capabilities, a region, every error ──
     expect("background-effect: second object for a surface", "ext_background_effect_manager_v1",
            EXT_BACKGROUND_EFFECT_MANAGER_V1_ERROR_BACKGROUND_EFFECT_EXISTS, [](client& c) {
@@ -3918,7 +3918,7 @@ int main() {
         }
         ok = ok && m && caps.got;
         detail = std::string("capabilities ") + (caps.got ? std::to_string(caps.flags) : "none");
-#if defined(LUMEN_TEST_VIEWPORTER)
+#ifdef LUMEN_TEST_VIEWPORTER
         auto* spb = ok ? static_cast<wp_single_pixel_buffer_manager_v1*>(
                              bind_global(c, &wp_single_pixel_buffer_manager_v1_interface, 1))
                        : nullptr;
@@ -3977,7 +3977,7 @@ int main() {
     }
 #endif
 
-#if defined(LUMEN_TEST_COLOR_MANAGEMENT)
+#ifdef LUMEN_TEST_COLOR_MANAGEMENT
     // ── wp_color_manager_v1: what is offered, descriptions, surfaces, outputs, every error ──
     {
         struct cm_state {

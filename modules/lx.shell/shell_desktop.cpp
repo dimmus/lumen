@@ -129,7 +129,6 @@ std::string uri_path(std::string_view uri) {
 
 } // namespace
 
-#if defined(LUMEN_SHELL_WAYLAND)
 
 bool lx::shell::shell_app::notifications_owned() const {
     return desktop_started_ && note_server_.attached() && bus_.owns(k_notifications_name);
@@ -890,12 +889,3 @@ void lx::shell::shell_app::show_tooltip() {
         log_tray.debug("tray: tooltip \"{}\"", title);
 }
 
-#else // !LUMEN_SHELL_WAYLAND
-
-bool lx::shell::shell_app::notifications_owned() const { return false; }
-void lx::shell::shell_app::start_desktop_services() {}
-void lx::shell::shell_app::stop_desktop_services() {}
-void lx::shell::shell_app::desktop_after_dispatch() {}
-void lx::shell::shell_app::apply_notify_config(const lx::config::config_snapshot&) {}
-
-#endif
