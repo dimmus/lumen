@@ -406,6 +406,50 @@ LUMEN_TEST(settings_session_loads_the_located_layers_and_writes_them) {
     std::filesystem::remove_all(dir);
 }
 
+LUMEN_TEST(settings_string_rows_carry_examples_and_refuse_blank_spec) {
+    settings::session s{};
+    settings::set_active_session(&s);
+    harness h{};
+    s.root = &h.root;
+    h.root.set_describer(&settings::describe);
+    LUMEN_CHECK(h.tick());
+
+    // Every string row's field is there by name (its placeholder names what belongs in
+    // the empty field) — pane by pane, only the current one renders.
+    const auto& rows = settings::catalog();
+    unsigned strings = 0;
+    for (unsigned pane = 0; pane < settings::k_pane_count; ++pane) {
+        s.set_current(static_cast<settings::pane_id>(pane));
+        invalidate_layout(*h.root.tree());
+        LUMEN_CHECK(h.tick());
+        for (unsigned i = 0; i < rows.size(); ++i) {
+            if (rows[i].owner != s.current() || !rows[i].desc ||
+                rows[i].desc->kind != lx::config::value_kind::string)
+                continue;
+            LUMEN_CHECK(find(h.root.tree(), lx::a11y::role::text_field, rows[i].label) != nullptr);
+            ++strings;
+        }
+    }
+    LUMEN_CHECK(strings >= 8);
+
+    // A blank commit where "" is not a value the key takes (the background's spec)
+    // refills the field with the running value and writes nothing.
+    for (unsigned i = 0; i < rows.size(); ++i) {
+        if (!rows[i].desc || std::strcmp(rows[i].desc->section, "background") != 0 ||
+            std::strcmp(rows[i].desc->key, "spec") != 0)
+            continue;
+        const unsigned slot = settings::string_slot(i);
+        LUMEN_CHECK(slot != settings::session::k_no_row);
+        s.string_buffer(slot).assign("");
+        s.commit_string(i);
+        LUMEN_CHECK(std::string_view(s.string_buffer(slot).storage.data()) ==
+                    std::string_view("lumen"));
+        LUMEN_CHECK(s.state() != settings::session::save_state::written);
+        break;
+    }
+    settings::set_active_session(nullptr);
+}
+
 int main(int argc, char** argv) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     const int status = lumen_test::run_all(argc, argv);

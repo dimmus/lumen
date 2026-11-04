@@ -529,6 +529,28 @@ constexpr std::string_view k_descriptions[][2] = {
     {"accel-speed", "-1 slowest, 1 fastest"},
 };
 
+/// One string key's placeholder: the example an empty field shows (its section, its
+/// key, the example). The config file's own documented forms.
+constexpr std::string_view k_string_examples[][3] = {
+    {"input.keyboard", "layout", "us,ru (empty: the system default)"},
+    {"input.keyboard", "variant", "dvorak, (per layout, comma separated)"},
+    {"input.keyboard", "options", "grp:alt_shift_toggle,caps:escape"},
+    {"input.keyboard", "model", "pc105"},
+    {"input.keyboard", "rules", "evdev"},
+    {"cursor", "theme", "default (empty: $XCURSOR_THEME)"},
+    {"ui", "theme", "one-dark (empty: LUMEN_THEME, else One Dark)"},
+    {"background", "spec", "lumen | #RRGGBB | gradient:… | image:PATH"},
+    {"idle", "lock-command", "swaylock -f (empty: no locking)"},
+};
+
+/// The example for a string row, or null.
+[[nodiscard]] const char* example_of(std::string_view section, std::string_view key) {
+    for (const auto& e : k_string_examples)
+        if (e[0] == section && e[1] == key)
+            return e[2].data();
+    return nullptr;
+}
+
 /// The description for `key`, or null.
 [[nodiscard]] const char* description_of(std::string_view key) {
     for (const auto& [k, text] : k_descriptions)
@@ -1063,6 +1085,17 @@ void session::commit_string(unsigned row) {
     if (slot == k_no_row)
         return; // no buffer of its own (past the cap): nothing to commit
     string_field& f = slot_buffer(slot);
+    // Empty is a value most string keys document (the system default, no locking, …);
+    // where it is not, the edit is refused and the field refills with what runs now.
+    if (f.storage[0] == '\0' && rows[row].desc &&
+        std::strcmp(rows[row].desc->section, "background") == 0 &&
+        std::strcmp(rows[row].desc->key, "spec") == 0) {
+        const char* value =
+            static_cast<const char*>(rows[row].desc->field(config_));
+        f.set(value ? std::string_view(value) : std::string_view{});
+        refresh();
+        return;
+    }
     if (write_key(row, lx::config::edit_value::string(f.storage))) {
         // The snapshot now carries the file's value; the input keeps typing in its buffer.
         if (rows[row].desc && std::strcmp(rows[row].desc->section, "ui") == 0)
@@ -1572,9 +1605,14 @@ namespace {
                           control_paint::fixed({k_transparent, k_transparent}),
                           {&text, 1});
         }
+        const char* example =
+            example_of(r.desc ? std::string_view(r.desc->section)
+                              : std::string_view(k_pointer_section_names[r.pointer_section]),
+                       r.desc ? std::string_view(r.desc->key) : std::string_view(r.pdesc->key));
         lx::ui::child field =
             text_input()
                 .buffer(s->string_buffer(slot))
+                .placeholder(example ? example : "")
                 .max_bytes(spec.capacity ? spec.capacity - 1u : 559u)
                 .on_change([s](int) { s->refresh(); })
                 .on_submit([s, index](int) { s->commit_string(index); })
@@ -2283,10 +2321,12 @@ namespace {
     search_bar.name = "Search";
     lx::ui::child search_child = control(search_bar, {search_kids, 2u});
 
-    lx::ui::child tree = st_box(
-        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f))
-            .w_full().gap(st_px16(2.f)).px(st_px16(6.f)).pt(st_px16(4.f)),
+    lx::ui::child tree_rows = st_box(
+        st_v_flex().flex_none().w_full().gap(st_px16(2.f)).px(st_px16(6.f)).pt(st_px16(4.f)),
         control_paint{}, {rows, n});
+    lx::ui::child tree = scroll_area(
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f)).w_full(),
+        {&tree_rows, 1u}, lx::ui::scroll_axes::vertical, st_v_flex().w_full());
     lx::ui::child col[2] = {search_child, tree};
     lx::ui::control_props rail_props{};
     rail_props.layout = st_v_flex().flex_none().w(st_px16(k_rail_w)).h_full()

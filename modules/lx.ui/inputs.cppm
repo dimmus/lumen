@@ -1058,6 +1058,7 @@ lx::ui::spinner_builder::operator child() const {
                                            disabled_ || at_min, "Decrease");
     text_input_builder field = text_input().buffer(*buffer_)
                                   .framed(false)
+                                  .placeholder(frame_format("{}", value_))
                                   .layout(lx_in_h_flex().flex_none().min_w(lx::layout::px(0.f))
                                               .h(lx_in_px16(k_st_h)))
                                   .max_bytes(16)
