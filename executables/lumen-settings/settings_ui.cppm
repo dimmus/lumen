@@ -1695,7 +1695,7 @@ namespace {
         texts[tn++] = name_line;
         lx::ui::child label_block = st_box(
             st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
-                .justify_center(),
+                .gap(st_px16(2.f)),
             control_paint{}, {texts, tn});
         // The binding: the canonical combo as a keycap hint, or "unbound".
         char canon[64]{};
@@ -1719,7 +1719,8 @@ namespace {
                                      control_paint{}, {value_kids, 2u});
         lx::ui::child row_kids[2] = {label_block, value};
         lx::ui::control_props row{};
-        row.layout = st_h_flex().flex_none().w_full().min_h(st_px16(k_row_h))
+        row.layout = st_h_flex().flex_none().w_full().items_start().py(st_px16(4.f))
+                         .min_h(st_px16(k_row_h))
                          .px(st_px16(12.f)).gap(st_px16(12.f)).rounded(lx::ui::radius::sm);
         lx::ui::control_paint p{};
         p.rest = {k_transparent, k_transparent};
@@ -1799,7 +1800,7 @@ namespace {
         lx::ui::child enabled = toggle_switch(d.staged ? d.staged_enabled : d.enabled)
                                     .on_toggle([i](int v) { stage_enabled(i, v != 0); })
                                     .name(frame_format("{} enabled", d.name));
-        kids[n++] = st_box(st_h_flex().flex_none().w_full().px(st_px16(12.f)),
+        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)),
                            control_paint{}, {&enabled, 1u});
         if (!(d.staged ? d.staged_enabled : d.enabled))
             continue;
@@ -1830,7 +1831,7 @@ namespace {
         // The select's open state: reuse the session's row-open slot with a pane-specific
         // key beyond the catalog's range.
         lx::ui::child mode_row = st_box(
-            st_h_flex().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(12.f)),
+            st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(12.f)),
             control_paint::fixed({k_transparent, k_transparent}),
             {&mode_ctl, 1u});
         kids[n++] = mode_row;
@@ -1848,7 +1849,7 @@ namespace {
             frame_format("scale {:.2f}", d.staged ? d.staged_scale : d.scale), st_text_px(12.f),
             tok::text_muted, false, true);
         lx::ui::child scale_kids[2] = {scale, scale_label};
-        kids[n++] = st_box(st_h_flex().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
+        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
                            control_paint{}, {scale_kids, 2u});
         // Transform: a dropdown like every other selector.
         static const char* const k_transforms[8] = {"normal",    "90",         "180",
@@ -1876,7 +1877,7 @@ namespace {
                     stage_transform(i, k[v]);
                 })
                 .name(frame_format("{} transform", d.name));
-        kids[n++] = st_box(st_h_flex().flex_none().w_full().px(st_px16(12.f)),
+        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)),
                            control_paint{}, {&transform, 1u});
         // Position + adaptive sync + Apply.
         lx::ui::child pos_label = st_text(frame_format("at {}, {}", d.staged_x, d.staged_y),
@@ -1886,7 +1887,7 @@ namespace {
                                      .on_toggle([i](int v) { stage_adaptive(i, v != 0); })
                                      .name(frame_format("{} adaptive sync", d.name));
         lx::ui::child tail_kids[2] = {pos_label, adaptive};
-        kids[n++] = st_box(st_h_flex().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(16.f)),
+        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(16.f)),
                            control_paint{}, {tail_kids, 2u});
         if (d.staged) {
             lx::ui::child apply = button("Apply").style(lx::ui::button_style::filled)
@@ -1896,7 +1897,7 @@ namespace {
                 button("Discard").on_press([i](int) { discard_staged(i); });
             lx::ui::child btns[2] = {apply, discard};
             kids[n++] = st_box(
-                st_h_flex().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
+                st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
                 control_paint{}, {btns, 2u});
         }
     }
@@ -2282,32 +2283,11 @@ namespace {
     search_bar.name = "Search";
     lx::ui::child search_child = control(search_bar, {search_kids, 2u});
 
-    // The save state at the bottom, where Zed keeps its keybinding hint.
-    const char* state_text =
-        s->state() == session::save_state::written
-            ? "saved to config.toml — Lumen applies it as it watches the file"
-            : s->state() == session::save_state::memory_only
-                ? "in memory only (no writable config.toml)"
-                : "the configuration as Lumen runs it";
-    lx::ui::child status_child = st_mono(state_text, st_text_px(11.f), tok::text_muted);
-    lx::ui::control_props status_props{};
-    status_props.layout = st_h_flex().flex_none().w_full().px(st_px16(12.f))
-                              .py(st_px16(10.f));
-    lx::ui::control_paint status_paint =
-        control_paint::fixed({paint(tok::surface_background), k_transparent});
-    status_paint.border_widths[0] = 1; // a rule over the status line
-    status_paint.rest.border = paint(tok::border_variant);
-    status_paint.hover = status_paint.active = status_paint.rest;
-    status_props.paint = status_paint;
-    status_props.role = lx::a11y::role::status_bar;
-    status_props.name = "Save state";
-    lx::ui::child status_row = control(status_props, {&status_child, 1u}, k_status_key);
-
     lx::ui::child tree = st_box(
         st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f))
             .w_full().gap(st_px16(2.f)).px(st_px16(6.f)).pt(st_px16(4.f)),
         control_paint{}, {rows, n});
-    lx::ui::child col[3] = {search_child, tree, status_row};
+    lx::ui::child col[2] = {search_child, tree};
     lx::ui::control_props rail_props{};
     rail_props.layout = st_v_flex().flex_none().w(st_px16(k_rail_w)).h_full()
                             .bg(tok::surface_background)
@@ -2315,7 +2295,7 @@ namespace {
     rail_props.paint = control_paint::fixed({paint(tok::surface_background), k_transparent});
     rail_props.role = lx::a11y::role::list;
     rail_props.name = "Panes";
-    return control(rail_props, {col, 3u}, k_rail_key);
+    return control(rail_props, {col, 2u}, k_rail_key);
 }
 
 } // namespace
@@ -2337,8 +2317,22 @@ lx::ui::child describe(lx::ui::build_context&) {
     };
     lx::ui::child body = st_box(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f)),
                                 control_paint{}, {body_kids, 2u});
+    // The status bar: full width under the sidebar and the content alike (Zed's workspace
+    // bar) — the save state left (the bar's overflow-hidden left, it can never spill),
+    // the app's name right.
+    const char* state_text =
+        s->state() == session::save_state::written
+            ? "saved to config.toml — Lumen applies it as it watches the file"
+            : s->state() == session::save_state::memory_only
+                ? "in memory only (no writable config.toml)"
+                : "the configuration as Lumen runs it";
+    lx::ui::child state_line =
+        st_mono(frame_format("  {}", state_text), st_text_px(11.f), tok::text_muted);
+    lx::ui::child app_line = st_mono("Lumen Settings  ", st_text_px(11.f), tok::text_muted);
+    lx::ui::child bar = status_bar({&state_line, 1u}, {&app_line, 1u}).key(k_status_key);
+    lx::ui::child root_kids[2] = {body, bar};
     lx::ui::child root[1] = {st_box(st_v_flex().size_full().bg(tok::background),
-                                    control_paint{}, {&body, 1u}, k_content_key)};
+                                    control_paint{}, root_kids, k_content_key)};
     return div(st_v_flex().size_full().bg(tok::background), {root, 1u});
 }
 
