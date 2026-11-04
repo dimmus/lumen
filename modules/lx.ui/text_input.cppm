@@ -262,9 +262,6 @@ private:
     text_block_node* text_ = nullptr;
     text_buffer* buffer_ = nullptr;
     bool framed_ = true;
-    /// The laid-out text's width (an unframed cell measures to it; the caret's width
-    /// before the first arrange).
-    int text_w_ = 4;
     std::uint32_t seen_revision_ = 0;
     std::uint32_t own_size_ = 0;
     std::uint32_t max_bytes_ = k_text_input_capacity;
@@ -642,7 +639,8 @@ void lx::ui::text_input_node::sync_text() {
 lx::size2i lx::ui::text_input_node::measure(lx::layout::constraints c, size_hint) const {
     constexpr int unbounded = lx::layout::constraints{}.max.width;
     const int h = std::max(k_ti_min_h, lx_ui_ti_line_px() + 2 * (k_ti_pad_y + k_ti_border));
-    const int w = !framed_ ? 2 * (k_ti_pad_x + k_ti_border) + text_w_
+    const int w = !framed_ ? 2 * (k_ti_pad_x + k_ti_border) +
+                                 (text_ ? std::max(text_->measure_cached({}, size_hint::preferred).width, 4) : 4)
                             : c.max.width < unbounded ? c.max.width : k_ti_min_w;
     lx::size2i s{w, h};
     s.width = std::clamp(s.width, c.min.width, std::max(c.min.width, c.max.width));
@@ -669,7 +667,6 @@ void lx::ui::text_input_node::arrange(lx::rect2i bounds) {
     layout_dirty_ = false;
     const lx::rect2i area = text_area();
     const lx::size2i s = text_->measure_cached({}, size_hint::preferred);
-    text_w_ = std::max(s.width, 4);
     const int line = lx_ui_ti_line_px();
     text_->place({area.x, area.y + (area.height - line) / 2, std::max(s.width, 1), line});
     keep_caret_visible();

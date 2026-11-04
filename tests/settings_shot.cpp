@@ -69,6 +69,11 @@ int main(int argc, char** argv) {
     // The app's state: the defaults, no file editing (nothing to click here). An optional
     // pane index opens that pane (the search stays empty).
     settings::session the_session{};
+    if (std::getenv("LUMEN_SHOT_ALL")) // every pane expanded: the sidebar overflows
+        for (unsigned i = 0; i < settings::k_pane_count; ++i)
+            the_session.set_current(static_cast<settings::pane_id>(i));
+    the_session.set_current(static_cast<settings::pane_id>(
+        argc > 3 ? std::strtol(argv[3], nullptr, 10) : 0));
     if (argc > 3) {
         const long pane = std::strtol(argv[3], nullptr, 10);
         if (pane < 0 || pane >= static_cast<long>(settings::k_pane_count)) {
