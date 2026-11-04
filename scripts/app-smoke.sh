@@ -723,10 +723,10 @@ R_CFG_PATH="$LOG_DIR/R-config/config.toml"
 rm -rf "$LOG_DIR/R-config"
 echo "1/2  compositor on $SOCKET (LUMEN_LOG=debug) ..."
 if (( ! IN_SEAT && JOIN_SEAT )); then
-  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$4" LUMEN_CONFIG="$5" "$2" "$3" --ping-timeout 1500 ${6:+--scale "$6"}' \
+  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$4" LUMEN_CONFIG="$5" "$2" "$3" --ping-timeout 1500 ${LUMEN_SMOKE_SCALE:+--scale "$LUMEN_SMOKE_SCALE"} ${6:+--scale "$6"}' \
     _ "$SEAT_SCOPE" "$COMP" "$SOCKET" "$LOG_DIR" "$R_CFG_PATH" "$SCALE_ARG" >"$COMP_LOG" 2>&1 &
 else
-  LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$LOG_DIR" LUMEN_CONFIG="$R_CFG_PATH" "$COMP" "$SOCKET" --ping-timeout 1500 ${SCALE_ARG:+--scale "$SCALE_ARG"} \
+  LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$LOG_DIR" LUMEN_CONFIG="$R_CFG_PATH" "$COMP" "$SOCKET" --ping-timeout 1500 ${LUMEN_SMOKE_SCALE:+--scale "$LUMEN_SMOKE_SCALE"} ${SCALE_ARG:+--scale "$SCALE_ARG"} \
     >"$COMP_LOG" 2>&1 &
 fi
 COMP_PID=$!

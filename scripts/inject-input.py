@@ -62,6 +62,7 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import time
 
@@ -446,10 +447,28 @@ def run_hover(inj, a):
         inj.move(x, y, "hover", inside=inside)
 
 
+def udev_property(path, key):
+    """One property of udev's database for the device, empty string without udevadm."""
+    try:
+        out = subprocess.run(["udevadm", "info", "-q", "property", path],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return ""
+    prefix = key + "="
+    for line in out.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return ""
+
+
 def run_watch():
     """Record every frame on every event node until SIGTERM/SIGINT."""
     fds = {}
     for path in sorted(glob.glob("/dev/input/event*")):
+        # A udev-tagged accelerometer is refused before opening, as the compositor refuses
+        # it (HP DriveGuard's lis3lv02d blocks in its kernel open for seconds).
+        if udev_property(path, "ID_INPUT_ACCELEROMETER") == "1":
+            continue
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError:

@@ -1,6 +1,24 @@
 # Unit tests
 cd build && ctest --output-on-failure
 
+# The notebook host (iritur: HD 5500 + GTX 950M, eDP 3200x1800@2)
+# - Multi-GPU: the GPU tests take the render node of the card with a connected connector
+#   (tests/render_node.hpp; LUMEN_TEST_RENDER_NODE overrides, "none" forces no GPU). A
+#   hardcoded renderD128 lands on the GTX 950M there, whose nvc0 GL cannot compile the
+#   GLES UI shaders — never force the GL tier on it.
+# - Input injection needs an absolute pointer. The touchpad is multitouch-only (no hover)
+#   and this kernel needs `modprobe uinput` (7.2.14 ships it); create one:
+#     sudo python3 scripts/uinput-mouse.py --output 3200x1800 &   # prints the event node
+#     export LUMEN_INJECT_POINTER=<node> LUMEN_INJECT_RELATIVE=<node> \
+#            LUMEN_INJECT_KEYBOARD=/dev/input/event3
+# - The smokes' geometry assumes a scale-1 output (the eDP defaults to 2), so run them with
+#     export LUMEN_SMOKE_SCALE=1
+#   (group O's own --scale is unchanged; the injector's watch skips udev-tagged
+#   accelerometers — the lis3lv02d's kernel open blocks ~8 s.)
+# - app-smoke's pixel-geometry rows are calibrated to the dev VM's 1914x924 output and its
+#   font metrics; on another display ~36 rows fail with matching-but-different values —
+#   host calibration, not regressions (2026-11-03: 140/176 PASS on hardware).
+
 # vkms Vulkan scanout (needs modprobe vkms + DRM master)
 LUMEN_TEST_VKMS=1 ./test_kms_vulkan_scanout
 

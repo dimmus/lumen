@@ -85,8 +85,23 @@ CTL="$PREFIX/bin/lumen-ctl"
 
 prop() { systemctl --user show -p "$2" --value "$1" 2>/dev/null; }
 mono_us() { awk '{printf "%d", $1 * 1000000}' /proc/uptime; }
+drm_driver() {
+  # The DRM driver of the card that drives a connector (vmwgfx on the dev VM, i915 on the
+  # notebook). The connector's `device` symlink names the card (a drm_minor, whose uevent
+  # has no DRIVER line); the PCI device — whose uevent has it — is the card's `device`.
+  local c d card
+  for c in /sys/class/drm/card*-*; do
+    [[ $(cat "$c/status" 2>/dev/null) == connected ]] || continue
+    card=$(readlink -f "$c/device" 2>/dev/null) || continue
+    d=$(sed -n 's/^DRIVER=//p' "$card/device/uevent" 2>/dev/null)
+    [[ -n "$d" ]] && { echo "$d"; return; }
+  done
+  echo vmwgfx
+}
+
 console_shown() {
-  sudo -n modetest -M vmwgfx -p 2>/dev/null | awk '/^Planes:/{p=1;next} p && $1 ~ /^[0-9]+$/ && NF>=3 {print $3; exit}'
+  sudo -n modetest -M "$(drm_driver)" -p 2>/dev/null |
+    awk '/^Planes:/{p=1;next} p && $1 ~ /^[0-9]+$/ && NF>=3 {print $3; exit}'
 }
 restore_console() {
   local fb
@@ -178,7 +193,8 @@ else
     grep -q 'ready, environment exported, watchdog on' "$S1/ctl-health.json" &&
     ok "lumen-ctl health: systemd part ready, environment exported, watchdog on" ||
     bad "lumen-ctl health: $(head -c 300 "$S1/ctl-health.json")"
-  "$CTL" outputs >"$S1/ctl-outputs.txt" 2>&1 && grep -q 'Virtual-1' "$S1/ctl-outputs.txt" &&
+  "$CTL" outputs >"$S1/ctl-outputs.txt" 2>&1 &&
+    grep -qE 'Virtual-[0-9]+|eDP-[0-9]+|DP-[0-9]+|HDMI-[0-9]+|HEADLESS-[0-9]+' "$S1/ctl-outputs.txt" &&
     ok "lumen-ctl outputs: $(head -1 "$S1/ctl-outputs.txt")" || bad "lumen-ctl outputs: $(cat "$S1/ctl-outputs.txt")"
   for _ in $(seq 1 50); do "$CTL" windows 2>/dev/null | grep -q foot && break; sleep 0.1; done
   "$CTL" windows >"$S1/ctl-windows.txt" 2>&1
@@ -246,9 +262,16 @@ else
   t=$(loginctl show-session "$sid" -p Type --value)
   [[ "$t" == "$type_before" ]] && ok "logind session Type back to $t" || bad "logind session Type=$t after"
 fi
-sleep 0.5
-fb=$(console_shown)
-[[ -n "$fb" && "$fb" != 0 ]] && ok "console shown (fb $fb)" || { bad "console blank after the session"; restore_console; }
+fb=""
+for _ in $(seq 1 60); do
+  fb=$(console_shown)
+  [[ -n "$fb" && "$fb" != 0 ]] && break
+  sleep 0.25   # i915 hands the plane back to fbcon a moment after the session ends
+done
+[[ -n "$fb" && "$fb" != 0 ]] && ok "console shown (fb $fb)" || {
+  bad "console blank after the session"
+  restore_console
+}
 
 if (( WATCHDOG )); then
   echo "Session run 2: the watchdog"
@@ -278,8 +301,12 @@ if (( WATCHDOG )); then
       wait_rd 30
     fi
   fi
-  sleep 1
-  fb=$(console_shown)
+  fb=""
+  for _ in $(seq 1 60); do
+    fb=$(console_shown)
+    [[ -n "$fb" && "$fb" != 0 ]] && break
+    sleep 0.25
+  done
   [[ -n "$fb" && "$fb" != 0 ]] && ok "console shown after the watchdog (fb $fb)" ||
     { bad "console blank after the watchdog"; restore_console; }
 fi

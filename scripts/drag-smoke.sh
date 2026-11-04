@@ -295,10 +295,10 @@ echo "1/3  compositor on $SOCKET (LUMEN_LOG=debug) ..."
 if (( ! IN_SEAT && JOIN_SEAT )); then
   # The shell moves itself into the seat session's cgroup, then becomes the compositor:
   # same PID, so $! is the compositor and SIGTERM reaches it.
-  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug "$2" "$3"' \
+  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug "$2" "$3" ${LUMEN_SMOKE_SCALE:+--scale "$LUMEN_SMOKE_SCALE"}' \
     _ "$SEAT_SCOPE" "$COMP" "$SOCKET" >"$COMP_LOG" 2>&1 &
 else
-  LUMEN_LOG=debug "$COMP" "$SOCKET" >"$COMP_LOG" 2>&1 &
+  LUMEN_LOG=debug "$COMP" "$SOCKET" ${LUMEN_SMOKE_SCALE:+--scale "$LUMEN_SMOKE_SCALE"} >"$COMP_LOG" 2>&1 &
 fi
 COMP_PID=$!
 
