@@ -59,6 +59,26 @@ public:
             ++filled_;
     }
 
+    /// Feed how far past the vblank it aimed at a frame's atomic commit was issued. The
+    /// repaint estimate above measures the two threads' CPU and the GPU's tail, but not
+    /// what sits between them and the flip: the render thread's wake after the publish,
+    /// the commit ioctl's own submission. On an otherwise idle core that handoff costs
+    /// milliseconds — enough to miss a vblank with a sub-millisecond composite (measured
+    /// on an HD 5500: a third of a wl_shm client's frames a full period late while each
+    /// tick cost 0.4 ms). The whole-path lateness is read where it shows — the commit
+    /// issued past its aimed deadline — and added to the lead, so a frame that misses
+    /// starts earlier on its own, the same convergence the estimate has. Clamped to half
+    /// a period: a stall (a modeset, a read-back) is not a steady-state lead.
+    void observe_commit_late(lx::runtime::clock_time late_ns) {
+        if (late_ns <= 0)
+            return;
+        const auto cap = period_ns_ / 2;
+        late_window_[late_cursor_] = late_ns > cap ? cap : late_ns;
+        late_cursor_ = (late_cursor_ + 1) % k_window;
+        if (late_filled_ < k_window)
+            ++late_filled_;
+    }
+
     /// A flip landed. `flip_ns` is on the same clock as `next_start`'s `now`.
     void on_present(lx::runtime::clock_time flip_ns) {
         last_present_ns_ = flip_ns;
@@ -75,6 +95,15 @@ public:
             if (window_[i] > peak)
                 peak = window_[i];
         }
+        return peak;
+    }
+
+    /// Peak whole-path lateness over the window (0 before any commit was late).
+    [[nodiscard]] lx::runtime::clock_time late_peak_ns() const {
+        lx::runtime::clock_time peak = 0;
+        for (unsigned i = 0; i < late_filled_; ++i)
+            if (late_window_[i] > peak)
+                peak = late_window_[i];
         return peak;
     }
 
@@ -99,13 +128,19 @@ public:
     void set_vrr(bool on) { vrr_ = on; }
     [[nodiscard]] bool vrr() const { return vrr_; }
 
+    /// The lead a repaint must be given: its measured cost, the safety margin, and the
+    /// whole-path lateness the flips have shown.
+    [[nodiscard]] lx::runtime::clock_time lead_ns() const {
+        return estimate_ns() + k_margin_ns + late_peak_ns();
+    }
+
     /// When the next repaint should begin. Never in the past, and never so close to the
     /// deadline that the frame cannot land.
     [[nodiscard]] lx::runtime::clock_time next_start(lx::runtime::clock_time now) const {
         if (vrr_) {
             if (last_present_ns_ <= 0)
                 return now;
-            const auto earliest = last_present_ns_ + period_ns_ - (estimate_ns() + k_margin_ns);
+            const auto earliest = last_present_ns_ + period_ns_ - lead_ns();
             return earliest > now ? earliest : now;
         }
         // No flip yet, so no display phase to aim at: start now. Aiming at "one period out"
@@ -114,7 +149,7 @@ public:
         if (last_present_ns_ <= 0)
             return now;
         const auto deadline = next_deadline(now);
-        const auto lead = estimate_ns() + k_margin_ns;
+        const auto lead = lead_ns();
 
         auto start = deadline - lead;
         if (start < now) {
@@ -149,6 +184,9 @@ private:
     lx::runtime::clock_time window_[k_window]{};
     unsigned cursor_ = 0;
     unsigned filled_ = 0;
+    lx::runtime::clock_time late_window_[k_window]{};
+    unsigned late_cursor_ = 0;
+    unsigned late_filled_ = 0;
     unsigned presents_ = 0;
 };
 
@@ -285,7 +323,7 @@ bool lx::scheduler::frame_clocks::request_at(unsigned slot, lx::runtime::clock_t
     // `next_deadline` is the first vblank strictly after its argument.
     const lx::runtime::clock_time from = target - slack - 1 > now ? target - slack - 1 : now;
     const lx::runtime::clock_time deadline = c.next_deadline(from);
-    lx::runtime::clock_time start = deadline - (c.estimate_ns() + repaint_scheduler::k_margin_ns);
+    lx::runtime::clock_time start = deadline - c.lead_ns();
     if (start < now)
         start = now;
     next_start_[slot] = start;

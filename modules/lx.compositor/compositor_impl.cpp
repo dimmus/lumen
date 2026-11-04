@@ -292,12 +292,16 @@ struct output_ui {
     unsigned response_next = 0;
     /// Health (`lx.health`): content frames presented, those that landed a refresh period
     /// or more after the vblank their repaint aimed at, and the last 128 of them. The aim
-    /// is noted when a tick serves the output (`aim_frame` its frame index).
+    /// is noted when a tick serves the output; kept for the last few frames, because a
+    /// slow frame's flip can land after the following tick has aimed its own (the
+    /// single-slot form never matched then, and exactly those late frames went unseen).
     unsigned long long presented = 0;
     unsigned long long missed = 0;
     lx::health::miss_ring recent{};
-    lx::runtime::clock_time aim_ns = 0;
-    unsigned aim_frame = 0;
+    static constexpr unsigned k_aim_ring = 4;
+    lx::runtime::clock_time aim_ns[k_aim_ring]{};
+    unsigned aim_frame[k_aim_ring]{};
+    unsigned aim_next = 0;
 };
 
 struct compositor_impl {
@@ -1185,6 +1189,8 @@ struct compositor_impl {
     static void callback_timer_callback();
     /// Margin added to the clients' measured answer time.
     static constexpr runtime::clock_time k_client_margin_ns = 1'500'000;
+    /// What a missed flip adds to the slack it had, in the repaint lead's feedback.
+    static constexpr runtime::clock_time k_late_step_ns = 250'000;
     /// Holding callbacks for less than this is not worth a timer wake-up.
     static constexpr runtime::clock_time k_callback_hold_min_ns = 500'000;
     /// UI thread: arms the shared timer at the earliest running clock, or the housekeeping
@@ -1905,12 +1911,15 @@ unsigned long long monotonic_us() {
 } // namespace
 
 void compositor_impl::publish_commit_timing(output_pipeline& p, int fence_fd) {
+    // Always: the repaint scheduler's commit-lateness feedback reads this on every flip.
+    // The fence dup below is what the debug-only latency split needs; the timestamp is one
+    // clock read.
+    p.committed_submit_us.store(monotonic_us(), std::memory_order_release);
     if (!log_latency.enabled(lx::trace::level::debug))
         return;
     const int dup_fd = fence_fd >= 0 ? ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (const int old = p.committed_fence_fd.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
         ::close(old);
-    p.committed_submit_us.store(monotonic_us(), std::memory_order_release);
 }
 
 void compositor_impl::retract_commit_timing(output_pipeline& p) {
@@ -5768,16 +5777,47 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
         // Health: presented, and missed when it landed half a period or more past its aim
         // (a whole vblank late). Only the frame the aim was noted for is judged.
         ++o.presented;
-        if (o.aim_frame == fb.tag && o.aim_ns > 0) {
+        unsigned aim_i = output_ui::k_aim_ring;
+        for (unsigned i = 0; i < output_ui::k_aim_ring; ++i)
+            if (o.aim_frame[i] == fb.tag && o.aim_ns[i] > 0) {
+                aim_i = i;
+                break;
+            }
+        if (aim_i < output_ui::k_aim_ring) {
             const auto period = clocks_.clock(slot).refresh_period();
             const auto landed = fb.hw_clock && fb.actual_present_ns > 0
                                     ? static_cast<lx::runtime::clock_time>(fb.actual_present_ns)
                                     : now_ns();
-            const bool late = period > 0 && landed - o.aim_ns > period / 2;
+            const bool late = period > 0 && landed - o.aim_ns[aim_i] > period / 2;
             if (late)
                 ++o.missed;
             o.recent.record(late);
-            o.aim_ns = 0;
+            // The scheduler's lead covers the whole path to the flip, not only the threads
+            // the repaint estimate measures: the render thread's wake after the publish,
+            // the ioctl's submission, the slack the kernel needs to latch a commit onto
+            // the vblank it is aiming at. A flip that landed a period late is the outcome;
+            // the commit's slack against this aim (aim − submit, ≥ 0 when issued in time)
+            // is what did not suffice, so the lead asks for that slack plus a step — and
+            // because a miss recurs with the slack the new lead produced, the sum
+            // converges from wherever the lateness comes. A commit issued past its aim
+            // feeds its lateness directly. Only misses are recorded: the peak is sticky
+            // by design, so an idle desktop keeps the lead it needed.
+            if (submit_us > 0) {
+                const auto submit_ns = static_cast<lx::runtime::clock_time>(submit_us) * 1000;
+                if (late) {
+                    // However the miss happened — issued past the aim, or in time but the
+                    // kernel latched the following vblank — the distance between the commit
+                    // and the aim plus a step is what the next start must move earlier by:
+                    // a miss recurs with the lead this feedback gave, so it converges.
+                    const auto d = submit_ns >= o.aim_ns[aim_i]
+                                       ? submit_ns - o.aim_ns[aim_i]
+                                       : o.aim_ns[aim_i] - submit_ns;
+                    clocks_.clock(slot).observe_commit_late(d + k_late_step_ns);
+                } else {
+                    clocks_.clock(slot).observe_commit_late(submit_ns - o.aim_ns[aim_i]);
+                }
+            }
+            o.aim_frame[aim_i] = 0;
         }
         present_info info{};
         info.timestamp_ns = static_cast<unsigned long long>(fb.actual_present_ns);
@@ -9116,14 +9156,23 @@ void compositor_impl::on_vsync(std::uint32_t forced, bool housekeeping) {
     // Health: the vblank each served output's repaint aims at (one store per output served).
     for (std::uint32_t m = due; m != 0; m &= m - 1) {
         const unsigned slot = static_cast<unsigned>(std::countr_zero(m));
-        outs_[slot].aim_ns = clocks_.clock(slot).next_deadline(tick.timestamp_ns);
-        outs_[slot].aim_frame = tick.frame_index;
-        if (outs_[slot].pipe)
-            outs_[slot].pipe->fence_deadline_ns.store(outs_[slot].aim_ns,
-                                                      std::memory_order_relaxed);
+        output_ui& o = outs_[slot];
+        const auto aim = clocks_.clock(slot).next_deadline(tick.timestamp_ns);
+        o.aim_ns[o.aim_next] = aim;
+        o.aim_frame[o.aim_next] = tick.frame_index;
+        o.aim_next = (o.aim_next + 1) % output_ui::k_aim_ring;
+        if (o.pipe)
+            o.pipe->fence_deadline_ns.store(aim, std::memory_order_relaxed);
     }
     in_vsync_ = true;
     tick_quiet_mask_ = 0;
+    // Frame callbacks whose release deadline (the repaint start minus the clients' lead)
+    // has passed go out now, before this tick's dispatch: the callback timer can fire
+    // late (the loop was busy at the deadline), and a release that waits for the next
+    // flip costs the client a whole period — its answer can no longer join the tick it
+    // was held for, but released here it joins the next one, which keeps the cadence at
+    // one period instead of slipping to every other flip.
+    release_due_callbacks();
     if (owner) owner->tick_ui(tick);
     in_vsync_ = false;
 
@@ -10230,7 +10279,11 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         (void)wayland().dispatch(0, false);
     }
     // Queued content updates whose target this tick's frame reaches, or that stopped being
-    // shown, apply now and join it.
+    // shown, apply now and join it. The poller is drained first: the loop's fd source is
+    // what usually notices a signalled fence, but a tick-driven host (the in-process test
+    // compositor) runs no loop, and its updates would wait on a fence that already
+    // signalled. Nothing queued and nothing armed costs one branch (drain checks used_).
+    content_updates_poll(impl->wire_);
     content_updates_try(impl->wire_);
 
     // wl_surface.frame means "the content you committed has been shown". Answering it once
