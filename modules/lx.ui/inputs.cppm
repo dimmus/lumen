@@ -260,7 +260,8 @@ public:
     drop_down_builder& on_dismiss(handler h) { on_dismiss_ = h; return *this; }
     /// Shown instead of the current word when no option is selected (index −1).
     drop_down_builder& placeholder(const char* text) { placeholder_ = text; return *this; }
-    /// The trigger's width floor, px at the rem (default 150; the content can exceed it).
+    /// The trigger's width floor, px at the rem (default 100 — Zed's compact dropdown;
+    /// the content can exceed it).
     drop_down_builder& min_width(float px) { min_width_ = px; return *this; }
     drop_down_builder& disabled(bool on = true) { disabled_ = on; return *this; }
     drop_down_builder& tab_index(int i) { tab_index_ = static_cast<std::int16_t>(i); return *this; }
@@ -276,7 +277,7 @@ private:
     handler on_open_{};
     handler on_dismiss_{};
     const char* placeholder_ = nullptr;
-    float min_width_ = 150.f;
+    float min_width_ = 100.f;
     bool disabled_ = false;
     std::int16_t tab_index_ = 0;
     const char* name_ = nullptr;
@@ -930,13 +931,13 @@ lx::ui::select_builder::operator child() const {
     drop.open(open_ && !disabled_);
     drop.on_dismiss(on_dismiss_);
     drop.key(key_);
-    // The control, its trigger and its dropdown in one column so the popover tracks it.
+    // The popover alone: it carries the trigger (the overlay's anchor box) — a second
+    // bare trigger beside it would draw the control twice.
     lx::ui::control_props wrap{};
     wrap.layout = lx::ui::style{}.flex_col().flex_grow(1.f).flex_shrink(1.f)
                       .min_w(lx::layout::px(0.f));
     lx::ui::child drop_child = drop;
-    lx::ui::child kids[2] = {trigger_child, drop_child};
-    return control(wrap, {kids, 2u}, key_);
+    return control(wrap, {&drop_child, 1u}, key_);
 }
 
 lx::ui::select_builder lx::ui::select(std::span<const char* const> options, int selected) {
@@ -1005,12 +1006,12 @@ lx::ui::drop_down_builder::operator child() const {
     drop.open(open_ && !disabled_);
     drop.on_dismiss(on_dismiss_);
     drop.key(key_);
-    // The control, its trigger and its dropdown in one column so the popover tracks it.
+    // The popover alone: it carries the trigger (the overlay's anchor box) — a second
+    // bare trigger beside it would draw the control twice.
     lx::ui::control_props wrap{};
     wrap.layout = lx::ui::style{}.flex_col().items_start().flex_none();
     lx::ui::child drop_child = drop;
-    lx::ui::child kids[2] = {trigger_child, drop_child};
-    return control(wrap, {kids, 2u}, key_);
+    return control(wrap, {&drop_child, 1u}, key_);
 }
 
 lx::ui::drop_down_builder lx::ui::drop_down(std::span<const char* const> options, int selected) {

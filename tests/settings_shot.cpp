@@ -2,7 +2,7 @@
 // session the tests render) drawn by the CPU UI renderer into a PNG — the dev-aid eye on
 // the settings surface between releases, beside the widget gallery's panes.
 //
-//   lumen-settings-shot [out.png] [one-dark|one-light]
+//   lumen-settings-shot [out.png] [one-dark|one-light] [pane 0-7]
 
 #include "ui_golden.hpp"
 
@@ -66,8 +66,17 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // The app's state: the defaults, no file editing (nothing to click here).
+    // The app's state: the defaults, no file editing (nothing to click here). An optional
+    // pane index opens that pane (the search stays empty).
     settings::session the_session{};
+    if (argc > 3) {
+        const long pane = std::strtol(argv[3], nullptr, 10);
+        if (pane < 0 || pane >= static_cast<long>(settings::k_pane_count)) {
+            std::fprintf(stderr, "lumen-settings-shot: pane %s out of range\n", argv[3]);
+            return 2;
+        }
+        the_session.set_current(static_cast<settings::pane_id>(pane));
+    }
     settings::set_active_session(&the_session);
 
     lx::runtime::memory_arena arena{1024 * 1024};
@@ -80,6 +89,25 @@ int main(int argc, char** argv) {
         return 1;
     }
     list->batch_for_render();
+    if (std::getenv("LUMEN_SHOT_BOXES")) {
+        // Where every row's control landed: bounds by element key (a layout check aid).
+        const std::vector<settings::row_ref>& rows = settings::catalog();
+        std::function<void(lx::ui::ui_node*)> walk = [&](lx::ui::ui_node* n) {
+            if (!n)
+                return;
+            const lx::rect2i b = n->bounds();
+            if (n->key() >= settings::k_row_control_base &&
+                n->key() < settings::k_row_control_base + rows.size()) {
+                const unsigned i = n->key() - settings::k_row_control_base;
+                std::printf("  row %u (%s %s): %dx%d at (%d,%d)\n", i,
+                            rows[i].desc ? rows[i].desc->section : "", rows[i].label,
+                            b.width, b.height, b.x, b.y);
+            }
+            for (unsigned c = 0; c < n->child_count(); ++c)
+                walk(n->child_at(c));
+        };
+        walk(root.tree());
+    }
 
     std::vector<std::uint32_t> px(static_cast<std::size_t>(k_w) * k_h, 0u);
     lx::gfx::pixel_surface surface{};
