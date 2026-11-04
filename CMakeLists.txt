@@ -726,6 +726,24 @@ if(LUMEN_BUILD_TESTS)
         add_test(NAME ui_gallery COMMAND lumen-ui-gallery --check)
         # The settings app's own face: its real describe() rendered by the CPU UI renderer
         # into a PNG (a dev aid, not a test).
+        # The bell-menu anatomy over the real host path: a layer surface and an xdg_popup
+        # with the menu's rows (text + quads), for the popup-text damage.
+        add_executable(popup-probe)
+        target_sources(popup-probe PRIVATE FILE_SET CXX_MODULES TYPE CXX_MODULES
+            BASE_DIRS ${CMAKE_SOURCE_DIR} FILES tests/popup_probe.cpp)
+        target_link_libraries(popup-probe PRIVATE lx.ui.host lx.ui lx.wayland.client
+            lx.runtime lx.foundation lx.trace lx.text)
+        lumen_apply_module_properties(popup-probe)
+        lumen_link_platform(popup-probe)
+        add_executable(test_shell_menu tests/test_shell_menu.cpp)
+        target_link_libraries(test_shell_menu PRIVATE lx.ui lx.scene lx.gfx lx.runtime
+            lx.a11y lx.text lx.layout ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_shell_menu)
+        lumen_link_platform(test_shell_menu)
+        target_include_directories(test_shell_menu PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_shell_menu PRIVATE
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+        add_test(NAME test_shell_menu COMMAND test_shell_menu)
         add_executable(lumen-settings-shot tests/settings_shot.cpp)
         target_link_libraries(lumen-settings-shot PRIVATE lx.ui lx.scene lx.gfx lx.runtime
             lx.a11y lx.trace lumen-settings-ui ${LIBPNG_LINK_LIBRARIES})
