@@ -43,7 +43,13 @@ animation, no timer due, no key held → no frame callback requested, nothing su
 | panel redraw | ≤ 314 µs | 213–309 µs of shell CPU per hover-switched frame | schedstat over 240 alternated hovers, 2026-11-01 |
 
 `lumen-ui-bench` rows (S1–S4) live in `tests/bench/results/<machine>-<driver>/` and compare
-against `tests/bench/baseline/` per machine — never across hosts.
+against `tests/bench/baseline/` per machine — never across hosts. The notebook host
+(`iritur-08fd3c`, Broadwell i7-5500U, HD 5500: hasvk Vulkan / crocus GL) has its baselines
+committed since 2026-11-03 (`iritur-08fd3c-{none,cpu,gl,vulkan,client-cpu}.json`); its
+G6 on the hardware Vulkan path: window-move median 12.7 ms, p95 22.7, the gpu leg of the
+split a measured 0.8 ms fence signal (drag-smoke, scale 1), and S9 end to end
+(`ui-bench --e2e`) input→presented p50 **12.85 ms (0.77 periods)**, p95 24.96, commit
+p50 0.88 ms — PASS.
 
 ## 4. The engine comparison (ADR-010 §8.6)
 

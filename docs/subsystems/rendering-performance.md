@@ -48,6 +48,18 @@ The full table with sources lives in [ui-engine.md](ui-engine.md) §3; what move
 - **Panel redraw** — 213–309 µs of shell CPU per hover-switched frame (gate 314 µs,
   schedstat over 240 alternated hovers).
 
+Same rows on the notebook host (Broadwell, HD 5500, hasvk, Vulkan composite path, eDP
+3200×1800@59.982, drag-smoke at scale 1, 2026-11-03) — the first hardware-Vulkan G6
+numbers, and the `gpu` leg of the latency split is a real fence signal now, not a
+lavapipe stub:
+
+- **G6 (input→photon)** — cursor hover median **9.0 ms** (p95 15.8); window move median
+  **12.7 ms** (p95 22.7, max 39.5), the split queued 0.0 / compositor 8.2 / **gpu 0.8** /
+  display 1.2, newest-input→flip 9.3 ms; 120/120 motions reached a flip. The VM's
+  SVGA3D-fence tail is gone.
+- **G1 (idle)** and the clean-run rules held on hardware: no error or warning across the
+  whole drag-smoke, console restored, exit 0.
+
 `lumen-ui-bench` S1–S4 rows are per-machine JSON under `tests/bench/results/` compared
 against `tests/bench/baseline/` (§8.1's rules); they are not repeated here.
 
@@ -99,7 +111,9 @@ backend declines itself rather than accepting a downgrade.
 less is not listed (`device_selector::probe_devices`, `device::create`): to `automatic` it is
 "no hardware Vulkan", and GL composites. That is NVK on Kepler, PowerVR, panvk on Bifrost and
 possibly hasvk — all of which have GL drivers; RADV, ANV, NVK (Maxwell+), NVIDIA (Turing+),
-turnip and panvk (Valhall) report 1.4, v3dv 1.3. In exchange every pass is dynamic rendering
+turnip and panvk (Valhall) report 1.4, v3dv 1.3. (hasvk on Broadwell, Mesa 26.2, reports
+**1.3.354** — measured on the notebook host — so it passes the floor and `automatic` picks
+Vulkan there; NVK on GM107 reports 1.3.354 as well.) In exchange every pass is dynamic rendering
 (`vkCmdBeginRendering` — no `VkRenderPass`, no `VkFramebuffer`, pipelines made for a format),
 every barrier synchronization2, and timeline semaphores core. For comparison, wlroots' Vulkan
 renderer is built on render passes, and KWin and Mutter composite on GL. This changes how a
@@ -171,6 +185,19 @@ cares about:
 CPU   composite, opaque fullscreen             1.8 ms
 GL    composite, dmabuf client (no upload)     0.1 ms
 GL    composite, shm client (full upload)      2.7 ms
+```
+
+The same rows on the notebook host (HD 5500 — crocus GLES for GL, hasvk for the Vulkan
+composite that `automatic` picks — 1920×1080, `bench_composite`, medians of 3; the
+Vulkan rows are a hardware device now, not lavapipe):
+
+```
+CPU   composite, opaque fullscreen, 1 thread   1.49 ms   (1.42 with 4 threads)
+GL    composite, dmabuf client (no upload)     0.25 ms  (render thread; 0.18 best run)
+GL    composite, shm client (full upload)      4.41 ms  (render thread)
+Vk    whole target, full damage, fence waited  4.53 ms  (cpu 0.29 ms; gpu 4.12: composite 1.9, encode 2.2)
+Vk    frame, one moving 64×64 cursor           0.22 ms
+Vk    frame, one terminal line                 0.35 ms
 ```
 
 The GL figures are **submission** cost, not GPU wall time. The composite exports a fence
@@ -309,6 +336,13 @@ encode is 46 % of a full frame (50.6 of 110.5 ms). `test_dmabuf_composite`
 also under the validation layer) check that both passes report non-zero time no longer than
 the frame's wall time and that a timed frame's pixels equal an untimed one's.
 
+**Hardware** (HD 5500, hasvk, 1920×1080, one run with `--gpu-timing` beside the three
+without): the timer changes nothing outside noise (full frame 4.41 against 4.53 ms), and
+the split is the real GPU now — a full frame 4.12 ms of GPU (composite 1.91, encode 2.20:
+the encode pass is 53 % of it, against 46 % on lavapipe), the moving cursor 0.09 ms, a
+terminal line 0.20 ms. The wall-clock fence-waited row and the GPU row agree within 0.4 ms
+on every case — on a hardware device the fence is the frame.
+
 ### A real client, end to end: vkmark
 
 `scripts/vkmark-bench.sh --join-seat-session` (manual, not in ctest; about 3.5 minutes, and it
@@ -356,6 +390,40 @@ fifo             FPS   interval mean / sd / p99 ms   late per ~570 frames  rende
 ```
 
 \* Composites locked to every other refresh in that scene: the open issue below.
+
+**Hardware** — the notebook host (HP, Broadwell i7-5500U, HD Graphics 5500, Mesa 26.2.6:
+hasvk 1.3.354 behind the eDP at 3200×1800@59.982 scale 1, GTX 950M as a second GPU).
+Same script, same commit, one run per mode (vkmark itself draws on the HD 5500; the
+compositor's log says `Vulkan device Intel(R) HD Graphics 5500 … matched by primary node`,
+`Vulkan composite path active`). The columns are the script's `summary.txt`:
+
+```
+immediate        FPS (bare/panel/shell)   render_us p50       cpu/frame µs
+  clear          887 / 910 / 898          315 / 312 / 200     249 / 243 / 248
+  cube           937 / 901 / 869          322 / 207 / 215     228 / 230 / 252
+  texture        701 / 710 / 686          353 / 349 / 370     305 / 301 / 323
+  desktop        686 / 699 / 677          375 / 341 / 389     316 / 302 / 323
+fifo             FPS   interval mean / sd / p99 ms   late   render_us p50 / p95
+  clear  bare    60    16.70 / 0.70 / 16.68            1     377 / 514
+  cube   bare    60    16.67 / 0.00 / 16.68            0     350 / 402
+```
+
+- vkmark's immediate FPS is **7–14× the software-host numbers** (686–937 against 68–94):
+  the commit → import → `wl_buffer.release` path is no longer the WSI's upload bound but
+  the dmabuf import round trip, and every immediate scene keeps exactly one composite per
+  refresh (60.0/s) — the VM's every-other-refresh lock (the open issue below) did not
+  appear once on real vblank.
+- fifo is a locked **60.00 FPS with an interval stddev of 0.00 ms** (cube) and 0–3 late
+  frames per ~600 — the flip timestamps ride i915's real vblank instead of SVGA3D's
+  emulated one.
+- The panel and the background still cost nothing per frame: damage stays the one
+  480 000 px rect of vkmark's window (1 rect, 1 draw) in every scene and mode, and
+  render_us and CPU per frame are within run-to-run noise of `bare` (the one WARN: the
+  panel clock redrew once inside a 10 s fifo scene).
+- render_us p50 is **0.2–0.4 ms** — a hardware composite of an 800×600 dmabuf client
+  over the full 3200×1800 encode, against 1.1–1.7 ms of GL submission on SVGA3D. The
+  fifo CPU of ~90–100 ms/s is the compositor's whole steady-state CPU with vkmark
+  running.
 
 What this shows:
 
@@ -815,7 +883,7 @@ FB_DAMAGE_CLIPS takes.
 | Composite | `frame damage ∪ age(slot)`: each of the three scanout slots records what it missed since it was last drawn into. Without this a damage-limited composite into a slot two frames old leaves ghost trails behind a moving window |
 | GL | `gl_compositor::composite_region` — state set once, then per rect: scissor, clear, draw only the draws whose dst meets the rect; one fence per frame |
 | CPU | `cpu_compositor::composite_region` — the existing per-rect path (with its occlusion cull) once per rect |
-| Vulkan | `vulkan_compositor::composite_region` (and `ui_vk_renderer::composite` with `region`): the linear intermediate is persistent and holds the output's newest complete frame, so the composite pass loads it and redraws only this frame's damage — per rect: clear, then every draw (batch) meeting the rect, scissored to it — while the encode pass writes `damage ∪ age(slot)` into the target (loaded, one scissored triangle per rect). The chain is checked, not assumed: the intermediate records the target its frame went into, and anything else (first frame, new or resized intermediate, a whole-target `composite` such as the power-off black frame, a failed frame, device re-init) composites the whole target; a target not yet written is encoded whole. Pixels equal a full repaint byte for byte (`test_dmabuf_composite` `damage_limited_frames_match_a_full_repaint`, `test_deco_titles` `vk_damage_limited_titles_match_a_full_repaint`). lavapipe, 1920×1080, 3 slots (`bench_composite --vk`, 5 runs, medians [range]): a 64×64 cursor moving 125.1 [120.0–131.2] → 1.86 [1.54–2.30] ms per frame (CPU 232.6 → 1.8 ms), one terminal line 122.9 [121.2–126.2] → 3.31 [3.04–3.58] ms (CPU 231.2 → 4.6 ms), full damage 126.4 [121.7–128.9] → 123.5 [122.8–125.7] ms (CPU 231.9 → 233.3 ms, within the run-to-run spread) |
+| Vulkan | `vulkan_compositor::composite_region` (and `ui_vk_renderer::composite` with `region`): the linear intermediate is persistent and holds the output's newest complete frame, so the composite pass loads it and redraws only this frame's damage — per rect: clear, then every draw (batch) meeting the rect, scissored to it — while the encode pass writes `damage ∪ age(slot)` into the target (loaded, one scissored triangle per rect). The chain is checked, not assumed: the intermediate records the target its frame went into, and anything else (first frame, new or resized intermediate, a whole-target `composite` such as the power-off black frame, a failed frame, device re-init) composites the whole target; a target not yet written is encoded whole. Pixels equal a full repaint byte for byte (`test_dmabuf_composite` `damage_limited_frames_match_a_full_repaint`, `test_deco_titles` `vk_damage_limited_titles_match_a_full_repaint`). lavapipe, 1920×1080, 3 slots (`bench_composite --vk`, 5 runs, medians [range]): a 64×64 cursor moving 125.1 [120.0–131.2] → 1.86 [1.54–2.30] ms per frame (CPU 232.6 → 1.8 ms), one terminal line 122.9 [121.2–126.2] → 3.31 [3.04–3.58] ms (CPU 231.2 → 4.6 ms), full damage 126.4 [121.7–128.9] → 123.5 [122.8–125.7] ms (CPU 231.9 → 233.3 ms, within the run-to-run spread). On the HD 5500 (hasvk, same bench, medians of 3): cursor frame 0.222 ms, terminal line 0.346 ms, full damage 4.53 ms — damage-limited frames are 13–20× cheaper than a full one on hardware too, and the whole frame is 28× cheaper than lavapipe's |
 | KMS | Every rect since the last successful commit, as separate FB_DAMAGE_CLIPS: the plane's previous framebuffer predates this frame |
 
 A tick whose snapshot carries no damage composites nothing and commits nothing. On this
@@ -1166,7 +1234,9 @@ On a GPU it is a fraction of a millisecond to 2.6 ms for the length of the motio
 backend a large resampled window costs 20–50 ms a frame: animations are not for hosts whose
 only renderer is the CPU. Lavapipe (Vulkan on the CPU): +5–15 % (113–150 ms a frame either
 way). Nothing allocates per frame: the motions are a fixed table of 64, the ghosts' copies are
-made at the unmap.
+made at the unmap. On the HD 5500 (hasvk) the same scenes composite in 4.2–9.6 ms per frame
+through the whole animated window (fence waited; the i7-5500U's one CPU thread needs
+5.5–85 ms for the same frames) — comfortably inside a 60 Hz refresh at twice the area.
 
 ### Backdrop blur (ext-background-effect-v1)
 
@@ -1253,18 +1323,17 @@ under a 1920×32 panel blur with a 72 % overlay, fence waited; "blurred again": 
 changes under the footprint every frame; "window row update": a 960×16 row of the window far
 below the panel, its commit leaving the backdrop stale):
 
-| Case | GL, SVGA3D | Vulkan, lavapipe |
-|------|-----------:|-----------------:|
-| full repaint, no blur draw | 4.44 ms | 98.3 ms |
-| full repaint, cached blur | 4.58 ms | 100.1 ms |
-| full repaint, blurred again | 5.65 ms | 114.4 ms |
-| panel update (120×24), no blur draw | 1.94 ms | 1.19 ms |
-| panel update, cached blur | 1.91 ms | 1.23 ms |
-| panel update + backdrop moving, blurred again (frame grown to the 1920×96 footprint) | 3.42 ms | 24.4 ms |
-| backdrop moving, no blur draw | 1.97 ms | 1.47 ms |
-| window row update, no blur draw (15 360 px) | 1.65 ms | 1.23 ms |
-| window row update, blurred again (row + footprint, 199 680 px) | 3.38 ms | 23.7 ms |
-| the same, frame collapsed to its bounds (first version, 1 067 520 px) | 5.38 ms | 65.0 ms |
+| Case | GL, SVGA3D | Vulkan, lavapipe | GL, crocus (HD 5500) | Vulkan, hasvk (HD 5500) |
+|------|-----------:|-----------------:|---------------------:|-----------------------:|
+| full repaint, no blur draw | 4.44 ms | 98.3 ms | 1.70 ms | 4.35 ms |
+| full repaint, cached blur | 4.58 ms | 100.1 ms | 2.23 ms | 4.04 ms |
+| full repaint, blurred again | 5.65 ms | 114.4 ms | 2.98 ms | 4.35 ms |
+| panel update (120×24), no blur draw | 1.94 ms | 1.19 ms | 0.12 ms | 0.15 ms |
+| panel update, cached blur | 1.91 ms | 1.23 ms | 0.13 ms | 0.13 ms |
+| panel update + backdrop moving, blurred again (frame grown to the 1920×96 footprint) | 3.42 ms | 24.4 ms | 0.97 ms | 1.98 ms |
+| backdrop moving, no blur draw | 1.97 ms | 1.47 ms | 0.18 ms | 0.51 ms |
+| window row update, no blur draw (15 360 px) | 1.65 ms | 1.23 ms | 0.18 ms | 0.49 ms |
+| window row update, blurred again (row + footprint, 199 680 px) | 3.38 ms | 23.7 ms | 0.95 ms | — |
 
 So a cached panel blur costs nothing measurable, and blurring it again about 1.2 ms on SVGA3D
 (+1.5 ms over a small update, most of it redrawing the 1920×96 footprint); lavapipe pays for
@@ -1338,6 +1407,8 @@ whole, fence waited, medians of 3; GL on SVGA3D, Vulkan on lavapipe):
 | Vulkan | 97.7 ms | 98.2 ms | 99.0 ms | 128.2 ms |
 | CPU, 1 thread | 1.88 ms | 37.7 ms | 34.7 ms | 64.9 ms |
 | CPU, 4 threads | 2.37 ms | 24.9 ms | 24.1 ms | 43.6 ms |
+| GL, crocus (HD 5500) | 1.78 ms | 2.90 ms | 2.82 ms | 4.18 ms |
+| CPU, 4 threads (HD 5500) | 1.40 ms | 19.7 ms | 22.6 ms | 33.0 ms |
 
 A described surface pays for its curve: on GL what the identity program saves an undescribed
 one (the pow()s; SVGA3D emulates the shader on the host); on lavapipe little but PQ's
@@ -1784,7 +1855,31 @@ commit, plus 1.5 ms — and `callback_timer_` releases them (sway's per-view
 `max_render_time`, measured instead of configured). Until an answer was measured, and when
 the lead exceeds the period, they go out at the flip as before; a late answer raises the
 lead for the next frame, and its worst case is the flip-time behaviour. A tick that finds
-callbacks still held answers them itself.
+callbacks still held answers them itself: the tick's first act is `release_due_callbacks`,
+so a callback timer that fired late (the loop was busy at the deadline) costs its client
+one period at most — released there, the answer joins the following tick, and the cadence
+stays at one period instead of slipping to every other flip.
+
+**The repaint lead covers the whole path, and learns it from the flips.** The repaint
+estimate above measures the two threads' CPU and the GPU's tail — not the render thread's
+wake after the publish, the commit ioctl's submission, or the slack the kernel needs to
+latch a commit onto the vblank it is aiming at. On an otherwise idle core that handoff
+costs milliseconds, and with a sub-millisecond composite the lead it invalidates is razor
+thin: measured on an HD 5500, a `wl_surface.frame`-driven wl_shm client (answers in ~60 µs)
+had a third of its frames presented a full period late at 46–53 fps, while every tick cost
+0.4 ms and the health counters reported **0 missed** — the single aim slot had been
+overwritten by the next tick's aim before the slow frame's flip landed, so exactly the
+late frames were never judged. Two changes close that (2026-11-04): the aim is kept for
+the last four frames (`output_ui`'s aim ring), so a flip is always judged against the
+vblank its own repaint aimed at; and a flip that landed a period late feeds the scheduler
+`observe_commit_late` — the distance between its commit and that aim plus a step, the peak
+over a short window added to the lead — so a frame that misses starts earlier on its own,
+the same convergence the estimate has. The same client now holds 59.8–59.9 fps with
+1 late frame in 200 and an interval sd of 1.2 ms, at a commit→present p50 of 8–12 ms
+(weston 22, sway 33 on the same display); the input→photon median moves with the lead
+(window-move 16.8 ms against 12.7 with the too-thin lead — the gate is one period + 2 ms).
+`publish_commit_timing` therefore stamps the submit time unconditionally; the fence dup it
+also does stays debug-gated.
 
 **An output's first frame starts at once** (`repaint_scheduler::next_start` with no flip
 yet: no phase to aim at, where it used to wait for half a period), and **waits for a
@@ -1879,6 +1974,49 @@ That table predates the cursor theme moving off the critical path: three traced 
 put the window's configure 4–6 ms after the socket. sway's latency comes from compositing
 every commit as it arrives (561 fps on a virtual display whose flips do not wait for a
 vblank), at four times Lumen's CPU.
+
+**The same comparison on real hardware** (notebook host: Broadwell i7-5500U, HD 5500 —
+hasvk for Lumen's Vulkan composite, crocus GLES for weston/sway — eDP 3200×1800@59.982 at
+scale 1, bare compositors: Lumen `LUMEN_CONFIG=0`, weston 15.0.1 `--shell=kiosk
+--no-config --idle-time=0`, sway 1.12 with a one-line config; Hyprland 0.57 excluded —
+it wedges before its socket exists when launched from SSH and needs a real tty). The
+client differs from the VM probe: `pres-probe` (`~/lumen-compare`), a 256×256 wl_shm
+window paced by `wl_surface.frame` — a commit per callback — with
+`wp_presentation` feedback on every frame; 9 interleaved rounds, medians of rounds 2–9
+(round 1 warms every shader cache). p50/p95/sd/late are from the final round (stable
+across rounds):
+
+| | Lumen | weston 15.0.1 | sway 1.12 |
+|---|---|---|---|
+| socket ready | **370 ms** | 8948 | 10432 |
+| **first frame presented** (after another compositor ran before) | 1568 (215 isolated) | 9001 | 10653 |
+| commit → present p50 / p95 | **9.5 / 9.9 ms** | 22.4 / 23.2 | 33.3 / 33.3 |
+| fps of the callback-driven client | 59.0 | **60.28** | **60.28** |
+| interval sd / late per 200 | 2.4 ms / 4 | 0.004 / 0 | 0.004 / 0 |
+| compositor CPU, client animating | 5.1 % | 4.8 % | 2.4 % |
+| idle (8 s, window mapped) | 0.0 % | 0.0 % | 0.0 % |
+| shutdown | 416 ms | **158** | **157** |
+
+(The first hardware table of this comparison, 2026-11-03, had Lumen at a 3.9 ms p50 with
+53.6 fps and 22 late of 200 — the broken lead, §6.1. The row above is the same probe
+after the 2026-11-04 fix: the p50 pays the honest lead, and the cadence and the misses
+are within a hair of the answer-at-flip compositors while presenting 2.3–3.5× sooner.)
+
+- **Lumen presents a commit 5.7× sooner than weston and 8.4× sooner than sway** for this
+  client: the held-callback scheme releases the client just before the repaint that will
+  show its frame, where weston and sway answer at the flip and the commit waits a whole
+  period. p95 20 ms carries the misses below.
+- **Lumen's socket is up in 370 ms against ~9–10 s** for weston and sway on this host
+  (the VM measured 80/88 ms — these are cold-ish GL/EGL/fontconfig paths on a real
+  driver at a 3200×1800 mode; reproducible across all rounds). Lumen starting alone
+  presents in 215 ms; the 1.57 s row is a start right after another compositor's
+  teardown, the sequence the rounds measure.
+- **sway's per-frame CPU is the lowest here** (2.4 % against Lumen's 5.1 % at the same
+  scene) — its renderer idles the GPU between frames on this hardware; Lumen's Vulkan
+  composite pays the encode pass each frame. All three are at exactly 0.0 % idle.
+- weston's and sway's p50 ≈ their p95 (22–33 ms): one period, every frame, by design of
+  answer-at-flip. Lumen holds a 9.5 ms median with a 9.9 p95 — the held-callback scheme
+  with the whole-path lead (§6.1).
 
 ## 7. DRM page-flip + presentation feedback
 
