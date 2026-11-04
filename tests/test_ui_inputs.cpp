@@ -100,6 +100,16 @@ struct harness {
     return nullptr;
 }
 
+[[nodiscard]] unsigned count(ui_node* n, lx::a11y::role role, const char* name) {
+    if (!n)
+        return 0;
+    const lx::a11y::node a = n->accessibility_node();
+    unsigned hit = a.role_ == role && a.name && std::strcmp(a.name, name) == 0 ? 1u : 0u;
+    for (unsigned i = 0; i < n->child_count(); ++i)
+        hit += count(n->child_at(i), role, name);
+    return hit;
+}
+
 [[nodiscard]] control_node& ctl(ui_node* n) {
     LUMEN_CHECK(n && n->type() == control_node::static_type());
     return *static_cast<control_node*>(n);
@@ -366,6 +376,7 @@ LUMEN_TEST(drop_down_hugs_opens_and_checks_the_current_entry) {
     // dropdown does not fill the row).
     auto* trigger = find(root, lx::a11y::role::button, "close-mode");
     LUMEN_CHECK(trigger);
+    LUMEN_CHECK(count(root, lx::a11y::role::button, "close-mode") == 1);
     LUMEN_CHECK(find(root, lx::a11y::role::menu_item, "Close Window") == nullptr);
     LUMEN_CHECK(trigger->bounds().width < 280);
 
