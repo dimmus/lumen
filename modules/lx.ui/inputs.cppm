@@ -518,14 +518,15 @@ constexpr float k_st_h = 28.f;
 constexpr float k_sw_chip = 20.f;
 constexpr float k_sw_gap = 6.f;
 
-/// One ghost icon square, the stepper's − / + (an icon button's compact look): 24×22,
-/// rounded `sm`, ghost hover, the icon 14 px centred. `on_press` gets `value`.
+/// One ghost icon square, the stepper's − / + (an icon button's compact look): 28×22
+/// (Zed's number-input cells), rounded `sm`, ghost hover, the icon 14 px centred.
+/// `on_press` gets `value`.
 [[nodiscard]] lx::ui::child lx_in_ghost_icon(lx::ui::icon id, int value, handler on_press,
                                              bool disabled, const char* a11y_name) {
     const float rem = lx_in_rem();
     lx::ui::control_props c{};
     c.layout = lx_in_h_flex().flex_none().justify_center()
-                   .w(lx_in_px16(24.f)).h(lx_in_px16(22.f));
+                   .w(lx_in_px16(28.f)).h(lx_in_px16(22.f));
     lx::ui::control_paint p{};
     p.rest = {paint(tok::ghost_element_background), k_transparent};
     p.hover = {paint(tok::ghost_element_hover), k_transparent};
@@ -1073,15 +1074,15 @@ lx::ui::spinner_builder::operator child() const {
     lx::ui::child field_box = control(centre, {&field_child, 1u});
     lx::ui::child plus = lx_in_ghost_icon(lx::ui::icon::plus, 1, on_change_,
                                           disabled_ || at_max, "Increase");
-    // The rules between the cells: 1 px, the variant border, 20 px tall, centred.
+    // The rules between the cells: 1 px, the variant border, the box's full height.
     lx::ui::control_props rule{};
-    rule.layout = lx::ui::style{}.flex_none().w(lx::layout::px(1.f)).h(lx_in_px16(20.f));
+    rule.layout = lx::ui::style{}.flex_none().w(lx::layout::px(1.f)).h(lx_in_px16(k_st_h));
     rule.paint = control_paint::fixed({paint(tok::border_variant), k_transparent});
     lx::ui::child left_rule = control(rule, {});
     lx::ui::child right_rule = control(rule, {});
     lx::ui::child kids[5] = {minus, left_rule, field_box, right_rule, plus};
     lx::ui::control_props box{};
-    box.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(110.f)).h(lx_in_px16(k_st_h))
+    box.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(96.f)).h(lx_in_px16(k_st_h))
                      .rounded(radius::md);
     lx::ui::control_paint paint_{};
     paint_.rest = {paint(tok::element_background), paint(tok::border_variant)};
