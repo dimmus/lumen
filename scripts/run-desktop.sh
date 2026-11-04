@@ -53,7 +53,8 @@
 #                         gradient:#RRGGBB:#RRGGBB[:DEG], image:PATH[:fill|fit|center|
 #                         stretch|tile] (PNG, JPEG, WebP, SVG); --no-background for none
 #   --no-lock-on-blank    the blank timeout blanks without locking first
-#   --debug               LUMEN_LOG=debug for the compositor and the shell (default info)
+#   --debug               LUMEN_LOG=debug for the compositor and the shell (the default)
+#   --info                LUMEN_LOG=info (the quieter level, for clean runs)
 #   --logs DIR            log directory (default <repo>/run-desktop-logs)
 #   --join-seat-session   move the compositor into the active seat0 logind session's
 #                         cgroup, so logind lets libinput open input devices; needed when
@@ -87,7 +88,7 @@ SHELL_BIN="${BUILD}/lumen-shell"
 SOCKET="lumen-0"
 LIMIT=600
 LOG_DIR="${ROOT}/run-desktop-logs"
-LOG_LEVEL=info
+LOG_LEVEL=debug
 WITH_SHELL=1
 WITH_PORTALS=1
 JOIN_SEAT=0
@@ -114,6 +115,7 @@ while (( $# > 0 )); do
     --no-background) SHELL_ARGS+=(--no-background) ;;
     --no-lock-on-blank) SHELL_ARGS+=(--no-lock-on-blank) ;;
     --debug) LOG_LEVEL=debug ;;
+    --info) LOG_LEVEL=info ;;
     --logs) LOG_DIR="${2:?--logs needs a directory}"; shift ;;
     --join-seat-session) JOIN_SEAT=1 ;;
     --no-restart-shell) RESTART_SHELL=0 ;;
