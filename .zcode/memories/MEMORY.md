@@ -12,6 +12,7 @@
 - [Tiling (ADR 012)](lumen-tiling-adr012.md) — master-stack per workspace, merged PR #58; all 11 default bindings kept by user's choice
 - [UI bench noise and G7 audit](lumen-ui-bench-noise-and-g7.md) — 2026-10-28: Phase 0–4 "regressions" are host drift (A/B); gate on p50; GL build-ahead rejected; clipboard #61, primary + DnD #62
 - [UI Phase 5](lumen-ui-phase5.md) — 2026-10-29 workflows on claude/ui-phase5; lx.ui.host, shell cpu tier ≤25 MB, lower_to_blits extended, egui+pacman ok
+- [Frame pacing fix](lumen-frame-pacing-fix.md) — 2026-11-04: aim-ring pairing + observe_commit_late whole-path lead; 59.9 fps after; the disproven theories listed
 - [Notebook test hardware](lumen-notebook-hw.md) — HP: HD 5500 (hasvk) + GTX 950M (NVK), 3200x1800@2, lis3lv02d; PRs #64-68 from its runs; vkmark after fixes
 - [Render scale (HiDPI supersampling)](lumen-render-scale.md) — merged PR #70; area filter kept by user choice
 - [PRIME offload in launcher](lumen-prime-offload.md) — PrefersNonDefaultGPU via switcheroo/DRI_PRIME, merged PR #71 2026-10-29; notebook check pending; lx.shell.cppm is CRLF

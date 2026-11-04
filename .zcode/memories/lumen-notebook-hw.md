@@ -33,9 +33,11 @@ Facts from the 2026-11-03 hardware session (kernel 7.2.14; Mesa 26.2.6):
 - **nouveau GL (nvc0) cannot compile Lumen's GLES UI shaders**
   (`unpack_32_2x16_split_x/y` unknown op) and Mesa segfaults in draw after the failed
   link — never force the GL tier on the GTX 950M; NVK is its path.
-- **drag-smoke PASS** (scale 1): cursor 9.0/15.8 ms, window move 12.7/22.7 ms — gpu leg
-  a real 0.8 ms fence. **vkmark**: immediate 686–937 FPS, fifo 60.00 with sd 0.00 ms and
-  0–3 late; the panel/background still free; render_us p50 0.2–0.4 ms. In docs.
+- **drag-smoke PASS** (scale 1, before the 2026-11-04 pacing fix): cursor 9.0/15.8 ms,
+  window move 12.7/22.7 ms — gpu leg a real 0.8 ms fence. After the fix the honest lead
+  reads cursor 14.4 / move 16.8 ms (gate 18.7). **vkmark**: immediate 650–937 FPS, fifo
+  60.00 with sd 0.00 ms and 0–3 late; the panel/background still free; render_us p50
+  0.2–0.4 ms. In docs.
 - **Input injection** on the notebook: the touchpad is multitouch-only (no hover; bare
   ABS_X/Y ignored by libinput) and the 7.2.11 kernel had no uinput (module/tree
   mismatch). After reboot into 7.2.14: `scripts/uinput-mouse.py` creates an ABS mouse
@@ -47,6 +49,25 @@ Facts from the 2026-11-03 hardware session (kernel 7.2.14; Mesa 26.2.6):
   exists; needs a real tty launch). weston and sway start fine with the cgroup-join
   trick but take ~8.6/10 s to their socket on this host (reproducible; the VM measured
   80/88 ms).
+
+Facts from the 2026-11-04 bug-fix session:
+
+- **[[lumen-frame-pacing-fix]]**: the callback-client pacing bug found on this host was
+  fixed here (59.8–59.9 fps after); the fix, its root causes and numbers are that memory
+  and rendering-performance.md §6.1.
+- **session-smoke 24/24 PASS on hardware**: the "console blank after a session" was never
+  a compositor bug — the exit restore was verified correct (SetCrtc of the saved fbcon fb,
+  rc 0, plane back ~2 s after logout). session-smoke's `drm_driver()` must resolve
+  `readlink -f <connector>/device` and read THAT node's `device/uevent`: the connector's
+  `device` symlink names the card (a drm_minor whose uevent has no DRIVER line), the PCI
+  device is one level deeper. Two faster-looking reads both silently fell back to vmwgfx.
+- **The CRLF gotcha is wider than lx.shell.cppm**: lx.drm.cppm is CRLF too, and a
+  scripted/Python edit strips it silently (the whole file reads as rewritten in git).
+  `git diff --stat` showing a whole-file rewrite is the tell; restore with a bytes-mode
+  rewrite.
+- The comparison harness (pres-probe.c, compare.sh, STATE.md, results/) lives in
+  `~/lumen-compare`, outside the repo; its field extraction must use sed, not
+  `grep -oE '[0-9.]+'` (it matches digits inside field names like p50_ms).
 
 **Why:** hardware results arrive as pasted logs; a future session needs the device context to read them.
 **How to apply:** when the user pastes notebook logs, assume this hardware; ask them to log out of Lumen before benches. Related: [[lumen-no-degradation-rule]], [[lumen-best-in-class-bar]].

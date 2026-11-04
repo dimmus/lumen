@@ -70,6 +70,10 @@ KWin, Mutter, Smithay/niri, Hyprland; measure, don't assert) and **no degradatio
   may build egui from crates.io and pacman-install waybar/ironbar/gtk4-layer-shell/layer-shell-qt.
   Theme fallback table was rebuilt from MIT one.json because the first version took values
   from Zed's GPL crates — **keep Zed GPL sources out**.
+- **Whole-path repaint lead** (2026-11-04, notebook): the frame-clock lead carries the
+  measured thread cost AND the flip-fed whole-path lateness (`observe_commit_late`,
+  aim ring) — a callback client holds 59.9 fps with a 12 ms median present. Don't widen
+  `k_client_margin_ns` for handoff costs; the feedback absorbs them.
 - **Font-match persistence** (PR #44): `face_cache::persist_matches`, first decorated tick_ui
   24.6 ms → 1.7–2.8 ms. Don't port the WIP's font part again.
 
