@@ -7,14 +7,16 @@ C++26.
 
 ## Why Lumen
 
-- **Fast where you feel it.** On the same machine as weston, sway and Hyprland: the first
-  frame on screen 106 ms after start (sway 379, Hyprland 617), commit to present 5.1 ms at
-  the median (weston 11.1), 8 % CPU while a client animates (sway 35 %, Hyprland 74 %).
-  An idle desktop costs no measurable CPU: the frame clock stops.
+- **Fast where you feel it.** On the same real machine as weston and sway (a Broadwell
+  notebook, hardware Vulkan): the socket is up in 370 ms (weston 9 s, sway 10.4 s), a
+  client's commit reaches the screen in 9.5 ms at the median (weston 22, sway 33), and a
+  vsync'd client rides 60.00 fps with a 0.00 ms frame-interval spread. An idle desktop
+  costs no measurable CPU: the frame clock stops.
   [Measurements](docs/subsystems/rendering-performance.md#62-start-up)
-- **Zero copy.** dma-buf clients are composited where they live (0.1 ms of render thread per
-  frame), with explicit sync, a per-surface commit queue (FIFO, commit timing) and
-  presentation feedback that carries the real flip time.
+- **Zero copy.** dma-buf clients are composited where they live (~0.2 ms of render thread
+  per frame; a moving 64×64 cursor frame costs 0.09 ms of GPU), with explicit sync, a
+  per-surface commit queue (FIFO, commit timing) and presentation feedback that carries
+  the real flip time.
 - **Never does work twice.** Damage-limited compositing, occlusion culling, covered windows
   throttled to one frame callback a second, screen capture copied from the composite it
   already drew, so an idle screencast is free.
