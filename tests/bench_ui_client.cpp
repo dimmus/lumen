@@ -76,6 +76,7 @@
 // private socket (lumen-bench-<pid>), and is stopped on exit (SIGTERM, then SIGKILL); its
 // children die with it (PR_SET_PDEATHSIG).
 
+#include "render_node.hpp"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2300,10 +2301,9 @@ struct startup_run {
     // Automatic as on a KMS session: the headless compositor names no main device (its
     // automatic is cpu, nothing to time), so the render node stands in for it — the hardware
     // Vulkan probe, its refusal, then EGL on GBM, as lumen-hello starts on the real display.
-    struct stat node{};
-    if (std::strcmp(tier, "auto") == 0 && ::stat("/dev/dri/renderD128", &node) == 0) {
+    if (std::strcmp(tier, "auto") == 0 && !lumen_test::render_node_path().empty()) {
         args.push_back("--render-node");
-        args.push_back("/dev/dri/renderD128");
+        args.push_back(lumen_test::render_node_path());
     }
     std::vector<char*> argv;
     for (const std::string& s : args)
@@ -2592,8 +2592,7 @@ int orchestrate(const client_options& o) {
     std::vector<std::string> records;
     bool gate_failed = false;
     bool infra_failed = false;
-    struct stat st{};
-    const bool render_node = ::stat("/dev/dri/renderD128", &st) == 0;
+    const bool render_node = lumen_test::open_render_node() >= 0;
     for (unsigned t = 0; t < 4; ++t) {
         if (!o.tiers[t])
             continue;

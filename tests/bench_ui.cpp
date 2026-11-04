@@ -69,6 +69,7 @@
 // was before Phase 3) — every node dirty (cold), the root alone dirty over warm caches, one
 // label dirty (a clock cell) — under "layout_solve" (`--no-layout-solve` skips it).
 
+#include "render_node.hpp"
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
@@ -256,9 +257,9 @@ gl_info g_gl_info{};
     gl_options.persistent_ring = !opt.gl_mapped_ring;
     gl_options.fetch = opt.gl_attribute_fetch ? lx::gfx::ui_gl_fetch::attributes
                                               : lx::gfx::ui_gl_fetch::storage_buffer;
-    gl.fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    gl.fd = lumen_test::open_render_node();
     if (gl.fd < 0) {
-        std::fprintf(stderr, "lumen-ui-bench: gl: no render node (/dev/dri/renderD128)\n");
+        std::fprintf(stderr, "lumen-ui-bench: gl: no render node\n");
         return false;
     }
     auto device = lx::gfx::egl_device::create(gl.fd);

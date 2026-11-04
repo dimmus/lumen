@@ -1,0 +1,969 @@
+[
+  {
+    "host": {
+      "kernel": "7.2.14-arch1-1",
+      "cpus": 4,
+      "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "cpu",
+    "git": "b03dac3-dirty",
+    "preset": "release",
+    "scenario": "S1",
+    "title": "idle window",
+    "backend": "cpu",
+    "frames": 600,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 640,
+      "height": 480
+    },
+    "stages": {
+      "update": {
+        "p50": 0.062,
+        "p95": 0.159,
+        "p99": 0.168,
+        "max": 0.406,
+        "samples": 600
+      },
+      "tick_idle": {
+        "p50": 0.459,
+        "p95": 3.21,
+        "p99": 4.068,
+        "max": 4.655,
+        "samples": 600
+      },
+      "tick": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "emit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "order": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "encode": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "emit_order_encode": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "frame": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "raster": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "submit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "gpu": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout_emit_order_encode": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "update_frame": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "update_idle": {
+        "p50": 0.517,
+        "p95": 3.365,
+        "p99": 4.226,
+        "max": 4.814,
+        "samples": 600
+      }
+    },
+    "counters": {
+      "frames_produced": 0,
+      "frames_idle": 600,
+      "frames_described": 0,
+      "nodes": 15,
+      "primitives": 0,
+      "primitives_built": 86,
+      "primitives_total": 0,
+      "surfaces": 0,
+      "refs": 0,
+      "batches": 0,
+      "instance_bytes": 0,
+      "damage_rects": 0,
+      "damage_px": 0,
+      "damage_fraction": 0.0,
+      "overflow_drops": 0,
+      "raster_px": 0,
+      "draw_calls": 0,
+      "gpu_disjoint": 0,
+      "measures_max": 0,
+      "measures_total": 0,
+      "measure_hits_max": 0,
+      "arranges_max": 0,
+      "arranges_total": 0,
+      "nodes_emitted": 0,
+      "damage_rects_min": 0
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 7384,
+      "minor_faults": 1,
+      "major_faults": 0,
+      "involuntary_switches": 0
+    },
+    "gpu": {},
+    "gates": {
+      "G1": "pass",
+      "G5": "pass"
+    }
+  },
+  {
+    "host": {
+      "kernel": "7.2.14-arch1-1",
+      "cpus": 4,
+      "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "cpu",
+    "git": "b03dac3-dirty",
+    "preset": "release",
+    "scenario": "S2",
+    "title": "shell panel on components",
+    "backend": "cpu",
+    "frames": 36000,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 1920,
+      "height": 1080
+    },
+    "stages": {
+      "update": {
+        "p50": 0.333,
+        "p95": 1.134,
+        "p99": 1.965,
+        "max": 10.844,
+        "samples": 36000
+      },
+      "tick_idle": {
+        "p50": 0.958,
+        "p95": 3.065,
+        "p99": 3.869,
+        "max": 17.282,
+        "samples": 35400
+      },
+      "tick": {
+        "p50": 64.688,
+        "p95": 76.635,
+        "p99": 87.491,
+        "max": 100.184,
+        "samples": 600
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 8.053,
+        "p95": 9.457,
+        "p99": 10.259,
+        "max": 16.782,
+        "samples": 600
+      },
+      "layout": {
+        "p50": 44.447,
+        "p95": 49.171,
+        "p99": 59.702,
+        "max": 70.663,
+        "samples": 600
+      },
+      "emit": {
+        "p50": 8.41,
+        "p95": 10.005,
+        "p99": 24.764,
+        "max": 27.567,
+        "samples": 600
+      },
+      "order": {
+        "p50": 0.859,
+        "p95": 1.257,
+        "p99": 1.938,
+        "max": 2.317,
+        "samples": 600
+      },
+      "encode": {
+        "p50": 0.394,
+        "p95": 0.573,
+        "p99": 1.052,
+        "max": 1.715,
+        "samples": 600
+      },
+      "emit_order_encode": {
+        "p50": 9.829,
+        "p95": 11.384,
+        "p99": 25.99,
+        "max": 29.084,
+        "samples": 600
+      },
+      "frame": {
+        "p50": 66.481,
+        "p95": 79.221,
+        "p99": 89.826,
+        "max": 101.724,
+        "samples": 600
+      },
+      "raster": {
+        "p50": 23.311,
+        "p95": 25.224,
+        "p99": 30.384,
+        "max": 37.34,
+        "samples": 600
+      },
+      "submit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "gpu": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout_emit_order_encode": {
+        "p50": 54.756,
+        "p95": 66.46,
+        "p99": 76.54,
+        "max": 87.896,
+        "samples": 600
+      },
+      "update_frame": {
+        "p50": 67.953,
+        "p95": 80.644,
+        "p99": 91.057,
+        "max": 104.077,
+        "samples": 600
+      },
+      "update_idle": {
+        "p50": 1.289,
+        "p95": 4.27,
+        "p99": 4.935,
+        "max": 18.271,
+        "samples": 35400
+      }
+    },
+    "counters": {
+      "frames_produced": 600,
+      "frames_idle": 35400,
+      "frames_described": 0,
+      "nodes": 301,
+      "primitives": 10,
+      "primitives_built": 141,
+      "primitives_total": 6000,
+      "surfaces": 0,
+      "refs": 10,
+      "batches": 2,
+      "instance_bytes": 672,
+      "damage_rects": 1,
+      "damage_px": 1357,
+      "damage_fraction": 0.00065,
+      "overflow_drops": 0,
+      "raster_px": 3274,
+      "draw_calls": 0,
+      "gpu_disjoint": 0,
+      "measures_max": 9,
+      "measures_total": 5400,
+      "measure_hits_max": 2,
+      "arranges_max": 5,
+      "arranges_total": 3000,
+      "nodes_emitted": 7,
+      "damage_rects_min": 1
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 17892,
+      "minor_faults": 191,
+      "major_faults": 0,
+      "involuntary_switches": 0
+    },
+    "gpu": {},
+    "text": {
+      "doc_bytes": 0,
+      "doc_lines": 0,
+      "doc_glyphs": 0,
+      "layout_storage_bytes": 0,
+      "first_frame_us": 26611.2,
+      "first_layout_us": 20899.0,
+      "first_shaping_calls": 26,
+      "first_rasterized": 86,
+      "first_upload_bytes": 28152,
+      "shaping_calls": 600,
+      "shaping_calls_max": 1,
+      "rasterized": 13,
+      "rasterized_max": 1,
+      "raster_frames": 13,
+      "upload_bytes": 1024,
+      "upload_bytes_max": 90,
+      "upload_rects_max": 1,
+      "upload_frames": 13,
+      "sprites_max": 8,
+      "sprites_total": 4800,
+      "glyphs_max": 0,
+      "lines_drawn_max": 0,
+      "sprite_batches_max": 1,
+      "sprite_batches_per_page_max": 1,
+      "pages_max": 1,
+      "sprite_draws_per_page_max": 0
+    },
+    "layout_solve": {
+      "nodes": 301,
+      "node_bytes": 64,
+      "allocations": 0,
+      "cold": {
+        "p50": 104.49,
+        "p95": 125.03,
+        "p99": 242.78,
+        "samples": 3000,
+        "measures": 1170,
+        "hits": 0,
+        "arranges": 301,
+        "skipped": 0
+      },
+      "warm": {
+        "p50": 1.66,
+        "p95": 1.68,
+        "p99": 1.69,
+        "samples": 3000,
+        "measures": 0,
+        "hits": 10,
+        "arranges": 1,
+        "skipped": 10
+      },
+      "leaf": {
+        "p50": 10.93,
+        "p95": 10.97,
+        "p99": 13.24,
+        "samples": 3000,
+        "measures": 5,
+        "hits": 121,
+        "arranges": 3,
+        "skipped": 37
+      }
+    },
+    "gates": {
+      "G2": "pass",
+      "G5": "pass"
+    }
+  },
+  {
+    "host": {
+      "kernel": "7.2.14-arch1-1",
+      "cpus": 4,
+      "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "cpu",
+    "git": "b03dac3-dirty",
+    "preset": "release",
+    "scenario": "S3",
+    "title": "drifting rounded quads",
+    "backend": "cpu",
+    "frames": 1800,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 1919,
+      "height": 1080
+    },
+    "stages": {
+      "update": {
+        "p50": 112.254,
+        "p95": 117.983,
+        "p99": 142.75,
+        "max": 163.338,
+        "samples": 1800
+      },
+      "tick_idle": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "tick": {
+        "p50": 455.201,
+        "p95": 506.144,
+        "p99": 733.649,
+        "max": 944.943,
+        "samples": 1800
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout": {
+        "p50": 96.409,
+        "p95": 116.417,
+        "p99": 163.542,
+        "max": 263.258,
+        "samples": 1800
+      },
+      "emit": {
+        "p50": 356.041,
+        "p95": 383.746,
+        "p99": 576.756,
+        "max": 678.647,
+        "samples": 1800
+      },
+      "order": {
+        "p50": 22.175,
+        "p95": 25.935,
+        "p99": 39.705,
+        "max": 53.371,
+        "samples": 1800
+      },
+      "encode": {
+        "p50": 73.949,
+        "p95": 93.923,
+        "p99": 115.12,
+        "max": 139.852,
+        "samples": 1800
+      },
+      "emit_order_encode": {
+        "p50": 452.946,
+        "p95": 504.475,
+        "p99": 709.96,
+        "max": 840.226,
+        "samples": 1800
+      },
+      "frame": {
+        "p50": 552.875,
+        "p95": 625.516,
+        "p99": 868.756,
+        "max": 1107.1,
+        "samples": 1800
+      },
+      "raster": {
+        "p50": 31751.127,
+        "p95": 32395.813,
+        "p99": 37790.348,
+        "max": 46962.992,
+        "samples": 1800
+      },
+      "submit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "gpu": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout_emit_order_encode": {
+        "p50": 550.678,
+        "p95": 621.88,
+        "p99": 863.94,
+        "max": 1103.484,
+        "samples": 1800
+      },
+      "update_frame": {
+        "p50": 666.311,
+        "p95": 737.107,
+        "p99": 996.369,
+        "max": 1243.547,
+        "samples": 1800
+      },
+      "update_idle": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      }
+    },
+    "counters": {
+      "frames_produced": 1800,
+      "frames_idle": 0,
+      "frames_described": 0,
+      "nodes": 10651,
+      "primitives": 10001,
+      "primitives_built": 10001,
+      "primitives_total": 18001800,
+      "surfaces": 0,
+      "refs": 10001,
+      "batches": 1,
+      "instance_bytes": 800080,
+      "damage_rects": 0,
+      "damage_px": 0,
+      "damage_fraction": 0.0,
+      "overflow_drops": 0,
+      "raster_px": 2872520,
+      "draw_calls": 0,
+      "gpu_disjoint": 0,
+      "measures_max": 0,
+      "measures_total": 0,
+      "measure_hits_max": 0,
+      "arranges_max": 1,
+      "arranges_total": 1800,
+      "nodes_emitted": 10651,
+      "damage_rects_min": 0
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 15484,
+      "minor_faults": 0,
+      "major_faults": 0,
+      "involuntary_switches": 267
+    },
+    "gpu": {},
+    "gates": {
+      "G3": "pass",
+      "G5": "pass"
+    }
+  },
+  {
+    "host": {
+      "kernel": "7.2.14-arch1-1",
+      "cpus": 4,
+      "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "cpu",
+    "git": "b03dac3-dirty",
+    "preset": "release",
+    "scenario": "S4",
+    "title": "scrolling text wall",
+    "backend": "cpu",
+    "frames": 1800,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 1920,
+      "height": 1080
+    },
+    "stages": {
+      "update": {
+        "p50": 0.537,
+        "p95": 1.473,
+        "p99": 1.94,
+        "max": 8.069,
+        "samples": 1800
+      },
+      "tick_idle": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "tick": {
+        "p50": 133.782,
+        "p95": 152.546,
+        "p99": 203.272,
+        "max": 247.275,
+        "samples": 1800
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout": {
+        "p50": 0.473,
+        "p95": 1.374,
+        "p99": 1.91,
+        "max": 11.996,
+        "samples": 1800
+      },
+      "emit": {
+        "p50": 132.081,
+        "p95": 148.915,
+        "p99": 199.899,
+        "max": 242.711,
+        "samples": 1800
+      },
+      "order": {
+        "p50": 20.315,
+        "p95": 21.576,
+        "p99": 29.335,
+        "max": 39.065,
+        "samples": 1800
+      },
+      "encode": {
+        "p50": 13.781,
+        "p95": 15.377,
+        "p99": 20.202,
+        "max": 27.316,
+        "samples": 1800
+      },
+      "emit_order_encode": {
+        "p50": 166.669,
+        "p95": 185.715,
+        "p99": 246.777,
+        "max": 304.86,
+        "samples": 1800
+      },
+      "frame": {
+        "p50": 168.635,
+        "p95": 189.015,
+        "p99": 251.318,
+        "max": 309.874,
+        "samples": 1800
+      },
+      "raster": {
+        "p50": 4208.769,
+        "p95": 4425.313,
+        "p99": 4680.551,
+        "max": 5826.611,
+        "samples": 1800
+      },
+      "submit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "gpu": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout_emit_order_encode": {
+        "p50": 167.32,
+        "p95": 186.992,
+        "p99": 248.073,
+        "max": 306.416,
+        "samples": 1800
+      },
+      "update_frame": {
+        "p50": 169.15,
+        "p95": 189.877,
+        "p99": 252.994,
+        "max": 311.172,
+        "samples": 1800
+      },
+      "update_idle": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      }
+    },
+    "counters": {
+      "frames_produced": 1800,
+      "frames_idle": 0,
+      "frames_described": 0,
+      "nodes": 2,
+      "primitives": 2014,
+      "primitives_built": 1918,
+      "primitives_total": 3553815,
+      "surfaces": 0,
+      "refs": 2014,
+      "batches": 2,
+      "instance_bytes": 128912,
+      "damage_rects": 0,
+      "damage_px": 0,
+      "damage_fraction": 0.0,
+      "overflow_drops": 0,
+      "raster_px": 2203533,
+      "draw_calls": 0,
+      "gpu_disjoint": 0,
+      "measures_max": 0,
+      "measures_total": 0,
+      "measure_hits_max": 0,
+      "arranges_max": 0,
+      "arranges_total": 0,
+      "nodes_emitted": 2,
+      "damage_rects_min": 0
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 26880,
+      "minor_faults": 34,
+      "major_faults": 0,
+      "involuntary_switches": 42
+    },
+    "gpu": {},
+    "text": {
+      "doc_bytes": 139375,
+      "doc_lines": 2000,
+      "doc_glyphs": 99771,
+      "layout_storage_bytes": 8094023,
+      "first_frame_us": 73566.5,
+      "first_layout_us": 68955.2,
+      "first_shaping_calls": 3673,
+      "first_rasterized": 402,
+      "first_upload_bytes": 39904,
+      "shaping_calls": 0,
+      "shaping_calls_max": 0,
+      "rasterized": 45,
+      "rasterized_max": 4,
+      "raster_frames": 33,
+      "upload_bytes": 3740,
+      "upload_bytes_max": 318,
+      "upload_rects_max": 2,
+      "upload_frames": 33,
+      "sprites_max": 2096,
+      "sprites_total": 3687809,
+      "glyphs_max": 2499,
+      "lines_drawn_max": 50,
+      "sprite_batches_max": 1,
+      "sprite_batches_per_page_max": 1,
+      "pages_max": 1,
+      "sprite_draws_per_page_max": 0
+    },
+    "reshape": [
+      {
+        "size": "label",
+        "bytes": 14,
+        "lines": 1,
+        "glyphs": 10,
+        "shaping_calls": 2,
+        "first": {
+          "p50": 12.7,
+          "p95": 15.8
+        },
+        "cold": {
+          "p50": 11.6,
+          "p95": 14.5,
+          "samples": 300
+        },
+        "warm": {
+          "p50": 2.5,
+          "p95": 2.5,
+          "samples": 300
+        },
+        "rewrap": {
+          "p50": 0.2,
+          "p95": 0.2,
+          "samples": 600
+        }
+      },
+      {
+        "size": "line",
+        "bytes": 76,
+        "lines": 1,
+        "glyphs": 50,
+        "shaping_calls": 9,
+        "first": {
+          "p50": 363.1,
+          "p95": 379.3
+        },
+        "cold": {
+          "p50": 34.6,
+          "p95": 37.9,
+          "samples": 300
+        },
+        "warm": {
+          "p50": 11.7,
+          "p95": 11.9,
+          "samples": 300
+        },
+        "rewrap": {
+          "p50": 0.5,
+          "p95": 0.5,
+          "samples": 600
+        }
+      },
+      {
+        "size": "paragraph",
+        "bytes": 669,
+        "lines": 2,
+        "glyphs": 507,
+        "shaping_calls": 46,
+        "first": {
+          "p50": 611.2,
+          "p95": 619.5
+        },
+        "cold": {
+          "p50": 255.5,
+          "p95": 269.2,
+          "samples": 100
+        },
+        "warm": {
+          "p50": 103.2,
+          "p95": 110.6,
+          "samples": 100
+        },
+        "rewrap": {
+          "p50": 3.5,
+          "p95": 3.6,
+          "samples": 200
+        }
+      },
+      {
+        "size": "page",
+        "bytes": 6879,
+        "lines": 100,
+        "glyphs": 4990,
+        "shaping_calls": 320,
+        "first": {
+          "p50": 2769.3,
+          "p95": 2790.1
+        },
+        "cold": {
+          "p50": 2402.9,
+          "p95": 2412.7,
+          "samples": 30
+        },
+        "warm": {
+          "p50": 1173.0,
+          "p95": 1181.5,
+          "samples": 30
+        },
+        "rewrap": {
+          "p50": 48.2,
+          "p95": 50.5,
+          "samples": 60
+        }
+      },
+      {
+        "size": "document",
+        "bytes": 139375,
+        "lines": 2000,
+        "glyphs": 99771,
+        "shaping_calls": 3673,
+        "first": {
+          "p50": 40967.8,
+          "p95": 45340.0
+        },
+        "cold": {
+          "p50": 40611.0,
+          "p95": 40729.0,
+          "samples": 7
+        },
+        "warm": {
+          "p50": 23818.0,
+          "p95": 23848.7,
+          "samples": 7
+        },
+        "rewrap": {
+          "p50": 1077.3,
+          "p95": 1088.9,
+          "samples": 14
+        }
+      }
+    ],
+    "gates": {
+      "G4": "pass",
+      "G5": "pass"
+    }
+  }
+]

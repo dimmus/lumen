@@ -17,6 +17,7 @@
 //   - 1:1 and magnification are unchanged (the identity copy; bilinear upscale);
 //   - non-integer, 3:1 and 4:1 ratios, and a 90°-turned buffer, follow the area filter.
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -170,7 +171,7 @@ lx::gfx::egl_device* gl_device() {
     static int state = 0; // 0 untried, 1 usable, 2 not
     if (state == 0) {
         state = 2;
-        const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        const int fd = lumen_test::open_render_node();
         if (fd < 0)
             return nullptr;
         auto created = lx::gfx::egl_device::create(fd);

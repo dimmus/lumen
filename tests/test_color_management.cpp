@@ -11,6 +11,7 @@
 // stream frame. A surface described as plain sRGB must come out byte-identical to an
 // undescribed one.
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 #include <fcntl.h>
 #include <stdlib.h>
@@ -483,7 +484,7 @@ lx::gfx::egl_device* gl_device() {
     static bool usable = false;
     if (!initialized) {
         initialized = true;
-        const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        const int fd = lumen_test::open_render_node();
         if (fd < 0)
             return nullptr;
         auto created = lx::gfx::egl_device::create(fd);

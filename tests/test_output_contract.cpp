@@ -44,10 +44,17 @@ namespace {
 
 const char* const k_socket = "lumen-test-output-contract";
 
-/// The compositor's first output, as the wire must describe it.
+/// The compositor's first output, as the wire must describe it. The identity and scale
+/// come from the output state the events are built from (EDID make/model on real
+/// connectors, "Lumen"/the name without one; the ceiling of the scale), so the same
+/// contract holds on a virtual VM output and on a HiDPI panel.
 struct expected_output {
     std::string name;
     int x = 0, y = 0, w = 0, h = 0, refresh = 0;
+    int wire_scale = 1;     // wl_output.scale: ceil(scale), at least 1
+    int lw = 0, lh = 0;     // xdg-output logical size: mode / scale, rounded
+    int buffer_scale = 1;   // wl_surface.preferred_buffer_scale; no event at 1
+    std::string make, model, description;
 } g_want;
 
 int g_failed = 0;
@@ -256,8 +263,16 @@ int main() {
         const auto st = comp.outputs().state(comp.outputs().nth(0));
         g_want = {st.name, st.position.x, st.position.y, st.mode.width, st.mode.height,
                   static_cast<int>(st.refresh_mhz)};
-        std::printf("  output under test: %s %dx%d+%d+%d @%d mHz\n", g_want.name.c_str(),
-                    g_want.w, g_want.h, g_want.x, g_want.y, g_want.refresh);
+        g_want.wire_scale = std::max(1, static_cast<int>(std::ceil(st.scale)));
+        g_want.lw = static_cast<int>(std::lround(st.mode.width / st.scale));
+        g_want.lh = static_cast<int>(std::lround(st.mode.height / st.scale));
+        g_want.buffer_scale =
+            static_cast<int>(lx::compositor::preferred_buffer_scale(comp.outputs(), 1u << 0));
+        g_want.make = st.make[0] ? st.make : "Lumen";
+        g_want.model = st.model[0] ? st.model : st.name;
+        g_want.description = st.description;
+        std::printf("  output under test: %s %dx%d+%d+%d @%d mHz scale %d\n", g_want.name.c_str(),
+                    g_want.w, g_want.h, g_want.x, g_want.y, g_want.refresh, g_want.wire_scale);
     }
     std::atomic<bool> pump{true};
     std::mutex dispatch_lock;
@@ -306,21 +321,25 @@ int main() {
             output_info o{};
             bind_output(c, o);
             (void)wl_display_roundtrip(c.display);
-            check(!g_want.name.empty() && o.name == g_want.name && o.description == g_want.name,
-                  "wl_output v4 name and description: the output's (connector) name");
+            check(!g_want.name.empty() && o.name == g_want.name &&
+                      o.description == g_want.description,
+                  "wl_output v4 name and description: the output's name and description");
             check(o.w == g_want.w && o.h == g_want.h && o.refresh == g_want.refresh &&
-                      o.refresh > 0 && o.scale == 1 && o.x == g_want.x && o.y == g_want.y,
-                  "wl_output mode and refresh are the output's, scale 1, at its position");
-            check(o.make == "Lumen" && o.model == g_want.name && o.dones == 1,
-                  "wl_output geometry make=Lumen model=<name>, one done");
+                      o.refresh > 0 && o.scale == g_want.wire_scale && o.x == g_want.x &&
+                      o.y == g_want.y,
+                  "wl_output mode and refresh are the output's, scale its ceiling, at its "
+                  "position");
+            check(o.make == g_want.make && o.model == g_want.model && o.dones == 1,
+                  "wl_output geometry make and model from the output's EDID (Lumen and the "
+                  "name without one), one done");
 
             xdg_output_info x{};
             x.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
             zxdg_output_v1_add_listener(x.xo, &xdg_output_listener, &x);
             (void)wl_display_roundtrip(c.display);
-            check(x.x == g_want.x && x.y == g_want.y && x.w == g_want.w && x.h == g_want.h,
-                  "zxdg_output_v1 logical position and size (the mode at scale 1)");
-            check(x.name == g_want.name && x.description == g_want.name,
+            check(x.x == g_want.x && x.y == g_want.y && x.w == g_want.lw && x.h == g_want.lh,
+                  "zxdg_output_v1 logical position and size (the mode divided by the scale)");
+            check(x.name == g_want.name && x.description == g_want.description,
                   "zxdg_output_v1 v3 name and description");
             check(x.dones == 0 && o.dones == 2,
                   "zxdg_output_v1 v3 is closed by wl_output.done, not its own done");
@@ -347,7 +366,7 @@ int main() {
         wl_display_disconnect(c.display);
     }
 
-    // ── enter on map, leave on unmap; nothing preferred at scale 1 ──
+    // ── enter on map, leave on unmap; the preferred scale only when it is not 1 ──
     {
         client c{};
         if (connect(c)) {
@@ -357,8 +376,11 @@ int main() {
             window w{};
             map_window(c, w);
             check(w.info.events == "+", "a mapped toplevel gets wl_surface.enter once");
-            check(w.info.preferred_scale == 0 && w.info.preferred_transform == -1,
-                  "v6 surface at scale 1: no preferred_buffer_scale/_transform (the defaults)");
+            check(w.info.preferred_scale ==
+                          (g_want.buffer_scale > 1 ? g_want.buffer_scale : 0) &&
+                      w.info.preferred_transform == -1,
+                  "v6 surface: preferred_buffer_scale only when the scale is not 1, no "
+                  "preferred_buffer_transform (the defaults)");
             // An output change: the next tick tells every wl_output and moves the preferred
             // transform of the surfaces on it.
             const unsigned dones = o.dones;

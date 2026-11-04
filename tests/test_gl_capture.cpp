@@ -9,6 +9,7 @@
 //
 // Skips (passes) without a hardware GL renderer with ES 3.0 and EGL dma-buf import.
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 #include <fcntl.h>
 #include <poll.h>
@@ -50,7 +51,7 @@ rig* shared() {
     static bool tried = false;
     if (!tried) {
         tried = true;
-        r.fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        r.fd = lumen_test::open_render_node();
         if (r.fd < 0)
             return nullptr;
         auto created = lx::gfx::egl_device::create(r.fd);

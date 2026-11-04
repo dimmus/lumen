@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 import std;
 import lx.foundation;
@@ -395,7 +396,7 @@ LUMEN_TEST(turned_output_turns_primitives_with_their_draws) {
 // ── GL: the compositor's GLES 3.1 path and its GLES 2 lowering ──────────────────
 
 LUMEN_TEST(gl_decorated_frame_matches_cpu_and_the_gles2_lowering) {
-    const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    const int fd = lumen_test::open_render_node();
     if (fd < 0) {
         std::printf("    (gl skip: no render node)\n");
         return;
@@ -559,7 +560,7 @@ LUMEN_TEST(snap_preview_and_backdrop_draw_the_pixels_of_their_old_textures) {
     }
     lx::gfx::ui_cpu_renderer ui;
     std::optional<lx::gfx::egl_device> device{};
-    int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    int fd = lumen_test::open_render_node();
     if (fd >= 0) {
         auto made = lx::gfx::egl_device::create(fd);
         if (made && !made->is_software_renderer())

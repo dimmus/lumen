@@ -22,6 +22,7 @@
 // ([animations]: its tree container's `node_animation`, 0.95 of its size about its centre
 // at opacity 0.6): what an animating frame costs every backend.
 
+#include "render_node.hpp"
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/resource.h>
@@ -141,7 +142,7 @@ double bench_composite(unsigned width, unsigned height, lx::fourcc src_format, u
 
 /// The GL backend against a real render node. Prints nothing when there is no usable GPU.
 void bench_gl(unsigned width, unsigned height, int iters) {
-    const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    const int fd = lumen_test::open_render_node();
     if (fd < 0)
         return;
     auto device = lx::gfx::egl_device::create(fd);
@@ -673,7 +674,7 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
     }
 
     // GL backend on a hardware renderer, the frame's fence waited (GPU time included).
-    if (const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); fd >= 0) {
+    if (const int fd = lumen_test::open_render_node(); fd >= 0) {
         auto device = lx::gfx::egl_device::create(fd);
         if (device && !device.value().is_software_renderer()) {
             auto& dev = device.value();
@@ -943,7 +944,7 @@ void bench_blur(unsigned width, unsigned height, int iters, bool vk_on_software)
             ::close(fd);
         }
     };
-    if (const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); fd >= 0) {
+    if (const int fd = lumen_test::open_render_node(); fd >= 0) {
         auto device = lx::gfx::egl_device::create(fd);
         if (device && !device.value().is_software_renderer()) {
             auto& dev = device.value();
@@ -1035,7 +1036,7 @@ void bench_downsample(unsigned width, unsigned height, int iters, bool vk_on_sof
             ::close(fd);
         }
     };
-    const int gl_fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    const int gl_fd = lumen_test::open_render_node();
     std::optional<lx::gfx::egl_device> gl_device;
     if (gl_fd >= 0)
         if (auto d = lx::gfx::egl_device::create(gl_fd); d && !d.value().is_software_renderer())
@@ -1180,7 +1181,7 @@ void bench_color(unsigned width, unsigned height, int iters, bool vk_on_software
             ::close(fd);
         }
     };
-    if (const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); fd >= 0) {
+    if (const int fd = lumen_test::open_render_node(); fd >= 0) {
         auto device = lx::gfx::egl_device::create(fd);
         if (device && !device.value().is_software_renderer()) {
             auto& dev = device.value();

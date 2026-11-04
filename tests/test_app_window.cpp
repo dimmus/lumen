@@ -19,6 +19,7 @@
 //
 // Allocation counting: operator new and malloc on the child's UI thread while a measurement
 // is open (the worker thread, libwayland's reader and the drivers' threads are not the UI's).
+#include "render_node.hpp"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -842,6 +843,14 @@ int client_main(const char* tier_name, int fd) {
     app.config().backend = lx::gfx::parse_client_tier(tier_name);
     app.config().watch_theme = 0;
     app.config().theme = "one-dark";
+    // The headless compositor names no main device, so the tier would take the first
+    // render node — the discrete card on a hybrid host, not the one that drives the
+    // display. Choose on the test's node instead (the seam exists for this).
+    if (const int node = lumen_test::open_render_node(); node >= 0) {
+        struct stat st{};
+        if (::fstat(node, &st) == 0)
+            app.config().device_override = static_cast<std::uint64_t>(st.st_rdev);
+    }
     if (auto s = app.start(); !s) {
         check("connect", false, lx::format_error(s.get_error()));
         return g_failed;
@@ -1636,8 +1645,7 @@ int main(int argc, char** argv) {
     int failed = 0;
     std::printf("tier cpu:\n");
     failed += run_child("cpu");
-    struct stat st{};
-    if (::stat("/dev/dri/renderD128", &st) == 0) {
+    if (lumen_test::open_render_node() >= 0) {
         std::printf("tier gl (forced; the headless compositor names no main device):\n");
         failed += run_child("gl");
     } else {

@@ -15,6 +15,7 @@
 // <case>-gl.png, to look at beside the reference.
 
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 #include "ui_golden.hpp"
 
 #include <fcntl.h>
@@ -552,7 +553,7 @@ gl_context* shared_gl() {
     if (tried)
         return usable ? &ctx : nullptr;
     tried = true;
-    ctx.fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    ctx.fd = lumen_test::open_render_node();
     if (ctx.fd < 0) {
         std::printf("    (gl skip: no render node)\n");
         return nullptr;

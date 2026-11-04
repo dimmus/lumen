@@ -5,6 +5,7 @@
 // Skips (passes) when there is no usable GPU — a machine without /dev/dri or with only a
 // software rasterizer has nothing to say about this path.
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -28,7 +29,7 @@ int render_node() {
     static bool tried = false;
     if (!tried) {
         tried = true;
-        g_drm_fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        g_drm_fd = lumen_test::open_render_node();
     }
     return g_drm_fd;
 }

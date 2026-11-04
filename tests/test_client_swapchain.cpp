@@ -21,6 +21,11 @@
 //     free from libwayland and the driver reported) and the per-frame present cost per tier
 //     at 640×480 (acquire → draw → present → attach/damage/commit), p50/p95.
 #include <errno.h>
+#include <sys/stat.h>
+#include <thread>
+#include <chrono>
+
+#include "render_node.hpp"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -50,6 +55,20 @@
 #include <stdint.h>
 
 #include "ui_golden.hpp"
+
+
+namespace {
+/// The dev_t of the test render node (tests/render_node.hpp); 0 when there is none.
+/// `lx::gfx::open_render_node(0)` would take the first renderD* — the discrete card on a
+/// hybrid host, not the GPU that drives the display these buffers end up scanned out of.
+std::uint64_t test_render_dev() {
+    const int fd = lumen_test::open_render_node();
+    if (fd < 0)
+        return 0;
+    struct stat st{};
+    return ::fstat(fd, &st) == 0 ? static_cast<std::uint64_t>(st.st_rdev) : 0;
+}
+} // namespace
 
 import std;
 import lx.foundation;
@@ -475,7 +494,7 @@ struct gl_reader {
     bool ready = false;
 
     bool init() {
-        auto node = lx::gfx::open_render_node(0);
+        auto node = lx::gfx::open_render_node(test_render_dev());
         if (!node)
             return false;
         fd = std::move(node.value().fd);
@@ -919,6 +938,9 @@ void ring_cases(lx::gfx::client_gpu& gpu, const lx::gfx::format_choice& format, 
         small.add({1, 2, 3, 4});
         (void)present(again.value());
         // Release all; the next acquire takes the newest content (age 1) and misses nothing.
+        // On a hardware GPU the just-presented image is idle only once its fence signals
+        // (`vk_idle` gates acquire; llvmpipe is idle at once), so wait for it first.
+        (void)chain.wait_presented();
         for (std::uint32_t id : ids)
             chain.release(id);
         auto young = chain.acquire();
@@ -1058,9 +1080,25 @@ void compositor_cases(lx::wayland::display& d, lx::gfx::client_gpu& gpu,
                                   ui_golden::premultiplied(c->clear));
         auto presented = chain.present(image, full);
         w.commit(image, full);
-        (void)d.roundtrip();
-        tick();
-        (void)d.roundtrip();
+        // A hardware GPU signals the commit's fence asynchronously, so the update applies
+        // at a tick after it, not at the roundtrip that carried the commit (llvmpipe and
+        // the CPU tier apply at once). Wait until the compositor holds this frame's buffer
+        // before reading it back.
+        if (gpu.tier() != lx::gfx::client_tier::cpu)
+            for (unsigned tries = 0; tries < 250; ++tries) {
+                (void)d.roundtrip();
+                tick();
+                (void)d.roundtrip();
+                const received now = compositor_dmabuf(app_id.c_str());
+                if (now.ok && same_file(now.desc.planes[0].fd.get(), image.planes[0].fd))
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        else {
+            (void)d.roundtrip();
+            tick();
+            (void)d.roundtrip();
+        }
 
         std::vector<std::uint32_t> px;
         int stride = 0;
@@ -1390,7 +1428,7 @@ void run_cases() {
               std::format("tier {}; gl: {}", lx::gfx::client_tier_name(gpu.tier()),
                           gpu.refusal(lx::gfx::client_tier::gl)));
     }
-    auto node = lx::gfx::open_render_node(0);
+    auto node = lx::gfx::open_render_node(test_render_dev());
     const std::uint64_t render_dev = node ? node.value().dev : 0;
     if (node)
         measure(std::format("render node {} dev {:#x}", node.value().path, render_dev));

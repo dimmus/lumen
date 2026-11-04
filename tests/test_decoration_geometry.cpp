@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 import std;
 import lx.foundation;
@@ -535,7 +536,7 @@ LUMEN_TEST(managed_frame_draws_its_fills_and_close_from_the_first_snapshot) {
 // circle (a rounded solid blit) and the × (a coverage blit from the atlas's page) still draw,
 // with nothing dropped.
 LUMEN_TEST(gles2_context_draws_the_circle_and_the_close_glyph) {
-    const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    const int fd = lumen_test::open_render_node();
     if (fd < 0) {
         std::printf("    (gl skip: no render node)\n");
         return;

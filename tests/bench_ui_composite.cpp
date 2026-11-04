@@ -20,6 +20,7 @@
 //
 //   bench_ui_composite [--frames N] [--warmup N] [--backend cpu|gl|all]
 
+#include "render_node.hpp"
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -340,7 +341,7 @@ int main(int argc, char** argv) {
     }
 
     if (backend == "gl" || backend == "all") {
-        const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        const int fd = lumen_test::open_render_node();
         if (fd < 0) {
             std::printf("gl: no render node, skipped\n");
             return 0;

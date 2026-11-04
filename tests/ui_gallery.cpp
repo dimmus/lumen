@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "ui_golden.hpp"
+#include "render_node.hpp"
 
 import std;
 import lx.foundation;
@@ -531,7 +532,7 @@ struct gl_context {
 
 [[nodiscard]] std::unique_ptr<gl_context> open_gl() {
     auto ctx = std::make_unique<gl_context>();
-    ctx->fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    ctx->fd = lumen_test::open_render_node();
     if (ctx->fd < 0)
         return nullptr;
     auto device = lx::gfx::egl_device::create(ctx->fd);
@@ -708,7 +709,7 @@ int main(int argc, char** argv) {
     if (std::strcmp(backend, "gl") == 0) {
         gl = open_gl();
         if (!gl) {
-            std::fprintf(stderr, "lumen-ui-gallery: no GLES 3.1 context on /dev/dri/renderD128\n");
+            std::fprintf(stderr, "lumen-ui-gallery: no GLES 3.1 context on the render node\n");
             return 1;
         }
     }

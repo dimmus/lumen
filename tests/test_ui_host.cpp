@@ -21,6 +21,7 @@
 //
 // Allocation counting: operator new and malloc on the child's UI thread while a measurement
 // is open.
+#include "render_node.hpp"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -567,6 +568,14 @@ int client_main(const char* tier_name, int fd) {
     co.theme = "one-dark";
     co.watch_theme = 0;
     co.async_icons = false;
+    // The headless compositor names no main device, so the tier would take the first
+    // render node — the discrete card on a hybrid host, not the one that drives the
+    // display. Choose on the test's node instead (the seam exists for this).
+    if (const int node = lumen_test::open_render_node(); node >= 0) {
+        struct stat st{};
+        if (::fstat(node, &st) == 0)
+            co.device_override = static_cast<std::uint64_t>(st.st_rdev);
+    }
     if (auto s = ctx.start(d, loop, co); !s) {
         check("context starts", false, lx::format_error(s.get_error()));
         return g_failed;
@@ -952,8 +961,7 @@ int main(int argc, char** argv) {
     int failed = 0;
     std::printf("tier cpu:\n");
     failed += run_child("cpu");
-    struct stat st{};
-    if (::stat("/dev/dri/renderD128", &st) == 0) {
+    if (lumen_test::open_render_node() >= 0) {
         std::printf("tier gl (forced; the headless compositor names no main device):\n");
         failed += run_child("gl");
     } else {

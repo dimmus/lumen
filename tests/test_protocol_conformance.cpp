@@ -1247,8 +1247,8 @@ int main() {
            });
     {
         // The first preferred_scale arrives with the object, before the first configure,
-        // so the first frame is already drawn at the right scale (120: the test output is
-        // at scale 1).
+        // so the first frame is already drawn at the right scale — whatever the output's
+        // is (120 on a scale-1 output, 240 on this host's scale-2 panel).
         struct order {
             std::vector<std::string> events;
             uint32_t scale = 0;
@@ -1277,11 +1277,17 @@ int main() {
             wp_fractional_scale_v1_destroy(f);
             (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
         });
+        unsigned want = 120;
+        {
+            std::lock_guard<std::mutex> hold(dispatch_lock);
+            want = lx::compositor::preferred_scale_120(comp.outputs(), 1u << 0);
+        }
         const bool ok = o.events.size() >= 2 && o.events[0] == "preferred" &&
-                        o.events[1] == "configure" && o.scale == 120;
+                        o.events[1] == "configure" && o.scale == want;
         ++g_ran;
-        std::printf("  %s  fractional scale: preferred_scale (%u) before the first configure\n",
-                    ok ? "PASS" : "FAIL", o.scale);
+        std::printf("  %s  fractional scale: preferred_scale (%u of %u) before the first "
+                    "configure\n",
+                    ok ? "PASS" : "FAIL", o.scale, want);
         if (!ok)
             ++g_failed;
     }

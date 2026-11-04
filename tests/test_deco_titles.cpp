@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
 import std;
 import lx.foundation;
@@ -463,7 +464,7 @@ gl_env* shared_gl() {
     if (tried)
         return g.get();
     tried = true;
-    const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    const int fd = lumen_test::open_render_node();
     if (fd < 0) {
         std::printf("    (gl skip: no render node)\n");
         return nullptr;
@@ -1450,7 +1451,7 @@ LUMEN_TEST(lowered_paths_draw_titles_close_and_circle) {
     desktop d1{k_windows};
     desktop d125{k_windows_125, 1.25};
 
-    const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    const int fd = lumen_test::open_render_node();
     LUMEN_CHECK(fd >= 0);
     if (fd < 0)
         return;
