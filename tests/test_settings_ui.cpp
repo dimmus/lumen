@@ -142,14 +142,15 @@ LUMEN_TEST(settings_window_renders_rail_panes_and_switches_between_them) {
     ui_node* root = h.root.tree();
     LUMEN_CHECK(root);
 
-    // The rail: a button per pane, Appearance selected.
+    // The sidebar: a button per pane, the current pane's category the expanded one (Zed's
+    // list highlights only the focused group leaf — never the category).
     for (unsigned i = 0; i < settings::k_pane_count; ++i) {
         ui_node* b = find(root, lx::a11y::role::button,
                           std::string(settings::k_pane_names[i]).c_str());
         LUMEN_CHECK(b);
-        const bool selected = (b->accessibility_node().state &
-                               static_cast<unsigned>(lx::a11y::state_flag::selected)) != 0u;
-        LUMEN_CHECK(selected == (i == 0));
+        const bool expanded = (b->accessibility_node().state &
+                               static_cast<unsigned>(lx::a11y::state_flag::expanded)) != 0u;
+        LUMEN_CHECK(expanded == (i == 0));
     }
     // The search field and the content exist; the content carries rows (Appearance's).
     LUMEN_CHECK(find_key(root, settings::k_search_key));

@@ -708,6 +708,15 @@ precondition — occluded windows carry visibility rects the crop path does not 
 the three-button geometry regolded. 134/134 test targets green (`test_ui_inputs` now runs
 8 cases; the gallery grew a dropdown-and-spinner row, both themes regolded).
 
+A second follow-up restyled the sidebar list to Zed's anatomy (measured off its
+screenshot): category rows muted and never highlighted — the chevron alone says expansion,
+and the pane's identity lives in the content header — a 10 px chevron, uniform 28 px rows
+with a 2 px rhythm, children whose pills span the sidebar minus a 6 px inset with 6 px
+corners (the *text* indents 22 px inside the pill, not the pill itself), the selected
+child's text bright white rather than accent, and the current pane opening expanded.
+`tests/settings_shot.cpp` (`lumen-settings-shot`, a dev aid) renders the app's own
+`describe()` through the CPU UI renderer to a PNG — the app's face without a compositor.
+
 A follow-up pass against Zed's own settings panes: **every** enumeration picks through the
 dropdown (the two- and three-word selectors like focus mode and the acceleration profile
 too — never segmented; the Displays transform likewise), the rows top-align their controls

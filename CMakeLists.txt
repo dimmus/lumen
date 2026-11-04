@@ -724,6 +724,16 @@ if(LUMEN_BUILD_TESTS)
             LUMEN_GALLERY_DIR="${CMAKE_SOURCE_DIR}/docs/images"
             LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
         add_test(NAME ui_gallery COMMAND lumen-ui-gallery --check)
+        # The settings app's own face: its real describe() rendered by the CPU UI renderer
+        # into a PNG (a dev aid, not a test).
+        add_executable(lumen-settings-shot tests/settings_shot.cpp)
+        target_link_libraries(lumen-settings-shot PRIVATE lx.ui lx.scene lx.gfx lx.runtime
+            lx.a11y lx.trace lumen-settings-ui ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(lumen-settings-shot)
+        lumen_link_platform(lumen-settings-shot)
+        target_include_directories(lumen-settings-shot PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(lumen-settings-shot PRIVATE
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
         # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log no error.
         find_file(LUMEN_VK_VALIDATION_LAYER VkLayer_khronos_validation.json
             PATHS /usr/share/vulkan/explicit_layer.d /usr/local/share/vulkan/explicit_layer.d

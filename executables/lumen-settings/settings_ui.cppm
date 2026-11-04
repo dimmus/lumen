@@ -123,6 +123,8 @@ public:
         if (load_files)
             load_from_files();
         load_strings();
+        // Zed's settings open with the current category expanded.
+        expanded_[static_cast<unsigned>(current_)] = true;
     }
 
     /// The layered configuration the compositor itself reads (locate → read → parse).
@@ -2194,21 +2196,19 @@ namespace {
         const pane_id p = static_cast<pane_id>(i);
         const bool active = s->current() == p;
         const bool open = s->expanded(p);
-        const bool pane_selected = active && focus.empty();
+        // Zed's category row: muted text, a small chevron, no highlight ever (the pane's
+        // groups highlight; the header says where you are).
         lx::ui::child chev = icon_view(
             open ? lx::ui::icon::chevron_down : lx::ui::icon::chevron_right,
-            st_text_px(14.f), tok::icon_muted);
-        lx::ui::child text = st_text(k_pane_names[i].data(), st_text_px(13.f),
-                                     pane_selected ? tok::text_accent : tok::text);
+            st_text_px(10.f), tok::icon_muted);
+        lx::ui::child text =
+            st_text(k_pane_names[i].data(), st_text_px(13.f), tok::text_muted);
         lx::ui::child pair[2] = {chev, text};
         lx::ui::control_props row{};
-        row.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f)).px(st_px16(8.f))
-                         .gap(st_px16(6.f)).rounded(lx::ui::radius::sm);
+        row.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f)).px(st_px16(6.f))
+                         .gap(st_px16(6.f)).rounded(lx::ui::radius::md);
         lx::ui::control_paint paint_{};
-        if (pane_selected)
-            paint_.rest = {paint(tok::ghost_element_selected), k_transparent};
-        else
-            paint_.rest = {paint(tok::ghost_element_background), k_transparent};
+        paint_.rest = {k_transparent, k_transparent};
         paint_.hover = {paint(tok::ghost_element_hover), k_transparent};
         paint_.active = {paint(tok::ghost_element_active), k_transparent};
         row.paint = paint_;
@@ -2220,10 +2220,9 @@ namespace {
         };
         row.role = lx::a11y::role::button;
         row.name = k_pane_names[i].data();
-        row.a11y_state = pane_selected ? st_a11y(lx::a11y::state_flag::selected) : 0u;
+        row.a11y_state = active ? st_a11y(lx::a11y::state_flag::expanded) : 0u;
         row.interactive = true;
         row.focusable = true;
-        row.selected = pane_selected;
         row.focus_ring = true;
         rows[n++] = control(row, {pair, 2u});
         if (!open)
@@ -2233,16 +2232,20 @@ namespace {
         for (unsigned gi = 0; gi < gn; ++gi) {
             const char* g = groups[gi];
             const bool leaf_active = active && focus == std::string_view(g);
-            lx::ui::child leaf_text = st_text(g, st_text_px(12.5f),
-                                              leaf_active ? tok::text_accent : tok::text_muted);
+            // Zed's child row: the pill spans the sidebar minus its own 6 px inset (the
+            // row itself is not deeply indented — the text is, by its padding), the
+            // selected text bright, not accent.
+            lx::ui::child leaf_text =
+                st_text(g, st_text_px(12.5f), leaf_active ? tok::text : tok::text_muted);
             lx::ui::control_props leaf{};
-            leaf.layout = st_h_flex().flex_none().w_full().h(st_px16(26.f)).px(st_px16(8.f))
-                              .ml(st_px16(22.f)).rounded(lx::ui::radius::sm);
+            leaf.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f))
+                              .pl(st_px16(22.f)).pr(st_px16(6.f))
+                              .rounded(lx::ui::radius::md);
             lx::ui::control_paint leaf_paint{};
             if (leaf_active)
                 leaf_paint.rest = {paint(tok::ghost_element_selected), k_transparent};
             else
-                leaf_paint.rest = {paint(tok::ghost_element_background), k_transparent};
+                leaf_paint.rest = {k_transparent, k_transparent};
             leaf_paint.hover = {paint(tok::ghost_element_hover), k_transparent};
             leaf_paint.active = {paint(tok::ghost_element_active), k_transparent};
             leaf.paint = leaf_paint;
@@ -2302,7 +2305,7 @@ namespace {
 
     lx::ui::child tree = st_box(
         st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f))
-            .w_full().gap(st_px16(1.f)).px(st_px16(8.f)).pt(st_px16(4.f)),
+            .w_full().gap(st_px16(2.f)).px(st_px16(6.f)).pt(st_px16(4.f)),
         control_paint{}, {rows, n});
     lx::ui::child col[3] = {search_child, tree, status_row};
     lx::ui::control_props rail_props{};
