@@ -269,6 +269,16 @@ LUMEN_TEST(settings_search_filters_rows_across_panes) {
         if (find_key(root, settings::k_row_control_base + i))
             ++none;
     LUMEN_CHECK(none == 0);
+
+    // Zed's clear button is there only while there is a query, and clears it.
+    ui_node* clear = find(root, lx::a11y::role::button, "Clear");
+    LUMEN_CHECK(clear);
+    LUMEN_CHECK(h.root.pointer_move(centre(*clear)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+    LUMEN_CHECK(s.query_buffer().size == 0);
+    LUMEN_CHECK(h.tick());
+    LUMEN_CHECK(find(h.root.tree(), lx::a11y::role::button, "Clear") == nullptr);
     settings::set_active_session(nullptr);
 }
 
@@ -287,14 +297,20 @@ LUMEN_TEST(settings_bindings_editor_validates_conflicts_and_writes) {
     s.root = &h.root;
     h.root.set_describer(&settings::describe);
 
-    // The Shortcuts pane lists every action.
+    // The Shortcuts pane lists every action a key can be given — all but `none`, the
+    // unbinding sentinel (a row's editor unbinds with an empty field).
     s.set_current(settings::pane_id::shortcuts);
     LUMEN_CHECK(h.tick());
     unsigned listed = 0;
-    for (unsigned i = 0; i < lx::config::actions().size(); ++i)
-        if (find_key(h.root.tree(), settings::k_row_control_base + i))
-            ++listed;
-    LUMEN_CHECK(listed == lx::config::actions().size());
+    unsigned bindable = 0;
+    for (unsigned i = 0; i < lx::config::actions().size(); ++i) {
+        const bool row = find_key(h.root.tree(), settings::k_row_control_base + i) != nullptr;
+        const bool sentinel = lx::config::actions()[i].owner == lx::config::action_owner::none;
+        LUMEN_CHECK(row != sentinel);
+        listed += row ? 1u : 0u;
+        bindable += sentinel ? 0u : 1u;
+    }
+    LUMEN_CHECK(listed == bindable && bindable > 0);
 
     // Bind window.close to Super+Y: the file gains the line, the snapshot takes it.
     const auto& all = lx::config::actions();
@@ -447,6 +463,163 @@ LUMEN_TEST(settings_string_rows_carry_examples_and_refuse_blank_spec) {
         LUMEN_CHECK(s.state() != settings::session::save_state::written);
         break;
     }
+    settings::set_active_session(nullptr);
+}
+
+LUMEN_TEST(settings_labels_survive_the_catalog_build) {
+    // The derived labels were interned in a growing vector of short strings: each one's
+    // characters lived inline (the small-string buffer), so the next push moved them and
+    // every earlier label dangled — the Tiling layout row read "ile", the [ui] appearance
+    // row a fragment of freed memory. Every label is printable now, capitalised, and these
+    // two read what their keys say.
+    const auto& rows = settings::catalog();
+    unsigned checked = 0;
+    for (const settings::row_ref& r : rows) {
+        LUMEN_CHECK(r.label && r.label[0] >= 'A' && r.label[0] <= 'Z');
+        for (const char* c = r.label; *c; ++c)
+            LUMEN_CHECK(*c >= 0x20 && *c < 0x7f);
+        if (r.desc && std::strcmp(r.desc->section, "tiling") == 0 &&
+            std::strcmp(r.desc->key, "layout") == 0) {
+            LUMEN_CHECK(std::string_view(r.label) == "Layout");
+            ++checked;
+        }
+        if (r.desc && std::strcmp(r.desc->section, "ui") == 0 &&
+            std::strcmp(r.desc->key, "appearance") == 0) {
+            LUMEN_CHECK(std::string_view(r.label) == "Appearance");
+            ++checked;
+        }
+    }
+    LUMEN_CHECK(checked == 2);
+}
+
+LUMEN_TEST(settings_number_keys_step_on_their_grid_and_clamp) {
+    settings::session s{};
+    settings::set_active_session(&s);
+    const auto& rows = settings::catalog();
+    const auto row_of = [&](const char* section, const char* key) {
+        for (unsigned i = 0; i < rows.size(); ++i)
+            if (rows[i].desc && std::strcmp(rows[i].desc->section, section) == 0 &&
+                std::strcmp(rows[i].desc->key, key) == 0)
+                return i;
+        return settings::session::k_no_row;
+    };
+
+    // The master ratio (0.1..0.9) steps by 0.05 on a spinner. The slider it replaced had
+    // `min(hi − lo, 120)` steps — one step here — so any touch wrote 0.1 or 0.9.
+    const unsigned ratio = row_of("tiling", "master-ratio");
+    LUMEN_CHECK(ratio != settings::session::k_no_row);
+    const unsigned slot = settings::string_slot(ratio);
+    LUMEN_CHECK(slot != settings::session::k_no_row);
+    double& v = *static_cast<double*>(rows[ratio].desc->field(s.config()));
+    s.set_number(ratio, 0.55);
+    s.step_number(ratio, +1);
+    LUMEN_CHECK(std::abs(v - 0.60) < 1e-9);
+    LUMEN_CHECK(std::string_view(s.string_buffer(slot).storage.data()) == "0.60");
+    s.step_number(ratio, -1);
+    s.step_number(ratio, -1);
+    LUMEN_CHECK(std::abs(v - 0.50) < 1e-9);
+    for (int k = 0; k < 40; ++k)
+        s.step_number(ratio, +1);
+    LUMEN_CHECK(std::abs(v - 0.9) < 1e-9);
+
+    // Typed text commits (rounded onto the step's grid); junk puts the value back.
+    s.string_buffer(slot).assign("0.31");
+    s.commit_number(ratio);
+    LUMEN_CHECK(std::abs(v - 0.30) < 1e-9);
+    s.string_buffer(slot).assign("abc");
+    s.commit_number(ratio);
+    LUMEN_CHECK(std::abs(v - 0.30) < 1e-9);
+    LUMEN_CHECK(std::string_view(s.string_buffer(slot).storage.data()) == "0.30");
+
+    // A large number prints whole, never as an exponent (`%.2g` showed 800 as "8e+02").
+    const unsigned stiffness = row_of("animations", "stiffness");
+    LUMEN_CHECK(stiffness != settings::session::k_no_row);
+    s.set_number(stiffness, 800.0);
+    LUMEN_CHECK(std::string_view(
+                    s.string_buffer(settings::string_slot(stiffness)).storage.data()) == "800");
+
+    // An integer typed past `int` clamps to the key's range instead of wrapping
+    // (4294967336 cast to int is 40).
+    const unsigned history = row_of("notifications", "history");
+    LUMEN_CHECK(history != settings::session::k_no_row);
+    s.string_buffer(settings::string_slot(history)).assign("4294967336");
+    s.commit_int(history);
+    LUMEN_CHECK(*static_cast<int*>(rows[history].desc->field(s.config())) ==
+                static_cast<int>(rows[history].desc->hi));
+    settings::set_active_session(nullptr);
+}
+
+LUMEN_TEST(settings_shortcuts_show_the_bindings_lumen_runs) {
+    // Without a config file the session holds Lumen's defaults, and a default binding is
+    // what the Shortcuts row shows: the launcher on Super. An unbound action reads as
+    // unbound — the old test took a `combo{}` (kind `key`) for a binding and printed
+    // keysym 0's name, "NoSymbol", on every row.
+    settings::session s{};
+    const auto all = lx::config::actions();
+    const lx::config::action_info* launcher = lx::config::find_action("shell.launcher");
+    LUMEN_CHECK(launcher != nullptr);
+    const lx::config::combo c =
+        s.binding_of_action(static_cast<unsigned>(launcher - all.data()));
+    LUMEN_CHECK(!settings::combo_empty(c));
+    char text[64]{};
+    lx::config::format_combo(c, text, sizeof text);
+    LUMEN_CHECK(std::string_view(text) == "Super");
+
+    unsigned unbound = 0;
+    for (unsigned i = 0; i < all.size(); ++i) {
+        bool has_default = false;
+        for (const lx::config::default_binding& d : lx::config::default_bindings())
+            has_default = has_default || d.action == all[i].id;
+        if (has_default || all[i].owner == lx::config::action_owner::none)
+            continue;
+        LUMEN_CHECK(settings::combo_empty(s.binding_of_action(i)));
+        ++unbound;
+    }
+    LUMEN_CHECK(unbound > 0);
+}
+
+LUMEN_TEST(settings_ctrl_shift_e_moves_the_focus_between_nav_and_page) {
+    // Zed's `ToggleFocusNav`, the shortcut the sidebar's footer names.
+    settings::session s{};
+    settings::set_active_session(&s);
+    harness h{};
+    s.root = &h.root;
+    key_event e{};
+    e.keycode = 18; // KEY_E
+    e.codepoint = U'E';
+    e.pressed = true;
+    e.modifiers = k_mod_ctrl | k_mod_shift;
+    const auto inside = [](const ui_node* n, element_key k) {
+        for (; n; n = n->parent())
+            if (n->key() == k)
+                return true;
+        return false;
+    };
+
+    // Nothing focused: to the open page's entry in the navigation.
+    LUMEN_CHECK(h.root.key(e));
+    const ui_node* f = h.root.focus().focused();
+    LUMEN_CHECK(f && f->key() ==
+                         settings::k_nav_key_base + static_cast<unsigned>(s.current()));
+    LUMEN_CHECK(h.tick());
+
+    // From the navigation: to the page's first control.
+    LUMEN_CHECK(h.root.key(e));
+    f = h.root.focus().focused();
+    LUMEN_CHECK(f && inside(f, settings::k_page_key) && !inside(f, settings::k_rail_key));
+    LUMEN_CHECK(h.tick());
+
+    // And back.
+    LUMEN_CHECK(h.root.key(e));
+    f = h.root.focus().focused();
+    LUMEN_CHECK(f && inside(f, settings::k_rail_key));
+
+    // Ctrl+E alone is not the shortcut.
+    key_event plain = e;
+    plain.modifiers = k_mod_ctrl;
+    const ui_node* before = h.root.focus().focused();
+    (void)h.root.key(plain);
+    LUMEN_CHECK(h.root.focus().focused() == before);
     settings::set_active_session(nullptr);
 }
 
