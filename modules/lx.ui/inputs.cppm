@@ -344,6 +344,15 @@ public:
     }
     spinner_builder& on_change(handler h) { on_change_ = h; return *this; }
     spinner_builder& on_submit(handler h) { on_submit_ = h; return *this; }
+    /// A value that is not an integer (Zed's `NumberField` over an `f32`): the text the
+    /// cleared field shows dim, and whether − / + are at the range's ends — `range` and
+    /// the constructor's `value` speak integers only.
+    spinner_builder& display(const char* placeholder, bool at_min, bool at_max) {
+        placeholder_ = placeholder;
+        at_min_ = at_min;
+        at_max_ = at_max;
+        return *this;
+    }
     spinner_builder& disabled(bool on = true) { disabled_ = on; return *this; }
     spinner_builder& tab_index(int i) { tab_index_ = static_cast<std::int16_t>(i); return *this; }
     spinner_builder& name(const char* a11y) { name_ = a11y; return *this; }
@@ -356,6 +365,9 @@ private:
     bool has_range_ = false;
     int min_ = 0;
     int max_ = 0;
+    const char* placeholder_ = nullptr;
+    bool at_min_ = false;
+    bool at_max_ = false;
     handler on_change_{};
     handler on_submit_{};
     bool disabled_ = false;
@@ -954,10 +966,12 @@ lx::ui::drop_down_builder::operator child() const {
     const char* current = has_selection ? options_[static_cast<unsigned>(selected_)] : nullptr;
 
     // The trigger: a bordered box the content sizes (to the `min_width` floor), the word
-    // left and the stacked chevrons right.
+    // left and the stacked chevrons right. Zed's settings dropdown, measured on One Dark at
+    // scale 2: 28 px tall (`h_7`), the word at `TextSize::Default` (14 px — the same size
+    // as the row's label beside it).
     lx::ui::control_props trigger{};
     trigger.layout = lx_in_h_flex().flex_none().min_w(lx_in_px16(min_width_))
-                         .justify_between().h(lx_in_px16(26.f)).px(sp::b08).gap(sp::b04);
+                         .justify_between().h(lx_in_px16(28.f)).px(sp::b08).gap(sp::b04);
     lx::ui::control_paint p{};
     p.rest = {paint(tok::element_background), paint(tok::border_variant)};
     p.hover = {paint(tok::element_background), paint(tok::border)};
@@ -974,7 +988,7 @@ lx::ui::drop_down_builder::operator child() const {
     trigger.focus_ring = true;
     lx::ui::child word = text_block(lx_in_text(
         current ? current : (placeholder_ ? placeholder_ : ""),
-        lx_in_text_px(13.f),
+        lx_in_text_px(14.f),
         disabled_ ? tok::text_disabled : current ? tok::text : tok::text_placeholder, 1.f));
     // The dropdown glyph: the up and down chevrons stacked, Zed's `ChevronUpDown`.
     lx::ui::child chevrons_kids[2] = {
@@ -1052,13 +1066,14 @@ lx::ui::stepper_builder lx::ui::stepper(text_buffer& buffer, int value) {
 // ── spinner ────────────────────────────────────────────────────────────────────────────
 
 lx::ui::spinner_builder::operator child() const {
-    const bool at_min = has_range_ && value_ <= min_;
-    const bool at_max = has_range_ && value_ >= max_;
+    const bool at_min = at_min_ || (has_range_ && value_ <= min_);
+    const bool at_max = at_max_ || (has_range_ && value_ >= max_);
     lx::ui::child minus = lx_in_ghost_icon(lx::ui::icon::minus, -1, on_change_,
                                            disabled_ || at_min, "Decrease");
     text_input_builder field = text_input().buffer(*buffer_)
                                   .framed(false)
-                                  .placeholder(frame_format("{}", value_))
+                                  .placeholder(placeholder_ ? placeholder_
+                                                            : frame_format("{}", value_))
                                   .layout(lx_in_h_flex().flex_none().min_w(lx::layout::px(0.f))
                                               .h(lx_in_px16(k_st_h)))
                                   .max_bytes(16)

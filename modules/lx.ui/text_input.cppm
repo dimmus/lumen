@@ -157,6 +157,10 @@ struct text_input_props {
     /// Unframed: no border, no background — the chrome around the field paints (a
     /// spinner's middle, an inline cell). Caret, selection and editing are unchanged.
     bool framed = true;
+    /// The frame's rule at rest: `border_variant` (Zed's `InputField`), or `border` for a
+    /// field that must read as framed on the editor background (Zed's
+    /// `SettingsInputField` and the settings search). Focused, it is `border_focused`.
+    tok border = tok::border_variant;
     std::int16_t tab_index = 0;
     const char* name = nullptr;
 };
@@ -262,6 +266,7 @@ private:
     text_block_node* text_ = nullptr;
     text_buffer* buffer_ = nullptr;
     bool framed_ = true;
+    tok border_ = tok::border_variant;
     std::uint32_t seen_revision_ = 0;
     std::uint32_t own_size_ = 0;
     std::uint32_t max_bytes_ = k_text_input_capacity;
@@ -317,6 +322,8 @@ public:
     text_input_builder& on_submit(handler h) { props_.on_submit = h; return *this; }
     text_input_builder& disabled(bool on = true) { props_.disabled = on; return *this; }
     text_input_builder& framed(bool on = true) { props_.framed = on; return *this; }
+    /// The frame's rule at rest (`text_input_props::border`).
+    text_input_builder& border(tok t) { props_.border = t; return *this; }
     text_input_builder& tab_index(int i) { props_.tab_index = static_cast<std::int16_t>(i); return *this; }
     text_input_builder& name(const char* a11y) { props_.name = a11y; return *this; }
     text_input_builder& key(element_key k) { key_ = k; return *this; }
@@ -523,7 +530,7 @@ void lx::ui::text_input_node::resolve_paint() {
         q.corner_radii[i] = radius_px(radius::md, ui_rem_px());
         q.border_widths[i] = static_cast<float>(k_ti_border);
     }
-    q.border_color = t.color(tok::border_variant);
+    q.border_color = t.color(border_);
     box_[0] = pack_quad_style(q);
     q.border_color = t.color(tok::border_focused);
     box_[1] = pack_quad_style(q);
@@ -541,8 +548,9 @@ bool lx::ui::text_input_node::apply(const text_input_props& p) {
         flex_ = flex;
         layout_ = p.layout;
     }
-    const bool framed_changed = p.framed != framed_;
+    const bool framed_changed = p.framed != framed_ || p.border != border_;
     framed_ = p.framed;
+    border_ = p.border;
     const bool repaint = !applied_ || generation != generation_ || framed_changed;
     if (repaint)
         resolve_paint();

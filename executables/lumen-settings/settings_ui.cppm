@@ -3,9 +3,14 @@
 // `pointer_keys()`) — the value kind picks the control, the range constrains it, the reload
 // class writes its badge — so a key added to the schema appears here with no pane code.
 //
-// Layout (ADR-013 §5.2): a search row over a left rail (the panes) and the content column
-// (grouped setting rows; ghost hovers), a status bar under it. Values edit in place: a
-// control's change mutates the session's snapshot and asks for one frame.
+// Layout: Zed's settings window (crates/settings_ui), measured against it on One Dark at
+// scale 2. A 226 px navigation sidebar on the panel background — the search field, the
+// pane tree (`TreeViewItem`s: roots with a disclosure, sections on an indentation line),
+// the Ctrl-Shift-E hint in its footer — beside the page on the editor background: the
+// files header fixed at the top, then the title, and per section a mono header over a
+// faded rule and its rows (14 px label, 12 px wrapping description, the control centred
+// beside them), ruled off from each other, `pb_10` after the last. Values edit in place:
+// a control's change mutates the session's snapshot and asks for one frame.
 //
 // Values edit the session's snapshot and the user's config.toml: every edit splices the
 // user layer (lx.config:edit), re-parses to verify and renames atomically (ADR-013
@@ -106,14 +111,24 @@ struct string_field {
 
 /// This process's settings state: the snapshot the rows render and edit, the selected
 /// pane, the search query, one text buffer per string key. One per process (UI affinity).
+///
+/// No binding: a `combo{}` is `{key, 0, 0}` — its kind is not `tap` — so "unbound" is no
+/// modifier and no code, whatever the kind (a tap always carries its modifier). Testing
+/// the kind instead read every default as present-but-empty and printed keysym 0's name,
+/// "NoSymbol", on every row of the Shortcuts pane.
+[[nodiscard]] constexpr bool combo_empty(const lx::config::combo& c) {
+    return c.mods == 0 && c.code == 0;
+}
+
 class session {
 public:
     static constexpr unsigned k_no_row = ~0u;
-    /// The schema's string and integer keys each get their own edit buffer (the strings'
-    /// fields, the integers' spinners — 9 + 16 today). Headroom for the editors still open
-    /// (per-device overrides, window rules); a key past the cap renders read-only — never
-    /// two rows sharing one buffer.
-    static constexpr unsigned k_max_string_rows = 32;
+    /// The string, integer and number keys each get their own edit buffer (the strings'
+    /// fields, the numeric keys' spinners — 9 + 16 + 12 today, the pointer sections'
+    /// numbers counted per section). Headroom for the editors still open (per-device
+    /// overrides, window rules); a key past the cap renders read-only — never two rows
+    /// sharing one buffer.
+    static constexpr unsigned k_max_string_rows = 48;
 
     /// `load_files`: read the layered configuration (main does this; tests keep the
     /// defaults). Seeds `config_` and the string buffers from what Lumen runs with.
@@ -185,8 +200,14 @@ public:
     [[nodiscard]] std::string_view config_path() const {
         return std::string_view(user_file_);
     }
-    /// A number key takes `v`.
+    /// A number key takes `v` (clamped to the range, rounded to the key's step); the
+    /// row's spinner buffer re-seeds with the canonical text.
     void set_number(unsigned row, double v);
+    /// A number spinner's − / +: one step of the key (`number_step`) down or up.
+    void step_number(unsigned row, int delta);
+    /// A number spinner's field submit: the buffer's text becomes the value (invalid
+    /// text re-seeds from the snapshot).
+    void commit_number(unsigned row);
     /// An enumeration key takes the word index.
     void set_enum(unsigned row, unsigned v);
     /// A string key's buffer applies to its field (an input's change or submit).
@@ -222,7 +243,7 @@ public:
         const std::vector<row_ref>& rows = catalog(); // (no-op: keeps the catalog warm)
         (void)rows;
         const lx::config::combo current = binding_of_action(index);
-        if (current.kind != lx::config::combo_kind::tap || current.mods || current.code) {
+        if (!combo_empty(current)) {
             char canon[64];
             lx::config::format_combo(current, canon, sizeof(canon));
             edit_.set(canon);
@@ -306,7 +327,11 @@ private:
         return strings_[row < k_max_string_rows ? row : 0];
     }
 
-    lx::config::config_snapshot config_{};
+    /// Lumen's defaults until a layer parses over them — what the compositor runs with when
+    /// there is no file, it is disabled (LUMEN_CONFIG=0) or it does not parse. An empty
+    /// `config_snapshot{}` is not that: it has no bindings and libinput's own touchpad
+    /// defaults, so the panes showed values Lumen never runs.
+    lx::config::config_snapshot config_{lx::config::default_config()};
     pane_id current_ = pane_id::appearance;
     unsigned open_menu_ = k_no_row;
     /// The sidebar tree's expansion, and the group the pane is narrowed to.
@@ -343,7 +368,8 @@ private:
 void set_active_session(session* s);
 [[nodiscard]] session* active_session();
 
-/// The window's UI: search row, rail, content, status bar.
+/// The window's UI (Zed's settings window): the navigation sidebar — search, tree,
+/// keybinding hint — beside the page, whose files header stays put over the scrolling items.
 [[nodiscard]] lx::ui::child describe(lx::ui::build_context& ctx);
 
 /// A subsequence match of `query` (lower case) against a row's search text.
@@ -353,7 +379,10 @@ void set_active_session(session* s);
 inline constexpr lx::ui::element_key k_search_key = 0x73'0001;
 inline constexpr lx::ui::element_key k_rail_key = 0x73'0002;
 inline constexpr lx::ui::element_key k_content_key = 0x73'0003;
-inline constexpr lx::ui::element_key k_status_key = 0x73'0004;
+/// The page column (the files header and the scrolling list).
+inline constexpr lx::ui::element_key k_page_key = 0x73'0005;
+/// Pane `i`'s root entry in the navigation tree: `k_nav_key_base + i`.
+inline constexpr lx::ui::element_key k_nav_key_base = 0x73'0100;
 /// Row `i`'s value control: `k_row_control_base + i` (the catalog index).
 inline constexpr lx::ui::element_key k_row_control_base = 0x73'1000;
 
@@ -371,10 +400,22 @@ namespace cfg = lx::config;
 
 settings::session* g_session = nullptr; // NOLINT(cppcoreguidelines-avoid-non-const-global-variable)
 
-constexpr float k_rail_w = 240.f;   ///< px at the rem (Zed's sidebar)
-constexpr float k_value_w = 220.f;  ///< the value column, px at the rem
-constexpr float k_row_h = 32.f;     ///< a setting row without a badge
-constexpr float k_badge_row_h = 40.f;
+constexpr float k_rail_w = 226.f;   ///< px at the rem (Zed's SIDEBAR_WIDTH)
+/// Zed's `SettingsInputField`: `min_w_64` — a string field is 256 px wide.
+constexpr float k_field_w = 256.f;
+/// Zed's setting row: `pt_4().pb_4()` around a label (14 px) over its description (12 px),
+/// the control top-aligned beside them, a rule (`Divider::horizontal`) between rows.
+constexpr float k_row_pad = 16.f;
+/// A section's last row: `pb_10` instead of the rule, the space before the next header.
+constexpr float k_section_end_pad = 40.f;
+/// Zed's content gutter: the page header and every item sit `px_8` in from both edges.
+constexpr float k_content_px = 32.f;
+/// Zed's `TextSize`: `Default` 14 px (labels, the tree), `Small` 12 px (descriptions,
+/// section headers), `Large` 16 px — the page title is a `Label` at `LabelSize::Large`
+/// (measured: the title's "General" is 1.14× the sidebar's 14 px one).
+constexpr float k_text_default = 14.f;
+constexpr float k_text_small = 12.f;
+constexpr float k_text_title = 16.f;
 /// The "Edit in config.toml" popover's slot in the session's open-menu state (beyond the
 /// catalog rows and the displays pane's 0x4000+head keys).
 constexpr unsigned k_path_menu = 0x6000u;
@@ -407,8 +448,28 @@ constexpr unsigned k_path_menu = 0x6000u;
     return control(c, kids, key);
 }
 
+/// A plain column of `kids`, however many: a node keeps at most `ui_node::k_max_children`
+/// children and drops the rest without a word, so a longer list is stacked as columns of
+/// at most that many inside one column (no gap, no padding: it lays out identically).
+[[nodiscard]] lx::ui::child st_column(const lx::ui::element** kids, unsigned n) {
+    constexpr unsigned cap = lx::ui::ui_node::k_max_children;
+    const lx::ui::style col = lx::ui::style{}.flex_col().flex_none().w_full();
+    if (n <= cap)
+        return st_box(col, control_paint{}, {kids, n});
+    lx::ui::build_context* ctx = lx::ui::build_context::current();
+    const unsigned chunks = (n + cap - 1) / cap;
+    const auto** outer = ctx ? ctx->alloc_children(chunks) : nullptr;
+    if (!outer || chunks > cap)
+        return nullptr;
+    for (unsigned c = 0; c < chunks; ++c) {
+        const unsigned from = c * cap;
+        outer[c] = st_box(col, control_paint{}, {kids + from, std::min(cap, n - from)});
+    }
+    return st_box(col, control_paint{}, {outer, chunks});
+}
+
 [[nodiscard]] lx::ui::child st_text(const char* text, float px, tok color, bool bold = false,
-                                    bool muted_line = false) {
+                                    bool muted_line = false, bool wrap = false) {
     lx::ui::text_block_props p{};
     p.text = text ? text : "";
     const char* family = active_theme().fonts().ui_family;
@@ -416,7 +477,7 @@ constexpr unsigned k_path_menu = 0x6000u;
               bold ? lx::text::weight::bold : lx::text::weight::normal, lx::text::style::normal};
     p.color = active_theme().color(color);
     p.line_height = muted_line ? 1.f : lx::ui::k_phi;
-    p.wrap = lx::text::text_wrap::none;
+    p.wrap = wrap ? lx::text::text_wrap::word : lx::text::text_wrap::none;
     p.context = active_ui_resources().text;
     return text_block(p);
 }
@@ -438,6 +499,31 @@ constexpr unsigned k_path_menu = 0x6000u;
 }
 
 [[nodiscard]] unsigned st_a11y(lx::a11y::state_flag f) { return static_cast<unsigned>(f); }
+
+/// `n` pointer slots in the current build's frame arena, aligned for pointers (null outside
+/// a build or when the arena is spent). `alloc_chars` hands out bytes at alignment 1, so a
+/// pointer array cast straight from it is misaligned.
+[[nodiscard]] const char** frame_ptrs(unsigned n) {
+    lx::ui::build_context* ctx = lx::ui::build_context::current();
+    if (!ctx || n == 0)
+        return nullptr;
+    std::size_t space = sizeof(const char*) * n + alignof(const char*);
+    void* raw = ctx->alloc_chars(static_cast<unsigned>(space));
+    if (!raw)
+        return nullptr;
+    void* aligned = std::align(alignof(const char*), sizeof(const char*) * n, raw, space);
+    return static_cast<const char**>(aligned);
+}
+
+/// `text` with its first letter upper-cased, in the frame arena (ASCII: the schema's).
+[[nodiscard]] const char* sentence_case(const char* text) {
+    if (!text || !text[0])
+        return text ? text : "";
+    char* out = const_cast<char*>(frame_format("{}", text));
+    if (out && out[0] >= 'a' && out[0] <= 'z')
+        out[0] = static_cast<char>(out[0] - 'a' + 'A');
+    return out ? out : text;
+}
 
 // ── Labels ────────────────────────────────────────────────────────────────────────────
 
@@ -560,8 +646,15 @@ constexpr std::string_view k_string_examples[][3] = {
 }
 
 /// "repeat-rate" → "Repeat rate", the overrides above taking precedence. Interned once.
+///
+/// The storage is a deque, not a vector: every one of these labels is shorter than
+/// libstdc++'s 16-byte small-string buffer, so a `std::string` inside a growing vector
+/// keeps its characters inline — and the reallocation that steals them is what the
+/// previous `push_back` did, leaving every earlier label a dangling pointer mid-string
+/// ("Tile" rendered "ile", "appearance" rendered a fragment). A deque never moves its
+/// elements, so a returned `c_str()` stays valid for the process.
 [[nodiscard]] const char* intern_label(std::string_view key) {
-    static std::vector<std::string> g_interned; // filled during catalog(), then stable
+    static std::deque<std::string> g_interned; // filled during catalog(), then stable
     for (const auto& [k, label] : k_label_overrides)
         if (k == key)
             return label.data();
@@ -702,8 +795,8 @@ void build_catalog() {
             push(std::move(r));
         }
     // The string rows take their buffer slots in catalog order, the integer rows follow
-    // (their spinners edit through a buffer too); a row past the cap gets k_no_row
-    // (read-only) — never another row's buffer.
+    // and then the number rows (their spinners edit through a buffer too); a row past the
+    // cap gets k_no_row (read-only) — never another row's buffer.
     for (unsigned& s : g_string_slots)
         s = session::k_no_row;
     unsigned slot = 0;
@@ -722,6 +815,12 @@ void build_catalog() {
     }
     for (unsigned i = 0; i < g_catalog.size() && i < std::size(g_string_slots); ++i) {
         if (g_catalog[i].desc && g_catalog[i].desc->kind == cfg::value_kind::integer)
+            take(i);
+    }
+    for (unsigned i = 0; i < g_catalog.size() && i < std::size(g_string_slots); ++i) {
+        const cfg::value_kind k =
+            g_catalog[i].desc ? g_catalog[i].desc->kind : g_catalog[i].pdesc->kind;
+        if (k == cfg::value_kind::number)
             take(i);
     }
 }
@@ -743,6 +842,41 @@ struct field_spec {
                 r.desc->capacity, r.desc->reload};
     return {r.pdesc->kind, r.pdesc->lo, r.pdesc->hi, r.pdesc->names, r.pdesc->name_count, 0,
             cfg::reload_class::live};
+}
+
+/// One step of a number key's spinner. Zed's `NumberField` steps an `f32` by a fixed
+/// increment; the schema carries only the range, so the step is named per key where the
+/// range alone would pick a poor one, else a 1-2-5 step near a fortieth of the range.
+[[nodiscard]] double number_step(const row_ref& r) {
+    const std::string_view key = r.desc ? std::string_view(r.desc->key)
+                                        : std::string_view(r.pdesc->key);
+    if (key == "master-ratio" || key == "damping-ratio" || key == "scroll-factor")
+        return 0.05;
+    if (key == "accel-speed")
+        return 0.1;
+    if (key == "ui-font-size")
+        return 1.0;
+    if (key == "stiffness")
+        return 50.0;
+    const field_spec spec = spec_of(r);
+    const double raw = (spec.hi - spec.lo) / 40.0;
+    if (!(raw > 0.0))
+        return 1.0;
+    const double mag = std::pow(10.0, std::floor(std::log10(raw)));
+    for (const double m : {1.0, 2.0, 5.0, 10.0})
+        if (m * mag >= raw)
+            return m * mag;
+    return 10.0 * mag;
+}
+
+/// A number as its spinner shows it: the step's decimals, no exponent ("0.55", "800").
+[[nodiscard]] std::string number_text(double v, double step) {
+    int decimals = 0;
+    for (double s = step; decimals < 4 && s < 0.999999; s *= 10.0)
+        ++decimals;
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.*f", decimals, v);
+    return text;
 }
 
 } // namespace
@@ -811,15 +945,19 @@ void session::load_strings() {
         if (slot == k_no_row || slot >= k_max_string_rows)
             continue;
         string_rows_[slot] = i;
-        const cfg::key_desc& d = *rows[i].desc;
-        if (d.kind == cfg::value_kind::string) {
-            const char* value = static_cast<const char*>(d.field(config_));
+        // A pointer section's row has no `key_desc` (its numbers have slots too).
+        const field_spec spec = spec_of(rows[i]);
+        const void* field = ::field_of(config_, rows[i]);
+        if (spec.kind == cfg::value_kind::string) {
+            const char* value = static_cast<const char*>(field);
             strings_[slot].set(value ? std::string_view(value) : std::string_view{});
-        } else if (d.kind == cfg::value_kind::integer) {
+        } else if (spec.kind == cfg::value_kind::integer) {
             char text[24];
-            std::snprintf(text, sizeof(text), "%d",
-                          *static_cast<const int*>(d.field(config_)));
+            std::snprintf(text, sizeof(text), "%d", *static_cast<const int*>(field));
             strings_[slot].set(text);
+        } else if (spec.kind == cfg::value_kind::number) {
+            strings_[slot].set(
+                number_text(*static_cast<const double*>(field), number_step(rows[i])));
         }
     }
     // The query buffer starts empty.
@@ -833,6 +971,15 @@ void session::load_strings() {
     const std::vector<row_ref>& rows = catalog();
     if (row >= rows.size() || row >= std::size(g_string_slots) ||
         !rows[row].desc || rows[row].desc->kind != cfg::value_kind::integer)
+        return session::k_no_row;
+    return g_string_slots[row];
+}
+
+/// The text slot of the number row `row` (a pointer section's too), or k_no_row.
+[[nodiscard]] unsigned number_slot(unsigned row) {
+    const std::vector<row_ref>& rows = catalog();
+    if (row >= rows.size() || row >= std::size(g_string_slots) ||
+        spec_of(rows[row]).kind != cfg::value_kind::number)
         return session::k_no_row;
     return g_string_slots[row];
 }
@@ -1045,7 +1192,8 @@ void session::commit_int(unsigned row) {
         refresh();
         return;
     }
-    set_int(row, static_cast<int>(parsed));
+    set_int(row, static_cast<int>(std::clamp<long>(parsed, std::numeric_limits<int>::min(),
+                                                   std::numeric_limits<int>::max())));
 }
 
 void session::set_number(unsigned row, double v) {
@@ -1053,11 +1201,45 @@ void session::set_number(unsigned row, double v) {
     if (row >= rows.size())
         return;
     const field_spec spec = spec_of(rows[row]);
+    const double step = number_step(rows[row]);
+    // On the step's grid (0.55 + 0.05 is 0.6000000000000001 otherwise), then in range.
+    v = std::round(v / step) * step;
     v = std::clamp(v, spec.lo, spec.hi);
+    const std::string text = number_text(v, step);
+    v = std::strtod(text.c_str(), nullptr); // what the file will say is what we hold
+    if (const unsigned slot = number_slot(row); slot != k_no_row)
+        (void)string_buffer(slot).assign(text.c_str());
     if (write_key(row, lx::config::edit_value::number(v)))
         return written();
     *static_cast<double*>(field_of(row)) = v;
     repaint();
+}
+
+void session::step_number(unsigned row, int delta) {
+    const std::vector<row_ref>& rows = catalog();
+    if (row >= rows.size())
+        return;
+    const double now = *static_cast<const double*>(::field_of(config_, rows[row]));
+    set_number(row, now + delta * number_step(rows[row]));
+}
+
+void session::commit_number(unsigned row) {
+    const std::vector<row_ref>& rows = catalog();
+    if (row >= rows.size())
+        return;
+    const unsigned slot = number_slot(row);
+    if (slot == k_no_row)
+        return;
+    const char* text = string_buffer(slot).storage.data();
+    char* end = nullptr;
+    const double parsed = text ? std::strtod(text, &end) : 0.0;
+    if (!text || end == text || (end && *end != '\0') || !std::isfinite(parsed)) {
+        // Not a number: the field shows the snapshot's value again.
+        set_number(row, *static_cast<const double*>(::field_of(config_, rows[row])));
+        refresh();
+        return;
+    }
+    set_number(row, parsed);
 }
 
 void session::set_enum(unsigned row, unsigned v) {
@@ -1235,8 +1417,7 @@ lx::config::combo session::binding_of_action(unsigned index) const {
             continue;
         if (b.layer != lx::config::k_no_layer)
             return b.keys; // the effective (user) one
-        if (fallback.kind == lx::config::combo_kind::tap && fallback.mods == 0 &&
-            fallback.code == 0)
+        if (combo_empty(fallback))
             fallback = b.keys; // the first default
     }
     return fallback;
@@ -1509,8 +1690,7 @@ namespace {
                               .on_toggle([s, index](int v) { s->set_bool(index, v != 0); })
                               .name(r.label)
                               .key(key);
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
-                      control_paint{}, {&sw, 1u});
+        return st_box(st_h_flex().flex_none().justify_end(), control_paint{}, {&sw, 1u});
     }
     case cfg::value_kind::enumeration: {
         // Every selector is Zed's dropdown — the trigger hugs its content, the current
@@ -1528,71 +1708,41 @@ namespace {
                 })
                 .name(r.label)
                 .key(key);
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
-                      control_paint{}, {&ctl, 1u});
+        return st_box(st_h_flex().flex_none().justify_end(), control_paint{}, {&ctl, 1u});
     }
     case cfg::value_kind::integer:
     case cfg::value_kind::number: {
-        // Integers are Zed's number input (− value +, the field editable); the buffer cap's
-        // leftovers and the numbers stay on the slider + readout.
-        const unsigned slot = int_slot(index);
-        if (spec.kind == cfg::value_kind::integer && slot != session::k_no_row) {
+        // Every number is Zed's `NumberField` (− value +, the field editable): integers step
+        // by one, fractional keys by `number_step` on the same spinner. A row past the
+        // session's buffer cap (build_catalog warned) shows its value read-only.
+        const bool integer = spec.kind == cfg::value_kind::integer;
+        const unsigned slot = integer ? int_slot(index) : number_slot(index);
+        if (slot == session::k_no_row) {
+            lx::ui::child text = st_text(frame_format("{}", value_text(r, c)),
+                                         st_text_px(k_text_small), tok::text_muted, false, true);
+            return st_box(st_h_flex().flex_none().justify_end(),
+                          control_paint::fixed({k_transparent, k_transparent}), {&text, 1});
+        }
+        if (integer) {
             lx::ui::child sp = spinner(s->string_buffer(slot), read_int(r, c))
                                    .range(static_cast<int>(spec.lo), static_cast<int>(spec.hi))
                                    .on_change([s, index](int d) { s->step_int(index, d); })
                                    .on_submit([s, index](int) { s->commit_int(index); })
                                    .name(r.label)
                                    .key(key);
-            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
-                          control_paint{}, {&sp, 1u});
+            return st_box(st_h_flex().flex_none().justify_end(), control_paint{}, {&sp, 1u});
         }
-        const int steps =
-            std::max(1, static_cast<int>(std::min(spec.hi - spec.lo, spec.kind ==
-                                                                        cfg::value_kind::integer
-                                                                    ? 32.0
-                                                                    : 120.0)));
-        lx::ui::child readout_text = st_text(frame_format("{}", value_text(r, c)),
-                                             st_text_px(12.f), tok::text_muted, false, true);
-        const child readout =
-            st_box(st_h_flex().flex_none().w(st_px16(56.f)).justify_end(),
-                   control_paint::fixed({k_transparent, k_transparent}),
-                   {&readout_text, 1u});
-        lx::ui::slider_builder bar = slider(spec.kind == cfg::value_kind::integer
-                                                ? static_cast<float>(read_int(r, c))
-                                                : static_cast<float>(read_number(r, c)),
-                                            static_cast<float>(spec.lo),
-                                            static_cast<float>(spec.hi))
-                                         .steps(steps)
-                                         .on_change([s, index, kind = spec.kind](int idx) {
-                                             const std::vector<row_ref>& rows = catalog();
-                                             if (index >= rows.size())
-                                                 return;
-                                             const field_spec f = spec_of(rows[index]);
-                                             const double v =
-                                                 f.lo + (f.hi - f.lo) *
-                                                            static_cast<double>(idx) /
-                                                            static_cast<double>(
-                                                                std::max(1, static_cast<int>(
-                                                                                 std::min(
-                                                                                     f.hi - f.lo,
-                                                                                     kind ==
-                                                                                         cfg::value_kind::integer
-                                                                                         ? 32.0
-                                                                                         : 120.0))));
-                                             if (kind == cfg::value_kind::integer)
-                                                 s->set_int(index,
-                                                            static_cast<int>(std::lround(v)));
-                                             else
-                                                 s->set_number(index, v);
-                                         })
-                                         .name(r.label)
-                                         .key(key);
-        lx::ui::child bar_child = bar.layout(
-            st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
-                .h(st_px16(20.f)));
-        const child parts[2] = {bar_child, readout};
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).gap(st_px16(8.f)),
-                      control_paint{}, parts);
+        const double v = read_number(r, c);
+        const double step = number_step(r);
+        lx::ui::child sp =
+            spinner(s->string_buffer(slot), 0)
+                .display(frame_format("{}", number_text(v, step)), v <= spec.lo + step * 1e-6,
+                         v >= spec.hi - step * 1e-6)
+                .on_change([s, index](int d) { s->step_number(index, d); })
+                .on_submit([s, index](int) { s->commit_number(index); })
+                .name(r.label)
+                .key(key);
+        return st_box(st_h_flex().flex_none().justify_end(), control_paint{}, {&sp, 1u});
     }
     case cfg::value_kind::string: {
         const unsigned slot = string_slot(index);
@@ -1600,8 +1750,8 @@ namespace {
             // Past the session's buffer cap (build_catalog warned): the value shows,
             // it does not edit.
             lx::ui::child text = st_text(frame_format("{}", value_text(r, c)),
-                                         st_text_px(12), tok::text_muted, false, true);
-            return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
+                                         st_text_px(k_text_small), tok::text_muted, false, true);
+            return st_box(st_h_flex().flex_none().justify_end(),
                           control_paint::fixed({k_transparent, k_transparent}),
                           {&text, 1});
         }
@@ -1618,17 +1768,16 @@ namespace {
                 .on_submit([s, index](int) { s->commit_string(index); })
                 .name(r.label)
                 .tab_index(0)
-                .layout(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
-                            .h(st_px16(28.f)))
+                .layout(st_h_flex().w(st_px16(k_field_w)).h(st_px16(32.f)))
+                .border(tok::border)
                 .key(key);
-        // The value column keeps every control aligned down the pane (§5.3).
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)), control_paint{},
-                      {&field, 1});
+        // Zed's `SettingsInputField`: `h_8().min_w_64()`, right-aligned in the row.
+        return st_box(st_h_flex().flex_none().justify_end(), control_paint{}, {&field, 1});
     }
     case cfg::value_kind::string_list: {
         lx::ui::child list_text = st_text(frame_format("{}", value_text(r, c)),
-                                          st_text_px(12.f), tok::text_muted, false, true);
-        return st_box(st_h_flex().flex_none().w(st_px16(k_value_w)).pt(st_px16(2.f)).justify_end(),
+                                          st_text_px(k_text_small), tok::text_muted, false, true);
+        return st_box(st_h_flex().flex_none().justify_end(),
                       control_paint::fixed({k_transparent, k_transparent}),
                       {&list_text, 1u});
     }
@@ -1637,48 +1786,52 @@ namespace {
     }
 }
 
-/// One setting row: the label block (label + reload badge) and the value control, a ghost
-/// hover over the whole row (ADR-013 §5.3).
-[[nodiscard]] lx::ui::child setting_row(const row_ref& r, unsigned index, session* s) {
+/// One setting row (Zed's `SettingsPageItem::SettingItem`): the label at `TextSize::Default`
+/// over its description at `Small`, muted and wrapping, beside the value control. Zed's
+/// row has no hover fill of its own — the controls carry the interaction — and its
+/// vertical rhythm is `apply_padding`'s `pt_4().pb_4()`, the rows separated by a rule.
+[[nodiscard]] lx::ui::child setting_row(const row_ref& r, unsigned index, session* s,
+                                        bool last_in_section = false) {
     const char* badge = reload_badge(r);
     lx::ui::child texts[3]{};
     unsigned n = 0;
-    texts[n++] = st_text(r.label, st_text_px(13.f), tok::text);
+    texts[n++] = st_text(r.label, st_text_px(k_text_default), tok::text);
     if (r.description)
-        texts[n++] = st_text(r.description, st_text_px(12.f), tok::text_muted, false, true);
+        texts[n++] = st_text(r.description, st_text_px(k_text_small), tok::text_muted, false,
+                             false, true);
     if (badge)
-        texts[n++] = st_text(badge, st_text_px(11.f), tok::text_muted, false, true);
+        texts[n++] = st_text(badge, st_text_px(k_text_small), tok::text_muted, false, false,
+                             true);
+    // Zed's label column is `max_w_1_2`-ish: the description wraps well short of the
+    // control instead of running under it.
     lx::ui::child label_block = st_box(
-        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)).gap(st_px16(2.f)),
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
+            .max_w(lx::layout::percent(66.f)),
         control_paint{}, {texts, n});
+    lx::ui::child spacer =
+        st_box(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)),
+               control_paint{}, {});
     lx::ui::child control_child = value_control(r, index, s);
-    lx::ui::child kids[2] = {label_block, control_child};
+    lx::ui::child kids[3] = {label_block, spacer, control_child};
     lx::ui::control_props row{};
-    // Top-aligned columns (Zed's rows): the control rides the label's first line, the
-    // ghost hover a rounded highlight over the whole row.
-    row.layout = st_h_flex().flex_none().w_full().items_start()
-                     .min_h(st_px16((badge || r.description) ? k_badge_row_h : k_row_h))
-                     .px(st_px16(12.f)).py(st_px16(4.f)).gap(st_px16(12.f))
-                     .rounded(lx::ui::radius::sm);
-    lx::ui::control_paint p{};
-    p.rest = {k_transparent, k_transparent};
-    p.hover = {paint(tok::ghost_element_hover), k_transparent};
-    p.active = {paint(tok::ghost_element_active), k_transparent};
-    row.paint = p;
+    row.layout = st_h_flex().flex_none().w_full().items_center()
+                     .pt(st_px16(k_row_pad))
+                     .pb(st_px16(last_in_section ? k_section_end_pad : k_row_pad))
+                     .gap(st_px16(16.f));
+    row.paint = control_paint::fixed({k_transparent, k_transparent});
     row.role = lx::a11y::role::group;
     row.name = r.label;
-    return control(row, {kids, 2u});
+    return control(row, {kids, 3u});
 }
 
-/// A group header: the group's name over a rule.
+/// A section header (Zed's `SettingsSectionHeader`): the name at `LabelSize::Small`,
+/// muted, in the buffer (mono) font, over a `BorderFaded` rule, `gap_1p5` between.
 [[nodiscard]] lx::ui::child group_header(const char* name) {
-    lx::ui::child rule = divider();
-    lx::ui::child text =
-        st_text(name, st_text_px(11.f), tok::text_muted, true, true);
+    lx::ui::child rule = divider().color(lx::ui::divider_color::border_faded);
+    lx::ui::child text = st_mono(name, st_text_px(k_text_small), tok::text_muted);
     lx::ui::child kids[2] = {text, rule};
-    return st_box(st_v_flex().flex_none().w_full().gap(st_px16(4.f))
-                      .pt(st_px16(16.f)).pb(st_px16(2.f)),
-                  control_paint{}, {kids, 2u});
+    return st_box(st_v_flex().flex_none().w_full().gap(st_px16(6.f)), control_paint{},
+                  {kids, 2u});
 }
 
 /// The Shortcuts pane (ADR-013 Phase E): every action with its effective binding, the
@@ -1690,6 +1843,10 @@ namespace {
     // The tree's leaf click narrows the pane to one owner ("Shell" / "Compositor").
     const std::string_view focus = s->focus_group();
     const auto wanted = [&focus](const lx::config::action_info& a) {
+        // `none` is the unbinding sentinel, not an action a key can be given: the row's
+        // own editor unbinds (an empty field), so it has no row of its own.
+        if (a.owner == lx::config::action_owner::none)
+            return false;
         if (focus.empty())
             return true;
         return focus == (a.owner == lx::config::action_owner::shell ? "Shell" : "Compositor");
@@ -1707,29 +1864,47 @@ namespace {
         }
     }
     const bool editing = s->editing_action() != session::k_no_row;
-    const auto** kids = ctx ? ctx->alloc_children(count + groups + (editing ? 5 : 0) + 2) : nullptr;
+    // One column per owner group (its header, rows and rules — see pane_content), then
+    // the editor.
+    const auto** kids = ctx ? ctx->alloc_children(groups + (editing ? 5 : 0) + 2) : nullptr;
     if (!kids)
         return nullptr;
     unsigned n = 0;
+    const lx::ui::element** sec = nullptr;
+    unsigned sn = 0;
+    const auto close_section = [&] {
+        if (sec && sn > 0)
+            kids[n++] = st_column(sec, sn);
+        sec = nullptr;
+        sn = 0;
+    };
+    bool first_in_group = true;
     last_owner = lx::config::action_owner::none;
     for (unsigned i = 0; i < all.size(); ++i) {
         const lx::config::action_info& a = all[i];
         if (!wanted(a))
             continue;
         if (a.owner != last_owner) {
-            kids[n++] = group_header(a.owner == lx::config::action_owner::shell
-                                         ? "Shell (its windows, launcher, notifications)"
-                                         : "Compositor (windows, tiling, workspaces, session)");
+            close_section();
+            sec = ctx->alloc_children(count * 2);
+            if (!sec)
+                return nullptr;
+            sec[sn++] = group_header(a.owner == lx::config::action_owner::shell
+                                         ? "Shell"
+                                         : "Compositor");
             last_owner = a.owner;
+            first_in_group = true;
         }
         // The label block: the summary over the action's name; the value: the keycaps and
         // the edit / reset affordances.
         lx::ui::child texts[2]{};
         unsigned tn = 0;
-        texts[tn++] = st_text(a.summary, st_text_px(14.f), tok::text);
+        // The schema's summaries are sentences ("start a terminal"); a row's label is
+        // capitalised like every other label on the page.
+        texts[tn++] = st_text(sentence_case(a.summary), st_text_px(k_text_default), tok::text);
         lx::ui::child name_line =
-            st_text(frame_format("{}{}", a.name, a.available ? "" : " (not in this build)"),
-                    st_text_px(11.f), tok::text_muted, false, true);
+            st_mono(frame_format("{}{}", a.name, a.available ? "" : " (not in this build)"),
+                    st_text_px(k_text_small), tok::text_muted);
         texts[tn++] = name_line;
         lx::ui::child label_block = st_box(
             st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
@@ -1738,36 +1913,62 @@ namespace {
         // The binding: the canonical combo as a keycap hint, or "unbound".
         char canon[64]{};
         const lx::config::combo bound = s->binding_of_action(i);
-        const bool has = bound.kind != lx::config::combo_kind::tap || bound.mods || bound.code;
+        const bool has = !combo_empty(bound);
         if (has)
             lx::config::format_combo(bound, canon, sizeof(canon));
-        // The canonical combo as muted mono-ish text (the keycap hint wants a span that
-        // outlives the describe; the text says the same).
-        lx::ui::child combo_text =
-            st_text(has ? frame_format("{}", canon) : "unbound", st_text_px(12.f),
-                    has ? tok::text : tok::text_muted, false, true);
+        // Zed shows a binding as a `KeyBinding`, spelled the Linux way: modifiers and key
+        // joined by '-', a letter key upper-case ("Super-L"; the file says "Super+l"). The
+        // text and the span of keystrokes live in the frame arena (they outlive the
+        // describe).
+        lx::ui::child combo_view{};
+        const char** keys = frame_ptrs(1u);
+        if (has && keys) {
+            char* zed = const_cast<char*>(frame_format("{}", canon));
+            const std::size_t len = std::strlen(zed);
+            for (std::size_t c = 0; c < len; ++c)
+                if (zed[c] == '+' && c + 1 < len)
+                    zed[c] = '-';
+            const char* key_name = std::strrchr(zed, '-');
+            key_name = key_name ? key_name + 1 : zed;
+            if (key_name[0] >= 'a' && key_name[0] <= 'z' && key_name[1] == '\0')
+                const_cast<char*>(key_name)[0] = static_cast<char>(key_name[0] - 'a' + 'A');
+            keys[0] = zed;
+            combo_view = key_binding(std::span<const char* const>{keys, 1u});
+        } else {
+            combo_view = st_text("Unbound", st_text_px(k_text_small), tok::text_muted, false,
+                                 true);
+        }
         lx::ui::child combo_box = st_box(
-            st_h_flex().flex_none().w(st_px16(150.f)).justify_end(), control_paint{},
-            {&combo_text, 1u});
-        lx::ui::child edit_btn = button("Edit").style(lx::ui::button_style::subtle)
+            st_h_flex().flex_none().h(st_px16(28.f)).justify_end(), control_paint{},
+            {&combo_view, 1u});
+        // Zed's row affordance ("Configure"): an outlined-ghost button, `ButtonSize::Medium`.
+        lx::ui::child edit_btn = button("Edit").style(lx::ui::button_style::outlined_ghost)
+                                     .size(lx::ui::button_size::medium)
                                      .on_press([s, i](int) { s->begin_edit_action(i); })
                                      .name(frame_format("Edit {}", a.summary));
         lx::ui::child value_kids[2] = {combo_box, edit_btn};
         lx::ui::child value = st_box(st_h_flex().flex_none().gap(st_px16(8.f)),
                                      control_paint{}, {value_kids, 2u});
         lx::ui::child row_kids[2] = {label_block, value};
+        // The group's last row ends the section (`pb_10`, no rule after it).
+        unsigned next = i + 1;
+        while (next < all.size() && !wanted(all[next]))
+            ++next;
+        const bool last_in_group = next >= all.size() || all[next].owner != a.owner;
         lx::ui::control_props row{};
-        row.layout = st_h_flex().flex_none().w_full().items_start().py(st_px16(4.f))
-                         .min_h(st_px16(k_row_h))
-                         .px(st_px16(12.f)).gap(st_px16(12.f)).rounded(lx::ui::radius::sm);
-        lx::ui::control_paint p{};
-        p.rest = {k_transparent, k_transparent};
-        p.hover = {paint(tok::ghost_element_hover), k_transparent};
-        row.paint = p;
+        row.layout = st_h_flex().flex_none().w_full().items_center()
+                         .pt(st_px16(k_row_pad))
+                         .pb(st_px16(last_in_group ? k_section_end_pad : k_row_pad))
+                         .gap(st_px16(16.f));
+        row.paint = control_paint::fixed({k_transparent, k_transparent});
         row.role = lx::a11y::role::group;
         row.name = a.summary;
-        kids[n++] = control(row, {row_kids, 2u}, k_row_control_base + i);
+        if (!first_in_group)
+            sec[sn++] = divider();
+        first_in_group = false;
+        sec[sn++] = control(row, {row_kids, 2u}, k_row_control_base + i);
     }
+    close_section();
 
     // The editor for one action: a modal row (title, the combo field, the live error, the
     // buttons) at the top of the pane, under its own header.
@@ -1812,136 +2013,184 @@ namespace {
 /// The Displays pane (ADR-013 Phase F): one group per head — the live state, the staged
 /// edits (mode, scale, transform, position, adaptive sync, enabled), an Apply that asks
 /// the compositor (which tests, applies and persists outputs.toml itself).
+/// A setting row built by hand (the panes the schema does not drive — Displays): the same
+/// anatomy as `setting_row`, a label over an optional description beside one control.
+[[nodiscard]] lx::ui::child labeled_row(const char* label, const char* description,
+                                        lx::ui::child control_child) {
+    lx::ui::child texts[2]{};
+    unsigned n = 0;
+    texts[n++] = st_text(label, st_text_px(k_text_default), tok::text);
+    if (description && description[0])
+        texts[n++] = st_text(description, st_text_px(k_text_small), tok::text_muted, false,
+                             false, true);
+    lx::ui::child label_block = st_box(
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
+            .max_w(lx::layout::percent(66.f)),
+        control_paint{}, {texts, n});
+    lx::ui::child spacer =
+        st_box(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)),
+               control_paint{}, {});
+    lx::ui::child value = st_box(st_h_flex().flex_none().justify_end(), control_paint{},
+                                 {&control_child, 1u});
+    lx::ui::child kids[3] = {label_block, spacer, value};
+    lx::ui::control_props row{};
+    row.layout = st_h_flex().flex_none().w_full().items_center()
+                     .pt(st_px16(k_row_pad)).pb(st_px16(k_row_pad)).gap(st_px16(16.f));
+    row.paint = control_paint::fixed({k_transparent, k_transparent});
+    row.role = lx::a11y::role::group;
+    row.name = label;
+    return control(row, {kids, 3u});
+}
+
 [[nodiscard]] lx::ui::child displays_pane(session* s) {
     lx::ui::build_context* ctx = lx::ui::build_context::current();
     const std::vector<display_head>& heads = output_heads();
     if (!outputs_available()) {
+        // An empty state in the page's own column (Zed's settings never centre a page).
         lx::ui::child none[2] = {
-            headline("No output management").size(lx::ui::headline_size::medium),
+            st_text("No output management", st_text_px(k_text_default), tok::text),
             st_text("The compositor does not advertise zwlr_output_manager_v1 to this "
                     "client. Modes, scale and position stay where the session put them.",
-                    st_text_px(12.f), tok::text_muted, false, true),
+                    st_text_px(k_text_small), tok::text_muted, false, false, true),
         };
-        return st_box(st_v_flex().gap(st_px16(8.f)).p(st_px16(24.f)), control_paint{},
+        return st_box(st_v_flex().w_full().pt(st_px16(k_row_pad)), control_paint{},
                       {none, 2u});
     }
-    constexpr unsigned k_per_head = 10; // rows per head worst case
-    const auto** kids = ctx ? ctx->alloc_children(heads.size() * (k_per_head + 1) + 2) : nullptr;
+    // One column per head (as pane_content keeps one per section): the spacer, its
+    // header, up to six rows ruled off from each other, and the buttons.
+    constexpr unsigned k_per_head = 16;
+    const auto** kids = ctx ? ctx->alloc_children(static_cast<unsigned>(heads.size()) + 2)
+                            : nullptr;
     if (!kids)
         return nullptr;
     unsigned n = 0;
     for (unsigned i = 0; i < heads.size(); ++i) {
         const display_head& d = heads[i];
-        kids[n++] = group_header(
+        const auto** hk = ctx->alloc_children(k_per_head);
+        if (!hk)
+            return nullptr;
+        unsigned hn = 0;
+        // The space a section's last row carries in the schema panes (`pb_10`).
+        if (i > 0)
+            hk[hn++] = st_box(st_v_flex().flex_none().w_full().h(st_px16(k_section_end_pad - k_row_pad)),
+                               control_paint{}, {});
+        hk[hn++] = group_header(
             frame_format("{} — {}{}", d.name, d.description, d.staged ? "  ●" : ""));
-        // Enabled.
-        lx::ui::child enabled = toggle_switch(d.staged ? d.staged_enabled : d.enabled)
+        const bool on = d.staged ? d.staged_enabled : d.enabled;
+        lx::ui::child enabled = toggle_switch(on)
                                     .on_toggle([i](int v) { stage_enabled(i, v != 0); })
                                     .name(frame_format("{} enabled", d.name));
-        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)),
-                           control_paint{}, {&enabled, 1u});
-        if (!(d.staged ? d.staged_enabled : d.enabled))
-            continue;
-        // Mode (a select over the modes list).
-        const auto& modes = d.modes;
-        std::span<const char* const> words{};
-        // The words point into the frame arena (built fresh per describe).
-        auto* arena_words = reinterpret_cast<const char**>(
-            ctx ? ctx->alloc_chars(sizeof(const char*) * std::max<unsigned>(modes.size(), 1))
-                : nullptr);
-        int current_mode = d.staged ? d.staged_mode : -1;
-        if (arena_words) {
-            for (unsigned m = 0; m < modes.size(); ++m) {
-                arena_words[m] = frame_format("{} × {} @ {:.2f} Hz{}", modes[m].w, modes[m].h,
-                                              static_cast<double>(modes[m].refresh_mhz) / 1000.0,
-                                              modes[m].preferred ? "  (preferred)" : "");
-                if (modes[m].current && !d.staged)
-                    current_mode = static_cast<int>(m);
+        hk[hn++] = labeled_row("Enabled", "Whether this output shows the desktop.", enabled);
+        if (on) {
+            // Mode: a dropdown over the head's modes, like every other selector.
+            const auto& modes = d.modes;
+            std::span<const char* const> words{};
+            // The words point into the frame arena (built fresh per describe).
+            const char** arena_words =
+                frame_ptrs(std::max<unsigned>(static_cast<unsigned>(modes.size()), 1u));
+            int current_mode = d.staged ? d.staged_mode : -1;
+            if (arena_words) {
+                for (unsigned m = 0; m < modes.size(); ++m) {
+                    arena_words[m] = frame_format(
+                        "{} × {} @ {:.2f} Hz{}", modes[m].w, modes[m].h,
+                        static_cast<double>(modes[m].refresh_mhz) / 1000.0,
+                        modes[m].preferred ? "  (preferred)" : "");
+                    if (modes[m].current && !d.staged)
+                        current_mode = static_cast<int>(m);
+                }
+                words = {arena_words, modes.size()};
             }
-            words = {arena_words, modes.size()};
+            // The mode list opens in the session's open-menu slot, a pane-specific key
+            // beyond the catalog's range (0x4000 + head), as the transform's does.
+            lx::ui::child mode_ctl =
+                drop_down(words, current_mode)
+                    .open(s->open_menu() == 0x4000u + i)
+                    .on_open([s, i](int) { s->set_open_menu(0x4000u + i); })
+                    .on_dismiss([s](int) { s->set_open_menu(session::k_no_row); })
+                    .on_select([s, i](int v) {
+                        stage_mode(i, v);
+                        s->set_open_menu(session::k_no_row);
+                    })
+                    .name(frame_format("{} mode", d.name));
+            hk[hn++] = divider();
+            hk[hn++] = labeled_row("Resolution & refresh rate", nullptr, mode_ctl);
+            // Scale.
+            lx::ui::child scale =
+                slider(static_cast<float>(d.staged ? d.staged_scale : d.scale), 0.25f, 4.f)
+                    .steps(60)
+                    .on_change([i](int idx) { stage_scale(i, 0.25 + idx * (4.0 - 0.25) / 60.0); })
+                    .layout(st_h_flex().flex_none().w(st_px16(156.f)).h(st_px16(20.f)))
+                    .name(frame_format("{} scale", d.name));
+            lx::ui::child scale_label =
+                st_text(frame_format("{:.2f}", d.staged ? d.staged_scale : d.scale),
+                        st_text_px(k_text_small), tok::text_muted, false, true);
+            lx::ui::child scale_kids[2] = {scale, scale_label};
+            lx::ui::child scale_ctl = st_box(st_h_flex().flex_none().gap(st_px16(8.f)),
+                                             control_paint{}, {scale_kids, 2u});
+            hk[hn++] = divider();
+            hk[hn++] = labeled_row("Scale", "The output's scale factor.", scale_ctl);
+            // Transform.
+            static const char* const k_transforms[8] = {"normal",      "90",          "180",
+                                                        "270",         "flipped",     "flipped-90",
+                                                        "flipped-180", "flipped-270"};
+            const unsigned transform_now = [&] {
+                const std::string_view t = d.staged && !d.staged_transform.empty()
+                                               ? std::string_view(d.staged_transform)
+                                               : std::string_view(d.transform);
+                for (unsigned t2 = 0; t2 < 8; ++t2)
+                    if (k_transforms[t2] == t)
+                        return t2;
+                return 0u;
+            }();
+            lx::ui::child transform =
+                drop_down(std::span<const char* const>{k_transforms, 8},
+                          static_cast<int>(transform_now))
+                    .open(s->open_menu() == 0x4800u + i)
+                    .on_open([s, i](int) { s->set_open_menu(0x4800u + i); })
+                    .on_dismiss([s](int) { s->set_open_menu(session::k_no_row); })
+                    .on_select([i](int v) {
+                        static const char* const k[8] = {"normal",      "90",
+                                                         "180",         "270",
+                                                         "flipped",     "flipped-90",
+                                                         "flipped-180", "flipped-270"};
+                        stage_transform(i, k[v]);
+                    })
+                    .name(frame_format("{} transform", d.name));
+            hk[hn++] = divider();
+            hk[hn++] = labeled_row("Rotation", nullptr, transform);
+            // Position (read here; the layout is dragged in a later phase) and VRR.
+            lx::ui::child pos_label =
+                st_mono(frame_format("{}, {}", d.staged_x, d.staged_y),
+                        st_text_px(k_text_small), tok::text_muted);
+            hk[hn++] = divider();
+            hk[hn++] = labeled_row("Position", "The output's top-left corner in the layout.",
+                                    pos_label);
+            lx::ui::child adaptive =
+                toggle_switch(d.staged ? d.staged_adaptive : d.adaptive_sync)
+                    .on_toggle([i](int v) { stage_adaptive(i, v != 0); })
+                    .name(frame_format("{} adaptive sync", d.name));
+            hk[hn++] = divider();
+            hk[hn++] = labeled_row("Adaptive sync", "Variable refresh rate (VRR).", adaptive);
         }
-        lx::ui::child mode_ctl =
-            select(words, current_mode)
-                .open(s->open_menu() == 0x4000u + i)
-                .on_open([i](int) { /* the pane re-opens through the session */ })
-                .on_select([i](int v) { stage_mode(i, v); })
-                .name(frame_format("{} mode", d.name));
-        // The select's open state: reuse the session's row-open slot with a pane-specific
-        // key beyond the catalog's range.
-        lx::ui::child mode_row = st_box(
-            st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(12.f)),
-            control_paint::fixed({k_transparent, k_transparent}),
-            {&mode_ctl, 1u});
-        kids[n++] = mode_row;
-        // Scale.
-        lx::ui::child scale = slider(static_cast<float>(d.staged ? d.staged_scale : d.scale),
-                                     0.25f, 4.f)
-                                  .steps(60)
-                                  .on_change([i](int idx) {
-                                      stage_scale(i, 0.25 + idx * (4.0 - 0.25) / 60.0);
-                                  })
-                                  .layout(st_h_flex().flex_grow(1.f).flex_shrink(1.f)
-                                              .min_w(lx::layout::px(0.f)).h(st_px16(20.f)))
-                                  .name(frame_format("{} scale", d.name));
-        lx::ui::child scale_label = st_text(
-            frame_format("scale {:.2f}", d.staged ? d.staged_scale : d.scale), st_text_px(12.f),
-            tok::text_muted, false, true);
-        lx::ui::child scale_kids[2] = {scale, scale_label};
-        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
-                           control_paint{}, {scale_kids, 2u});
-        // Transform: a dropdown like every other selector.
-        static const char* const k_transforms[8] = {"normal",    "90",         "180",
-                                                    "270",       "flipped",    "flipped-90",
-                                                    "flipped-180", "flipped-270"};
-        const unsigned transform_now = [&] {
-            const std::string_view t = d.staged && !d.staged_transform.empty()
-                                           ? std::string_view(d.staged_transform)
-                                           : std::string_view(d.transform);
-            for (unsigned t2 = 0; t2 < 8; ++t2)
-                if (k_transforms[t2] == t)
-                    return t2;
-            return 0u;
-        }();
-        lx::ui::child transform =
-            drop_down(std::span<const char* const>{k_transforms, 8},
-                      static_cast<int>(transform_now))
-                .open(s->open_menu() == 0x4800u + i)
-                .on_open([s, i](int) { s->set_open_menu(0x4800u + i); })
-                .on_dismiss([s](int) { s->set_open_menu(session::k_no_row); })
-                .on_select([i](int v) {
-                    static const char* const k[8] = {"normal",  "90",       "180",
-                                                     "270",    "flipped",  "flipped-90",
-                                                     "flipped-180", "flipped-270"};
-                    stage_transform(i, k[v]);
-                })
-                .name(frame_format("{} transform", d.name));
-        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)),
-                           control_paint{}, {&transform, 1u});
-        // Position + adaptive sync + Apply.
-        lx::ui::child pos_label = st_text(frame_format("at {}, {}", d.staged_x, d.staged_y),
-                                          st_text_px(12.f), tok::text_muted, false, true);
-        lx::ui::child adaptive = toggle_switch(d.staged ? d.staged_adaptive : d.adaptive_sync)
-                                     .label("VRR")
-                                     .on_toggle([i](int v) { stage_adaptive(i, v != 0); })
-                                     .name(frame_format("{} adaptive sync", d.name));
-        lx::ui::child tail_kids[2] = {pos_label, adaptive};
-        kids[n++] = st_box(st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(16.f)),
-                           control_paint{}, {tail_kids, 2u});
         if (d.staged) {
             lx::ui::child apply = button("Apply").style(lx::ui::button_style::filled)
+                                      .size(lx::ui::button_size::medium)
                                       .on_press([i](int) { apply_head(i); })
                                       .name(frame_format("Apply {}", d.name));
-            lx::ui::child discard =
-                button("Discard").on_press([i](int) { discard_staged(i); });
-            lx::ui::child btns[2] = {apply, discard};
-            kids[n++] = st_box(
-                st_h_flex().items_start().flex_none().w_full().px(st_px16(12.f)).gap(st_px16(8.f)),
+            lx::ui::child discard = button("Discard").style(lx::ui::button_style::outlined_ghost)
+                                        .size(lx::ui::button_size::medium)
+                                        .on_press([i](int) { discard_staged(i); });
+            lx::ui::child btns[2] = {discard, apply};
+            hk[hn++] = st_box(
+                st_h_flex().flex_none().w_full().justify_end().pt(st_px16(8.f)).gap(st_px16(8.f)),
                 control_paint{}, {btns, 2u});
         }
+        kids[n++] = st_box(st_v_flex().flex_none().w_full(), control_paint{}, {hk, hn});
     }
     if (!outputs_note().empty()) {
-        lx::ui::child note_text = st_text(frame_format("{}", outputs_note()), st_text_px(12.f),
-                                          tok::text_muted, false, true);
+        lx::ui::child note_text = st_text(frame_format("{}", outputs_note()),
+                                          st_text_px(k_text_small), tok::text_muted, false,
+                                          false, true);
         kids[n++] = st_box(st_v_flex().flex_none().w_full().pt(st_px16(8.f)),
                            control_paint::fixed({k_transparent, k_transparent}),
                            {&note_text, 1u});
@@ -1949,28 +2198,26 @@ namespace {
     return st_box(st_v_flex().w_full(), control_paint{}, {kids, n});
 }
 
-/// The content header every pane shows (Zed's settings modal): the "User" badge left, the
-/// config-file button right (a popover naming the user layer, a click on "Copy path"
-/// clipboarding it), then the pane's title over its subtitle — the focused group (the
-/// tree's leaf click), else the pane's `[sections]`, in the mono family — over a rule.
-[[nodiscard]] lx::ui::child pane_header(session* s, bool searching) {
+/// Zed's files header (`render_files_header`), fixed above the scrolling page: the
+/// settings file as a selected tinted-accent button left; "Edit in …" an outlined ghost
+/// one right, its popover naming the user layer with a "Copy path" entry. When an edit
+/// cannot reach the file, Zed's warning `Banner` follows it.
+[[nodiscard]] lx::ui::child files_header(session* s) {
     lx::ui::build_context* ctx = lx::ui::build_context::current();
     const auto** kids = ctx ? ctx->alloc_children(2) : nullptr;
     if (!kids)
         return nullptr;
     unsigned n = 0;
-    // The badge: tinted info background, accent text — Zed's "User".
-    const status_colors badge_c = status_tokens(status_kind::info);
-    lx::ui::child badge_text = st_text("User", st_text_px(11.f), tok::text_accent, false, true);
-    lx::ui::control_props badge{};
-    badge.layout = st_h_flex().flex_none().items_center().px(st_px16(8.f)).h(st_px16(20.f));
-    badge.paint = st_rounded(
-        control_paint::fixed({paint(badge_c.background), k_transparent}), lx::ui::radius::sm);
-    kids[n++] = control(badge, {&badge_text, 1u});
+    // `ButtonStyle::Tinted(TintColor::Accent)` with `toggle_state(true)` — Lumen has the
+    // one user layer, so the one button.
+    kids[n++] = button("User")
+                    .tint(lx::ui::tint_color::accent)
+                    .label_color(tok::text_accent)
+                    .name("User settings");
 
     const bool path_open = s->open_menu() == k_path_menu;
     lx::ui::child file_btn = button("Edit in config.toml")
-                                 .style(lx::ui::button_style::outlined)
+                                 .style(lx::ui::button_style::outlined_ghost)
                                  .on_press([s](int) { s->set_open_menu(k_path_menu); })
                                  .name("Edit in config.toml");
     std::array<menu_entry, 2> path_entries{};
@@ -1992,48 +2239,47 @@ namespace {
     file_wrap.layout = lx::ui::style{}.flex_none().flex_col().items_end();
     kids[n++] = control(file_wrap, {&pop_child, 1u});
     lx::ui::child header_row = st_box(
-        st_h_flex().flex_none().w_full().justify_between().items_center().pb(st_px16(12.f)),
+        st_h_flex().flex_none().w_full().justify_between().items_center(),
         control_paint{}, {kids, n});
+    if (s->state() != session::save_state::memory_only)
+        return header_row;
 
-    // The title and its subtitle.
-    const char* title = searching ? "Search"
+    // Zed's `Banner::new().severity(Severity::Warning)`: the warning's tinted box, its
+    // icon, a label over a small muted second line.
+    const status_colors warn = status_tokens(status_kind::warning);
+    lx::ui::child icon = icon_view(lx::ui::icon::triangle_alert,
+                                   st_text_px(k_text_default), tok::warning);
+    lx::ui::child lines[2] = {
+        st_text("Changes are not being saved.", st_text_px(k_text_default), tok::text),
+        st_text("There is no writable config.toml, so edits apply to this session only.",
+                st_text_px(k_text_small), tok::text_muted, false, false, true),
+    };
+    lx::ui::child text_col = st_box(
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
+            .gap(st_px16(2.f)),
+        control_paint{}, {lines, 2u});
+    lx::ui::child banner_kids[2] = {icon, text_col};
+    lx::ui::child banner = st_box(
+        st_h_flex().flex_none().w_full().items_start().gap(st_px16(8.f)).px(st_px16(8.f))
+            .py(st_px16(6.f)),
+        st_rounded(st_bordered(control_paint::fixed({paint(warn.background),
+                                                     paint(warn.border)}),
+                               1),
+                   lx::ui::radius::md),
+        {banner_kids, 2u});
+    lx::ui::child stack[2] = {header_row, banner};
+    return st_box(st_v_flex().flex_none().w_full().gap(st_px16(8.f)), control_paint{},
+                  {stack, 2u});
+}
+
+/// The page's title, the list's first item: `Label::new(title).size(LabelSize::Large)
+/// .mt_2().mb_3()` — the page's first section header follows it directly.
+[[nodiscard]] lx::ui::child page_title(session* s, bool searching) {
+    const char* title = searching ? "Search results"
                                   : k_pane_names[static_cast<unsigned>(s->current())].data();
-    lx::ui::child headline_child = st_text(title, st_text_px(24.f), tok::text);
-    std::string subtitle;
-    if (!searching) {
-        const std::string_view focus = s->focus_group();
-        if (!focus.empty()) {
-            subtitle = std::string(focus);
-        } else if (s->current() == pane_id::shortcuts) {
-            subtitle = "[bindings]";
-        } else if (s->current() == pane_id::displays) {
-            subtitle = "outputs — zwlr_output_manager_v1";
-        } else {
-            const char* last = nullptr;
-            for (const row_ref& r : catalog()) {
-                if (r.owner != s->current() || !r.desc)
-                    continue;
-                if (last && std::strcmp(last, r.desc->section) == 0)
-                    continue;
-                if (!subtitle.empty())
-                    subtitle += " · ";
-                subtitle += "[" + std::string(r.desc->section) + "]";
-                last = r.desc->section;
-            }
-        }
-    }
-    lx::ui::child title_kids[2]{};
-    unsigned tn = 0;
-    title_kids[tn++] = headline_child;
-    if (!subtitle.empty())
-        title_kids[tn++] = st_mono(frame_format("{}", subtitle), st_text_px(12.5f),
-                                   tok::text_muted);
-    lx::ui::child title_block = st_box(
-        st_v_flex().flex_none().w_full().gap(st_px16(2.f)).pb(st_px16(12.f)),
-        control_paint{}, {title_kids, tn});
-    lx::ui::child rule = divider();
-    lx::ui::child outer[3] = {header_row, title_block, rule};
-    return st_box(st_v_flex().flex_none().w_full(), control_paint{}, {outer, 3u});
+    lx::ui::child text = st_text(title, st_text_px(k_text_title), tok::text);
+    return st_box(st_v_flex().flex_none().w_full().pt(st_px16(8.f)).pb(st_px16(12.f)),
+                  control_paint{}, {&text, 1u});
 }
 
 /// The content column: the pane's rows grouped by their group header, or the search
@@ -2072,48 +2318,71 @@ namespace {
     }
     if (!searching && s->current() == pane_id::shortcuts) {
         lx::ui::child body = shortcuts_pane(s);
-        lx::ui::child head = pane_header(s, searching);
+        lx::ui::child head = page_title(s, searching);
         lx::ui::child kids[2] = {head, body};
         return st_box(st_v_flex().w_full(), control_paint{}, {kids, 2u});
     }
     if (!searching && s->current() == pane_id::displays) {
         lx::ui::child body = displays_pane(s);
-        lx::ui::child head = pane_header(s, searching);
+        lx::ui::child head = page_title(s, searching);
         lx::ui::child kids[2] = {head, body};
         return st_box(st_v_flex().w_full(), control_paint{}, {kids, 2u});
     }
     const bool import_row = !searching && s->current() == pane_id::appearance;
     lx::ui::build_context* ctx = lx::ui::build_context::current();
-    const auto** kids =
-        ctx ? ctx->alloc_children(count * 2 + groups + 8 + (import_row ? 3 : 0)) : nullptr;
+    // The title, one column per section, the panes' extras.
+    const auto** kids = ctx ? ctx->alloc_children(groups + 12 + (import_row ? 3 : 0)) : nullptr;
+    (void)count;
+    (void)last_group;
     if (!kids)
         return nullptr;
     unsigned n = 0;
-    kids[n++] = pane_header(s, searching);
+    kids[n++] = page_title(s, searching);
 
-    unsigned rn = 0;
-    last_group = nullptr;
-    pane_id last_pane = pane_id::appearance;
-    bool first_pane_row = true;
-    for (unsigned i = 0; i < rows.size(); ++i) {
-        if (!shown(i))
+    // The section a shown row belongs to: its pane while searching, else its group.
+    const auto section_of = [&](unsigned i) -> const void* {
+        return searching ? static_cast<const void*>(&k_pane_names[static_cast<unsigned>(
+                               rows[i].owner)])
+                         : static_cast<const void*>(rows[i].group);
+    };
+    // Each section is its own column: its header, then its rows, each ruled off from the
+    // next (Zed's `bottom_border`), the last one carrying `pb_10` instead. A column per
+    // section also keeps every node under `ui_node::k_max_children` — a pane's rows and
+    // their rules together pass it, and the children past it are dropped.
+    for (unsigned i = 0; i < rows.size();) {
+        if (!shown(i)) {
+            ++i;
             continue;
-        if (searching && (rows[i].owner != last_pane || first_pane_row)) {
-            kids[n++] = group_header(
-                frame_format("{}", k_pane_names[static_cast<unsigned>(rows[i].owner)]));
-            first_pane_row = false;
-            last_pane = rows[i].owner;
-            rn = 0;
-        } else if (!searching && rows[i].group != last_group) {
-            kids[n++] = group_header(rows[i].group);
-            last_group = rows[i].group;
-            rn = 0;
-        } else if (rn > 0) {
-            // Zed's modal: a rule between consecutive setting rows.
-            kids[n++] = divider();
         }
-        kids[n++] = setting_row(rows[i], i, s);
-        ++rn;
+        const void* section = section_of(i);
+        unsigned in_section = 0;
+        unsigned end = i;
+        for (unsigned j = i; j < rows.size(); ++j) {
+            if (!shown(j))
+                continue;
+            if (section_of(j) != section)
+                break;
+            ++in_section;
+            end = j + 1;
+        }
+        const auto** sec = ctx->alloc_children(in_section * 2);
+        if (!sec)
+            return nullptr;
+        unsigned sn = 0;
+        sec[sn++] = group_header(
+            searching ? frame_format("{}", k_pane_names[static_cast<unsigned>(rows[i].owner)])
+                      : rows[i].group);
+        unsigned seen = 0;
+        for (unsigned j = i; j < end; ++j) {
+            if (!shown(j))
+                continue;
+            const bool last_in_section = ++seen == in_section;
+            sec[sn++] = setting_row(rows[j], j, s, last_in_section);
+            if (!last_in_section)
+                sec[sn++] = divider();
+        }
+        kids[n++] = st_column(sec, sn);
+        i = end;
     }
     // The Input pane's live device list (the compositor knows libinput's names; the
     // per-device overrides below match them exactly).
@@ -2218,10 +2487,70 @@ namespace {
     return n;
 }
 
-/// The left sidebar (Zed's settings navigation): the search field over the pane tree — a
-/// pane row with its chevron, its groups indented beneath it when expanded — and the save
-/// state at the bottom, where Zed keeps the keybinding hint. A pane row navigates and
-/// expands (the active pane's row collapses again); a leaf narrows the pane to that group.
+/// One entry of Zed's settings navigation (`TreeViewItem`): 28 px, `pl_0p5 pr_1 gap_2`,
+/// rounded, a transparent 1 px border; selected, the border at 40 % `border` over
+/// `element_active` at 50 %; hovered, `element_hover`. A root carries a `Disclosure`
+/// (a 22 px square, its chevron `IconSize::Small`, muted); a child the indentation line
+/// (22 px wide, a 1 px rule of `border` at 50 % down its middle). The label is
+/// `TextSize::Default`, muted unless selected.
+[[nodiscard]] lx::ui::child nav_item(const char* label, bool root, bool expanded,
+                                     bool selected, lx::ui::handler on_activate,
+                                     const char* a11y_name, lx::ui::element_key key) {
+    lx::ui::child lead{};
+    if (root) {
+        lx::ui::child chev = icon_view(
+            expanded ? lx::ui::icon::chevron_down : lx::ui::icon::chevron_right,
+            st_text_px(12.f), tok::icon_muted);
+        lead = st_box(st_h_flex().flex_none().w(st_px16(22.f)).h(st_px16(22.f))
+                          .justify_center(),
+                      control_paint{}, {&chev, 1u});
+    } else {
+        lx::ui::child line = st_box(
+            st_v_flex().flex_none().w(lx::layout::px(1.f)).h(st_px16(28.f)),
+            control_paint::fixed({paint(tok::border, 0.5f), k_transparent}), {});
+        lead = st_box(st_h_flex().flex_none().w(st_px16(22.f)).h(st_px16(28.f))
+                          .justify_center(),
+                      control_paint{}, {&line, 1u});
+    }
+    lx::ui::child text = st_text(label, st_text_px(k_text_default),
+                                 selected ? tok::text : tok::text_muted);
+    lx::ui::child pair[2] = {lead, text};
+    lx::ui::control_props item{};
+    item.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f)).pl(st_px16(2.f))
+                      .pr(st_px16(4.f)).gap(st_px16(8.f));
+    lx::ui::control_paint p{};
+    const lx::ui::paint_color rest_bg =
+        selected ? paint(tok::element_active, 0.5f) : k_transparent;
+    const lx::ui::paint_color border = selected ? paint(tok::border, 0.4f) : k_transparent;
+    p.rest = {rest_bg, border};
+    p.hover = {selected ? rest_bg : paint(tok::element_hover), border};
+    p.active = {paint(tok::element_active, 0.5f), border};
+    item.paint = st_rounded(st_bordered(p, 1), lx::ui::radius::sm);
+    item.on_activate = on_activate;
+    item.role = lx::a11y::role::button;
+    item.name = a11y_name;
+    item.a11y_state = root ? (expanded ? st_a11y(lx::a11y::state_flag::expanded) : 0u)
+                           : (selected ? st_a11y(lx::a11y::state_flag::selected) : 0u);
+    item.interactive = true;
+    item.focusable = true;
+    item.selected = selected;
+    item.focus_ring = true;
+    return control(item, {pair, 2u}, key);
+}
+
+/// Where the focus is: inside the navigation (the sidebar), or not.
+[[nodiscard]] bool focus_in_nav(session* s) {
+    if (!s || !s->root)
+        return false;
+    for (const lx::ui::ui_node* n = s->root->focus().focused(); n; n = n->parent())
+        if (n->key() == k_rail_key)
+            return true;
+    return false;
+}
+
+/// The left sidebar (Zed's settings navigation): `w(SIDEBAR_WIDTH) p_2p5`, the panel
+/// background, a `border` rule on its right; the search field over the tree; and the
+/// footer, a `border_variant` rule over the `ToggleFocusNav` keybinding hint.
 [[nodiscard]] lx::ui::child sidebar(session* s) {
     lx::ui::build_context* ctx = lx::ui::build_context::current();
     // A pane row plus its groups (the leaf cap `pane_groups` writes: 12) — the worst case
@@ -2235,108 +2564,179 @@ namespace {
         const pane_id p = static_cast<pane_id>(i);
         const bool active = s->current() == p;
         const bool open = s->expanded(p);
-        // Zed's category row: muted text, a small chevron, no highlight ever (the pane's
-        // groups highlight; the header says where you are).
-        lx::ui::child chev = icon_view(
-            open ? lx::ui::icon::chevron_down : lx::ui::icon::chevron_right,
-            st_text_px(10.f), tok::icon_muted);
-        lx::ui::child text =
-            st_text(k_pane_names[i].data(), st_text_px(13.f), tok::text_muted);
-        lx::ui::child pair[2] = {chev, text};
-        lx::ui::control_props row{};
-        row.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f)).px(st_px16(6.f))
-                         .gap(st_px16(6.f)).rounded(lx::ui::radius::md);
-        lx::ui::control_paint paint_{};
-        paint_.rest = {k_transparent, k_transparent};
-        paint_.hover = {paint(tok::ghost_element_hover), k_transparent};
-        paint_.active = {paint(tok::ghost_element_active), k_transparent};
-        row.paint = paint_;
-        row.on_activate = [s, p](int) {
-            if (s->current() == p)
-                s->toggle_expanded(p);
-            else
-                s->set_current(p);
-        };
-        row.role = lx::a11y::role::button;
-        row.name = k_pane_names[i].data();
-        row.a11y_state = active ? st_a11y(lx::a11y::state_flag::expanded) : 0u;
-        row.interactive = true;
-        row.focusable = true;
-        row.focus_ring = true;
-        rows[n++] = control(row, {pair, 2u});
+        // The open page's root is the selected entry until one of its sections is.
+        rows[n++] = nav_item(
+            k_pane_names[i].data(), true, open, active && focus.empty(),
+            [s, p](int) {
+                if (s->current() == p && s->focus_group().empty())
+                    s->toggle_expanded(p);
+                else
+                    s->set_current(p);
+            },
+            k_pane_names[i].data(), k_nav_key_base + i);
         if (!open)
             continue;
         const char* groups[12];
         const unsigned gn = pane_groups(p, groups, 12);
         for (unsigned gi = 0; gi < gn; ++gi) {
             const char* g = groups[gi];
-            const bool leaf_active = active && focus == std::string_view(g);
-            // Zed's child row: the pill spans the sidebar minus its own 6 px inset (the
-            // row itself is not deeply indented — the text is, by its padding), the
-            // selected text bright, not accent.
-            lx::ui::child leaf_text =
-                st_text(g, st_text_px(12.5f), leaf_active ? tok::text : tok::text_muted);
-            lx::ui::control_props leaf{};
-            leaf.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f))
-                              .pl(st_px16(22.f)).pr(st_px16(6.f))
-                              .rounded(lx::ui::radius::md);
-            lx::ui::control_paint leaf_paint{};
-            if (leaf_active)
-                leaf_paint.rest = {paint(tok::ghost_element_selected), k_transparent};
-            else
-                leaf_paint.rest = {k_transparent, k_transparent};
-            leaf_paint.hover = {paint(tok::ghost_element_hover), k_transparent};
-            leaf_paint.active = {paint(tok::ghost_element_active), k_transparent};
-            leaf.paint = leaf_paint;
-            leaf.on_activate = [s, p, g](int) { s->open_group(p, g); };
-            leaf.role = lx::a11y::role::button;
-            leaf.name = frame_format("{} — {}", k_pane_names[i], g);
-            leaf.a11y_state = leaf_active ? st_a11y(lx::a11y::state_flag::selected) : 0u;
-            leaf.interactive = true;
-            leaf.focusable = true;
-            leaf.selected = leaf_active;
-            leaf.focus_ring = true;
-            rows[n++] = control(leaf, {&leaf_text, 1u});
+            rows[n++] = nav_item(g, false, false, active && focus == std::string_view(g),
+                                 [s, p, g](int) { s->open_group(p, g); },
+                                 frame_format("{} — {}", k_pane_names[i], g), 0);
         }
     }
 
-    // The search field (Zed keeps it at the sidebar's top).
+    // Zed's `render_search`: `h_7 py_1 pl_1p5 pr_0p5 gap_1p5 mb_3`, rounded, the editor
+    // background inside a `border` rule, the magnifying glass muted at its default size.
     lx::ui::child search_icon =
-        icon_view(lx::ui::icon::search, st_text_px(14.f), tok::icon_muted);
+        icon_view(lx::ui::icon::search, st_text_px(16.f), tok::icon_muted);
     lx::ui::child field =
         text_input()
             .buffer(s->query_buffer())
-            .placeholder("Search settings")
+            .framed(false)
+            .placeholder("Search settings...")
             .name("Search settings")
             .on_change([s](int) { s->refresh(); })
+            .on_submit([s](int) { s->refresh(); })
             .layout(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
-                        .h(st_px16(28.f)))
+                        .h(st_px16(20.f)))
             .key(k_search_key);
-    lx::ui::child search_kids[2] = {search_icon, field};
+    // Zed's clear button, there only while there is a query. A submit carrying "" clears
+    // too: a click has no focus (the field's change is what re-describes), a typed query
+    // needs Enter before the clear button exists to click.
+    const std::string_view query{s->query_buffer().storage.data() ? s->query_buffer().storage.data()
+                                                                  : "",
+                                 s->query_buffer().size};
+    lx::ui::child clear_btn{};
+    if (!query.empty())
+        clear_btn = icon_button(lx::ui::icon::x)
+                        .style(lx::ui::button_style::subtle)
+                        .icon_size(lx::ui::icon_size::small)
+                        .icon_color(tok::icon_muted)
+                        .on_press([s](int) {
+                            (void)s->query_buffer().assign("");
+                            s->refresh();
+                        })
+                        .name("Clear");
+    lx::ui::child search_kids[3] = {search_icon, field, clear_btn};
+    const unsigned search_n = query.empty() ? 2u : 3u;
     lx::ui::control_props search_bar{};
-    search_bar.layout = st_h_flex().flex_none().w_full().px(st_px16(12.f)).pt(st_px16(12.f))
-                            .pb(st_px16(8.f)).gap(st_px16(8.f));
-    search_bar.paint = control_paint::fixed({paint(tok::surface_background), k_transparent});
+    search_bar.layout = st_h_flex().flex_none().w_full().h(st_px16(28.f)).py(st_px16(4.f))
+                            .pl(st_px16(6.f)).pr(st_px16(2.f)).gap(st_px16(6.f))
+                            .mb(st_px16(12.f));
+    search_bar.paint = st_rounded(
+        st_bordered(control_paint::fixed({paint(tok::editor_background), paint(tok::border)}),
+                    1),
+        lx::ui::radius::sm);
     search_bar.role = lx::a11y::role::toolbar;
     search_bar.name = "Search";
-    lx::ui::child search_child = control(search_bar, {search_kids, 2u});
+    lx::ui::child search_child = control(search_bar, {search_kids, search_n});
 
-    lx::ui::child tree_rows = st_box(
-        st_v_flex().flex_none().w_full().gap(st_px16(2.f)).px(st_px16(6.f)).pt(st_px16(4.f)),
-        control_paint{}, {rows, n});
+    lx::ui::child tree_rows =
+        st_box(st_v_flex().flex_none().w_full(), control_paint{}, {rows, n});
     lx::ui::child tree = scroll_area(
         st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f)).w_full(),
         {&tree_rows, 1u}, lx::ui::scroll_axes::vertical, st_v_flex().w_full());
-    lx::ui::child col[2] = {search_child, tree};
+
+    // The footer: `h_8 p_2 pb_0p5`, a `border_variant` rule on top, the hint for the
+    // action that moves the focus between the navigation and the page.
+    static constexpr const char* k_toggle_keys[1] = {"Ctrl-Shift-E"};
+    lx::ui::child hint = key_binding_hint(std::span<const char* const>{k_toggle_keys, 1u},
+                                          tok::surface_background)
+                             .suffix(focus_in_nav(s) ? "Focus Content" : "Focus Navbar");
+    lx::ui::control_props foot{};
+    foot.layout = st_h_flex().flex_none().w_full().h(st_px16(32.f)).p(st_px16(8.f))
+                      .pb(st_px16(2.f));
+    lx::ui::control_paint foot_paint =
+        control_paint::fixed({k_transparent, paint(tok::border_variant)});
+    foot_paint.border_widths[0] = 1; // the top edge only
+    foot.paint = foot_paint;
+    lx::ui::child footer = control(foot, {&hint, 1u});
+
+    lx::ui::child col[3] = {search_child, tree, footer};
     lx::ui::control_props rail_props{};
-    rail_props.layout = st_v_flex().flex_none().w(st_px16(k_rail_w)).h_full()
-                            .bg(tok::surface_background)
-                            .border_r_1(tok::border_variant);
-    rail_props.paint = control_paint::fixed({paint(tok::surface_background), k_transparent});
+    rail_props.layout = st_v_flex().flex_none().w(st_px16(k_rail_w)).h_full().p(st_px16(10.f));
+    lx::ui::control_paint rail_paint =
+        control_paint::fixed({paint(tok::panel_background), paint(tok::border)});
+    rail_paint.border_widths[1] = 1; // the right edge only
+    rail_props.paint = rail_paint;
     rail_props.role = lx::a11y::role::list;
     rail_props.name = "Panes";
-    return control(rail_props, {col, 2u}, k_rail_key);
+    return control(rail_props, {col, 3u}, k_rail_key);
 }
+
+/// Zed's `ToggleFocusNav` (Ctrl-Shift-E): from the navigation to the page's first
+/// focusable control, or from anywhere else to the open page's navigation entry.
+bool toggle_focus_nav(lx::ui::key_event e, lx::ui::focus_manager& focus) {
+    const unsigned needed = lx::ui::k_mod_ctrl | lx::ui::k_mod_shift;
+    const bool is_e = e.keycode == 18 /* evdev KEY_E */ || e.codepoint == U'e' ||
+                      e.codepoint == U'E' || e.codepoint == 0x05;
+    if (!e.pressed || (e.modifiers & needed) != needed || !is_e || !g_session ||
+        !g_session->root)
+        return false;
+    lx::ui::ui_node* tree = g_session->root->tree();
+    const std::function<lx::ui::ui_node*(lx::ui::ui_node*, lx::ui::element_key)> by_key =
+        [&](lx::ui::ui_node* n, lx::ui::element_key k) -> lx::ui::ui_node* {
+        if (!n)
+            return nullptr;
+        if (n->key() == k)
+            return n;
+        for (unsigned c = 0; c < n->child_count(); ++c)
+            if (lx::ui::ui_node* hit = by_key(n->child_at(c), k))
+                return hit;
+        return nullptr;
+    };
+    const std::function<lx::ui::ui_node*(lx::ui::ui_node*)> first_focusable =
+        [&](lx::ui::ui_node* n) -> lx::ui::ui_node* {
+        if (!n)
+            return nullptr;
+        if (n->has_flag(lx::ui::node_flag::focusable) &&
+            !n->has_flag(lx::ui::node_flag::disabled))
+            return n;
+        for (unsigned c = 0; c < n->child_count(); ++c)
+            if (lx::ui::ui_node* hit = first_focusable(n->child_at(c)))
+                return hit;
+        return nullptr;
+    };
+    lx::ui::ui_node* target =
+        focus_in_nav(g_session)
+            ? first_focusable(by_key(tree, k_page_key))
+            : by_key(tree, k_nav_key_base + static_cast<unsigned>(g_session->current()));
+    if (!target || !focus.focus(*target, lx::ui::focus_cause::keyboard))
+        return false;
+    g_session->refresh(); // the footer's hint names the other direction now
+    return true;
+}
+
+/// The window's root: the row the describe returns, which owns `ToggleFocusNav` — the
+/// keys no focused control took reach it (`on_focus_key` up the focus chain, or `on_key`
+/// when nothing has the focus).
+struct settings_window_props {
+    lx::ui::control_props control{};
+};
+
+class settings_window_node final : public lx::ui::control_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "settings_window"; }
+
+    bool apply(const settings_window_props& p) { return control_node::apply(p.control); }
+
+    bool on_focus_key(lx::ui::key_event event, lx::ui::focus_manager& focus) override {
+        if (toggle_focus_nav(event, focus))
+            return true;
+        return control_node::on_focus_key(event, focus);
+    }
+    bool on_key(lx::ui::key_event event) override {
+        if (g_session && g_session->root && toggle_focus_nav(event, g_session->root->focus()))
+            return true;
+        return control_node::on_key(event);
+    }
+};
 
 } // namespace
 
@@ -2348,32 +2748,33 @@ lx::ui::child describe(lx::ui::build_context&) {
     (void)catalog();
 
     lx::ui::child sidebar_child = sidebar(s);
+    // Zed's page: the editor background, `pt_6 gap_4`; the files header fixed at the top
+    // (`px_8`), the page's items scrolling under it, each `px_8` in from both edges.
+    lx::ui::child header = files_header(s);
+    lx::ui::child header_box =
+        st_box(st_v_flex().flex_none().w_full().px(st_px16(k_content_px)), control_paint{},
+               {&header, 1u});
     lx::ui::child content = pane_content(s);
-    lx::ui::child body_kids[2] = {
-        sidebar_child,
-        scroll_area(st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)),
-                    {&content, 1u}, lx::ui::scroll_axes::vertical,
-                    st_v_flex().w_full().p(st_px16(24.f)).gap(st_px16(0.f))),
-    };
-    lx::ui::child body = st_box(st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f)),
-                                control_paint{}, {body_kids, 2u});
-    // The status bar: full width under the sidebar and the content alike (Zed's workspace
-    // bar) — the save state left (the bar's overflow-hidden left, it can never spill),
-    // the app's name right.
-    const char* state_text =
-        s->state() == session::save_state::written
-            ? "saved to config.toml — Lumen applies it as it watches the file"
-            : s->state() == session::save_state::memory_only
-                ? "in memory only (no writable config.toml)"
-                : "the configuration as Lumen runs it";
-    lx::ui::child state_line =
-        st_mono(frame_format("  {}", state_text), st_text_px(11.f), tok::text_muted);
-    lx::ui::child app_line = st_mono("Lumen Settings  ", st_text_px(11.f), tok::text_muted);
-    lx::ui::child bar = status_bar({&state_line, 1u}, {&app_line, 1u}).key(k_status_key);
-    lx::ui::child root_kids[2] = {body, bar};
-    lx::ui::child root[1] = {st_box(st_v_flex().size_full().bg(tok::background),
-                                    control_paint{}, root_kids, k_content_key)};
-    return div(st_v_flex().size_full().bg(tok::background), {root, 1u});
+    lx::ui::child list = scroll_area(
+        st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_h(lx::layout::px(0.f)).w_full(),
+        {&content, 1u}, lx::ui::scroll_axes::vertical,
+        st_v_flex().w_full().px(st_px16(k_content_px)).pb(st_px16(k_content_px)));
+    lx::ui::child page_kids[2] = {header_box, list};
+    lx::ui::control_props page{};
+    page.layout = st_v_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f))
+                      .h_full().pt(st_px16(24.f)).gap(st_px16(16.f));
+    page.paint = control_paint::fixed({paint(tok::editor_background), k_transparent});
+    page.role = lx::a11y::role::group;
+    page.name = "Settings page";
+    lx::ui::child page_child = control(page, {page_kids, 2u}, k_page_key);
+
+    lx::ui::child body_kids[2] = {sidebar_child, page_child};
+    settings_window_props root{};
+    root.control.layout = st_h_flex().items_stretch().size_full();
+    root.control.paint = control_paint::fixed({paint(tok::editor_background), k_transparent});
+    return lx::ui::with_children(
+        lx::ui::describe<settings_window_node, settings_window_props>(root, k_content_key),
+        {body_kids, 2u});
 }
 
 } // namespace settings

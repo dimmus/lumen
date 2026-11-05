@@ -728,3 +728,50 @@ the glyph's own box so any size stays symmetric), and the stuck-hover bug is fix
 `set_decoration_hover` now resets every button unless the pointer is moving onto one —
 leaving a button for the title of the same window had left it lit forever (the per-button
 state made the old single-field clear a no-op for non-button zones).
+
+**The measured pass (2026-11-05).** The passes above were judged by eye; this one measured
+a screenshot of Zed's settings window (One Dark, scale 2) pixel by pixel and read
+`crates/settings_ui` for the constants, and three of the earlier claims turned out wrong.
+Zed **centres** a row's control against its label block (the dropdown's and the switch's
+centres sit on the text block's, within a device pixel) — the rows top-aligned theirs. Its
+labels are `TextSize::Default`, **14 px**, not 13, and its dropdown is **28 px** tall with a
+14 px word. And its navigation does highlight a root entry: a `TreeViewItem` selected is a
+pill (`element_active` at 50 % under a `border` rule at 40 %) whichever level it is on.
+What the app takes now, all of it from those numbers:
+
+- *The window.* No status bar: the sidebar (`SIDEBAR_WIDTH` 226 px, `p_2p5`,
+  `panel_background`, a `border` rule right) holds the search, the tree and a footer — a
+  `border_variant` rule over the Ctrl-Shift-E keybinding hint — and the page is on
+  `editor_background` (`pt_6 gap_4`, `px_8` gutters). The hint is true: the window's root
+  node implements `ToggleFocusNav`, the navigation entry of the open pane ↔ the page's first
+  control. The save state's place is Zed's warning `Banner` under the files header, shown
+  while edits cannot reach a file; a successful write says nothing (§5.1's "silence is
+  success").
+- *The navigation.* `TreeViewItem`s: 28 px, a 22 px disclosure (12 px chevron) on a root, a
+  22 px indentation line (`border` at 50 %) on a section, 14 px labels muted unless
+  selected; the open pane's root is the selected entry until one of its sections is. The
+  search is Zed's: `h_7`, rounded, the magnifying glass inside its `border` frame.
+- *The page.* The files header ("User", a tinted-accent button; "Edit in config.toml", an
+  outlined ghost one — both 22 px) stays put; the title (16 px, `LabelSize::Large`) and the
+  sections scroll under it. A section is `SettingsSectionHeader` — the name in the buffer
+  font at 12 px, muted, over a `border_faded` rule — then its rows (`pt_4 pb_4`, a 12 px
+  wrapping description under the label, the control centred) ruled off from each other,
+  `pb_10` after the last. The `[sections]` subtitle is gone: Zed's page has none. String
+  fields are `SettingsInputField` (32 × 256 px, a `border` frame — `text_input` gains
+  `.border(tok)`; its default stays `border_variant`, Zed's generic `InputField`).
+- *Numbers.* Every number is a spinner now, fractional keys stepping on a per-key grid
+  (`number_step`: 0.05 for the ratios, 50 for the stiffness, a 1-2-5 step otherwise) and
+  printed with the step's decimals. The slider it replaces took `min(hi − lo, 120)` as its
+  step count — one step for the 0.1..0.9 master ratio, so a touch wrote 0.1 or 0.9.
+
+Five defects surfaced on the way, each fixed with a test (`test_settings_ui`, 11 cases):
+derived labels dangled (interned in a `vector<string>`, every short label's characters
+inline and moved by the next push — "Tile" read "ile"); every Shortcuts row read
+"NoSymbol" (an empty `combo{}` is kind `key`, not `tap`, so defaults were never picked and
+keysym 0 was printed); a session with no readable file held `config_snapshot{}` rather
+than `default_config()`; an integer typed past `int` wrapped (4294967336 → 40); and a node
+keeps at most `ui_node::k_max_children` (64) children and silently drops the rest — with a
+rule between rows, the Compositor bindings lost their last rows, so every section is now
+its own column (`st_column` stacks longer lists). One deviation stays, deliberately for
+now: a section's entry in the tree narrows the page to that section where Zed scrolls the
+whole page to it — the engine has no scroll-to-node after layout yet.
