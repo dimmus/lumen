@@ -31,6 +31,7 @@ import :keybindings;
 import :input_router;
 import :session_lock;
 import :wire;
+import :window_rules;
 
 namespace {
 
@@ -208,16 +209,55 @@ const struct zlm_workspace_manager_v1_interface workspace_manager_impl = {
         [](struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t) {},
 };
 
+template <typename Edit>
+void edit_window_rule(wl_resource* resource, const char* app_id, Edit edit) {
+    if (!g_ctx || !g_ctx->window_rules) return;
+    window_rule rule; rule.app_id = app_id ? app_id : "";
+    if (auto v = window_rule_store::validate(rule); !v) {
+        wl_resource_post_error(resource, ZLM_WINDOW_RULES_V1_ERROR_INVALID_APP_ID, "%s", v.get_error().message);
+        return;
+    }
+    if (const auto* old = g_ctx->window_rules->find(rule.app_id)) rule = *old;
+    edit(rule);
+    if (auto v = g_ctx->window_rules->set(std::move(rule)); !v)
+        wl_resource_post_error(resource, ZLM_WINDOW_RULES_V1_ERROR_INVALID_VALUE, "%s", v.get_error().message);
+}
+
 const struct zlm_window_rules_v1_interface window_rules_impl = {
     .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
-    .reload_rules = [](struct wl_client*, struct wl_resource*) {},
-    .set_workspace_rule =
-        [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
-    .set_monitor_rule = [](struct wl_client*, struct wl_resource*, const char*, const char*) {},
-    .set_geometry_rule = [](struct wl_client*, struct wl_resource*, const char*, int32_t,
-                            int32_t, int32_t, int32_t) {},
-    .set_state_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
-    .set_decoration_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+    .reload_rules = [](struct wl_client*, struct wl_resource* r) {
+        if (g_ctx && g_ctx->window_rules) {
+            if (auto v = g_ctx->window_rules->reload(); !v)
+                wl_resource_post_error(r, ZLM_WINDOW_RULES_V1_ERROR_INVALID_VALUE, "%s", v.get_error().message);
+        }
+    },
+    .set_workspace_rule = [](wl_client*, wl_resource* r, const char* id, uint32_t index) {
+        edit_window_rule(r, id, [index](auto& rule) { rule.workspace_index = index; });
+    },
+    .set_monitor_rule = [](wl_client*, wl_resource* r, const char* id, const char* output) {
+        edit_window_rule(r, id, [output](auto& rule) { rule.output_name = output; });
+    },
+    .set_geometry_rule = [](wl_client*, wl_resource* r, const char* id, int32_t x, int32_t y,
+                            int32_t width, int32_t height) {
+        edit_window_rule(r, id, [=](auto& rule) { rule.geometry = lx::rect2i{x, y, width, height}; });
+    },
+    .set_state_rule = [](wl_client*, wl_resource* r, const char* id, uint32_t flags) {
+        edit_window_rule(r, id, [flags](auto& rule) { rule.state_flags = flags; });
+    },
+    .set_decoration_rule = [](wl_client*, wl_resource* r, const char* id, uint32_t server) {
+        if (server > 1) { wl_resource_post_error(r, ZLM_WINDOW_RULES_V1_ERROR_INVALID_VALUE, "invalid decoration"); return; }
+        edit_window_rule(r, id, [server](auto& rule) { rule.server_side = server != 0; });
+    },
+    .clear_rules = [](wl_client*, wl_resource* r, const char* id) {
+        if (g_ctx && g_ctx->window_rules)
+            if (auto v = g_ctx->window_rules->clear(id); !v)
+                wl_resource_post_error(r, ZLM_WINDOW_RULES_V1_ERROR_INVALID_VALUE, "%s", v.get_error().message);
+    },
+    .clear_all = [](wl_client*, wl_resource* r) {
+        if (g_ctx && g_ctx->window_rules)
+            if (auto v = g_ctx->window_rules->clear_all(); !v)
+                wl_resource_post_error(r, ZLM_WINDOW_RULES_V1_ERROR_INVALID_VALUE, "%s", v.get_error().message);
+    },
 };
 
 // ── zlm_key_grab_v1 (v4) ───────────────────────────────────────────────────

@@ -39,6 +39,7 @@ import :output_management;
 import :text_input;
 import :toplevel_icon;
 import :foreign_registry;
+import :window_rules;
 
 export namespace lx::compositor {
 
@@ -502,6 +503,7 @@ struct protocol_context {
     /// Window placement, configure flow and focus. Receives its wire ops from
     /// `install_protocols`.
     window_manager* wm = nullptr;
+    window_rule_store* window_rules = nullptr;
     /// Pointer image: wl_pointer.set_cursor, wp_cursor_shape_v1 and cursor-role commits
     /// land here. Receives its texture-staging hook from `install_protocols`.
     cursor_manager* cursor = nullptr;

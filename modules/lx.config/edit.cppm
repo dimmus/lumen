@@ -6,6 +6,8 @@ import std;
 
 import lx.foundation;
 import :parse;
+import :schema;
+import :toml;
 
 // ── ADR-013 §4.3: the user layer's splice editor ────────────────────────────────────────
 //
@@ -21,9 +23,8 @@ import :parse;
 // atomically (temp file, fsync, rename — output_config_store's pattern). The compositor's
 // watch picks the file up and reloads.
 //
-// Array-of-table sections (`[[input.device]]`, `[[output]]`) are refused: their keys are
-// per-entry, which is not one splice but a list edit (the panes that own them append and
-// remove whole entries).
+// Generic splices refuse array-of-table sections. Device helpers below select an exact
+// decoded device name, leaving other devices and sections byte-identical.
 
 export namespace lx::config {
 
@@ -88,6 +89,10 @@ enum class edit_status : unsigned char {
     bad_word,
     /// The text grew past `k_max_layer_bytes`.
     too_big,
+    /// Invalid device selector or pointer key.
+    invalid_device,
+    /// The original text has invalid TOML syntax.
+    invalid_text,
 };
 
 struct edit_report {
@@ -108,6 +113,17 @@ struct edit_report {
 /// pair). The other bytes stand. False when there was no such line (report line 0).
 [[nodiscard]] std::string remove_key(std::string_view text, std::string_view section,
                                      std::string_view key, edit_report& report);
+
+/// Edit one exact-name [[input.device]] override; unrelated bytes remain unchanged.
+/// Missing entries are appended. Repeated entries are resolved in file order.
+[[nodiscard]] std::string splice_device_key(std::string_view text, std::string_view device_name,
+    std::string_view key, const edit_value& value, edit_report& report);
+/// Remove this key from every matching entry, revealing the lower layers/class settings.
+[[nodiscard]] std::string remove_device_key(std::string_view text, std::string_view device_name,
+    std::string_view key, edit_report& report);
+/// Remove every table belonging to this exact device name.
+[[nodiscard]] std::string remove_device_override(std::string_view text,
+    std::string_view device_name, edit_report& report);
 
 } // namespace lx::config
 
@@ -379,4 +395,183 @@ std::string lx::config::remove_key(std::string_view text, std::string_view secti
         offset = eol + 1;
     }
     return std::string(text); // nothing matched: the text stands
+}
+
+namespace {
+struct device_text_table {
+    std::size_t begin = 0, body = 0, end = 0;
+    std::string name{};
+    std::vector<std::pair<std::string, std::size_t>> keys{};
+};
+
+// Use the TOML reader for decoded selectors/keys and table boundaries. In particular,
+// a bracket in a comment or a multiline array must never become a table boundary.
+bool device_tables(std::string_view text, std::vector<device_text_table>& tables) {
+    struct scan {
+        std::string_view text;
+        std::vector<std::size_t> lines{0};
+        std::vector<device_text_table>* tables;
+        bool device = false;
+        bool in_inline = false;
+        std::size_t at(unsigned line) const { return lines[line - 1]; }
+    } s{text, {0}, &tables};
+    for (std::size_t i = 0; i < text.size(); ++i)
+        if (text[i] == '\n') s.lines.push_back(i + 1);
+    lx::config::toml::handler h{};
+    h.user = &s;
+    h.table = [](void* u, const char* name, bool array, lx::config::toml::parse_error& e) {
+        auto& s = *static_cast<scan*>(u);
+        const auto at = s.at(e.line);
+        if (s.device) s.tables->back().end = at;
+        s.device = array && std::string_view(name) == "input.device";
+        if (s.device) {
+            const auto nl = s.text.find('\n', at);
+            s.tables->push_back({at, nl == std::string_view::npos ? s.text.size() : nl + 1,
+                                 s.text.size(), {}, {}});
+        }
+        return true;
+    };
+    h.key_value = [](void* u, const char* key, const lx::config::toml::value& v,
+                     lx::config::toml::parse_error& e) {
+        auto& s = *static_cast<scan*>(u);
+        if (!s.device || s.in_inline) return true;
+        auto& t = s.tables->back();
+        if (std::string_view(key) == "name") {
+            if (v.type == lx::config::toml::value::kind::string) t.name = v.str;
+        } else t.keys.emplace_back(key, s.at(e.line));
+        return true;
+    };
+    h.inline_table = [](void* u, const char*, bool begin, lx::config::toml::parse_error&) {
+        static_cast<scan*>(u)->in_inline = begin;
+        return true;
+    };
+    lx::config::toml::parse_error e{};
+    return lx::config::toml::parse(text.data(), text.size(), h, e);
+}
+
+bool valid_device_edit(std::string_view text, std::string_view name, std::string_view key,
+                       lx::config::edit_report& r) {
+    r = {};
+    if (text.size() > lx::config::k_max_layer_bytes) {
+        r.status = lx::config::edit_status::too_big;
+        return false;
+    }
+    if (name.empty() || name.size() >= 128 || name.find('\0') != std::string_view::npos ||
+        (!key.empty() && !std::ranges::any_of(lx::config::pointer_keys(),
+            [&](const auto& k) { return key == k.key; }))) {
+        r.status = lx::config::edit_status::invalid_device;
+        return false;
+    }
+    return true;
+}
+
+std::size_t after_line(std::string_view text, std::size_t at) {
+    const auto nl = text.find('\n', at);
+    return nl == std::string_view::npos ? text.size() : nl + 1;
+}
+
+// Preserve the indentation, spelling of the key, and trailing comment on replacement.
+std::string replace_device_value(std::string_view line, std::string_view value) {
+    char quote = 0;
+    bool escape = false;
+    std::size_t equal = std::string_view::npos, comment = line.size();
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (escape) { escape = false; continue; }
+        if (quote) {
+            if (quote == '"' && c == '\\') escape = true;
+            else if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') quote = c;
+        else if (c == '=' && equal == std::string_view::npos) equal = i;
+        else if (c == '#') { comment = i; break; }
+    }
+    auto begin = line.find_first_not_of(" \t", equal + 1);
+    if (begin == std::string_view::npos) begin = equal + 1;
+    auto end = comment;
+    while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' ||
+                          line[end - 1] == '\r' || line[end - 1] == '\n')) --end;
+    return std::string(line.substr(0, begin)) + std::string(value) + std::string(line.substr(end));
+}
+} // namespace
+
+std::string lx::config::splice_device_key(std::string_view text, std::string_view name,
+    std::string_view key, const edit_value& value, edit_report& report) {
+    if (!valid_device_edit(text, name, key, report) || key.empty()) {
+        report.status = key.empty() ? edit_status::invalid_device : report.status;
+        return std::string(text);
+    }
+    std::vector<device_text_table> tables;
+    if (!device_tables(text, tables)) {
+        report.status = edit_status::invalid_text;
+        return std::string(text);
+    }
+    std::string encoded;
+    append_value(encoded, value, report.status);
+    if (report.status != edit_status::ok) return std::string(text);
+    std::size_t at = text.size(), end = at;
+    const device_text_table* selected = nullptr;
+    bool existing = false;
+    for (const auto& t : tables) {
+        if (t.name != name) continue;
+        selected = &t;
+        for (const auto& [k, pos] : t.keys)
+            if (k == key) { at = pos; end = after_line(text, pos); existing = true; }
+    }
+    std::string insertion;
+    if (existing) insertion = replace_device_value(text.substr(at, end - at), encoded);
+    else {
+        if (selected) at = end = selected->body;
+        if (at && text[at - 1] != '\n') insertion += '\n';
+        if (!selected) {
+            insertion += "\n[[input.device]]\nname = ";
+            append_string(insertion, name);
+            insertion += '\n';
+        }
+        insertion += std::string(k_marker) + "\n" + std::string(key) + " = " + encoded + "\n";
+    }
+    std::string out(text);
+    out.replace(at, end - at, insertion);
+    if (out.size() > k_max_layer_bytes) {
+        report.status = edit_status::too_big;
+        return std::string(text);
+    }
+    report.line = static_cast<unsigned>(std::count(text.begin(), text.begin() + at, '\n')) + 1u;
+    return out;
+}
+
+std::string lx::config::remove_device_key(std::string_view text, std::string_view name,
+    std::string_view key, edit_report& report) {
+    if (!valid_device_edit(text, name, key, report)) return std::string(text);
+    std::vector<device_text_table> tables;
+    if (!device_tables(text, tables)) {
+        report.status = edit_status::invalid_text;
+        return std::string(text);
+    }
+    std::string out(text);
+    // Reverse order keeps every recorded byte offset valid.
+    for (auto ti = tables.rbegin(); ti != tables.rend(); ++ti) {
+        if (ti->name != name) continue;
+        if (key.empty()) {
+            out.erase(ti->begin, ti->end - ti->begin);
+            report.line = static_cast<unsigned>(std::count(text.begin(), text.begin() + ti->begin, '\n')) + 1u;
+            continue;
+        }
+        for (auto ki = ti->keys.rbegin(); ki != ti->keys.rend(); ++ki) {
+            if (ki->first != key) continue;
+            auto start = ki->second;
+            if (start > ti->body) {
+                const auto prev = start < 2 ? std::string_view::npos : text.rfind('\n', start - 2);
+                const auto p = prev == std::string_view::npos ? 0 : prev + 1;
+                if (trim(text.substr(p, start - p - 1)) == k_marker) start = p;
+            }
+            out.erase(start, after_line(text, ki->second) - start);
+            report.line = static_cast<unsigned>(std::count(text.begin(), text.begin() + start, '\n')) + 1u;
+        }
+    }
+    return out;
+}
+
+std::string lx::config::remove_device_override(std::string_view text, std::string_view name,
+    edit_report& report) {
+    return remove_device_key(text, name, {}, report);
 }

@@ -151,6 +151,8 @@ struct toplevel_record {
     void* deco_resource = nullptr;
     unsigned deco_version = 0;
     decoration_request deco_requested = decoration_request::unset;
+    std::optional<bool> rule_server_side;
+    unsigned rule_workspace_index = 0;
     /// The mode in effect: applied by the commit answering the configure that carried it;
     /// always client-side while no decoration object exists (`deco_resource` null).
     decoration_mode decoration_current = decoration_mode::client;
@@ -607,7 +609,11 @@ bool lx::compositor::toplevel_manager::apply_pending_state(toplevel_record& rec)
 
 lx::compositor::decoration_mode
 lx::compositor::toplevel_manager::wanted_decoration(const toplevel_record& rec) {
-    if (!rec.deco_resource || rec.deco_requested == decoration_request::client)
+    if (!rec.deco_resource)
+        return decoration_mode::client;
+    if (rec.rule_server_side)
+        return *rec.rule_server_side ? decoration_mode::server : decoration_mode::client;
+    if (rec.deco_requested == decoration_request::client)
         return decoration_mode::client;
     return decoration_mode::server;
 }
@@ -676,6 +682,8 @@ bool lx::compositor::toplevel_manager::consume_ack(toplevel_record& rec,
 }
 
 void lx::compositor::toplevel_manager::reset_for_remap(toplevel_record& rec) {
+    rec.rule_server_side.reset();
+    rec.rule_workspace_index = 0;
     rec.initial_commit_seen = false;
     rec.initial_configure_sent = false;
     rec.ever_acked = false;

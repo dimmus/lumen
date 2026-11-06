@@ -22,6 +22,7 @@ using lx::compositor::control_action_result;
 using lx::compositor::control_server;
 
 struct fake_host {
+    lx::compositor::window_rule_store rules;
     unsigned health_token = ~0u;
     unsigned health_calls = 0;
     unsigned timeouts = 0;
@@ -34,6 +35,7 @@ struct fake_host {
     static lx::compositor::control_host make(fake_host& h) {
         lx::compositor::control_host host{};
         host.user = &h;
+        host.window_rules = &h.rules;
         host.version = [](void*, lx::compositor::control_version& v) {
             v.version = "0.3.0";
             v.zlm_version = 6;
@@ -247,6 +249,34 @@ LUMEN_TEST(the_interface_parses_and_describes_itself) {
     LUMEN_CHECK(d.error.empty());
     LUMEN_CHECK(std::string_view{str(d.params, "description")}.find("method GetHealth") !=
                 std::string_view::npos);
+}
+
+LUMEN_TEST(window_rule_methods_roundtrip_replace_and_reject) {
+    fixture f;
+    sd_json_variant* rule = nullptr;
+    sd_json_variant* p = nullptr;
+    (void)sd_json_variant_set_field_string(&rule, "app_id", "org.example.App");
+    (void)sd_json_variant_set_field_integer(&rule, "workspace_index", 2);
+    (void)sd_json_variant_set_field_boolean(&rule, "server_side", false);
+    (void)sd_json_variant_set_field(&p, "rule", rule);
+    LUMEN_CHECK(f.call("io.lumen.Compositor.SetWindowRule", p).error.empty());
+    sd_json_variant_unref(p); p = nullptr;
+    auto& result = f.call("io.lumen.Compositor.GetWindowRules");
+    LUMEN_CHECK(result.error.empty());
+    auto* rules = sd_json_variant_by_key(result.params, "rules");
+    LUMEN_CHECK(sd_json_variant_elements(rules) == 1);
+    auto* first = sd_json_variant_by_index(rules, 0);
+    LUMEN_CHECK(num(first, "workspace_index") == 2);
+    LUMEN_CHECK(!sd_json_variant_boolean(sd_json_variant_by_key(first, "server_side")));
+    (void)sd_json_variant_set_field_integer(&rule, "state_flags", 12);
+    (void)sd_json_variant_set_field(&p, "rule", rule);
+    LUMEN_CHECK(f.call("io.lumen.Compositor.SetWindowRule", p).error == "io.lumen.Compositor.WindowRuleFailed");
+    sd_json_variant_unref(p); p = nullptr;
+    LUMEN_CHECK(f.host.rules.find("org.example.App")->workspace_index == 2);
+    (void)sd_json_variant_set_field_string(&p, "app_id", "org.example.App");
+    LUMEN_CHECK(f.call("io.lumen.Compositor.ClearWindowRule", p).error.empty());
+    LUMEN_CHECK(f.host.rules.rules().empty());
+    sd_json_variant_unref(rule); sd_json_variant_unref(p);
 }
 
 LUMEN_TEST(health_is_answered_when_the_host_finishes_it) {

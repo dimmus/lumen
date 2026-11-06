@@ -357,6 +357,7 @@ struct compositor_impl {
     decoration_manager decorations_{};
     /// UI affinity. Window geometry, configure flow and focus — see `:wm`.
     window_manager wm_{};
+    window_rule_store window_rules_{};
     gfx::device graphics{};
     drm::kms_device kms{};
     gfx::dmabuf_import_cache import_cache;
@@ -3111,6 +3112,10 @@ void compositor_impl::register_protocol_globals() {
     wire_.decorations = &decorations_;
     wire_.server_side_decorations = cfg.server_side_decorations;
     wire_.wm = &wm_;
+    wire_.window_rules = &window_rules_;
+    wm_.set_window_rules(&window_rules_);
+    if (auto loaded = window_rules_.load_default(); !loaded)
+        log_session.error(loaded.get_error());
     wm_.set_cursor(&cursor_);
     wire_.cursor = &cursor_;
     dnd_.bind(tree_, dnd_icon_layer_, &cursor_);
@@ -3546,6 +3551,7 @@ void compositor_impl::start_session() {
 
     if (cfg.control_socket || cfg.session_mode || watchdog_period_ns_ > 0) {
         control_host host{};
+        host.window_rules = &window_rules_;
         host.user = this;
         host.version = [](void* u, control_version& out) {
             auto* self = static_cast<compositor_impl*>(u);
