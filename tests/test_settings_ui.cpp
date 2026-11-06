@@ -60,7 +60,7 @@ struct harness {
     return nullptr;
 }
 
-[[nodiscard]] control_node& ctl(ui_node* n) {
+[[maybe_unused]] [[nodiscard]] control_node& ctl(ui_node* n) {
     LUMEN_CHECK(n && n->type() == control_node::static_type());
     return *static_cast<control_node*>(n);
 }
@@ -320,10 +320,14 @@ LUMEN_TEST(settings_bindings_editor_validates_conflicts_and_writes) {
             close_idx = i;
     LUMEN_CHECK(close_idx < all.size());
     s.begin_edit_action(close_idx);
-    LUMEN_CHECK(s.edit_buffer().assign("Super+Y"));
+    s.begin_binding_capture();
+    LUMEN_CHECK(s.capture_binding_key('y', lx::config::mod_super, true));
+    s.stop_binding_capture();
+    LUMEN_CHECK(s.edit_buffer().view() == "Super+y");
     s.refresh();
     LUMEN_CHECK(h.tick());
     LUMEN_CHECK(s.edit_error().empty());
+    LUMEN_CHECK(find(h.root.tree(), lx::a11y::role::button, "Record shortcut"));
     s.apply_edit_action();
     if (!s.edit_error().empty())
         std::printf("      apply said: %s\n", std::string(s.edit_error()).c_str());
@@ -364,7 +368,10 @@ LUMEN_TEST(settings_bindings_editor_validates_conflicts_and_writes) {
             swap_idx = i;
     LUMEN_CHECK(swap_idx < all.size());
     s.begin_edit_action(swap_idx);
-    LUMEN_CHECK(s.edit_buffer().assign("Super+Y"));
+    s.begin_binding_capture();
+    LUMEN_CHECK(s.capture_binding_key('y', lx::config::mod_super, true));
+    s.stop_binding_capture();
+    LUMEN_CHECK(s.edit_buffer().view() == "Super+y");
     s.refresh();
     (void)h.tick();
     s.apply_edit_action();
@@ -621,6 +628,79 @@ LUMEN_TEST(settings_ctrl_shift_e_moves_the_focus_between_nav_and_page) {
     (void)h.root.key(plain);
     LUMEN_CHECK(h.root.focus().focused() == before);
     settings::set_active_session(nullptr);
+}
+
+LUMEN_TEST(settings_shortcut_capture_records_keys_and_modifier_taps) {
+    settings::session s{};
+    const auto actions = lx::config::actions();
+    const auto* action = lx::config::find_action("window.close");
+    LUMEN_CHECK(action);
+    const unsigned index = static_cast<unsigned>(action - actions.data());
+    LUMEN_CHECK(!s.capture_binding_key('a', 0, true));
+    s.begin_edit_action(index);
+    LUMEN_CHECK(!s.capture_binding_key('a', 0, true)); // explicit opt-in
+    s.begin_binding_capture();
+    const auto check = [&](std::string_view expected) {
+        LUMEN_CHECK(s.edit_buffer().view() == expected);
+    };
+    // Modifiers are config bits, independent from lock state and text/UTF-8.
+    LUMEN_CHECK(s.capture_binding_key('1', lx::config::mod_shift, true));
+    check("Shift+1");
+    LUMEN_CHECK(s.capture_binding_key('1', 0, false));
+    check("Shift+1");
+    LUMEN_CHECK(s.capture_binding_key('2', 0, true, true));
+    check("Shift+1"); // repeat does not overwrite
+    LUMEN_CHECK(s.capture_binding_key(0xffe5, 0, true)); // Caps Lock
+    LUMEN_CHECK(s.capture_binding_key(0, 0, true)); // no keymap
+    check("Shift+1");
+    LUMEN_CHECK(s.capture_binding_key(0xffeb, lx::config::mod_super, true));
+    check("Shift+1"); // modifier press waits for a tap or a chord
+    // Wayland modifiers commonly follow the release: Super can still be set.
+    LUMEN_CHECK(s.capture_binding_key(0xffeb, lx::config::mod_super, false));
+    check("Super");
+    LUMEN_CHECK(s.capture_binding_key(0xffeb, lx::config::mod_super, true));
+    LUMEN_CHECK(s.capture_binding_key('y', lx::config::mod_super | lx::config::mod_shift, true));
+    LUMEN_CHECK(s.capture_binding_key(0xffeb, 0, false));
+    check("Super+Shift+y"); // release cannot replace the chord with a tap
+    s.stop_binding_capture();
+    LUMEN_CHECK(!s.capture_binding_key('z', 0, true));
+    check("Super+Shift+y");
+    s.begin_binding_capture();
+    s.set_current(settings::pane_id::appearance);
+    LUMEN_CHECK(!s.capturing_binding());
+}
+
+LUMEN_TEST(settings_shortcut_capture_cancel_clear_and_reserved) {
+    settings::session s{};
+    const auto* action = lx::config::find_action("window.close");
+    LUMEN_CHECK(action);
+    const unsigned index = static_cast<unsigned>(action - lx::config::actions().data());
+    s.begin_edit_action(index);
+    s.begin_binding_capture();
+    LUMEN_CHECK(s.capture_binding_key(lx::config::keysym::f1,
+                                     lx::config::mod_ctrl | lx::config::mod_alt, true));
+    LUMEN_CHECK(s.edit_buffer().view() == "Ctrl+Alt+F1");
+    LUMEN_CHECK(!s.edit_error().empty());
+    LUMEN_CHECK(s.state() != settings::session::save_state::written);
+    s.apply_edit_action(); // capture uses the existing reserved-key validation on save
+    LUMEN_CHECK(!s.edit_error().empty());
+    LUMEN_CHECK(s.editing_action() == index);
+    LUMEN_CHECK(!s.capturing_binding());
+    s.begin_binding_capture();
+    LUMEN_CHECK(s.capture_binding_key(lx::config::keysym::backspace, 0, true));
+    LUMEN_CHECK(s.edit_buffer().view().empty());
+    LUMEN_CHECK(s.edit_error().empty());
+    LUMEN_CHECK(s.capture_binding_key(lx::config::keysym::backspace,
+                                     lx::config::mod_ctrl, true));
+    LUMEN_CHECK(s.edit_buffer().view() == "Ctrl+BackSpace");
+    LUMEN_CHECK(s.capture_binding_key(lx::config::keysym::escape,
+                                     lx::config::mod_super, true));
+    LUMEN_CHECK(!s.edit_error().empty()); // modified Escape is reserved, not cancel
+    LUMEN_CHECK(s.editing_action() == index);
+    LUMEN_CHECK(s.capture_binding_key(lx::config::keysym::escape, 0, true));
+    LUMEN_CHECK(s.editing_action() == settings::session::k_no_row);
+    LUMEN_CHECK(!s.capturing_binding());
+    LUMEN_CHECK(s.state() != settings::session::save_state::written);
 }
 
 int main(int argc, char** argv) {

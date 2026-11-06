@@ -150,6 +150,7 @@ public:
 
     [[nodiscard]] pane_id current() const { return current_; }
     void set_current(pane_id p) {
+        stop_binding_capture();
         current_ = p;
         open_menu_ = k_no_row;
         focus_group_[0] = '\0';
@@ -171,6 +172,7 @@ public:
     [[nodiscard]] std::string_view focus_group() const { return focus_group_; }
     /// Opens `pane` narrowed to `group` (an empty `group` shows the whole pane).
     void open_group(pane_id p, const char* group) {
+        stop_binding_capture();
         current_ = p;
         expanded_[static_cast<unsigned>(p) % k_pane_count] = true;
         open_menu_ = k_no_row;
@@ -239,6 +241,7 @@ public:
     [[nodiscard]] unsigned editing_action() const { return editing_action_; }
     void begin_edit_action(unsigned index) {
         editing_action_ = index;
+        stop_binding_capture();
         error_[0] = '\0';
         const std::vector<row_ref>& rows = catalog(); // (no-op: keeps the catalog warm)
         (void)rows;
@@ -253,10 +256,28 @@ public:
         repaint();
     }
     void cancel_edit_action() {
+        stop_binding_capture();
         editing_action_ = k_no_row;
         repaint();
     }
     [[nodiscard]] lx::ui::text_buffer& edit_buffer() { return edit_.buffer; }
+    /// Explicit recording keeps the text grammar available for pointer bindings.
+    void begin_binding_capture() {
+        if (editing_action_ == k_no_row)
+            return;
+        capturing_binding_ = true;
+        tap_keysym_ = tap_mod_ = 0;
+        error_[0] = '\0';
+        repaint();
+    }
+    void stop_binding_capture() {
+        capturing_binding_ = false;
+        tap_keysym_ = tap_mod_ = 0;
+        repaint();
+    }
+    [[nodiscard]] bool capturing_binding() const { return capturing_binding_; }
+    /// sym: active layout first-level keysym; mods: config::key_mod. No file I/O.
+    bool capture_binding_key(unsigned sym, unsigned mods, bool pressed, bool repeated = false);
     /// The current binding of the action `index` (its first; a fresh combo when unbound).
     [[nodiscard]] lx::config::combo binding_of_action(unsigned index) const;
     /// The canonical spelling of the combo bound to this action in the user layer, "" when
@@ -350,6 +371,9 @@ private:
     health_snapshot health_{};
     /// The bindings editor's state.
     unsigned editing_action_ = k_no_row;
+    bool capturing_binding_ = false;
+    unsigned tap_keysym_ = 0;
+    unsigned tap_mod_ = 0;
     string_field edit_{};
     char error_[128]{};
     std::string reset_note_{};
@@ -1482,7 +1506,79 @@ bool session::commit_layer(const std::string& edited) {
     return true;
 }
 
+bool session::capture_binding_key(unsigned sym, unsigned mods, bool pressed, bool repeated) {
+    namespace cfg = lx::config;
+    if (!capturing_binding_ || editing_action_ == k_no_row)
+        return false;
+    if (repeated)
+        return true;
+    mods &= cfg::k_mods_all; // Caps/Num Lock never belong to a binding.
+    unsigned modifier = 0;
+    switch (sym) {
+    case 0xffe1: case 0xffe2: modifier = cfg::mod_shift; break;
+    case 0xffe3: case 0xffe4: modifier = cfg::mod_ctrl; break;
+    case 0xffe9: case 0xffea: modifier = cfg::mod_alt; break;
+    case 0xffeb: case 0xffec: modifier = cfg::mod_super; break;
+    default: break;
+    }
+    cfg::combo combo{};
+    if (modifier) {
+        if (pressed) {
+            if ((mods & ~modifier) == 0 && tap_keysym_ == 0) {
+                tap_keysym_ = sym;
+                tap_mod_ = modifier;
+            } else {
+                tap_keysym_ = tap_mod_ = 0;
+            }
+            return true;
+        }
+        // wl_keyboard.modifiers may follow the release, so the released bit can
+        // still be set in this event. Other held modifiers disqualify a tap.
+        if (tap_keysym_ != sym || (mods & ~modifier) != 0) {
+            tap_keysym_ = tap_mod_ = 0;
+            return true;
+        }
+        combo = {cfg::combo_kind::tap, tap_mod_, 0};
+        tap_keysym_ = tap_mod_ = 0;
+    } else {
+        if (!pressed)
+            return true;
+        tap_keysym_ = tap_mod_ = 0;
+        if (sym == cfg::keysym::escape && mods == 0) {
+            cancel_edit_action();
+            return true;
+        }
+        if (sym == cfg::keysym::backspace && mods == 0) {
+            edit_.set({});
+            error_[0] = '\0';
+            repaint();
+            return true;
+        }
+        // Lock/group selectors are state changes, never a configurable modifier tap.
+        if (sym == 0 || sym == 0xffe5 || sym == 0xffe6 || sym == 0xff7f ||
+            sym == 0xfe03 || sym == 0xff7e || (sym >= 0xfe01 && sym <= 0xfe13))
+            return true;
+        combo = {cfg::combo_kind::key, mods, sym};
+    }
+    char canon[64]{};
+    cfg::format_combo(combo, canon, sizeof(canon));
+    cfg::combo parsed{};
+    const char* why = nullptr;
+    if (!cfg::parse_combo(canon, parsed, why)) {
+        std::snprintf(error_, sizeof(error_), "This key has no binding name");
+    } else {
+        cfg::format_combo(parsed, canon, sizeof(canon));
+        edit_.set(canon);
+        error_[0] = '\0';
+        if (cfg::reserved(parsed))
+            std::snprintf(error_, sizeof(error_), "%s is reserved by Lumen", canon);
+    }
+    repaint();
+    return true;
+}
+
 void session::apply_edit_action() {
+    stop_binding_capture();
     namespace cfg = lx::config;
     const std::span<const cfg::action_info> all = cfg::actions();
     if (editing_action_ >= all.size())
@@ -1701,7 +1797,7 @@ namespace {
             drop_down(words, static_cast<int>(v))
                 .open(s->open_menu() == index)
                 .on_open([s, index](int) { s->set_open_menu(index); })
-                .on_dismiss([s, index](int) { s->set_open_menu(session::k_no_row); })
+                .on_dismiss([s](int) { s->set_open_menu(session::k_no_row); })
                 .on_select([s, index](int i) {
                     s->set_enum(index, static_cast<unsigned>(i));
                     s->set_open_menu(session::k_no_row);
@@ -1992,9 +2088,19 @@ namespace {
         lx::ui::child field_box = st_box(
             st_h_flex().flex_grow(1.f).flex_shrink(1.f).min_w(lx::layout::px(0.f)),
             control_paint{}, {&field, 1u});
-        lx::ui::child row_kids[3] = {field_box, save, cancel};
+        lx::ui::child record = button(s->capturing_binding() ? "Stop recording" : "Record shortcut")
+            .on_press([s](int) {
+                if (s->capturing_binding())
+                    s->stop_binding_capture();
+                else
+                    s->begin_binding_capture();
+            });
+        lx::ui::child row_kids[4] = {field_box, record, save, cancel};
         kids[n++] = st_box(st_h_flex().flex_none().w_full().gap(st_px16(8.f)),
-                           control_paint::fixed({k_transparent, k_transparent}), {row_kids, 3u});
+                           control_paint::fixed({k_transparent, k_transparent}), {row_kids, 4u});
+        if (s->capturing_binding())
+            kids[n++] = st_text("Press a shortcut; Escape cancels, Backspace clears. Stop recording to type.",
+                                st_text_px(12.f), tok::text_muted, false, true, true);
         const std::string_view err = s->edit_error();
         lx::ui::child error_line = st_text(
             err.empty() ? frame_format("The binding writes [bindings] in config.toml; {}",

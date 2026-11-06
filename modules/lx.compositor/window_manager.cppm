@@ -29,6 +29,7 @@ import :activation;
 import :workspaces;
 import :tiling;
 import :window_animation;
+import :window_rules;
 
 namespace {
 
@@ -458,6 +459,7 @@ public:
     /// First commit after get_toplevel (or after an unmap): sends the initial configure
     /// right away rather than at the next tick, so the client is not held up a frame.
     void on_initial_commit(lx::toplevel_id id);
+    void set_window_rules(window_rule_store* rules) { window_rules_ = rules; }
     /// Every later commit of a toplevel's surface, after the content reached the surface
     /// manager. Maps, unmaps, applies acked configures and keeps the node in place.
     void on_toplevel_commit(lx::toplevel_id id, const toplevel_commit_info& info);
@@ -730,6 +732,7 @@ public:
     [[nodiscard]] static frame_extents extents_of(const toplevel_record& rec);
 
 private:
+    window_rule_store* window_rules_ = nullptr;
     void send_configure(toplevel_record& rec, lx::runtime::clock_time now_ns, bool initial,
                         bool watchdog);
     /// `placed`: the commit answered a configure that placed the window (maximized before
@@ -2673,6 +2676,23 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
     // initial configure's bounds, a pre-map maximize and the fractional scale it is told
     // all follow from it.
     rec->output = placement_output(*rec);
+    const auto* rule = window_rules_ ? window_rules_->find(rec->app_id ? rec->app_id : "") : nullptr;
+    rec->rule_server_side = rule ? rule->server_side : std::nullopt;
+    rec->rule_workspace_index = rule && rule->workspace_index ? *rule->workspace_index : 0;
+    if (rule) {
+        if (rule->output_name && outputs_)
+            for (unsigned slot = 0; slot < output_manager::k_max; ++slot)
+                if (outputs_->slot_live(slot) && *rule->output_name == outputs_->slot_state(slot).name) {
+                    rec->output = static_cast<int>(slot); break;
+                }
+        if (rule->state_flags) {
+            const auto flags = *rule->state_flags;
+            rec->want_maximized = (flags & 1u) != 0;
+            rec->want_fullscreen = (flags & 2u) != 0;
+            rec->want_fullscreen_output = rec->output;
+            rec->floating = (flags & 4u) != 0;
+        }
+    }
     // 0x0: the client picks its own size. Activated, because it takes focus when it maps
     // (placeholder policy) — saying so now saves a second configure right after.
     rec->desired = {};
@@ -2681,6 +2701,11 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
     if (suspend_reasons_ != 0)
         rec->desired.states |= tl_suspended;
     rec->desired.decoration = toplevel_manager::wanted_decoration(*rec);
+    if (rule && rule->geometry) {
+        rec->desired.size = {rule->geometry->width, rule->geometry->height};
+        rec->desired.place = true;
+        rec->desired.place_at = {rule->geometry->x, rule->geometry->y};
+    }
     if (rec->want_maximized) {
         // set_maximized before the initial commit: the first configure maximizes, and the
         // commit answering it maps the window in place.
@@ -2714,9 +2739,12 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
     if (rec->output >= 0) {
         // Workspaces made at start-up only matter here when they would start tiled.
         const auto slot = static_cast<unsigned>(rec->output);
-        if (!workspaces_.active(slot) && tiling_.layout == workspace_layout::master_stack)
+        if (!workspaces_.active(slot) &&
+            (tiling_.layout == workspace_layout::master_stack || rec->rule_workspace_index))
             sync_workspace_outputs(true);
-        if (const lx::workspace_id ws = workspaces_.active(slot); ws && tiles_on(*rec, ws)) {
+        if (const lx::workspace_id ws = rec->rule_workspace_index
+                ? workspaces_.by_index(slot, rec->rule_workspace_index) : workspaces_.active(slot);
+            ws && tiles_on(*rec, ws)) {
             rec->tile_workspace = ws;
             rec->tile_order = ++tile_seq_;
             tiling_dirty_ = true;
@@ -2948,7 +2976,11 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
         if (parent && parent->mapped && parent->workspace)
             ws = parent->workspace;
         else if (const int slot = window_output(rec); slot >= 0)
-            ws = workspaces_.active(static_cast<unsigned>(slot));
+            ws = rec.rule_workspace_index
+                ? workspaces_.by_index(static_cast<unsigned>(slot), rec.rule_workspace_index)
+                : workspaces_.active(static_cast<unsigned>(slot));
+        if (!ws && rec.output >= 0)
+            ws = workspaces_.active(static_cast<unsigned>(rec.output));
         rec.workspace_dirty = true;
         ws_dirty_ = true;
         if (ws) {

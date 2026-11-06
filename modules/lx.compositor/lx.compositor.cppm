@@ -55,6 +55,7 @@ export import :capture;
 export import :capture_engine;
 export import :ui_composite;
 export import :control;
+export import :window_rules;
 
 export namespace lx::compositor {
 

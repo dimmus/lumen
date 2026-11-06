@@ -17,6 +17,7 @@ import lx.health;
 export module lx.compositor:control;
 
 import std;
+import :window_rules;
 
 export namespace lx::compositor {
 
@@ -104,6 +105,8 @@ enum class control_action_result : unsigned char {
 
 /// The compositor's side. Every function runs on the UI thread from inside `dispatch()`.
 struct control_host {
+    /// Shared UI-affinity store; null means the rule methods are unavailable.
+    window_rule_store* window_rules = nullptr;
     void (*version)(void* user, control_version& out) = nullptr;
     /// A GetHealth arrived. The host answers with `control_server::finish_health(token, …)`
     /// — at once or later (the compositor asks the render thread first). If it has not

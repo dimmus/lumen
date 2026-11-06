@@ -167,4 +167,66 @@ LUMEN_TEST(other_devices_get_nothing) {
     LUMEN_CHECK(kb.calls.empty() && r.applied_count == 0);
 }
 
+LUMEN_TEST(device_edit_preserves_text_and_applies_through_compositor) {
+    namespace cfg = lx::config;
+    const std::string prefix = "# personal config\n[input.mouse]\naccel-speed = 0.2\n";
+    const std::string suffix = "[[input.device]]\nname = 'Other'\naccel-speed = 0.6\n"
+                               "[cursor]\nsize = 24\n";
+    const std::string text = prefix + "[[input.device]] # [not a table]\n"
+        "name = \"USB \\\"Mouse\\\"\"\n"
+        "  \"accel-speed\" = -0.3   # keep comment\n" + suffix;
+    cfg::edit_report r{};
+    const auto edited = cfg::splice_device_key(text, "USB \"Mouse\"", "accel-speed",
+                                               cfg::edit_value::number(0.4), r);
+    LUMEN_CHECK(r.status == cfg::edit_status::ok && r.line > 0);
+    LUMEN_CHECK(edited.starts_with(prefix) && edited.ends_with(suffix));
+    LUMEN_CHECK(edited.find("  \"accel-speed\" = 0.4   # keep comment\n") != std::string::npos);
+    const auto c = parse(edited.c_str());
+    const auto selected = lx::compositor::pointer_config_of(c, "USB \"Mouse\"",
+        lx::input::device_class::mouse);
+    fake_device d{};
+    lx::input::apply_report applied{};
+    lx::input::apply_pointer_config(&d, fake_ops(), lx::input::device_class::mouse,
+                                    selected, applied);
+    LUMEN_CHECK(called(d, "speed=0.4"));
+    LUMEN_CHECK(lx::compositor::diff_config(parse(text.c_str()), c) == lx::compositor::cfg_pointer);
+}
+
+LUMEN_TEST(device_edit_create_reset_and_repeated_entries) {
+    namespace cfg = lx::config;
+    cfg::edit_report r{};
+    const std::string base = "[input.mouse]\naccel-speed = 0.2\n";
+    const auto created = cfg::splice_device_key(base, "Mouse", "accel-speed",
+                                                cfg::edit_value::number(-0.5), r);
+    LUMEN_CHECK(r.status == cfg::edit_status::ok && created.starts_with(base));
+    const auto repeated = created + "[[input.device]]\nname = 'Mouse'\nnatural-scroll = true\n"
+                                   "accel-speed = -0.7\n";
+    const auto edited = cfg::splice_device_key(repeated, "Mouse", "accel-speed",
+                                               cfg::edit_value::number(0.8), r);
+    LUMEN_CHECK(cfg::device_settings(parse(edited.c_str()), 1, "Mouse").accel_speed == 0.8);
+    const auto reset = cfg::remove_device_key(edited, "Mouse", "accel-speed", r);
+    const auto c = parse(reset.c_str());
+    const auto p = cfg::device_settings(c, 1, "Mouse");
+    LUMEN_CHECK(p.accel_speed == 0.2 && p.natural_scroll);
+    LUMEN_CHECK(reset.find("# set by lumen-settings") == std::string::npos);
+    LUMEN_CHECK(cfg::remove_device_override(reset, "Mouse", r) == base + "\n");
+    LUMEN_CHECK(cfg::remove_device_override(base, "Missing", r) == base && r.line == 0);
+}
+
+LUMEN_TEST(device_edit_rejects_invalid_targets_and_syntax) {
+    namespace cfg = lx::config;
+    cfg::edit_report r{};
+    const std::string text = "# untouched\n";
+    LUMEN_CHECK(cfg::splice_device_key(text, "", "tap", cfg::edit_value::boolean(true), r) == text);
+    LUMEN_CHECK(r.status == cfg::edit_status::invalid_device);
+    LUMEN_CHECK(cfg::splice_device_key(text, "Mouse", "name", cfg::edit_value::string("Other"), r) == text);
+    LUMEN_CHECK(r.status == cfg::edit_status::invalid_device);
+    const std::string broken = "[[input.device]]\nname = \"unterminated\n";
+    LUMEN_CHECK(cfg::remove_device_override(broken, "Mouse", r) == broken);
+    LUMEN_CHECK(r.status == cfg::edit_status::invalid_text);
+    const std::string large(cfg::k_max_layer_bytes, '#');
+    LUMEN_CHECK(cfg::splice_device_key(large, "Mouse", "tap", cfg::edit_value::boolean(true), r) == large);
+    LUMEN_CHECK(r.status == cfg::edit_status::too_big);
+}
+
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

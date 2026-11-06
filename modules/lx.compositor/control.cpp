@@ -34,6 +34,7 @@ import lx.foundation;
 import lx.health;
 import lx.trace;
 import :control;
+import :window_rules;
 
 namespace lx::compositor {
 
@@ -152,6 +153,16 @@ type Window (
   width: int,
   height: int
 )
+
+type Geometry (x: int, y: int, width: int, height: int)
+
+# Exact app-ID match. Set replaces the whole rule; absent fields use normal policy.
+type WindowRule (app_id: string, workspace_index: ?int, output_name: ?string, geometry: ?Geometry, state_flags: ?int, server_side: ?bool)
+
+method GetWindowRules() -> (rules: []WindowRule)
+method SetWindowRule(rule: WindowRule) -> ()
+method ClearWindowRule(app_id: string) -> ()
+error WindowRuleFailed (message: string)
 
 type Diagnostic (severity: string, file: string, line: int, key: string, message: string)
 
@@ -544,6 +555,85 @@ struct control_server::impl {
         return sd_varlink_reply(link, r.v);
     }
 
+    static int rule_error(sd_varlink* link, const lx::error& error) {
+        json e;
+        e.str("message", error.message);
+        return sd_varlink_error(link, "io.lumen.Compositor.WindowRuleFailed", e.v);
+    }
+
+    static int get_window_rules(sd_varlink* link, sd_json_variant*, sd_varlink_method_flags_t, void*) {
+        auto* s = self(link);
+        if (!s || !s->host_.window_rules)
+            return sd_varlink_error(link, "org.varlink.service.MethodNotImplemented", nullptr);
+        json arr;
+        for (const auto& r : s->host_.window_rules->rules()) {
+            json j;
+            j.str("app_id", r.app_id.c_str());
+            if (r.workspace_index) j.num("workspace_index", *r.workspace_index);
+            if (r.output_name) j.str("output_name", r.output_name->c_str());
+            if (r.geometry) {
+                json g;
+                g.num("x", r.geometry->x); g.num("y", r.geometry->y);
+                g.num("width", r.geometry->width); g.num("height", r.geometry->height);
+                j.set("geometry", g);
+            }
+            if (r.state_flags) j.num("state_flags", *r.state_flags);
+            if (r.server_side) j.flag("server_side", *r.server_side);
+            arr.append(j);
+        }
+        json out; out.set_array("rules", arr);
+        return sd_varlink_reply(link, out.v);
+    }
+
+    static int set_window_rule(sd_varlink* link, sd_json_variant* params,
+                               sd_varlink_method_flags_t, void*) {
+        auto* s = self(link);
+        if (!s || !s->host_.window_rules)
+            return sd_varlink_error(link, "org.varlink.service.MethodNotImplemented", nullptr);
+        auto* obj = sd_json_variant_by_key(params, "rule");
+        const char* id = param_string(obj, "app_id");
+        if (!id) return sd_varlink_error_invalid_parameter_name(link, "rule");
+        window_rule r; r.app_id = id;
+        for (const char* key : {"workspace_index", "state_flags"}) {
+            auto* v = sd_json_variant_by_key(obj, key);
+            if (!v || sd_json_variant_is_null(v)) continue;
+            const auto n = sd_json_variant_integer(v);
+            if (n < 0 || n > std::numeric_limits<unsigned>::max())
+                return sd_varlink_error_invalid_parameter_name(link, key);
+            if (std::string_view{key} == "workspace_index") r.workspace_index = static_cast<unsigned>(n);
+            else r.state_flags = static_cast<unsigned>(n);
+        }
+        if (const char* name = param_string(obj, "output_name")) r.output_name = name;
+        if (auto* v = sd_json_variant_by_key(obj, "server_side"); v && !sd_json_variant_is_null(v))
+            r.server_side = sd_json_variant_boolean(v);
+        if (auto* g = sd_json_variant_by_key(obj, "geometry"); g && !sd_json_variant_is_null(g)) {
+            int values[4]; unsigned i = 0;
+            for (const char* key : {"x", "y", "width", "height"}) {
+                auto* v = sd_json_variant_by_key(g, key);
+                if (!v || !sd_json_variant_is_integer(v))
+                    return sd_varlink_error_invalid_parameter_name(link, "geometry");
+                const auto n = sd_json_variant_integer(v);
+                if (n < std::numeric_limits<int>::min() || n > std::numeric_limits<int>::max())
+                    return sd_varlink_error_invalid_parameter_name(link, "geometry");
+                values[i++] = static_cast<int>(n);
+            }
+            r.geometry = lx::rect2i{values[0], values[1], values[2], values[3]};
+        }
+        if (auto v = s->host_.window_rules->set(std::move(r)); !v) return rule_error(link, v.get_error());
+        return sd_varlink_reply(link, nullptr);
+    }
+
+    static int clear_window_rule(sd_varlink* link, sd_json_variant* params,
+                                 sd_varlink_method_flags_t, void*) {
+        auto* s = self(link);
+        if (!s || !s->host_.window_rules)
+            return sd_varlink_error(link, "org.varlink.service.MethodNotImplemented", nullptr);
+        const char* id = param_string(params, "app_id");
+        if (!id) return sd_varlink_error_invalid_parameter_name(link, "app_id");
+        if (auto v = s->host_.window_rules->clear(id); !v) return rule_error(link, v.get_error());
+        return sd_varlink_reply(link, nullptr);
+    }
+
     static int reload(sd_varlink* link, sd_json_variant*, sd_varlink_method_flags_t, void*) {
         control_server* s = self(link);
         if (!s || !s->host_.reload)
@@ -731,6 +821,9 @@ lx::result<void> control_server::open(control_host host) {
             "io.lumen.Compositor.ListInputDevices", &impl::list_input_devices,
             "io.lumen.Compositor.ListWorkspaces", &impl::list_workspaces,
             "io.lumen.Compositor.ListWindows", &impl::list_windows,
+            "io.lumen.Compositor.GetWindowRules", &impl::get_window_rules,
+            "io.lumen.Compositor.SetWindowRule", &impl::set_window_rule,
+            "io.lumen.Compositor.ClearWindowRule", &impl::clear_window_rule,
             "io.lumen.Compositor.Reload", &impl::reload,
             "io.lumen.Compositor.RunAction", &impl::run_action,
             "io.lumen.Compositor.Logout", &impl::logout,

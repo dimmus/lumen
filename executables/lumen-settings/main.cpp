@@ -7,12 +7,19 @@
 //   lumen-settings [--backend cpu|gl|vulkan] [--allow-software-gpu] [--socket NAME]
 //                  [--theme one-dark|one-light|PATH] [--exit-after-first-present]
 
+#ifdef LUMEN_SETTINGS_HAS_XKBCOMMON
+#include <xkbcommon/xkbcommon.h>
+#endif
+
 import std;
 import lx.foundation;
 import lx.app;
 import lx.gfx;
+import lx.config;
 import lx.runtime;
 import lx.trace;
+import lx.wayland.client;
+import lx.ui.host;
 import lumen.settings_ui;
 
 #include <cstdlib>
@@ -67,6 +74,73 @@ void usage() {
 
 void on_close(void* user, lx::app::window&) { static_cast<lx::application*>(user)->quit(0); }
 
+// The app owns its seat handler. Forward ordinary input to the existing context;
+// only recording in the settings surface consumes wl_keyboard events (ADR-013).
+class shortcut_input final : public lx::wayland::seat_handler {
+public:
+    shortcut_input(lx::application& app, lx::app::window& window, settings::session& session)
+        : app_(app), window_(window), session_(session) {
+        if (auto* seat = app_.display().default_seat())
+            seat->set_handler(this);
+    }
+    ~shortcut_input() override {
+        if (auto* seat = app_.display().default_seat())
+            seat->set_handler(&app_.context());
+    }
+    void on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) override {
+        app_.context().on_pointer(s, f);
+    }
+    void on_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target,
+                           std::uint32_t serial, bool entered) override {
+        if (!entered && target == &window_.surface())
+            session_.stop_binding_capture();
+        app_.context().on_keyboard_focus(s, target, serial, entered);
+    }
+    void on_keymap(lx::wayland::seat&) override { session_.stop_binding_capture(); }
+    void on_key(lx::wayland::seat& s, const lx::wayland::key_event& e) override {
+        if (s.keyboard_focus() == &window_.surface() && session_.capturing_binding()) {
+            unsigned sym = 0;
+#ifdef LUMEN_SETTINGS_HAS_XKBCOMMON
+            // Match the compositor: active layout, level zero, with modifiers separate.
+            auto* keymap = static_cast<xkb_keymap*>(s.native_keymap());
+            auto* state = static_cast<xkb_state*>(s.native_state());
+            const xkb_keysym_t* syms = nullptr;
+            if (keymap && state &&
+                xkb_keymap_key_get_syms_by_level(keymap, e.key + 8,
+                    xkb_state_key_get_layout(state, e.key + 8), 0, &syms) == 1)
+                sym = xkb_keysym_to_lower(syms[0]);
+#endif
+            unsigned mods = 0;
+            if (e.modifiers & lx::wayland::mod_shift)
+                mods |= lx::config::mod_shift;
+            if (e.modifiers & lx::wayland::mod_ctrl)
+                mods |= lx::config::mod_ctrl;
+            if (e.modifiers & lx::wayland::mod_alt)
+                mods |= lx::config::mod_alt;
+            if (e.modifiers & lx::wayland::mod_super)
+                mods |= lx::config::mod_super;
+            if (session_.capture_binding_key(sym, mods,
+                    e.state != lx::wayland::key_state::released,
+                    e.state == lx::wayland::key_state::repeated))
+                return;
+        }
+        app_.context().on_key(s, e);
+    }
+    void on_modifiers(lx::wayland::seat& s, std::uint32_t mods) override {
+        app_.context().on_modifiers(s, mods);
+    }
+    void on_repeat_info(lx::wayland::seat& s, std::int32_t rate, std::int32_t delay) override {
+        app_.context().on_repeat_info(s, rate, delay);
+    }
+    void on_touch(lx::wayland::seat& s, const lx::wayland::touch_event& e) override {
+        app_.context().on_touch(s, e);
+    }
+private:
+    lx::application& app_;
+    lx::app::window& window_;
+    settings::session& session_;
+};
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -102,6 +176,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     the_session.root = &w.root();
+    shortcut_input shortcuts{app, w, the_session};
     // The heads changed (a stage_* or a done event): one re-describe. `the_session` has
     // static storage, so a captureless lambda reaches it.
     settings::start_outputs(app.display().native(), [] { the_session.refresh(); });
