@@ -452,6 +452,34 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   rasterized with `lx::text` (`shape_line` / `fit_line` / `render_line`, Sans 10, ellipsized
   at a cluster boundary). XRGB8888 in two buffers of one sealed memfd pool, re-created only
   when the width changes.
+- **Clock and calendar** (`lx.shell:clock`, `:calendar_popup`). The panel clock formats
+  local civil time in the process time zone and `LC_TIME` locale. Its fixed-size text,
+  measured width and revision feed the panel layout/damage calculation; a format or width
+  change must repaint both the old and new clock extents. The calendar is a native
+  `lx.ui.host` xdg_popup anchored to the clicked clock, using that input serial for its
+  popup grab. It has 42 consecutive Gregorian day cells, separate today/selected markers,
+  previous/next month and year, Today, and a settings callback. Selection/navigation is
+  bounded to years 1–9999; month/year steps clamp the day to the target month end. ISO week
+  labels retain ISO Monday/Thursday rules regardless of the visual first weekday.
+
+  `[clock]` keys in `config_snapshot.clock` are shell-owned and live-reloadable:
+  `format = "24h"` (`"12h"` also supported), `show-seconds = false`, `show-date = true`,
+  `show-weekday = true`, `first-day = "monday"` (`"sunday"` also supported), and
+  `week-numbers = false`. Date and weekday flags are independent: a weekday can remain
+  visible when the date is hidden. These are display/calendar preferences, not a request
+  to set the system clock or change the system time zone. They travel through the existing
+  v7 configuration snapshot; no new private protocol event is needed. The pure
+  `clock_next_boundary(realtime_ns, seconds)` helper returns the strictly next wall second
+  or minute, including when the supplied instant lies exactly on a boundary.
+
+  A dedicated `CLOCK_REALTIME` timerfd uses absolute deadlines at the next minute
+  boundary (next second with `show-seconds`), with `TFD_TIMER_CANCEL_ON_SET`. Expiry or
+  cancellation resamples local time, updates the open calendar, and rearms from the new
+  wall time. Live preference changes refresh text, reconfigure an open calendar and rearm
+  the cadence. The timer is disarmed while locked or with no powered panel; unlock and
+  output power restoration refresh the clock and resume its timer. The calendar closes on lock and is owned by its panel output.
+  Localized formatting is checked: if a component exceeds its fixed buffer, the clock
+  uses a deterministic ASCII date/time fallback instead of a partial localized string.
 - **Drawing is event-driven and incremental.** Model changes, pointer motion and configures
   only mark the panel dirty; after each dispatch it draws at most once per frame callback
   (a configure is always answered by a commit). The layout is computed and compared twice:
@@ -529,5 +557,47 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
 
 ## Window rules
 
-Rules load from `$XDG_CONFIG_HOME/lumen/window-rules.toml` via `reload_rules`.
-Typed setters replace stringly-typed key/value pairs.
+Rules load at compositor startup from `$XDG_CONFIG_HOME/lumen/window-rules.toml`
+(`$HOME/.config/lumen/window-rules.toml` when XDG_CONFIG_HOME is unset or relative).
+The privileged `reload_rules` request re-reads the file. The compositor owns one
+UI-affinity store shared by the typed Wayland setters and Varlink
+`GetWindowRules() -> (rules: []WindowRule)`,
+`SetWindowRule(rule: WindowRule) -> ()` and
+`ClearWindowRule(app_id: string) -> ()`. Varlink is available to the session UID;
+settings does not need access to the privileged shell global.
+
+The file uses one `[[rule]]` per exact, case-sensitive app ID (no glob or title match):
+
+```toml
+[[rule]]
+app_id = "org.example.Editor"
+workspace_index = 2
+output_name = "DP-1"
+geometry = [100, 80, 800, 600]
+state_flags = 4
+server_side = true
+```
+
+All fields except `app_id` are optional. Geometry is global logical window geometry;
+width and height must be positive. Workspace indices are 1-based (1..64), using the
+workspace model's existing index lookup: dynamic indices beyond the end select its
+last empty workspace; an unavailable static index falls back to the active workspace.
+An unavailable output falls back to ordinary placement. Child windows retain their
+parent's workspace. State bits retain the wire values: 1 maximized, 2 fullscreen,
+4 floating, 8 eligible for tiling in a workspace whose layout is master-stack;
+maximized/fullscreen and floating/tiled pairs are mutually exclusive. Zero clears
+these initial state preferences. Server decoration is negotiated only when the client
+has an xdg-decoration object.
+
+A Varlink set replaces the whole app rule; a Wayland typed setter merges its one field.
+Edits are written to a private temporary file and atomically renamed before the active
+store changes. Failed writes and malformed reloads preserve the active rules. Clearing
+an unknown app is idempotent. Validation rejects duplicate IDs/keys, unknown fields,
+control characters, IDs over 127 bytes, output names over 31 bytes, more than 256 rules,
+and files over 1 MiB. Varlink reports `WindowRuleFailed(message)` for store errors;
+an unavailable store reports `org.varlink.service.MethodNotImplemented`.
+
+Rules apply at the next initial configure/map (including remaps), preserving the
+configure/ack/commit pipeline. Edits and reloads do not reposition existing mapped
+windows. Maximized/fullscreen placement and workspace tiling take precedence over
+explicit geometry. No wire signatures change.

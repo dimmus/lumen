@@ -272,9 +272,9 @@ lx::shell::shell_app::output_record* lx::shell::shell_app::notify_output() {
 void lx::shell::shell_app::attach_widgets(output_record& o) {
     if (!o.bar)
         return;
-    // The clock ticks only while a panel can show it: armed once, re-armed at each minute.
-    if (deadline_[t_clock] == 0)
-        set_timer(t_clock, ((now_ns() / 60'000'000'000ll) + 1) * 60'000'000'000ll);
+    if (!clock_sample_)
+        refresh_clock(false);
+    arm_clock_timer();
     o.bar->set_widgets(
         {.fill_tray =
              [](panel_tray_input& in, void* user) {
@@ -307,6 +307,10 @@ void lx::shell::shell_app::attach_widgets(output_record& o) {
 }
 
 void lx::shell::shell_app::desktop_after_dispatch() {
+    if (calendar_.is_open())
+        calendar_.after_dispatch();
+    if (calendar_keyboard_ && !calendar_.is_open())
+        close_calendar();
     if (!desktop_started_)
         return;
     const long long now = now_ns();
@@ -596,6 +600,8 @@ void lx::shell::shell_app::toggle_dnd(const char* why) {
 }
 
 void lx::shell::shell_app::open_history(output_record& o, const panel_widget_event& e) {
+    close_calendar();
+    pending_menu_key_ = 0;
     if (!o.bar || !o.bar->popup_parent().valid())
         return;
     std::vector<menu_entry> items;
@@ -788,8 +794,14 @@ void lx::shell::shell_app::open_tray_menu(unsigned key, std::vector<menu_entry> 
     }
     if (pending_menu_key_ != key)
         return; // asked for something else since
+    const unsigned pending_output = pending_menu_output_;
+    const unsigned pending_serial = pending_menu_serial_;
+    const lx::rect2i pending_cell = pending_menu_cell_;
     pending_menu_key_ = 0;
-    output_record* o = output_by_name(pending_menu_output_);
+    if (calendar_.is_open() || launcher_.is_open() || menu_kind_ == menu_kind::history ||
+        menu_kind_ == menu_kind::launcher)
+        return;
+    output_record* o = output_by_name(pending_output);
     if (!o || !o->bar || !o->bar->popup_parent().valid() || items.empty() || !tray_.find(key))
         return;
     o->bar->set_menu_keyboard(true);
@@ -797,7 +809,7 @@ void lx::shell::shell_app::open_tray_menu(unsigned key, std::vector<menu_entry> 
     menu_key_ = key;
     menu_output_ = o->name;
     if (!menu_.open(
-            o->bar->popup_parent(), pending_menu_cell_, std::move(items), pending_menu_serial_,
+            o->bar->popup_parent(), pending_cell, std::move(items), pending_serial,
             [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
             [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); },
             [](int id, void* user) {
@@ -817,6 +829,12 @@ void lx::shell::shell_app::open_tray_menu(unsigned key, std::vector<menu_entry> 
 void lx::shell::shell_app::on_widget(const panel_widget_event& e, output_record& o) {
     constexpr unsigned k_left = 0x110, k_right = 0x111, k_middle = 0x112;
     switch (e.what) {
+    case panel_widget_event::kind::clock_click:
+        // The calendar opens on a left click and takes no other button: no menu, no
+        // activation token, so it returns here rather than falling through to the tray.
+        if (e.button == k_left)
+            open_calendar(e, o);
+        return;
     case panel_widget_event::kind::bell_click:
         if (e.button == k_middle)
             toggle_dnd("a middle click on the indicator"); // KDE's gesture
@@ -850,6 +868,7 @@ void lx::shell::shell_app::on_widget(const panel_widget_event& e, output_record&
     const bool menu = (e.button == k_right || (e.button == k_left && it->item_is_menu)) &&
                       it->has_menu();
     if (menu) {
+        close_calendar();
         pending_menu_key_ = e.key;
         pending_menu_output_ = o.name;
         pending_menu_cell_ = e.cell;

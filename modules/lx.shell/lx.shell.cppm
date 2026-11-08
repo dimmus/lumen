@@ -84,6 +84,8 @@ export import :user_bus;
 export import :notifications;
 export import :notify_view;
 export import :menu_popup;
+export import :clock;
+export import :calendar_popup;
 export import :view_ui;
 export import :tray;
 
@@ -216,11 +218,9 @@ private:
         t_tooltip,
         /// The launcher's first frame is painted ahead, once start-up has settled.
         t_prepare,
-        /// The clock's minute boundary (the panels' "HH:MM" refresh).
-        t_clock,
         t_count
     };
-    enum class pointer_target : unsigned char { none, panel, launcher, switcher, notify, menu };
+    enum class pointer_target : unsigned char { none, panel, launcher, switcher, notify, menu, calendar };
     /// One bound wl_output: its xdg-output rect, its panel and its power control. Created on
     /// `global`, destroyed on `global_remove` (panel first) — never per frame.
     struct output_record {
@@ -400,6 +400,12 @@ private:
     void stop_desktop_services();
     /// Every loop iteration after dispatch: expiry, the popups, menus, the panels' widgets.
     void desktop_after_dispatch();
+    void refresh_clock(bool damage_panels = true);
+    void arm_clock_timer();
+    void close_calendar();
+    void on_calendar_settings(unsigned serial);
+    void open_calendar(const panel_widget_event& e, output_record& o);
+    [[nodiscard]] bool clock_visible() const;
     /// [notifications] from the configuration.
     void apply_notify_config(const lx::config::config_snapshot& c);
     /// A click on the popups (`serial`: its press).
@@ -448,10 +454,11 @@ private:
     policy_bridge bridge_{};
     /// The workspace indicator's model (ext-workspace-v1, design-session-and-wm W.7).
     workspace_client workspaces_{};
-    /// The clock, formatted once per minute (the panels redraw at `t_clock`): the minute
-    /// it holds, its "HH:MM", the text's width in the panel's font, and its revision.
-    long long clock_minute_ = -1;
-    char clock_text_[6] = "";
+    /// One cached formatted clock per current config; revisions trigger panel damage only
+    /// on a wall-clock boundary, timezone/config change, or explicit popup refresh.
+    lx::config::clock_settings clock_settings_{};
+    std::time_t clock_sample_ = 0;
+    char clock_text_[96] = "";
     int clock_width_ = 0;
     unsigned clock_rev_ = 0;
     [[nodiscard]] panel_clock clock_state();
@@ -538,7 +545,12 @@ private:
     unsigned seat_name_ = 0;
     unsigned seat_version_ = 0;
     int timer_fd_ = -1;
+    int clock_timer_fd_ = -1;
+    bool clock_timer_failed_ = false;
     long long deadline_[t_count]{};
+    calendar_popup calendar_{};
+    unsigned calendar_output_ = 0;
+    bool calendar_keyboard_ = false;
     pointer_target pointer_target_ = pointer_target::none;
     bool axis_discrete_seen_ = false;
     double axis_accum_ = 0.0;
@@ -957,7 +969,9 @@ const wl_seat_listener k_seat_listener = {
     .capabilities = lx::shell::shell_app::events::seat_caps,
     .name = lx::shell::shell_app::events::seat_name,
 };
-// Bound at wl_seat v5 at most: every wl_pointer and wl_keyboard event up to v5 has a handler.
+// Bound at wl_seat v5 at most, but every slot is filled: a NULL one aborts libwayland the
+// day a compositor sends that event anyway (and the designated initialiser is what caught
+// the missing axis_value120).
 const wl_pointer_listener k_pointer_listener = {
     .enter = lx::shell::shell_app::events::ptr_enter,
     .leave = lx::shell::shell_app::events::ptr_leave,
@@ -1248,7 +1262,11 @@ void lx::shell::shell_app::events::resumed(void* data, ext_idle_notification_v1*
 
 void lx::shell::shell_app::events::power_mode(void* data, zwlr_output_power_v1*, uint32_t mode) {
     auto& o = out(data);
+    const bool was_off = o.off;
     o.off = mode == ZWLR_OUTPUT_POWER_V1_MODE_OFF;
+    if (was_off && !o.off)
+        o.app->refresh_clock();
+    o.app->arm_clock_timer();
     if (log_idle.enabled(lx::trace::level::debug)) {
         log_idle.debug("output power {} ({})", o.off ? "off" : "on", o.connector);
     }
@@ -1491,29 +1509,122 @@ void lx::shell::shell_app::output_ready(output_record& o) {
         attach_widgets(o);
     outputs_moved();
 }
-
 lx::shell::panel_clock lx::shell::shell_app::clock_state() {
-    // The *wall-clock* minute, not a monotonic one: `now_ns()` counts from an arbitrary boot
-    // instant, so "minute" derived from it changes at whatever second offset that instant
-    // landed on — the panel's HH:MM then flips a few seconds before or after the real
-    // minute. The timer below aims the next wake at the wall clock's boundary; this reads
-    // the minute from the same clock so the two agree.
-    const long long minute = static_cast<long long>(std::time(nullptr)) / 60;
-    if (minute != clock_minute_) {
-        clock_minute_ = minute;
-        const std::time_t t = std::time(nullptr);
-        std::tm tm{};
-        localtime_r(&t, &tm);
-        std::snprintf(clock_text_, sizeof(clock_text_), "%02u:%02u",
-                      static_cast<unsigned>(tm.tm_hour), static_cast<unsigned>(tm.tm_min));
-        clock_width_ = panel_text_width(clock_text_, 1.f);
-        ++clock_rev_;
-    }
     panel_clock c{};
     std::snprintf(c.text, sizeof(c.text), "%s", clock_text_);
     c.width = clock_width_;
     c.rev = clock_rev_;
     return c;
+}
+
+void lx::shell::shell_app::refresh_clock(bool damage_panels) {
+    timespec ts{};
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        const int saved = errno;
+        log_shell.error("cannot read realtime clock: errno={}", saved);
+        return;
+    }
+    tzset();
+    clock_sample_ = ts.tv_sec;
+    const auto formatted = format_clock(clock_sample_, clock_settings_);
+    const bool changed = std::strcmp(clock_text_, formatted.panel) != 0;
+    std::snprintf(clock_text_, sizeof(clock_text_), "%s", formatted.panel);
+    clock_width_ = panel_text_width(clock_text_, 1.f);
+    ++clock_rev_;
+    if (calendar_.is_open())
+        calendar_.update_time(clock_sample_);
+    if (damage_panels && (changed || clock_rev_ == 1))
+        for (auto& o : outputs_)
+            if (o->bar)
+                o->bar->clock_changed();
+}
+
+bool lx::shell::shell_app::clock_visible() const {
+    if (!panels_enabled_ || idle_.lock_state() != shell_lock::unlocked)
+        return false;
+    for (const auto& o : outputs_)
+        if (o->bar && !o->off)
+            return true;
+    return false;
+}
+
+void lx::shell::shell_app::arm_clock_timer() {
+    if (clock_timer_fd_ < 0 || clock_timer_failed_)
+        return;
+    itimerspec its{};
+    if (clock_visible()) {
+        timespec now{};
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+            const int saved = errno;
+            log_shell.error("cannot sample realtime clock for timer: errno={}", saved);
+            clock_timer_failed_ = true;
+            return;
+        }
+        const long long ns = static_cast<long long>(now.tv_sec) * 1'000'000'000LL + now.tv_nsec;
+        const long long next = clock_next_boundary(ns, clock_settings_.show_seconds);
+        its.it_value.tv_sec = next / 1'000'000'000LL;
+        its.it_value.tv_nsec = next % 1'000'000'000LL;
+    }
+    if (timerfd_settime(clock_timer_fd_, TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &its, nullptr) != 0) {
+        const int saved = errno;
+        log_shell.error("cannot arm realtime clock timer: errno={}", saved);
+        clock_timer_failed_ = true;
+    }
+}
+
+void lx::shell::shell_app::close_calendar() {
+    calendar_.close();
+    calendar_keyboard_ = false;
+    if (output_record* o = output_by_name(calendar_output_); o && o->bar)
+        o->bar->set_menu_keyboard(false);
+    calendar_output_ = 0;
+}
+
+void lx::shell::shell_app::open_calendar(const panel_widget_event& e, output_record& o) {
+    if (!o.bar || !o.bar->popup_parent().valid() || !e.serial || e.button != 0x110)
+        return;
+    pending_menu_key_ = 0;
+    if (menu_.is_open())
+        menu_.close();
+    if (launcher_.is_open())
+        close_launcher();
+    tooltip_.close();
+    set_timer(t_tooltip, 0);
+    if (calendar_.is_open() && calendar_output_ == o.name) {
+        close_calendar();
+        return;
+    }
+    close_calendar();
+    refresh_clock(false);
+    calendar_output_ = o.name;
+    o.bar->set_menu_keyboard(true);
+    calendar_keyboard_ = true;
+    const bool opened = calendar_.open(o.bar->popup_parent(), e.cell, e.serial, clock_settings_,
+                                       clock_sample_,
+                                       [](unsigned serial, void* user) {
+                                           static_cast<shell_app*>(user)->on_calendar_settings(serial);
+                                       },
+                                       this);
+    if (!opened)
+        close_calendar();
+}
+
+void lx::shell::shell_app::on_calendar_settings(unsigned serial) {
+    ensure_catalog();
+    const desktop_entry* entry = catalog_.find("lumen-settings.desktop");
+    if (!entry || !entry->listed()) {
+        show_notice("Lumen Settings is not installed");
+        return;
+    }
+    const char* home = std::getenv("HOME");
+    auto prepared = std::make_unique<prepared_launch>();
+    const launch_failure failure = prepare_entry_launch(*entry, catalog_, home ? home : "/", *prepared);
+    if (failure != launch_failure::none) {
+        report_failure(entry->id.data(), entry->name.data(), failure, nullptr, 0, nullptr);
+        return;
+    }
+    begin_launch(std::move(prepared), serial, calendar_.host_surface()->wl().native());
+    close_calendar();
 }
 
 void lx::shell::shell_app::fill_workspace_cells(const output_record& o, panel_ws_input& in) const {
@@ -1565,6 +1676,8 @@ void lx::shell::shell_app::outputs_moved() {
 }
 
 void lx::shell::shell_app::destroy_output(output_record& o) {
+    if (calendar_output_ == o.name)
+        close_calendar();
     if (o.bar.get() == pointer_panel_) {
         pointer_panel_ = nullptr;
         if (pointer_target_ == pointer_target::panel)
@@ -1592,6 +1705,8 @@ void lx::shell::shell_app::destroy_output(output_record& o) {
 }
 
 void lx::shell::shell_app::remove_output(unsigned name) {
+    if (calendar_output_ == name)
+        close_calendar();
     for (auto it = outputs_.begin(); it != outputs_.end(); ++it) {
         if ((*it)->name != name)
             continue;
@@ -1726,20 +1841,6 @@ void lx::shell::shell_app::on_timer() {
         deadline_[t_tooltip] = 0;
         show_tooltip();
     }
-    if (deadline_[t_clock] && deadline_[t_clock] <= now) {
-        deadline_[t_clock] = 0;
-        (void)clock_state(); // the new minute's text, width and revision
-        for (auto& o : outputs_)
-            if (o->bar)
-                o->bar->clock_changed();
-        // The next wall-clock minute boundary, as a monotonic deadline: the timer counts
-        // from `now`, so the wall clock's offset is read from `CLOCK_REALTIME` and added.
-        timespec wall{};
-        clock_gettime(CLOCK_REALTIME, &wall);
-        const long long since_minute =
-            static_cast<long long>(wall.tv_sec % 60) * 1000000000LL + wall.tv_nsec;
-        set_timer(t_clock, now + (60'000'000'000LL - since_minute));
-    }
     if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
         deadline_[t_lock_blank] = 0;
         // The lock did not come in time: dark anyway (the compositor keeps it locked if it
@@ -1864,6 +1965,8 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
     const shell_lock s = state <= 3 ? static_cast<shell_lock>(state) : shell_lock::locked;
     const bool blank = idle_.on_lock_state(s);
     if (s != shell_lock::unlocked) {
+        close_calendar();
+        arm_clock_timer();
         // Nothing of the shell is shown or reachable while locked (the compositor's doing);
         // what it had open is dropped, so the unlocked desktop comes back as it should.
         if (launcher_.is_open())
@@ -1890,8 +1993,11 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
     } else {
         set_timer(t_relaunch, 0);
     }
-    if (s == shell_lock::unlocked)
+    if (s == shell_lock::unlocked) {
         set_timer(t_lock_blank, 0);
+        refresh_clock();
+    }
+    arm_clock_timer();
     // Notifications arriving while locked wait (their timers too) and show after the unlock
     // (design-session-and-wm N.4); nothing of the shell is shown over the lock anyway.
     notes_.set_locked(s != shell_lock::unlocked, now_ns());
@@ -1956,6 +2062,8 @@ void lx::shell::shell_app::ensure_catalog() {
 }
 
 void lx::shell::shell_app::open_launcher() {
+    close_calendar();
+    pending_menu_key_ = 0;
     ensure_catalog();
     // On the active window's output, else the one whose panel was pointed at last (M13),
     // sized to its logical rect (xdg-output).
@@ -2238,6 +2346,15 @@ int lx::shell::shell_app::run() {
     if (sfd < 0)
         return fail("signalfd failed");
     timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    clock_timer_fd_ = timerfd_create(CLOCK_REALTIME, TFD_CLOEXEC | TFD_NONBLOCK);
+    if (clock_timer_fd_ < 0) {
+        const int saved = errno;
+        log_shell.error("cannot create realtime clock timerfd: errno={}", saved);
+        close(sfd);
+        teardown();
+        return 1;
+    }
+    calendar_.init(ui_host_);
     bg_notify_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     // zlm_shell_v1 v5: lock_state is sent right after the bind, before attach returns.
     bridge_.set_lock_handlers(
@@ -2469,8 +2586,8 @@ int lx::shell::shell_app::run() {
     }
 
     int code = 0;
-    // fds[0..5] and the views' connection (the panels' input and frames travel on it).
-    constexpr unsigned k_fixed = 7;
+    // Display, signals, catalog, shared timer, background, bus, views, realtime clock.
+    constexpr unsigned k_fixed = 8;
     pollfd fds[k_fixed + app_launcher::k_max_poll];
     for (;;) {
         // The canonical libwayland client loop: dispatch what is queued, flush, then
@@ -2519,6 +2636,10 @@ int lx::shell::shell_app::run() {
         for (auto& o : outputs_) {
             if (!o->bar || !o->bar->closed())
                 continue;
+            if (calendar_output_ == o->name)
+                close_calendar();
+            if (pending_menu_output_ == o->name)
+                pending_menu_key_ = 0;
             // The compositor closed it (its output went), or a buffer could not be made:
             // that output goes without a panel; the others stay.
             log_shell.warn("panel on output {} closed", o->connector);
@@ -2558,6 +2679,7 @@ int lx::shell::shell_app::run() {
         // The views' connection: a pointer frame over a panel must wake the loop, not wait
         // for the next event on the raw one.
         fds[6] = {client_.connected() ? client_.fd() : -1, POLLIN, 0};
+        fds[7] = {clock_timer_fd_, POLLIN, 0};
         if (client_.connected()) {
             // Flush what the views drew this iteration before sleeping: a surface's first
             // commit would otherwise sit in the queue until unrelated input wakes the loop
@@ -2604,6 +2726,17 @@ int lx::shell::shell_app::run() {
                 break;
             }
         }
+        const short clock_revents = fds[7].revents;
+        if (clock_revents & (POLLIN | POLLERR | POLLHUP)) {
+            std::uint64_t ticks = 0;
+            if (read(clock_timer_fd_, &ticks, sizeof(ticks)) < 0 && errno != EAGAIN && errno != ECANCELED) {
+                const int saved = errno;
+                log_shell.error("realtime clock timer read failed: errno={}", saved);
+                clock_timer_failed_ = true;
+            }
+            refresh_clock();
+            arm_clock_timer();
+        }
         if (n > 0 && (fds[1].revents & POLLIN)) {
             signalfd_siginfo si{};
             if (read(sfd, &si, sizeof(si)) == static_cast<ssize_t>(sizeof(si))) {
@@ -2640,6 +2773,7 @@ int lx::shell::shell_app::run() {
 }
 
 void lx::shell::shell_app::teardown() {
+    close_calendar();
     auto* d = static_cast<wl_display*>(display_);
     if (!d)
         return;
@@ -2725,6 +2859,9 @@ void lx::shell::shell_app::teardown() {
     if (timer_fd_ >= 0)
         close(timer_fd_);
     timer_fd_ = -1;
+    if (clock_timer_fd_ >= 0)
+        close(clock_timer_fd_);
+    clock_timer_fd_ = -1;
 }
 
 // ── Configuration (zlm_shell_v1 v7) ──
@@ -2781,6 +2918,19 @@ void lx::shell::shell_app::on_config(std::string_view bytes, unsigned generation
 }
 
 void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
+    const bool clock_changed = clock_settings_.format != c.clock.format ||
+                               clock_settings_.show_seconds != c.clock.show_seconds ||
+                               clock_settings_.show_date != c.clock.show_date ||
+                               clock_settings_.show_weekday != c.clock.show_weekday ||
+                               clock_settings_.first_day != c.clock.first_day ||
+                               clock_settings_.week_numbers != c.clock.week_numbers;
+    if (clock_changed) {
+        clock_settings_ = c.clock;
+        refresh_clock();
+        if (calendar_.is_open())
+            calendar_.configure(clock_settings_, clock_sample_);
+        arm_clock_timer();
+    }
     const unsigned cli = config_.cli_set;
     // ── idle and lock ──
     idle_policy_config want = config_.idle;
@@ -3107,6 +3257,8 @@ void lx::shell::shell_app::on_hold_key(unsigned keysym, unsigned mods, const cha
 void lx::shell::shell_app::open_switcher() {
     if (!switcher_.active() || switcher_.opened())
         return;
+    close_calendar();
+    pending_menu_key_ = 0;
     switcher_.mark_opened();
     // On the active window's output (else the one pointed at last, else the first).
     output_record* o = launcher_output();

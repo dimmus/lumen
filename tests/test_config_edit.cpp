@@ -194,6 +194,38 @@ LUMEN_TEST(config_edit_over_the_documented_defaults_changes_only_its_keys) {
     LUMEN_CHECK(after.default_bindings == base.default_bindings);
 }
 
+LUMEN_TEST(config_edit_clock_preferences_round_trip_and_preserve_other_keys) {
+    std::string text = "# user clock settings\n[clock]\nformat = \"24h\"\n"
+                       "show-seconds = false\nshow-date = true\nshow-weekday = true\n"
+                       "first-day = \"monday\"\nweek-numbers = false\n[focus]\nmode = \"click\"\n";
+    cfg::edit_report r{};
+    cfg::config_snapshot before{};
+    cfg::diagnostics d{};
+    LUMEN_CHECK(parse_one(text, before, d));
+
+    std::string edited = cfg::splice_key(text, "clock", "format", cfg::edit_value::word("12h"), r);
+    LUMEN_CHECK(r.status == cfg::edit_status::ok);
+    edited = cfg::splice_key(edited, "clock", "show-seconds", cfg::edit_value::boolean(true), r);
+    edited = cfg::splice_key(edited, "clock", "show-date", cfg::edit_value::boolean(false), r);
+    edited = cfg::splice_key(edited, "clock", "show-weekday", cfg::edit_value::boolean(false), r);
+    edited = cfg::splice_key(edited, "clock", "first-day", cfg::edit_value::word("sunday"), r);
+    edited = cfg::splice_key(edited, "clock", "week-numbers", cfg::edit_value::boolean(true), r);
+    LUMEN_CHECK(r.status == cfg::edit_status::ok);
+    LUMEN_CHECK(edited.find("format = \"12h\"") != std::string::npos);
+    LUMEN_CHECK(edited.find("first-day = \"sunday\"") != std::string::npos);
+    LUMEN_CHECK(edited.find("mode = \"click\"") != std::string::npos);
+
+    cfg::config_snapshot after{};
+    LUMEN_CHECK(parse_one(edited, after, d));
+    LUMEN_CHECK(d.errors() == 0);
+    LUMEN_CHECK(after.clock.format == cfg::clock_format::h12 && after.clock.show_seconds &&
+                !after.clock.show_date && !after.clock.show_weekday &&
+                after.clock.first_day == cfg::clock_first_day::sunday && after.clock.week_numbers);
+    LUMEN_CHECK(before.clock.format == cfg::clock_format::h24 && !before.clock.show_seconds &&
+                before.clock.show_date && before.clock.show_weekday &&
+                before.clock.first_day == cfg::clock_first_day::monday && !before.clock.week_numbers);
+}
+
 LUMEN_TEST(config_edit_string_lists_and_the_round_trip_through_the_parser) {
     std::string text = "[workspaces]\nmode = \"static\"\ncount = 3\n";
     cfg::edit_report r{};
