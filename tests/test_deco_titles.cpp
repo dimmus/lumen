@@ -299,7 +299,8 @@ std::vector<std::uint32_t> paint_cpu(desktop& d) {
 
 /// Max channel difference over the colour bytes, optionally only where `where(x, y)`.
 template <typename Where>
-int max_diff(const std::vector<std::uint32_t>& a, const std::vector<std::uint32_t>& b, Where where,
+[[maybe_unused]] int max_diff(const std::vector<std::uint32_t>& a,
+                             const std::vector<std::uint32_t>& b, Where where,
              int* wx = nullptr, int* wy = nullptr) {
     int worst = 0;
     for (int y = 0; y < k_h; ++y)
@@ -321,7 +322,8 @@ int max_diff(const std::vector<std::uint32_t>& a, const std::vector<std::uint32_
     return worst;
 }
 
-int max_diff(const std::vector<std::uint32_t>& a, const std::vector<std::uint32_t>& b) {
+[[maybe_unused]] int max_diff(const std::vector<std::uint32_t>& a,
+                             const std::vector<std::uint32_t>& b) {
     return max_diff(a, b, [](int, int) { return true; });
 }
 
@@ -949,8 +951,10 @@ LUMEN_TEST(gl_titles_match_cpu) {
         const std::vector<std::uint32_t> gl = paint_gl(*g, d);
         dump(scale == 1.0 ? "cpu" : "cpu-125", cpu);
         dump(scale == 1.0 ? "gl" : "gl-125", gl);
-        const std::span<const titled_window> ws = scale == 1.0 ? std::span<const titled_window>{k_windows}
-                                                               : std::span<const titled_window>{k_windows_125};
+        const std::span<const titled_window> ws =
+            scale == 1.0 ? std::span<const titled_window>{k_windows}
+                         : std::span<const titled_window>{k_windows_125};
+        (void)ws; // the scale's own windows: kept beside the capture dump for a reader
         // The button circles included: both blend them, as every primitive, in the encoded space.
         int x = 0, y = 0;
         const int worst = max_diff(cpu, gl, [](int, int) { return true; }, &x, &y);

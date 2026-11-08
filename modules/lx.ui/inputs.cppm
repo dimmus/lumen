@@ -484,15 +484,6 @@ namespace {
     return p;
 }
 
-[[nodiscard]] lx::ui::child lx_in_box(const lx::ui::style& s, const lx::ui::control_paint& p,
-                                      std::span<const lx::ui::child> kids,
-                                      element_key key = 0) {
-    lx::ui::control_props c{};
-    c.layout = s;
-    c.paint = p;
-    return control(c, kids, key);
-}
-
 [[nodiscard]] text_block_props lx_in_text(const char* text, float size_px, tok color,
                                           float line_height, bool bold = false) {
     text_block_props p{};
@@ -895,7 +886,6 @@ lx::ui::segmented_builder lx::ui::segmented(std::span<const char* const> options
 
 lx::ui::select_builder::operator child() const {
     const unsigned n = std::min<unsigned>(options_.size(), k_select_max_options);
-    const bool dark = active_theme().appearance_mode() == appearance::dark;
     const float rem = lx_in_rem();
     const bool has_selection = selected_ >= 0 && static_cast<unsigned>(selected_) < n;
     const char* current = has_selection ? options_[static_cast<unsigned>(selected_)] : nullptr;
@@ -922,9 +912,11 @@ lx::ui::select_builder::operator child() const {
         current ? current : (placeholder_ ? placeholder_ : ""),
         lx_in_text_px(12.f),
         disabled_ ? tok::text_disabled : current ? tok::text : tok::text_placeholder, 1.f));
-    lx::ui::child chevron =
-        icon_view(open_ ? lx::ui::icon::chevron_up : lx::ui::icon::chevron_down,
-                  14.f * rem / 16.f, disabled_ ? tok::icon_disabled : tok::icon_muted);
+    // The trigger's chevron: the select's own, down (opening) or up (open). It was built
+    // and never attached, so a select rendered as a bare word in a box.
+    words[1] = icon_view(open_ ? lx::ui::icon::chevron_up : lx::ui::icon::chevron_down,
+                         14.f * rem / 16.f,
+                         disabled_ ? tok::icon_disabled : tok::icon_muted);
     lx::ui::child trigger_child = control(trigger, words);
 
     if (n == 0)

@@ -968,6 +968,15 @@ const wl_pointer_listener k_pointer_listener = {
     .axis_source = lx::shell::shell_app::events::ptr_axis_source,
     .axis_stop = lx::shell::shell_app::events::ptr_axis_stop,
     .axis_discrete = lx::shell::shell_app::events::ptr_axis_discrete,
+    // wl_pointer v8/v9/v10 events. The seat is bound at v5 at most, so a conforming
+    // compositor never sends these — but a NULL slot is a hard abort in libwayland if one
+    // ever arrives, and the smooth-scroll fallback costs nothing.
+    .axis_value120 = [](void* data, wl_pointer*, uint32_t axis, int32_t value120) {
+        // The same accumulation the v5 notch takes, in 120ths of a notch.
+        lx::shell::shell_app::events::ptr_axis_discrete(data, nullptr, axis, value120 / 120);
+    },
+    .axis_relative_direction = [](void*, wl_pointer*, uint32_t, uint32_t) {},
+    .warp = [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {},
 };
 const xdg_wm_base_listener k_wm_base_listener = {
     .ping = lx::shell::shell_app::events::wm_ping,
@@ -1484,7 +1493,12 @@ void lx::shell::shell_app::output_ready(output_record& o) {
 }
 
 lx::shell::panel_clock lx::shell::shell_app::clock_state() {
-    const long long minute = now_ns() / 60'000'000'000ll;
+    // The *wall-clock* minute, not a monotonic one: `now_ns()` counts from an arbitrary boot
+    // instant, so "minute" derived from it changes at whatever second offset that instant
+    // landed on — the panel's HH:MM then flips a few seconds before or after the real
+    // minute. The timer below aims the next wake at the wall clock's boundary; this reads
+    // the minute from the same clock so the two agree.
+    const long long minute = static_cast<long long>(std::time(nullptr)) / 60;
     if (minute != clock_minute_) {
         clock_minute_ = minute;
         const std::time_t t = std::time(nullptr);
@@ -1718,7 +1732,13 @@ void lx::shell::shell_app::on_timer() {
         for (auto& o : outputs_)
             if (o->bar)
                 o->bar->clock_changed();
-        set_timer(t_clock, ((now / 60'000'000'000ll) + 1) * 60'000'000'000ll);
+        // The next wall-clock minute boundary, as a monotonic deadline: the timer counts
+        // from `now`, so the wall clock's offset is read from `CLOCK_REALTIME` and added.
+        timespec wall{};
+        clock_gettime(CLOCK_REALTIME, &wall);
+        const long long since_minute =
+            static_cast<long long>(wall.tv_sec % 60) * 1000000000LL + wall.tv_nsec;
+        set_timer(t_clock, now + (60'000'000'000LL - since_minute));
     }
     if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
         deadline_[t_lock_blank] = 0;
@@ -1900,12 +1920,10 @@ void lx::shell::shell_app::on_key(unsigned, unsigned, bool) {
 
 void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
                                                            const lx::wayland::pointer_frame& f) {
-    auto& a = *app;
-    using pf = lx::wayland::pointer_frame;
-    void* surf = f.target ? f.target->native() : nullptr;
     // Every canvas view but nothing else is left: the menus' popups are host surfaces now
     // (P5-8), routed by the context.
     (void)s;
+    (void)f;
     (void)app;
 }
 

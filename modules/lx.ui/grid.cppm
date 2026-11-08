@@ -150,11 +150,15 @@ lx::layout::flex_size lx_ui_child_measure(void* ctx, unsigned i, const lx::layou
     return {static_cast<float>(s.width), static_cast<float>(s.height)};
 }
 
-/// One solve over `self`'s children with the scratch on the stack.
+/// One solve over `self`'s children with the scratch on the stack. The row state is
+/// `k_grid_rows_max`: an item's row span, an explicit row or a template row makes more
+/// rows than children, and the solver writes up to `min(row_count, k_grid_rows_max)` of
+/// them (a scratch sized by the child count used to be overrun — 64 rows of 36 past the
+/// end for one span-100 item).
 struct lx_ui_grid_solve {
     lx::rect2f rects[lx::ui::ui_node::k_max_children];
     lx::layout::grid_item_state items[lx::ui::ui_node::k_max_children];
-    lx::layout::grid_row_state rows[lx::ui::ui_node::k_max_children];
+    lx::layout::grid_row_state rows[lx::layout::k_grid_rows_max];
 
     [[nodiscard]] lx::layout::grid_output run(const lx::ui::ui_node& self,
                                               const lx::layout::grid_style& style,

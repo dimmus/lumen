@@ -229,8 +229,9 @@ const wl_pointer_listener pointer_listener = {
     [](void*, wl_pointer*, uint32_t source) { g_axis_source = source; },
     [](void*, wl_pointer*, uint32_t, uint32_t) {},
     [](void*, wl_pointer*, uint32_t axis, int32_t discrete) { g_discrete[axis ? 1 : 0] = discrete; },
-    nullptr,
-    nullptr};
+    [](void*, wl_pointer*, uint32_t axis, int32_t v) { g_discrete[axis ? 1 : 0] = v; },
+    [](void*, wl_pointer*, uint32_t, uint32_t) {},
+    [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {}};
 
 struct window {
     wl_surface* surface = nullptr;

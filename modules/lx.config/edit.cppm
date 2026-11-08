@@ -248,6 +248,34 @@ void append_value(std::string& out, const lx::config::edit_value& v,
 
 constexpr std::string_view k_marker = "# set by lumen-settings";
 
+/// `line` with its value replaced by `value`: the indentation, the key as the user spelled
+/// it, the spacing around `=` and any trailing `# comment` are kept. A splice that drops the
+/// comment silently deletes the note a person wrote beside the key they are editing, and a
+/// comment is the one thing in the file this editor exists to preserve.
+[[nodiscard]] std::string replace_value(std::string_view line, std::string_view value) {
+    char quote = 0;
+    bool escape = false;
+    std::size_t equal = std::string_view::npos, comment = line.size();
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (escape) { escape = false; continue; }
+        if (quote) {
+            if (quote == '"' && c == '\\') escape = true;
+            else if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') quote = c;
+        else if (c == '=' && equal == std::string_view::npos) equal = i;
+        else if (c == '#') { comment = i; break; }
+    }
+    if (equal == std::string_view::npos) // not `key = …`: append the value
+        return std::string(line) + " " + std::string(value);
+    auto begin = line.find_first_not_of(" \t", equal + 1);
+    if (begin == std::string_view::npos) begin = equal + 1;
+    auto end = comment;
+    while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' ||
+                          line[end - 1] == '\r' || line[end - 1] == '\n')) --end;
+    return std::string(line.substr(0, begin)) + std::string(value) + std::string(line.substr(end));
+}
+
 } // namespace
 
 std::string lx::config::splice_key(std::string_view text, std::string_view section,
@@ -283,10 +311,16 @@ std::string lx::config::splice_key(std::string_view text, std::string_view secti
             if (header == section && section_header_at == std::string_view::npos)
                 section_header_at = offset;
         } else if (header == section && is_key_line(line, key)) {
+            // The value only: `value_line` is `key = value`, and the rest of the line (the
+            // user's indentation, key spelling, spacing and trailing comment) is the
+            // file's, not this splice's.
+            std::string_view bare = value_line;
+            bare.remove_prefix(bare.find(" = ") + 3);
+            const std::string replaced = replace_value(line, bare);
             std::string out;
-            out.reserve(text.size() + value_line.size() + marked.size());
+            out.reserve(text.size() + replaced.size() + 1);
             out += text.substr(0, offset);
-            out += value_line;
+            out += replaced;
             out += '\n';
             if (eol != std::string_view::npos)
                 out += text.substr(eol + 1);
@@ -470,27 +504,9 @@ std::size_t after_line(std::string_view text, std::size_t at) {
     return nl == std::string_view::npos ? text.size() : nl + 1;
 }
 
-// Preserve the indentation, spelling of the key, and trailing comment on replacement.
+// The device splices preserve a line the same way the section splice does.
 std::string replace_device_value(std::string_view line, std::string_view value) {
-    char quote = 0;
-    bool escape = false;
-    std::size_t equal = std::string_view::npos, comment = line.size();
-    for (std::size_t i = 0; i < line.size(); ++i) {
-        const char c = line[i];
-        if (escape) { escape = false; continue; }
-        if (quote) {
-            if (quote == '"' && c == '\\') escape = true;
-            else if (c == quote) quote = 0;
-        } else if (c == '"' || c == '\'') quote = c;
-        else if (c == '=' && equal == std::string_view::npos) equal = i;
-        else if (c == '#') { comment = i; break; }
-    }
-    auto begin = line.find_first_not_of(" \t", equal + 1);
-    if (begin == std::string_view::npos) begin = equal + 1;
-    auto end = comment;
-    while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' ||
-                          line[end - 1] == '\r' || line[end - 1] == '\n')) --end;
-    return std::string(line.substr(0, begin)) + std::string(value) + std::string(line.substr(end));
+    return replace_value(line, value);
 }
 } // namespace
 

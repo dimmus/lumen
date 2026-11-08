@@ -360,7 +360,7 @@ void data_device::set_selection(data_source* source, std::uint32_t serial) {
 }
 
 void data_device::start_drag(data_source& source, surface& origin, std::uint32_t serial,
-                             surface* icon) {
+                             wl_surface* icon) {
     if (!proxy_ || !clip(kind_) || !source.valid() || source.kind() != kind_)
         return;
     if (icon && wl_data_device_get_version(static_cast<wl_data_device*>(proxy_)) < 2)
@@ -368,7 +368,7 @@ void data_device::start_drag(data_source& source, surface& origin, std::uint32_t
     wl_data_device_start_drag(static_cast<wl_data_device*>(proxy_),
                               static_cast<wl_data_source*>(source.native()),
                               static_cast<wl_surface*>(origin.native()),
-                              icon ? static_cast<wl_surface*>(icon->native()) : nullptr,
+                              icon,
                               serial);
 }
 
@@ -501,7 +501,7 @@ lx::result<void> data_device::create(display&, seat&, selection_kind) {
 }
 void data_device::destroy() {}
 void data_device::set_selection(data_source*, std::uint32_t) {}
-void data_device::start_drag(data_source&, surface&, std::uint32_t) {}
+void data_device::start_drag(data_source&, surface&, std::uint32_t, wl_surface*) {}
 void data_device::finish_drop(bool) {}
 data_offer* data_device::find(const void*) {
     return nullptr;

@@ -749,8 +749,11 @@ void dp_ptr_button(void* d, wl_pointer*, uint32_t serial, uint32_t, uint32_t, ui
     p->events.push_back(state == WL_POINTER_BUTTON_STATE_PRESSED ? "ptr-press" : "ptr-release");
 }
 void dp_ptr_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {}
+void dp_ptr_frame(void*, wl_pointer*) {}
 const wl_pointer_listener dp_ptr_listener = {dp_ptr_enter, dp_ptr_leave, dp_ptr_motion,
-                                             dp_ptr_button, dp_ptr_axis};
+                                             dp_ptr_button, dp_ptr_axis, dp_ptr_frame,
+                                             nullptr, nullptr, nullptr, nullptr, nullptr,
+                                             nullptr};
 
 void dp_offer_offer(void*, wl_data_offer*, const char*) {}
 void dp_offer_source_actions(void* d, wl_data_offer*, uint32_t a) {

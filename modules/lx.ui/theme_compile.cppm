@@ -410,11 +410,6 @@ using rgba = std::array<float, 4>;
     return c;
 }
 
-[[nodiscard]] rgba lx_ui_with_alpha(rgba c, float a) {
-    c[3] = std::clamp(a, 0.f, 1.f);
-    return c;
-}
-
 /// GPUI's `Hsla::blend`: `over` on top of `under`, keeping `under`'s alpha.
 [[nodiscard]] rgba lx_ui_blend(rgba under, rgba over) {
     const float a = over[3];

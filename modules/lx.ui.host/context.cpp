@@ -404,6 +404,33 @@ bool context::attach(surface& s) {
     return true;
 }
 
+void context::defer_destroy(surface& s) {
+    for (unsigned i = 0; i < deferred_count_; ++i)
+        if (deferred_destroy_[i] == &s)
+            return;
+    if (deferred_count_ >= k_max_surfaces)
+        return; // the backstop in after_dispatch runs it either way
+    deferred_destroy_[deferred_count_++] = &s;
+}
+
+void context::flush_deferred_destroys() {
+    // A destroy can queue another (a menu closing while the window it belongs to tears
+    // down): drain until the queue stays empty.
+    for (unsigned guard = 0; guard < 4 && deferred_count_ > 0; ++guard) {
+        const unsigned n = deferred_count_;
+        deferred_count_ = 0;
+        surface* batch[k_max_surfaces]{};
+        for (unsigned i = 0; i < n; ++i)
+            batch[i] = deferred_destroy_[i];
+        for (unsigned i = 0; i < n; ++i) {
+            if (!batch[i] || !batch[i]->valid())
+                continue;
+            // destroy() is no longer inside a delivery: it tears down for real.
+            batch[i]->destroy();
+        }
+    }
+}
+
 void context::detach(surface& s) {
     for (unsigned i = 0; i < count_; ++i)
         if (surfaces_[i] == &s) {
@@ -444,6 +471,9 @@ lx::wayland::text_input* context::text_input() {
 // ── loop hooks ──
 
 void context::after_dispatch() {
+    // A destroy queued outside a seat event (a timer, a reducer) still lands here, before
+    // any deadline scan touches a half-freed surface.
+    flush_deferred_destroys();
     // Once per loop iteration: the timer follows the earliest deadline any surface needs,
     // and is disarmed when none does (the idle rule).
     if (!timer_)
@@ -475,6 +505,7 @@ void context::on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame&
         // Not one of the hosted surfaces: the caller's own canvas view owns it.
         unrouted_->on_unrouted_pointer(s, f);
     }
+    flush_deferred_destroys();
 }
 
 void context::on_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target,
@@ -509,6 +540,7 @@ void context::on_key(lx::wayland::seat& s, const lx::wayland::key_event& e) {
         // The keyboard is on a canvas view of the caller's.
         unrouted_->on_unrouted_key(s, e);
     }
+    flush_deferred_destroys();
 }
 
 void context::on_modifiers(lx::wayland::seat& s, std::uint32_t modifiers) {

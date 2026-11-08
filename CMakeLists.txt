@@ -732,9 +732,9 @@ if(LUMEN_BUILD_TESTS)
         # into a PNG (a dev aid, not a test).
         # The bell-menu anatomy over the real host path: a layer surface and an xdg_popup
         # with the menu's rows (text + quads), for the popup-text damage.
-        add_executable(popup-probe)
-        target_sources(popup-probe PRIVATE FILE_SET CXX_MODULES TYPE CXX_MODULES
-            BASE_DIRS ${CMAKE_SOURCE_DIR} FILES tests/popup_probe.cpp)
+        # An ordinary TU: a module unit cannot hold `main` (its linkage must be external),
+        # and CMake rejects a CXX_MODULES entry that provides no interface unit.
+        add_executable(popup-probe tests/popup_probe.cpp)
         target_link_libraries(popup-probe PRIVATE lx.ui.host lx.ui lx.wayland.client
             lx.runtime lx.foundation lx.trace lx.text)
         lumen_apply_module_properties(popup-probe)

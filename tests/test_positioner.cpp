@@ -36,9 +36,9 @@ positioner_rules rules(lx::size2i size, lx::rect2i anchor_rect, unsigned anchor,
     return r;
 }
 
-// Anchor/gravity wire values.
-constexpr unsigned none = 0, top = 1, bottom = 2, left = 3, right = 4, top_left = 5,
-                   bottom_left = 6, top_right = 7, bottom_right = 8;
+// Anchor/gravity wire values (the unused ones keep the spec's numbering readable).
+[[maybe_unused]] constexpr unsigned none = 0, top = 1, bottom = 2, left = 3, right = 4,
+                             top_left = 5, bottom_left = 6, top_right = 7, bottom_right = 8;
 
 } // namespace
 

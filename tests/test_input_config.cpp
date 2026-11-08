@@ -27,7 +27,7 @@ struct fake_device {
     bool dwt = false;
     bool middle = true;
     int three_fingers = 0;
-    std::vector<std::string> calls;
+    std::vector<std::string> calls{};
 };
 
 fake_device& dev(void* d) { return *static_cast<fake_device*>(d); }

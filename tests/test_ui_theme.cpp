@@ -45,7 +45,7 @@ using lx::ui::tok;
     return out;
 }
 
-[[nodiscard]] std::vector<std::uint8_t> read_bytes(const char* path) {
+[[maybe_unused]] [[nodiscard]] std::vector<std::uint8_t> read_bytes(const char* path) {
     const std::string s = read_file(path);
     return {s.begin(), s.end()};
 }

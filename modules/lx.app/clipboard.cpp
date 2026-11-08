@@ -253,13 +253,18 @@ lx::result<void> clipboard::start(lx::wayland::display& d, lx::runtime::event_lo
         return {};
     }
     lx::ui::clipboard::global().set_sink(&clipboard::sink, this);
-    if (channels_[0].device.valid() && host_)
+    if (channels_[0].device.valid() && host_) {
         lx::ui::drag_service::global().set_starter(&clipboard::start_drag, this);
+        // The chooser is part of the same registration — it used to sit under the `if`
+        // without braces, so it ran unconditionally (a clipboard without a drag device
+        // still claimed the service) and `stop()` never withdrew it.
         lx::ui::drag_service::global().set_chooser(
             [](void* user, std::uint32_t action) {
                 static_cast<clipboard*>(user)->choose_dnd_action(action);
             },
             this);
+        chooser_registered_ = true;
+    }
     // A paste target may close its end before the text is written: EPIPE, not a signal
     // that ends the process (as GIO does, only when nobody chose a disposition).
     struct sigaction now{};
@@ -272,6 +277,10 @@ void clipboard::stop() {
     if (display_) {
         lx::ui::clipboard::global().set_sink(nullptr, nullptr);
         lx::ui::drag_service::global().set_starter(nullptr, nullptr);
+        if (chooser_registered_) {
+            lx::ui::drag_service::global().set_chooser(nullptr, nullptr);
+            chooser_registered_ = false;
+        }
     }
     // A drag still running: its field hears it ended, unmoved.
     if (drag_source_.valid())
@@ -357,16 +366,24 @@ void clipboard::offer(channel& c, const char* text) {
 void clipboard::on_send(lx::wayland::data_source& s, const char* mime, int fd) {
     if (fd < 0)
         return;
-    if (!offered_mime(mime)) {
-        ::close(fd);
-        return;
-    }
     if (&s == &drag_source_) {
+        // The drag source offers `text/uri-list` besides the text types (a file manager's
+        // drop reads only that), and that offer has to be answerable. The text-only guard
+        // that used to stand above this branch closed the fd first, so a drag of files
+        // looked like a source refusing every format it had just advertised.
+        if (std::strcmp(mime, k_uri_list) != 0 && !offered_mime(mime)) {
+            ::close(fd);
+            return;
+        }
         ++drag_stats_.sends;
         if (std::strcmp(mime, k_uri_list) == 0)
             (void)write(fd, drag_uri_list());
         else
             (void)write(fd, drag_text_);
+        return;
+    }
+    if (!offered_mime(mime)) {
+        ::close(fd);
         return;
     }
     channel* c = channel_of(s);
@@ -539,8 +556,11 @@ bool clipboard::start_drag(void* user, const lx::ui::drag_payload& payload) {
     self->drag_text_ = payload.text ? payload.text : "";
     self->drag_action_ = lx::wayland::k_dnd_none;
     // The press that started it: the button is still held (the compositor's rule).
+    // The icon is a bare `wl_surface*` created here, never an `lx::wayland::surface` (which
+    // owns a proxy and a listener table): reinterpreting the pointer as one and calling
+    // `native()` on it read a member of an object that does not exist.
     c.device.start_drag(self->drag_source_, *origin, s->last_input_serial(),
-                        static_cast<lx::wayland::surface*>(self->icon_surface_));
+                        static_cast<wl_surface*>(self->icon_surface_));
     ++self->drag_stats_.started;
     // The compositor holds the pointer now: the press here ends without a click.
     root->pointer_cancel();
@@ -625,7 +645,10 @@ void clipboard::finish_read(reader& r, bool ok) {
             for (const std::string& u : uris)
                 views.emplace_back(u);
             if (drop_ask_)
-                taken = drop_root_->drop_ask(drop_at_, views, drag_offer_->action());
+                // The actions the *source* allowed, remembered by `on_drop`: it had already
+                // cleared `drag_offer_` through `reset_drag_over()`, so reading the action
+                // off the offer here dereferenced null on every ask drop.
+                taken = drop_root_->drop_ask(drop_at_, views, drop_actions_);
             else
                 taken = drop_root_->drop_files(drop_at_, views);
         } else {
@@ -633,9 +656,13 @@ void clipboard::finish_read(reader& r, bool ok) {
         }
     }
     ++(taken ? drag_stats_.drops : drag_stats_.refused);
-    if (!drop_ask_)
+    // An ask drop stays open only while the target may still answer through
+    // `choose_dnd_action`; one it refused is finished here, or the source waits forever for
+    // an answer that cannot come.
+    const bool open_ask = drop_ask_ && taken;
+    if (!open_ask)
         channels_[0].device.finish_drop(taken);
-    // An ask drop stays open: the target's answer arrives through `choose_dnd_action`.
+    drop_ask_ = open_ask;
     drop_root_ = nullptr;
     stop_reader(drop_reader_);
 }
@@ -652,8 +679,12 @@ void clipboard::on_drag_enter(lx::wayland::data_device& d, lx::wayland::data_off
     drag_offer_ = offer;
     drag_root_ = host_ ? host_->host_root_of(target) : nullptr;
     drag_serial_ = serial;
+    // A drag of files offers *only* `text/uri-list`, so the text types alone would leave
+    // `drag_mime_` null and the drop refused before it was read.
     drag_mime_ = offer ? wanted_mime(*offer) : nullptr;
     drop_uris_ = offer && offer->has_mime(k_uri_list);
+    if (!drag_mime_ && drop_uris_)
+        drag_mime_ = k_uri_list;
     drop_ask_ = offer && offer->action() == lx::wayland::k_dnd_ask;
     drag_at_ = {static_cast<int>(std::floor(x)), static_cast<int>(std::floor(y))};
     update_drop();
@@ -702,6 +733,9 @@ void clipboard::on_drop(lx::wayland::data_device& d, lx::wayland::data_offer* of
     lx::ui::ui_root* root = drag_root_;
     const lx::point2i at = drag_at_;
     const char* mime = drag_mime_;
+    // Read before `reset_drag_over()` drops the offer: the ask handshake needs the actions
+    // the source allowed, and every pointer to the offer is gone after the reset.
+    drop_actions_ = offer ? offer->source_actions() : lx::wayland::k_dnd_none;
     reset_drag_over();
     stop_reader(drop_reader_);
     if (!takes) {

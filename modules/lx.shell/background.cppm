@@ -203,8 +203,12 @@ rgbf unpack_rgb(std::uint32_t c) {
             static_cast<float>(c & 0xFFu) / 255.f};
 }
 
-float srgb_to_linear(float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); }
-float linear_to_srgb(float v) {
+// The gradient's two transfer functions; `render_gradient` is the only user (a build whose
+// tree does not reference it — the shell always does — must not warn on them).
+[[maybe_unused]] float srgb_to_linear(float v) {
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+[[maybe_unused]] float linear_to_srgb(float v) {
     v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
     return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
 }

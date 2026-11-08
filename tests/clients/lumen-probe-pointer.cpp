@@ -202,8 +202,9 @@ void watch_pointer_and_keyboard(wl_pointer* pointer) {
         [](void*, wl_pointer*, uint32_t) {},
         [](void*, wl_pointer*, uint32_t, uint32_t) {},
         [](void*, wl_pointer*, uint32_t, int32_t) {},
-        nullptr,
-        nullptr};
+        [](void*, wl_pointer*, uint32_t, int32_t) {},
+        [](void*, wl_pointer*, uint32_t, uint32_t) {},
+        [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {}};
     static const wl_keyboard_listener kl = {
         [](void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); },
         [](void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) { std::printf("focus in\n"); },

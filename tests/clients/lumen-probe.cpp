@@ -903,13 +903,6 @@ anim_buffer* anim_take(int w, int h) {
     return nullptr; // every buffer is still held by the compositor
 }
 
-feedback_rec* rec_of(struct wp_presentation_feedback* fb) {
-    for (auto& r : g_pres.recs)
-        if (r.used && r.fb == fb)
-            return &r;
-    return nullptr;
-}
-
 void on_fb_sync_output(void* data, struct wp_presentation_feedback*, wl_output*) {
     ++static_cast<feedback_rec*>(data)->sync_outputs;
 }
@@ -2010,10 +2003,18 @@ void on_pointer_frame(void*, wl_pointer*) { std::fflush(stdout); }
 void on_axis_source(void*, wl_pointer*, uint32_t) {}
 void on_axis_stop(void*, wl_pointer*, uint32_t, uint32_t) {}
 void on_axis_discrete(void*, wl_pointer*, uint32_t, int32_t) {}
+void on_pointer_axis_value120(void*, wl_pointer*, uint32_t, int32_t) {}
+void on_pointer_axis_relative_direction(void*, wl_pointer*, uint32_t, uint32_t) {}
+void on_pointer_warp(void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {}
+// Every slot: a missing one is NULL, and libwayland dispatches into it when the compositor
+// sends that event (wl_pointer's axis_value120, v11's warp).
 const wl_pointer_listener pointer_listener = {on_pointer_enter, on_pointer_leave,
                                               on_pointer_motion, on_pointer_button,
                                               on_pointer_axis, on_pointer_frame,
-                                              on_axis_source, on_axis_stop, on_axis_discrete};
+                                              on_axis_source, on_axis_stop, on_axis_discrete,
+                                              on_pointer_axis_value120,
+                                              on_pointer_axis_relative_direction,
+                                              on_pointer_warp};
 
 void on_keymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); }
 void on_key_enter(void*, wl_keyboard*, uint32_t serial, wl_surface* surface, wl_array* keys) {

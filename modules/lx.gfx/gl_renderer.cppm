@@ -418,8 +418,18 @@ private:
     static constexpr unsigned k_program_color = k_program_count + 1;
     /// `shape_program_` as the bound program.
     static constexpr unsigned k_program_shape = k_program_count + 2;
-    /// `downsample_programs_[i]` as the bound program: k_program_downsample + i.
-    static constexpr unsigned k_program_downsample = k_program_color + 1;
+    /// `downsample_programs_[i]` as the bound program: k_program_downsample + i. Past the
+    /// shape program's id by the variants' count — the two branches of the 2026-10-31 merge
+    /// each put their program right after `k_program_color`, so the shape program and the
+    /// linear downsample variant both got 4 and `glUseProgram` was skipped between them
+    /// (a tinted, downsampled draw after a shape draw ran on the shape program with the
+    /// wrong uniforms).
+    static constexpr unsigned k_program_downsample = k_program_shape + 1;
+    /// The downsample variants `downsample_programs_` holds (linear, identity, colour-
+    /// managed): the bound ids never reach the next program's.
+    static constexpr unsigned k_downsample_variants = 3;
+    static_assert(k_program_downsample + k_downsample_variants - 1 <= 7,
+                  "the bound-program ids are four bits wide");
 
     struct blur_level {
         unsigned texture = 0;

@@ -69,6 +69,7 @@ inline constexpr struct {
                    .overflow_hidden();
     c.paint.rest = {lx::ui::paint(selected ? lx::ui::tok::element_selected : lx::ui::tok::none),
                     lx::ui::k_transparent};
+    (void)key;
     return lx::ui::control(c, children, key);
 }
 
@@ -81,6 +82,7 @@ inline constexpr struct {
     st.direction = lx::layout::flex_direction::column;
     st.justify_content = lx::layout::content_align::center;
     st.align_items = lx::layout::item_align::stretch;
+    (void)key; // the strip is one decoration node; nothing looks it up by key
     return lx::ui::flex(st, children, color(palette.background));
 }
 

@@ -79,6 +79,13 @@ public:
               lx::ui::ui_root& root, lx::wayland::text_input* text_input = nullptr);
     void unbind();
 
+    /// True while this router is delivering an event to its root. A handler that closes its
+    /// own view (the launcher's Escape, a dialog's Cancel button) must defer the teardown:
+    /// `ui_root::key` and `ui_root::pointer_button` still touch the root after the handler
+    /// returns (`overlays.after_input()`), and the surface, its root and its context would
+    /// already be freed.
+    [[nodiscard]] bool delivering() const { return depth_ > 0; }
+
     // ── seat events (the context forwards those whose target is this surface) ──
     void on_pointer(lx::wayland::seat& seat, const lx::wayland::pointer_frame& f);
     void on_keyboard_focus(lx::wayland::seat& seat, bool entered);
@@ -120,6 +127,15 @@ public:
     void node_destroyed(lx::ui::ui_node& node) override;
 
 private:
+    /// Marks an event's delivery (`delivering()`).
+    struct delivery {
+        explicit delivery(input_router& r) : router(r) { ++router.depth_; }
+        ~delivery() { --router.depth_; }
+        delivery(const delivery&) = delete;
+        delivery& operator=(const delivery&) = delete;
+        input_router& router;
+    };
+    unsigned depth_ = 0;
     void deliver_key(const lx::wayland::key_event& e, bool pressed);
     void update_cursor();
     /// Sends what changed of the focused field to the input method (`force`: everything).

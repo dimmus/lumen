@@ -17,7 +17,10 @@
 // Phase C); the Varlink reads (version, health, devices) feed the Session pane.
 module;
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 export module lumen.settings_ui;
@@ -612,6 +615,12 @@ constexpr std::string_view k_label_overrides[][2] = {
     {"policy", "Policy"},
     {"lock-on-blank", "Lock on blank"},
     {"position", "Position"},
+    {"format", "Time format"},
+    {"show-seconds", "Show seconds"},
+    {"show-date", "Show date"},
+    {"show-weekday", "Show weekday"},
+    {"first-day", "First day of calendar week"},
+    {"week-numbers", "Calendar week numbers"},
 };
 
 /// One-line explanations for the keys that need one (the label says the rest). The value
@@ -637,6 +646,12 @@ constexpr std::string_view k_descriptions[][2] = {
     {"edge-snap-corner", "Corner size that snaps to quarter tiling"},
     {"scroll-factor", "Multiplier on lines scrolled per notch"},
     {"accel-speed", "-1 slowest, 1 fastest"},
+    {"format", "Choose a 24-hour or 12-hour clock"},
+    {"show-seconds", "Include seconds in the panel clock"},
+    {"show-date", "Show the date in the clock"},
+    {"show-weekday", "Show the weekday in the clock"},
+    {"first-day", "Set the calendar week start"},
+    {"week-numbers", "Show week numbers in the calendar"},
 };
 
 /// One string key's placeholder: the example an empty field shows (its section, its
@@ -740,6 +755,7 @@ void assign_section(std::string_view section, pane_id& owner, const char*& group
         {"input.trackpoint", pane_id::input, "Trackpoint"},
         {"cursor", pane_id::appearance, "Cursor"},
         {"ui", pane_id::appearance, "Theme & density"},
+        {"clock", pane_id::appearance, "Clock"},
         {"background", pane_id::appearance, "Background"},
         {"panel", pane_id::appearance, "Panel"},
         {"output", pane_id::displays, "Per-output rendering"},
@@ -956,6 +972,91 @@ namespace {
     return r.pdesc->field(p);
 }
 
+
+/// Writes `text` to `path` the way a configuration file has to be written, and returns why
+/// it did not when it did not (null on success).
+///
+/// Four things a plain `ofstream` gets wrong here:
+///
+/// * A symlinked `config.toml` (the usual dotfiles arrangement: `~/.config/lumen/config.toml`
+///   → `~/dotfiles/lumen.toml`). Renaming over the path would replace the *link* with a
+///   regular file, and the next `git status` in the dotfiles repository would show the file
+///   deleted — the edit never reaching it. The link is resolved first, so the rename lands in
+///   the directory that really holds the file.
+/// * The file's mode. A temp file created with the default mode and renamed into place
+///   silently resets a 0600 config (a file holding a lock command, a token) to 0644.
+/// * The directory entry. Renaming is atomic for the file but not durable until the
+///   directory itself is fsynced; a crash just after the edit otherwise leaves the old file.
+/// * The failure. `rename` over a read-only file, a full disk and a missing parent all end at
+///   the same boolean, and the pane then says "saved" for a write that did not take.
+[[nodiscard]] const char* write_config_file(const char* path, std::string_view text) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path target{path};
+    // Through a symlink: the file the link names is what a person edits.
+    for (unsigned hops = 0; hops < 8; ++hops) {
+        const fs::file_status st = fs::symlink_status(target, ec);
+        if (ec || st.type() != fs::file_type::symlink)
+            break;
+        const fs::path to = fs::read_symlink(target, ec);
+        if (ec)
+            return "config.toml links somewhere unreadable";
+        target = to.is_absolute() ? to : target.parent_path() / to;
+    }
+    // The first edit creates the user layer: its directory may not exist yet.
+    if (!target.has_parent_path())
+        return "config.toml has no directory";
+    fs::create_directories(target.parent_path(), ec);
+    if (ec)
+        return "the configuration directory cannot be created";
+
+    // The mode to keep: the file's own when it exists, else the umask's default.
+    mode_t mode = 0644;
+    struct stat before{};
+    if (::stat(target.c_str(), &before) == 0)
+        mode = before.st_mode & 07777;
+
+    fs::path tmp = target;
+    tmp += ".settings-tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    if (fd < 0)
+        return "the temporary file cannot be created";
+    std::size_t off = 0;
+    bool ok = true;
+    while (off < text.size()) {
+        const ssize_t n = ::write(fd, text.data() + off, text.size() - off);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    // The mode again explicitly: `open`'s argument is masked by the umask, and a stricter
+    // umask would narrow a file this edit is only rewriting.
+    if (ok && ::fchmod(fd, mode) != 0)
+        ok = false;
+    if (ok && ::fsync(fd) != 0)
+        ok = false;
+    ::close(fd);
+    if (!ok) {
+        ::unlink(tmp.c_str());
+        return "the file cannot be written (permissions or disk space)";
+    }
+    if (::rename(tmp.c_str(), target.c_str()) != 0) {
+        ::unlink(tmp.c_str());
+        return "the file cannot be replaced";
+    }
+    // The rename is durable once the directory is: without this a crash loses the edit.
+    const int dir = ::open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir >= 0) {
+        ::fsync(dir);
+        ::close(dir);
+    }
+    return nullptr;
+}
+
 } // namespace
 
 namespace settings {
@@ -1125,35 +1226,14 @@ bool session::write_key(unsigned row, const lx::config::edit_value& v) {
         }
     }
 
-    // Atomic write: temp in the same directory, fsync, rename (output_config_store's
-    // pattern). Human-frequency edits of a ≤ 256 KiB file: synchronous, on the UI thread.
-    {
-        std::filesystem::path target{user_file_};
-        std::filesystem::path tmp = target;
-        tmp += ".settings-tmp";
-        std::error_code ec;
-        // The first edit creates the user layer: its directory may not exist yet.
-        std::filesystem::create_directories(target.parent_path(), ec);
-        {
-            std::ofstream out{tmp, std::ios::binary | std::ios::trunc};
-            if (!out)
-                return false;
-            out.write(edited.data(), static_cast<std::streamsize>(edited.size()));
-            out.flush();
-            if (!out)
-                return false;
-        }
-        const int tmp_fd = ::open(tmp.c_str(), O_RDONLY);
-        if (tmp_fd >= 0) {
-            ::fsync(tmp_fd);
-            ::close(tmp_fd);
-        }
-        std::filesystem::rename(tmp, target, ec);
-        if (ec) {
-            std::filesystem::remove(tmp, ec);
-            return false;
-        }
+    // Atomic write (output_config_store's pattern). Human-frequency edits of a ≤ 256 KiB
+    // file: synchronous, on the UI thread. A failure is reported, not swallowed — a pane
+    // that says "saved" over a write that did not take is worse than one that says why.
+    if (const char* why = write_config_file(user_file_, edited)) {
+        std::snprintf(error_, sizeof(error_), "%s", why);
+        return false;
     }
+    error_[0] = '\0';
     // The file is the truth now: the rows re-read the effective configuration.
     reload_effective();
     save_ = save_state::written;
@@ -1476,31 +1556,11 @@ bool session::commit_layer(const std::string& edited) {
             !lx::config::parse_config(one, probe, d) || d.errors())
             return false;
     }
-    std::filesystem::path target{user_file_};
-    std::filesystem::path tmp = target;
-    tmp += ".settings-tmp";
-    std::error_code ec;
-    // The first edit creates the user layer: its directory may not exist yet.
-    std::filesystem::create_directories(target.parent_path(), ec);
-    {
-        std::ofstream out{tmp, std::ios::binary | std::ios::trunc};
-        if (!out)
-            return false;
-        out.write(edited.data(), static_cast<std::streamsize>(edited.size()));
-        out.flush();
-        if (!out)
-            return false;
-    }
-    const int tmp_fd = ::open(tmp.c_str(), O_RDONLY);
-    if (tmp_fd >= 0) {
-        ::fsync(tmp_fd);
-        ::close(tmp_fd);
-    }
-    std::filesystem::rename(tmp, target, ec);
-    if (ec) {
-        std::filesystem::remove(tmp, ec);
+    if (const char* why = write_config_file(user_file_, edited)) {
+        std::snprintf(error_, sizeof(error_), "%s", why);
         return false;
     }
+    error_[0] = '\0';
     reload_effective();
     save_ = save_state::written;
     return true;

@@ -94,6 +94,10 @@ const wl_pointer_listener k_pointer_listener = {
         [](void* data, wl_pointer*, std::uint32_t axis, std::uint32_t direction) {
             static_cast<seat*>(data)->on_pointer_axis_relative_direction(axis, direction);
         },
+    // v11: the compositor moved the pointer under a client (a focus click). libxkbcommon
+    // leaves the client's focus state alone; nothing to do until a caller wants it, and an
+    // uninitialised slot aborts libwayland when a v11 server sends it.
+    .warp = [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {},
 };
 
 const wl_keyboard_listener k_keyboard_listener = {

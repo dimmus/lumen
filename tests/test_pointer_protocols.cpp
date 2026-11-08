@@ -338,8 +338,9 @@ const wl_pointer_listener ptr_listener = {
     [](void*, wl_pointer*, uint32_t) {},
     [](void*, wl_pointer*, uint32_t, uint32_t) {},
     [](void*, wl_pointer*, uint32_t, int32_t) {},
-    nullptr,
-    nullptr};
+    [](void*, wl_pointer*, uint32_t, int32_t) {},
+    [](void*, wl_pointer*, uint32_t, uint32_t) {},
+    [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {}};
 
 const zwp_locked_pointer_v1_listener locked_listener = {
     [](void* d, zwp_locked_pointer_v1*) { static_cast<pointer_log*>(d)->locked++; },

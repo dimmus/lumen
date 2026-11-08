@@ -392,16 +392,6 @@ bool closest_point(const output_manager& outputs, double& x, double& y);
 namespace {
 
 /// What a client can see of an output (present mode aside).
-[[nodiscard]] bool same_visible(const lx::compositor::output_state& a,
-                                const lx::compositor::output_state& b) {
-    return a.id == b.id && a.position.x == b.position.x && a.position.y == b.position.y &&
-           a.mode.width == b.mode.width && a.mode.height == b.mode.height &&
-           a.scale == b.scale && a.refresh_mhz == b.refresh_mhz &&
-           a.transform == b.transform && a.phys_w_mm == b.phys_w_mm &&
-           a.phys_h_mm == b.phys_h_mm && std::strcmp(a.name, b.name) == 0 &&
-           std::strcmp(a.description, b.description) == 0;
-}
-
 [[nodiscard]] long long overlap_area(lx::rect2i a, lx::rect2i b) {
     const long long x0 = a.x > b.x ? a.x : b.x;
     const long long y0 = a.y > b.y ? a.y : b.y;

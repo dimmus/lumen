@@ -346,7 +346,7 @@ LUMEN_TEST(select_opens_picks_and_reports_the_dismissal) {
 
 int g_dd_pick = -1;
 bool g_dd_open = false;
-bool g_dd_dismissed = false;
+[[maybe_unused]] bool g_dd_dismissed = false; // the dropdown's dismiss path, checked below
 void on_dd_pick(int i) {
     g_dd_pick = i;
     g_dd_open = false;
