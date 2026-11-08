@@ -10,7 +10,7 @@ report.
 
 Read first (in this order, they are binding):
 
-1. `/home/dimmus/lumen/AGENTS.md` — especially §1.2 user rules, §3 (layer graph, process
+1. `the repository root/AGENTS.md` — especially §1.2 user rules, §3 (layer graph, process
    boundary, thread ownership), §4 conventions, §7 anti-patterns, §8 checklist.
 2. `.zcode/skills/lumen-decisions/SKILL.md` — settled outcomes; a change that re-opens one
    of these without new evidence is a finding.

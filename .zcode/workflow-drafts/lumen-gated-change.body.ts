@@ -63,7 +63,7 @@ if (task === "") {
 
 const implementerPersona =
   "You are the implement stage of Lumen's gated change workflow. " +
-  "Read /home/dimmus/lumen/AGENTS.md first — it is binding; especially §1.2 (the best-in-class bar " +
+  "Read the repository root/AGENTS.md first — it is binding; especially §1.2 (the best-in-class bar " +
   "and the no-degradation rule), §3 layering and §4 conventions. Read .zcode/skills/lumen-decisions/SKILL.md " +
   "and do not re-open anything it settled, and .zcode/skills/lumen-build-run/SKILL.md for how this host " +
   "behaves. Minimal diff; match the surrounding module's conventions; no new config keys, env vars or " +
@@ -74,7 +74,7 @@ const implementerPersona =
 
 const reviewerPersona =
   "You are the review stage of Lumen's gated change workflow, reading a diff you did not write. " +
-  "Read /home/dimmus/lumen/AGENTS.md (§3 layer/process/thread rules, §4 conventions, §7 anti-patterns, " +
+  "Read the repository root/AGENTS.md (§3 layer/process/thread rules, §4 conventions, §7 anti-patterns, " +
   "§8 checklist) and .zcode/skills/lumen-decisions/SKILL.md — a change that re-opens a settled decision " +
   "without new evidence is itself a finding. Review for correctness, layering, thread affinity, error " +
   "and logging conventions, hot-path rules (no heap churn, no info+ logs per frame), and the " +
@@ -90,7 +90,7 @@ const confirmerPersona =
 
 const fixerPersona =
   "You fix build failures, test failures and confirmed review findings in the Lumen repository. " +
-  "Read /home/dimmus/lumen/AGENTS.md §4 conventions before editing; minimal diffs only, no refactors " +
+  "Read the repository root/AGENTS.md §4 conventions before editing; minimal diffs only, no refactors " +
   "beyond what the failure forces, no new features. Do not commit or push. Do not run the full test " +
   "suite — the workflow re-gates after you; narrow checks are fine. If a failure looks environmental " +
   "(host noise, DRM master, missing protocol stamp) rather than caused by the change, escalate and " +

@@ -21,6 +21,7 @@ module lx.portal;
 import std;
 
 import lx.foundation;
+import lx.runtime;
 import lx.trace;
 import :compose;
 import :chooser;
@@ -488,6 +489,11 @@ void service::after_events() {
 }
 
 int service::run() {
+    // The overlay builds an lx.ui tree on an lx.ui.host context, and the engine asserts UI
+    // affinity in debug builds (`assert_affinity` aborts) — this D-Bus thread *is* the one
+    // that runs the overlay's frames, so it is the UI thread of this process. Without the
+    // claim, every interactive Screenshot in a debug build aborted inside `surface::create`.
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     int r = sd_bus_open_user(&bus_);
     if (r < 0) {
         log_portal.error("cannot connect to the session bus: {}", std::strerror(-r));
@@ -621,6 +627,9 @@ int run_service(const service_options&) {
 #endif
 
 int run_chooser(std::string_view input, std::string& chosen) {
+    // The chooser's list is an lx.ui overlay on an lx.ui.host context: this thread drives it,
+    // so it holds UI affinity (the engine asserts it, and a debug build aborts without it).
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     std::vector<chooser_entry> entries = parse_chooser_input(input);
     if (seat_session_locked()) {
         // The list would sit under the lock screen; nothing is shared while locked.

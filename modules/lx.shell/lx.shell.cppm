@@ -981,8 +981,9 @@ const wl_pointer_listener k_pointer_listener = {
     .frame = lx::shell::shell_app::events::ptr_frame,
     .axis_source = lx::shell::shell_app::events::ptr_axis_source,
     .axis_stop = lx::shell::shell_app::events::ptr_axis_stop,
-    .axis_discrete = lx::shell::shell_app::events::ptr_axis_discrete,
-    .axis_value120 = [](void* data, wl_pointer*, uint32_t axis, int32_t value120) {
+    // wl_pointer v8/v9/v10 events. The seat is bound at v5 at most, so a conforming
+    // compositor never sends these — but a NULL slot is a hard abort in libwayland if one
+    // ever arrives, and the smooth-scroll fallback costs nothing.
         // The same accumulation the v5 notch takes, in 120ths of a notch.
         lx::shell::shell_app::events::ptr_axis_discrete(data, nullptr, axis, value120 / 120);
     },
@@ -1506,7 +1507,6 @@ void lx::shell::shell_app::output_ready(output_record& o) {
         attach_widgets(o);
     outputs_moved();
 }
-
 lx::shell::panel_clock lx::shell::shell_app::clock_state() {
     panel_clock c{};
     std::snprintf(c.text, sizeof(c.text), "%s", clock_text_);
@@ -1838,8 +1838,7 @@ void lx::shell::shell_app::on_timer() {
     if (deadline_[t_tooltip] && deadline_[t_tooltip] <= now) {
         deadline_[t_tooltip] = 0;
         show_tooltip();
-    }
-    if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
+
         deadline_[t_lock_blank] = 0;
         // The lock did not come in time: dark anyway (the compositor keeps it locked if it
         // comes later; nothing of the session shows while it is off).

@@ -11,7 +11,7 @@ metadata:
 Verified 2026-10-14 on this host (kernel "fastvm", VMware SVGA / vmwgfx, 2 cores, 15 GB RAM, Arch, clang 23, cmake 4.4, ccache present):
 
 - A cold build needs `./scripts/fetch-protocols.sh` first (needs network; `protocols/upstream/` is gitignored).
-- `cmake --preset release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache` then `cmake --build --preset release`. Compositor plus demo clients is ~526 ninja steps, ~15 min on 2 cores. The user keeps a release build in the main checkout at /home/dimmus/lumen/build/release.
+- `cmake --preset release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache` then `cmake --build --preset release`. Compositor plus demo clients is ~526 ninja steps, ~15 min on 2 cores. The user keeps a release build in the main checkout at the repository root/build/release.
 - Vulkan: user installed vulkan-headers, vulkan-swrast (lavapipe) and shaderc on 2026-10-14. The compositor sees "llvmpipe" as a software device and still picks the GL path ("GL composite path active (EGL/GLES on GBM)", renderer "SVGA3D"), which is the intended behaviour. No hardware Vulkan exists for vmwgfx.
 - Running from an SSH/pts session works: /dev/dri/card0 has a logind ACL for dimmus (owner of the active tty1 session), so the direct-open fallback gets DRM master. Input devices have no ACL, so libinput needs logind TakeDevice.
 - To run "as tty1" from SSH: move the shell into the tty1 logind session's cgroup, then logind TakeControl/TakeDevice work and the VT is handled like a real tty1 launch:
