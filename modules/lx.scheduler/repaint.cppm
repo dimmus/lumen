@@ -42,8 +42,15 @@ public:
     static constexpr lx::runtime::clock_time k_min_lead_ns = 250'000;
 
     void set_refresh_period(lx::runtime::clock_time period_ns) {
-        if (period_ns > 0)
-            period_ns_ = period_ns;
+        if (period_ns <= 0 || period_ns == period_ns_)
+            return;
+        // A new mode (a refresh change included): the lateness measured against the old
+        // period says nothing about this one, and the cap that bounded it moved.
+        period_ns_ = period_ns;
+        late_cursor_ = 0;
+        late_filled_ = 0;
+        for (auto& v : late_window_)
+            v = 0;
     }
     [[nodiscard]] lx::runtime::clock_time refresh_period() const { return period_ns_; }
 
@@ -69,11 +76,21 @@ public:
     /// issued past its aimed deadline — and added to the lead, so a frame that misses
     /// starts earlier on its own, the same convergence the estimate has. Clamped to half
     /// a period: a stall (a modeset, a read-back) is not a steady-state lead.
+    ///
+    /// The window is a ring of the last `k_window` samples, old ones replaced as new ones
+    /// arrive — the same sliding window the repaint estimate keeps. An earlier form only
+    /// ever wrote a *late* flip's figure and never a zero, so a single stall (a modeset, a
+    /// read-back) added up to half a period of lead to every repaint for the rest of the
+    /// session: an idle desktop kept starting early for a frame that never came back. The
+    /// caller feeds the measured slack on every judged flip, 0 included (`late` is what
+    /// the miss counter wants; the scheduler wants the slack either way).
     void observe_commit_late(lx::runtime::clock_time late_ns) {
-        if (late_ns <= 0)
-            return;
+        // A stall is not a steady-state lead, and a negative slack is a frame issued
+        // early (nothing to add).
         const auto cap = period_ns_ / 2;
-        late_window_[late_cursor_] = late_ns > cap ? cap : late_ns;
+        const lx::runtime::clock_time sample =
+            late_ns <= 0 ? 0 : (late_ns > cap ? cap : late_ns);
+        late_window_[late_cursor_] = sample;
         late_cursor_ = (late_cursor_ + 1) % k_window;
         if (late_filled_ < k_window)
             ++late_filled_;
@@ -98,7 +115,9 @@ public:
         return peak;
     }
 
-    /// Peak whole-path lateness over the window (0 before any commit was late).
+    /// Peak whole-path lateness over the window (0 before any flip was judged). A peak,
+    /// not a mean, for the reason the repaint estimate is one: half the frames would
+    /// exceed a mean, and a missed deadline costs a whole period.
     [[nodiscard]] lx::runtime::clock_time late_peak_ns() const {
         lx::runtime::clock_time peak = 0;
         for (unsigned i = 0; i < late_filled_; ++i)

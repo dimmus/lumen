@@ -147,6 +147,14 @@ appearance = "dark"     # dark | light (the built-in fallback pair)
 density = "default"     # compact | default | comfortable
 ui-font-size = 16.0     # the rem base, px (10..24)
 
+[clock]                  # lumen-shell's panel clock and calendar; applied on config reload
+format = "24h"           # 24h | 12h
+show-seconds = false     # include seconds in the panel clock
+show-date = true         # show the date in the clock
+show-weekday = true      # show the weekday in the clock
+first-day = "monday"     # monday | sunday; calendar week start
+week-numbers = false     # show calendar week numbers
+
 [bindings]
 # "combination" = "action [argument]", or { action = "…", argument = …,
 #   allow-when-inhibited = true, allow-when-locked = true, repeat = true }.

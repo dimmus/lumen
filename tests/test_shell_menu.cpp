@@ -30,14 +30,14 @@ using namespace lx::ui;
         .h(lx::layout::px(static_cast<float>(r.height)));
 }
 
-int g_labels = 0;
+[[maybe_unused]] int g_labels = 0; // the labels the damaged popup would have drawn
 const char* const g_words[4] = {"Do not disturb", "Clear all", "No notifications",
                                 "14:32  org.lumen.Settings: saved"};
 
 child describe_menu_rows(build_context&) {
     // The menu: 200 wide, 26-px rows at 4-px padding, a label from x 28 to ~row width.
     constexpr int w = 200, row_h = 26, pad = 4;
-    const auto label_at = [&](int y, const char* text) {
+    const auto label_at = [&](int /*row*/, const char* text) {
         text_block_props t{};
         t.text = text;
         t.font = {"Sans", 10.f, lx::text::weight::normal, lx::text::style::normal};

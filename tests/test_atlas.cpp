@@ -81,6 +81,7 @@ void write_pattern(atlas& a, atlas_tile_id id, unsigned seed) {
         atlas_tile t{};
         if (!a.lookup(id, t))
             continue;
+        // The page's edge from the tile (a released id never gets here).
         const unsigned size = a.page(t.page).size;
         if (t.x + t.w > size || t.y + t.h > size)
             return false;
@@ -294,7 +295,6 @@ LUMEN_TEST(full_atlas_rebuilds_pages_with_stale_tiles) {
                 static_cast<double>(st.max_rebuild_ns) / 1000.0);
     LUMEN_CHECK(st.rebuilds >= 1);
     for (std::size_t i = 0; i < ids.size(); ++i) {
-        atlas_tile t{};
         if (i % 2u == 0)
             LUMEN_CHECK(pattern_intact(*a, ids[i], static_cast<unsigned>(i)));
     }

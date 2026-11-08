@@ -166,7 +166,10 @@ lx::result<void> window_rule_store::reload() {
         return io_failure();
     }
     struct stat st{};
-    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size > k_max_file_size) {
+    // `st_size` is signed (`off_t`) and a negative size means "unknown" on some filesystems;
+    // the cast happens after that is ruled out, so the comparison cannot invert.
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        static_cast<std::uintmax_t>(st.st_size) > k_max_file_size) {
         ::close(fd); return lx::invalid_argument("window rules: invalid file");
     }
     std::string text;

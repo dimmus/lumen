@@ -1912,12 +1912,14 @@ unsigned long long monotonic_us() {
 } // namespace
 
 void compositor_impl::publish_commit_timing(output_pipeline& p, int fence_fd) {
-    // Always: the repaint scheduler's commit-lateness feedback reads this on every flip.
-    // The fence dup below is what the debug-only latency split needs; the timestamp is one
-    // clock read.
+    // Always: the repaint scheduler's commit-lateness feedback reads this on every flip, and
+    // the GPU tail it adds to the repaint estimate is read from the fence — so the fence is
+    // kept at every log level. It used to be duplicated only under `LUMEN_LOG=debug`, which
+    // meant the tail was always 0 in a real session: every benchmark ran at debug (where
+    // the figure the docs quote was measured) and the compositor users run skewed a whole
+    // GPU composite early, exactly the two-in-three late frames `04ab70c` chased. The dup is
+    // one fcntl per commit; the file is closed at the next commit or the flip.
     p.committed_submit_us.store(monotonic_us(), std::memory_order_release);
-    if (!log_latency.enabled(lx::trace::level::debug))
-        return;
     const int dup_fd = fence_fd >= 0 ? ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (const int old = p.committed_fence_fd.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
         ::close(old);

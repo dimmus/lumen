@@ -1120,7 +1120,6 @@ void format_states(unsigned states, char* out, unsigned cap) {
 }
 
 constexpr unsigned k_btn_left = 0x110;
-constexpr unsigned k_btn_right = 0x111;
 constexpr unsigned k_key_esc = 1;
 
 [[nodiscard]] const char* grab_mode_name(lx::compositor::grab_mode m) {

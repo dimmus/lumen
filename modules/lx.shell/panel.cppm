@@ -145,9 +145,10 @@ struct panel_bell {
 /// The clock's input: the shell's "HH:MM" (24 h), as laid out at `width` logical px in the
 /// panel's font, and a revision that changes with it.
 struct panel_clock {
-    char text[8]{};
+    char text[96]{};
     int width = 0;
     unsigned rev = 0;
+    unsigned flags = 0;
 };
 enum panel_bell_flag : unsigned {
     bell_flag_hover = 1u << 0,
@@ -241,6 +242,7 @@ struct panel_layout {
     int clock_x = 0;
     int clock_w = 0;
     unsigned clock_rev = 0;
+    unsigned clock_flags = 0;
 };
 
 /// The logical edge of a task entry's icon, left of its title.
@@ -368,6 +370,7 @@ struct panel_widget_event {
         tray_hover,
         /// A button released on the notification indicator.
         bell_click,
+        clock_click,
     } what = kind::tray_click;
     unsigned key = 0;
     /// BTN_LEFT, BTN_RIGHT, BTN_MIDDLE.
@@ -575,6 +578,10 @@ private:
     bool bell_pressed_ = false;
     unsigned bell_pressed_button_ = 0;
     unsigned bell_pressed_serial_ = 0;
+    bool clock_hovered_ = false;
+    bool clock_pressed_ = false;
+    unsigned clock_pressed_button_ = 0;
+    unsigned clock_pressed_serial_ = 0;
     /// The clock's text of the layout being drawn.
     char clock_text_[sizeof(panel_clock::text)]{};
     bool menu_keyboard_ = false;
@@ -749,11 +756,15 @@ void lx::shell::panel::pointer_leave() {
     logout_armed_ = false;
     apps_pressed_ = false;
     notice_pressed_ = false;
-    if (ws_pressed_ >= 0 || tray_pressed_ || bell_pressed_)
+    if (ws_pressed_ >= 0 || tray_pressed_ || bell_pressed_ || clock_pressed_ || clock_hovered_)
         dirty_ = true;
     ws_pressed_ = -1;
     tray_pressed_ = 0;
     bell_pressed_ = false;
+    clock_hovered_ = false;
+    clock_pressed_ = false;
+    clock_pressed_button_ = 0;
+    clock_pressed_serial_ = 0;
     pointer_motion(-1.0, -1.0);
 }
 
@@ -802,6 +813,13 @@ void lx::shell::panel::pointer_motion(double x, double y) {
         const bool on_bell = panel_hit_bell(committed_, x, y);
         if (on_bell != bell_hovered_) {
             bell_hovered_ = on_bell;
+            dirty_ = true;
+        }
+        const bool on_clock = committed_.clock_w > 0 && x >= committed_.clock_x &&
+                              x < committed_.clock_x + committed_.clock_w &&
+                              y >= committed_.cell_y && y < committed_.cell_y + committed_.cell_h;
+        if (on_clock != clock_hovered_) {
+            clock_hovered_ = on_clock;
             dirty_ = true;
         }
     }
@@ -861,6 +879,29 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
             return;
         }
         const bool on_bell = panel_hit_bell(committed_, px, py);
+        const bool on_clock = committed_.clock_w > 0 && px >= committed_.clock_x &&
+                              px < committed_.clock_x + committed_.clock_w &&
+                              py >= committed_.cell_y && py < committed_.cell_y + committed_.cell_h;
+        if (down && on_clock && widget_fn_) {
+            clock_pressed_ = true;
+            clock_pressed_button_ = button;
+            clock_pressed_serial_ = serial;
+            dirty_ = true;
+            return;
+        }
+        if (!down && clock_pressed_) {
+            clock_pressed_ = false;
+            dirty_ = true;
+            if (on_clock && button == clock_pressed_button_ && widget_fn_) {
+                panel_widget_event e{};
+                e.what = panel_widget_event::kind::clock_click;
+                e.button = button;
+                e.serial = clock_pressed_serial_;
+                e.cell = {committed_.clock_x, committed_.cell_y, committed_.clock_w, committed_.cell_h};
+                widget_fn_(e, widget_user_);
+            }
+            return;
+        }
         if (down && on_bell && widget_fn_) {
             bell_pressed_ = true;
             bell_pressed_button_ = button;
@@ -1062,6 +1103,10 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
     out.bell_w = 0;
     out.bell_flags = 0;
     out.bell_unread = 0;
+    out.clock_x = 0;
+    out.clock_w = 0;
+    out.clock_rev = 0;
+    out.clock_flags = 0;
     // The logout button takes the right end, the Apps button the left; entries share
     // what is left.
     int reserve = 0;
@@ -1127,6 +1172,7 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
         out.clock_w = clock.width;
         out.clock_x = right - clock.width;
         out.clock_rev = clock.rev;
+        out.clock_flags = clock.flags;
         reserve += clock.width + k_panel_gap;
     }
     int start = k_panel_pad;
@@ -1280,6 +1326,10 @@ void lx::shell::copy_layout(panel_layout& to, const panel_layout& from) {
     to.bell_w = from.bell_w;
     to.bell_flags = from.bell_flags;
     to.bell_unread = from.bell_unread;
+    to.clock_x = from.clock_x;
+    to.clock_w = from.clock_w;
+    to.clock_rev = from.clock_rev;
+    to.clock_flags = from.clock_flags;
     to.ws_count = from.ws_count;
     for (unsigned i = 0; i < from.ws_count && i < k_max_ws_cells; ++i) {
         to.ws[i].x = from.ws[i].x;
@@ -1403,9 +1453,13 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
     if (b.bell_w > 0 && (a.bell_flags != b.bell_flags || a.bell_unread != b.bell_unread) &&
         !add({b.bell_x, b.cell_y, b.bell_w, b.cell_h}))
         return 1;
-    if (b.clock_w > 0 && (a.clock_rev != b.clock_rev || a.clock_x != b.clock_x) &&
-        !add({b.clock_x, b.cell_y, b.clock_w, b.cell_h}))
-        return 1;
+    if (a.clock_w != b.clock_w || a.clock_x != b.clock_x || a.clock_rev != b.clock_rev ||
+        a.clock_flags != b.clock_flags) {
+        if (a.clock_w > 0 && !add({a.clock_x, a.cell_y, a.clock_w, a.cell_h}))
+            return 1;
+        if (b.clock_w > 0 && !add({b.clock_x, b.cell_y, b.clock_w, b.cell_h}))
+            return 1;
+    }
     return n;
 }
 
@@ -1420,8 +1474,9 @@ void lx::shell::panel::relayout() {
     if (widgets_.fill_tray)
         widgets_.fill_tray(tray_input_, widgets_.user);
     const panel_bell bell = widgets_.bell ? widgets_.bell(widgets_.user) : panel_bell{};
-    const panel_clock clock =
-        widgets_.clock ? widgets_.clock(widgets_.user) : panel_clock{};
+    panel_clock clock = widgets_.clock ? widgets_.clock(widgets_.user) : panel_clock{};
+    clock.flags |= (clock_hovered_ ? bell_flag_hover : 0u) |
+                   (clock_pressed_ ? bell_flag_pressed : 0u);
     std::snprintf(clock_text_, sizeof(clock_text_), "%s", clock.text);
     layout_panel(bridge_->model(), width(), k_panel_height, pointer_x_, pointer_y_, pressed_,
                  next_, panel_logout{bridge_->can_logout(), logout_armed_, logout_pressed_},
@@ -1762,19 +1817,21 @@ lx::ui::child lx::shell::panel::build_ui() {
                                      .justify_center(),
                                  lx::ui::tok::none, {parts, k}, this, 0x7500'0000u + i);
     }
-    // The clock, left of the status icons: one line of the panel's own text.
+    // The clock is a real press target, with the same hover/pressed treatment as other panel controls.
     if (l.clock_w > 0) {
-        const lx::ui::child text[1] = {panel_text(clock_text_, k_text, false, 0x7700u)};
-        kids[n++] = lx::ui::styled(lx::ui::style{}
-                                       .absolute()
-                                       .top(cell_y)
-                                       .left(lx::layout::px(static_cast<float>(l.clock_x)))
-                                       .w(lx::layout::px(static_cast<float>(l.clock_w)))
-                                       .h(cell_h)
-                                       .flex_row()
-                                       .items_center()
-                                       .justify_center(),
-                                   text[0]);
+        lx::ui::child text[1] = {panel_text(clock_text_,
+            l.clock_flags & bell_flag_pressed ? k_text_focused :
+            l.clock_flags & bell_flag_hover ? k_text_focused : k_text, false, 0x7700u)};
+        kids[n++] = panel_button(lx::ui::style{}
+                                     .absolute()
+                                     .top(cell_y)
+                                     .left(lx::layout::px(static_cast<float>(l.clock_x)))
+                                     .w(lx::layout::px(static_cast<float>(l.clock_w)))
+                                     .h(cell_h)
+                                     .flex_row()
+                                     .items_center()
+                                     .justify_center(),
+                                 lx::ui::tok::none, {text, 1u}, this, 0x7701u);
     }
     // The notification indicator: a bell, the unread count beside it.
     if (l.bell_w > 0) {

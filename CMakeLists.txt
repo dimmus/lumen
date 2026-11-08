@@ -732,9 +732,8 @@ if(LUMEN_BUILD_TESTS)
         # into a PNG (a dev aid, not a test).
         # The bell-menu anatomy over the real host path: a layer surface and an xdg_popup
         # with the menu's rows (text + quads), for the popup-text damage.
-        add_executable(popup-probe)
-        target_sources(popup-probe PRIVATE FILE_SET CXX_MODULES TYPE CXX_MODULES
-            BASE_DIRS ${CMAKE_SOURCE_DIR} FILES tests/popup_probe.cpp)
+        # An ordinary TU: a module unit cannot hold `main` (its linkage must be external).
+        add_executable(popup-probe tests/popup_probe.cpp)
         target_link_libraries(popup-probe PRIVATE lx.ui.host lx.ui lx.wayland.client
             lx.runtime lx.foundation lx.trace lx.text)
         lumen_apply_module_properties(popup-probe)
@@ -1229,6 +1228,21 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_task_model)
     target_include_directories(test_task_model PRIVATE tests)
     add_test(NAME test_task_model COMMAND test_task_model)
+
+    add_executable(test_clock tests/test_clock.cpp)
+    target_link_libraries(test_clock PRIVATE lx.shell)
+    lumen_apply_module_properties(test_clock)
+    lumen_link_platform(test_clock)
+    target_include_directories(test_clock PRIVATE tests)
+    add_test(NAME test_clock COMMAND test_clock)
+
+    add_executable(test_clock_popup tests/test_clock_popup.cpp)
+    target_link_libraries(test_clock_popup PRIVATE lx.compositor lx.shell lx.ui.host)
+    lumen_apply_module_properties(test_clock_popup)
+    lumen_link_platform(test_clock_popup)
+    target_include_directories(test_clock_popup PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_clock_popup COMMAND test_clock_popup)
+    set_tests_properties(test_clock_popup PROPERTIES TIMEOUT 90)
 
     # lumen-shell's launcher: desktop entries, the catalog, launching, the launcher layout.
     foreach(shell_test test_desktop_entry test_app_catalog test_app_launch test_launcher_layout

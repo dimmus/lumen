@@ -1,0 +1,21 @@
+# Delivery procedure (non-trivial changes)
+
+Use the project's stricter workflow when declared. This generic fallback applies otherwise. Read references/contracts.md for the records below.
+
+1. **Discover and define.** Inspect current code and relevant decisions; separate declared interfaces, unimplemented scaffolding, and actual behavior. Identify the current blocking dependency. Define acceptance criteria and before/after measurements for behavior/performance claims. Sequence independently verifiable phases.
+2. **Establish the baseline.** Record base commit, initial dirty/untracked paths, environment, toolchain, commands and available hardware. Build and run required baseline tests before implementation. If required baseline checks fail, report their evidence and do not attribute those failures to the proposed change or proceed as though the baseline were green. Preserve existing work and use an isolated worktree when appropriate.
+3. **Implement.** Give workers scoped briefs. Run independent work in parallel only with disjoint writes and no shared runtime interference. Check that reported files actually exist. Coordinator reviews scope and integration; workers return narrow check results and unresolved questions.
+4. **Build/test and repair.** Allow at most three verification rounds. Diagnose failures before changing code. Each repair needs subsequent verification; the final round cannot end with an unverified fix. Exhaustion means incomplete with evidence. Environmental failures remain visible and are investigated against the baseline.
+5. **Independent review.** Freeze the candidate state for review. Supply the original task, exact base and diff, task-owned untracked files, pre-existing edit inventory, applicable decisions, and checks already run. Use software-studio-review or the project reviewer. An empty findings list is valid.
+6. **Confirm findings.** A worker independent of author and reviewer reads each finding's evidence and surrounding code; run a deciding narrow check if available. Return confirmed, refuted, or unresolved with reason. Do not fix refuted findings; missing evidence or failed delegation leaves a finding unresolved. Material unresolved findings block readiness.
+7. **Repair confirmed findings.** Apply minimal fixes and allow at most two verification rounds. Re-review altered logic and independently confirm new material findings. Stop at the budget rather than growing an unbounded loop; carry unresolved work in the report.
+8. **Final verification.** This final gate is separate from the three initial and two post-review repair verification rounds above. Run the project's required final suite on the finished tree. Add applicable integration/smoke, visual/golden, security and performance checks. Record pass only after the command finishes successfully and expected assertions/artifacts are present. Compare measurements on the same host/backend under controlled conditions; repeat/interleave baseline and candidate to distinguish noise. Respect the project's regression/escalation policy. Do not repeatedly rerun successful unchanged checks beyond the project's final gate without a reason.
+9. **Handover.** Inspect the final diff, record the tested state and limitations, and derive readiness from required gates and unresolved findings. Update contract docs and verified durable memory when appropriate. Do not commit, merge, publish or deploy unless requested.
+
+## Runtime constraints
+
+Coordinate full suites centrally. Build activity invalidates latency measurements; real user input can invalidate injected-input smoke tests. A container/headless success cannot establish physical display, device permissions, or hardware GPU success. Record unavailable checks as NOT RUN or UNSUPPORTED, with the capability needed to complete them. Never substitute a different backend silently.
+
+## Resumption
+
+Keep the task's objective, acceptance criteria, exact base, pre-existing changes, scopes, last verified state, findings and next action in the existing task record or a requested checkpoint. On resume, re-read current Git status and changed sources. Do not reuse results for a tree that changed or treat an inactive teammate as successful; obtain its result. Collect relevant jobs and required workers before the final answer.

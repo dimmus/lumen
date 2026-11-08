@@ -316,7 +316,13 @@ const wl_pointer_listener ptr_listener = {
         static_cast<keys*>(d)->buttons++;
     },
     [](void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {},
-    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    [](void*, wl_pointer*) {},
+    [](void*, wl_pointer*, uint32_t) {},
+    [](void*, wl_pointer*, uint32_t, uint32_t) {},
+    [](void*, wl_pointer*, uint32_t, int32_t) {},
+    [](void*, wl_pointer*, uint32_t, int32_t) {},
+    [](void*, wl_pointer*, uint32_t, uint32_t) {},
+    [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {}};
 
 // ── xdg-dialog-v1 ──
 

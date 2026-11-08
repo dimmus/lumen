@@ -5,6 +5,28 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
 
 **Read first:** [docs/architecture.md](docs/architecture.md)
 
+### DSH project context
+
+- The reusable Software Development Studio entry point is `software-development-studio`.
+  Lumen's studio adapter is `lumen-development-studio`; use it for studio planning and
+  coordinated delivery. Project skills live in `.agents/skills/`; setup, reusable
+  installation and usage are documented in `tools/software-development-studio/README.md`.
+  Small/read-only tasks stay proportional; non-trivial implementations use the existing
+  gated process below. Skills guide execution; they do not install automatic hooks.
+- Use the `project-memory` skill to query the indexed `.zcode/memories/` archive and
+  `.zcode/TODO.md`; read the cited source before acting. These are historical records:
+  confirm task/branch status against current ADRs, code and Git history. Do not import
+  unchecked TODO rows as new work without checking whether they are already done.
+- For independent review of a non-trivial change, use the `lumen-reviewer` skill,
+  adapted from `.zcode/agents/lumen-reviewer.md`, in a read-only subagent.
+- For a requested gated implementation, use the `lumen-gated-change` skill, adapted
+  from `.zcode/workflows/lumen-gated-change.dwf.ts`; the workflow draft contains the
+  same body. DSH executes the stages through its agent/tools interface, not the Zcode DSL.
+- Use Docker for development on this Windows host. Resolve paths from the current
+  checkout; Linux host paths and hardware facts in the archive are host-specific.
+- DSH skill adaptations are installed under the user-level `~/.agents/skills/`.
+  Keep `.zcode/` sources as the original references.
+
 ---
 
 ## 1. Project identity (non-negotiable)

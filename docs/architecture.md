@@ -144,7 +144,7 @@ Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 **Binary:** `lumen-shell`  
 **Modules:** `lx.shell` (`:bridge`, `:task_model`, `:panel`, `:shm_canvas`, `:launcher`,
 `:desktop_entry`, `:app_catalog`, `:app_launch`, `:background`, `:workspaces`, `:switcher`,
-`:user_bus`, `:notifications`, `:notify_view`, `:menu_popup`, `:tray`, `:icon_theme`,
+`:user_bus`, `:notifications`, `:notify_view`, `:menu_popup`, `:tray`, `:clock`, `:calendar_popup`, `:icon_theme`,
 `:svg`), `lx.shell.policy`, `lx.text`;
 libwayland-client directly (its bindings move onto `lx.wayland.client` in ADR-010 Phase 5), xkbcommon for the
 launcher's keyboard, sd-bus for the user bus (launching, notifications, the tray), librsvg
@@ -176,6 +176,12 @@ Acts as a **privileged Wayland client**:
 - Draws its **top panel** — a task list, one entry per window, the focused one
   highlighted — as a `wlr-layer-shell` surface (layer `top`, exclusive zone 32, so windows
   are placed and maximized below it), with CPU text from `lx::text`
+- Owns the **clock and calendar** (`:clock`, `:calendar_popup`): local date/time in the panel,
+  a native xdg_popup for date selection and month/year navigation, and shell-owned live
+  `[clock]` display preferences from `lx.config` (also exposed by `lumen-settings`). The
+  Gregorian model and wall-boundary calculation are independent of Wayland; popup state
+  stays on the shell UI thread. See [shell-state-sync.md](subsystems/shell-state-sync.md)
+  for the configuration and runtime contract.
 - Draws the **desktop background** (`:background`): one `wlr-layer-shell` surface per output
   on layer `background`, opaque, taking no input. A colour is a `wp_single_pixel_buffer_v1`
   stretched by a `wp_viewport` (no pixels; the compositor's solid draw, the cost of a clear).
@@ -323,7 +329,7 @@ flowchart TB
 
     subgraph L5["Desktop layer"]
         SH["lx.shell"]
-        SHB["lx.shell:bridge / task_model / panel / launcher / switcher / app_catalog / app_launch / user_bus / notifications / notify_view / menu_popup / tray"]
+        SHB["lx.shell:bridge / task_model / panel / clock / calendar_popup / launcher / switcher / app_catalog / app_launch / user_bus / notifications / notify_view / menu_popup / tray"]
         SHP["lx.shell.policy"]
         UI["lx.ui"]
         UIH["lx.ui.host (context, surface, roles)"]

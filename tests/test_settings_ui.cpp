@@ -429,6 +429,73 @@ LUMEN_TEST(settings_session_loads_the_located_layers_and_writes_them) {
     std::filesystem::remove_all(dir);
 }
 
+LUMEN_TEST(settings_clock_rows_are_searchable_and_persist_to_user_layer) {
+    char dir[] = "/tmp/lumen-settings-clock-XXXXXX";
+    LUMEN_CHECK(::mkdtemp(dir) != nullptr);
+    const std::string file = std::string(dir) + "/config.toml";
+    {
+        std::ofstream out{file};
+        out << "[clock]\nformat = \"24h\"\nshow-seconds = false\n"
+               "show-date = true\nshow-weekday = true\nfirst-day = \"monday\"\n"
+               "week-numbers = false\n";
+    }
+    LUMEN_CHECK(::setenv("LUMEN_CONFIG", file.c_str(), 1) == 0);
+    settings::session s{true};
+    const auto& rows = settings::catalog();
+    const auto row_of = [&](const char* key) {
+        for (unsigned i = 0; i < rows.size(); ++i)
+            if (rows[i].desc && std::strcmp(rows[i].desc->section, "clock") == 0 &&
+                std::strcmp(rows[i].desc->key, key) == 0)
+                return i;
+        return settings::session::k_no_row;
+    };
+    const unsigned format = row_of("format");
+    const unsigned seconds = row_of("show-seconds");
+    const unsigned first_day = row_of("first-day");
+    const unsigned weeks = row_of("week-numbers");
+    LUMEN_CHECK(format != settings::session::k_no_row && seconds != settings::session::k_no_row &&
+                first_day != settings::session::k_no_row && weeks != settings::session::k_no_row);
+    const auto search_hits = [&](std::string_view term) {
+        unsigned hits = 0;
+        for (const settings::row_ref& row : rows)
+            if (row.desc && std::strcmp(row.desc->section, "clock") == 0 &&
+                settings::row_matches(row, term))
+                ++hits;
+        return hits;
+    };
+    for (const char* term : {"clock", "format", "seconds", "weekday", "calendar", "week"})
+        LUMEN_CHECK(search_hits(term) > 0);
+    for (unsigned i = 0; i < rows.size(); ++i) {
+        if (!rows[i].desc || std::strcmp(rows[i].desc->section, "clock") != 0)
+            continue;
+        LUMEN_CHECK(rows[i].owner == settings::pane_id::appearance);
+        LUMEN_CHECK(std::string_view(rows[i].group) == "Clock");
+        LUMEN_CHECK(rows[i].label && rows[i].description);
+    }
+    LUMEN_CHECK(s.config().clock.format == lx::config::clock_format::h24);
+    s.set_enum(format, 1);
+    s.set_bool(seconds, true);
+    s.set_enum(first_day, 1);
+    s.set_bool(weeks, true);
+    LUMEN_CHECK(s.state() == settings::session::save_state::written);
+    LUMEN_CHECK(s.config().clock.format == lx::config::clock_format::h12 &&
+                s.config().clock.show_seconds &&
+                s.config().clock.first_day == lx::config::clock_first_day::sunday &&
+                s.config().clock.week_numbers);
+    {
+        std::ifstream in{file};
+        std::stringstream contents;
+        contents << in.rdbuf();
+        const std::string text = contents.str();
+        LUMEN_CHECK(text.find("format = \"12h\"") != std::string::npos);
+        LUMEN_CHECK(text.find("show-seconds = true") != std::string::npos);
+        LUMEN_CHECK(text.find("first-day = \"sunday\"") != std::string::npos);
+        LUMEN_CHECK(text.find("week-numbers = true") != std::string::npos);
+    }
+    ::unsetenv("LUMEN_CONFIG");
+    std::filesystem::remove_all(dir);
+}
+
 LUMEN_TEST(settings_string_rows_carry_examples_and_refuse_blank_spec) {
     settings::session s{};
     settings::set_active_session(&s);

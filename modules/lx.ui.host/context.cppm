@@ -146,6 +146,14 @@ public:
     /// modifiers reach it. False with the table full.
     [[nodiscard]] bool attach(surface& s);
     void detach(surface& s);
+    /// A surface's `destroy()` ran from inside one of its own input handlers: the free is
+    /// queued and `flush_deferred_destroys()` runs it once the seat event has returned (the
+    /// root's `overlays.after_input()`, the pressed node's release still run after a
+    /// handler that closed the view).
+    void defer_destroy(surface& s);
+    /// Destroys the queued surfaces, if any. The seat-event paths call it; the loop's
+    /// `after_dispatch` is the backstop for any other entry point.
+    void flush_deferred_destroys();
     [[nodiscard]] unsigned surface_count() const { return count_; }
     [[nodiscard]] surface* surface_at(unsigned i) const { return i < count_ ? surfaces_[i] : nullptr; }
     /// The context's surface on `wl` (null: not one of this context's).
@@ -220,6 +228,9 @@ private:
     lx::wayland::surface* touch_target_ = nullptr;
     unrouted_input_handler* unrouted_ = nullptr;
     std::uint32_t press_serial_ = 0;
+    /// Surfaces whose destroy waited for an input dispatch to return (see `defer_destroy`).
+    surface* deferred_destroy_[k_max_surfaces]{};
+    unsigned deferred_count_ = 0;
     /// The seat's modifier and repeat state, replayed to a surface that joins later.
     std::uint32_t modifiers_ = 0;
     bool have_modifiers_ = false;

@@ -102,8 +102,10 @@ struct grid_item_state {
     flex_size size{};
 };
 
-/// Caller-provided scratch: one item state and one cell rect per child, row state for at
-/// least the child count (an auto-flow grid makes at most one row per item).
+/// Caller-provided scratch: one item state and one cell rect per child, and row state for
+/// at least as many rows as the solve can produce — `k_grid_rows_max` of them, not the
+/// child count: row spans, explicit `row` placements and template rows all make more rows
+/// than items (a row span of 100 at the first item is 100 rows).
 struct grid_scratch {
     std::span<grid_item_state> items;
     std::span<lx::rect2f> cells;
@@ -164,10 +166,16 @@ lx::result<lx::layout::grid_output> lx::layout::solve_grid(
     const grid_style& cs, const grid_input& in, const grid_children& ch,
     std::span<lx::rect2f> out, grid_scratch scratch) {
     const unsigned n = ch.count;
-    if (out.size() < n || scratch.cells.size() < n || scratch.items.size() < n ||
-        scratch.rows.size() < n)
+    if (out.size() < n || scratch.cells.size() < n || scratch.items.size() < n)
         return lx::invalid_argument(
             "lx::layout::solve_grid: output or scratch shorter than the child count");
+    // The rows this solve may write: `min(row_count, k_grid_rows_max)` — capped to what the
+    // caller gave, so a solve never writes past its scratch (`lx.ui` passes 64). A
+    // placement that would need a row past the cap fails instead, below.
+    const unsigned row_cap =
+        std::min<unsigned>(scratch.rows.size(), k_grid_rows_max);
+    if (row_cap == 0 && n > 0)
+        return lx::invalid_argument("lx::layout::solve_grid: no row state");
     if (cs.columns == 0 || cs.columns > k_grid_tracks)
         return lx::invalid_argument("lx::layout::solve_grid: columns out of range");
 
@@ -199,7 +207,7 @@ lx::result<lx::layout::grid_output> lx::layout::solve_grid(
         it.col_span = std::clamp<unsigned>(given ? given->column_span : 1, 1, cs.columns);
         it.row_span = std::max<unsigned>(given ? given->row_span : 1, 1);
         it.col_span = std::min<unsigned>(it.col_span, k_grid_tracks);
-        it.row_span = std::min<unsigned>(it.row_span, k_grid_rows_max);
+        it.row_span = std::min<unsigned>(it.row_span, row_cap);
 
         const auto span_free = [&](unsigned r, unsigned c) {
             for (unsigned rr = r; rr < r + it.row_span; ++rr)
@@ -219,9 +227,9 @@ lx::result<lx::layout::grid_output> lx::layout::solve_grid(
             // An explicit column: the first row whose cells in it are free.
             it.column = std::min<unsigned>(given->column - 1, cs.columns - it.col_span);
             it.row = given->row > 0 ? given->row - 1 : 0;
-            while (it.row + it.row_span <= k_grid_rows_max && !span_free(it.row, it.column))
+            while (it.row + it.row_span <= row_cap && !span_free(it.row, it.column))
                 ++it.row;
-            if (it.row + it.row_span > k_grid_rows_max)
+            if (it.row + it.row_span > row_cap)
                 return lx::invalid_argument("lx::layout::solve_grid: too many rows");
         } else {
             it.column = cursor_col;
@@ -230,14 +238,14 @@ lx::result<lx::layout::grid_output> lx::layout::solve_grid(
                 ++it.row;
                 it.column = 0;
             }
-            while (it.row + it.row_span <= k_grid_rows_max && !span_free(it.row, it.column)) {
+            while (it.row + it.row_span <= row_cap && !span_free(it.row, it.column)) {
                 ++it.column;
                 if (it.column + it.col_span > cs.columns) {
                     ++it.row;
                     it.column = 0;
                 }
             }
-            if (it.row + it.row_span > k_grid_rows_max)
+            if (it.row + it.row_span > row_cap)
                 return lx::invalid_argument("lx::layout::solve_grid: too many rows");
             cursor_row = it.row;
             cursor_col = it.column + it.col_span;
@@ -245,7 +253,7 @@ lx::result<lx::layout::grid_output> lx::layout::solve_grid(
         occupy_span(it.row, it.column);
     }
     row_count = std::max(row_count, std::min<unsigned>(cs.rows, k_grid_tracks));
-    row_count = std::min(row_count, k_grid_rows_max);
+    row_count = std::min(row_count, row_cap);
 
     // ── column tracks: fixed, then auto (max-content of their single-column items), then
     // spanned items grow theirs, then fr shares what is left ──

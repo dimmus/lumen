@@ -277,10 +277,13 @@ constexpr bool variation_selector(char32_t c) {
     return (c >= 0xFE00 && c <= 0xFE0F) || (c >= 0xE0100 && c <= 0xE01EF);
 }
 
-/// Mandatory breaks inside a paragraph (UAX #14 BK): VT, FF, NEL, LS.
+#ifndef LUMEN_HAS_UNIBREAK
+/// Mandatory breaks inside a paragraph (UAX #14 BK): VT, FF, NEL, LS. The fallback
+/// itemizer uses it; with libunibreak, the library classifies the same breaks.
 constexpr bool hard_break(char32_t c) {
     return c == 0x0B || c == 0x0C || c == 0x85 || c == 0x2028;
 }
+#endif
 
 #ifdef LUMEN_HAS_UNIBREAK
 void init_unibreak_once() {

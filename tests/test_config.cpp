@@ -146,6 +146,10 @@ void test_defaults() {
     check(!d.mouse.natural_scroll && d.mouse.accel == cfg::accel_profile::device_default,
           "mouse: natural scroll off, device's accel profile");
     check(d.cursor.size == 0 && !d.cursor.theme[0], "cursor from the environment");
+    check(d.clock.format == cfg::clock_format::h24 && !d.clock.show_seconds &&
+              d.clock.show_date && d.clock.show_weekday &&
+              d.clock.first_day == cfg::clock_first_day::monday && !d.clock.week_numbers,
+          "clock defaults: 24h, date and weekday, Monday, no seconds or week numbers");
     check(d.focus.mode == cfg::focus_mode::click && d.focus.raise_on_click, "click to focus");
     check(d.idle.policy == cfg::idle_policy_kind::shell && d.idle.blank_after == 600 &&
               d.idle.blank_locked_after == 60 && d.idle.lock_on_blank && !d.idle.lock_command[0],
@@ -314,6 +318,13 @@ layout = "master-stack"
 master-ratio = 0.6
 master-count = 2
 gaps = 0
+[clock]
+format = "12h"
+show-seconds = true
+show-date = false
+show-weekday = false
+first-day = "sunday"
+week-numbers = true
 )");
     check(p.ok && p.d.empty(), "valid values: no diagnostic");
     dump(p.d);
@@ -340,6 +351,10 @@ gaps = 0
               std::strcmp(p.c.idle.lock_command, "swaylock -f") == 0,
           "idle");
     check(p.c.notifications.position == cfg::notification_position::bottom_left, "an enum word");
+    check(p.c.clock.format == cfg::clock_format::h12 && p.c.clock.show_seconds &&
+              !p.c.clock.show_date && !p.c.clock.show_weekday &&
+              p.c.clock.first_day == cfg::clock_first_day::sunday && p.c.clock.week_numbers,
+          "clock formatting and calendar preferences");
     check(std::strcmp(p.c.background.spec, "#203040") == 0, "background spec");
     check(p.c.tiling.layout == cfg::tiling_layout::master_stack && p.c.tiling.master_ratio == 0.6 &&
               p.c.tiling.master_count == 2 && p.c.tiling.gaps == 0,
@@ -360,6 +375,9 @@ accel-profile = "adaptiv"
 size = 1.5
 [workspaces]
 names = ["a", 2]
+[clock]
+format = "12-hour"
+first-day = "friday"
 )");
     check(p.ok, "bad values do not reject the file");
     check(std::strcmp(p.c.keyboard.layout, "de") == 0, "the good key next to bad ones applies");
@@ -378,7 +396,13 @@ names = ["a", 2]
     check(has_diag(p.d, "cursor.size", "must be a whole number"), "a float for an integer");
     check(p.c.workspaces.name_count == 0 && has_diag(p.d, "workspaces.names", "array of strings"),
           "a list with a non-string");
-    check(p.d.errors() == 7 && p.d.warnings() == 0, "seven errors, no warnings");
+    check(p.c.clock.format == cfg::clock_format::h24 &&
+              has_diag(p.d, "clock.format", "24h, 12h"),
+          "invalid clock format reports choices and keeps the default");
+    check(p.c.clock.first_day == cfg::clock_first_day::monday &&
+              has_diag(p.d, "clock.first-day", "monday, sunday"),
+          "invalid first day reports choices and keeps the default");
+    check(p.d.errors() == 9 && p.d.warnings() == 0, "nine errors, no warnings");
     dump(p.d);
 
     // With the configuration in use given, a bad value keeps *that* value.

@@ -181,6 +181,17 @@ struct panel_settings {
     bool blur = false;
 };
 
+enum class clock_format : unsigned char { h24, h12 };
+enum class clock_first_day : unsigned char { monday, sunday };
+struct clock_settings {
+    clock_format format = clock_format::h24;
+    bool show_seconds = false;
+    bool show_date = true;
+    bool show_weekday = true;
+    clock_first_day first_day = clock_first_day::monday;
+    bool week_numbers = false;
+};
+
 enum class notification_position : unsigned char {
     top_right,
     top_center,
@@ -256,6 +267,7 @@ struct config_snapshot {
     panel_settings panel{};
     notification_settings notifications{};
     ui_settings ui{};
+    clock_settings clock{};
     bool default_bindings = true;
     /// Effective: the defaults (unless `default_bindings` is false) with the files' bindings
     /// over them.
@@ -352,6 +364,8 @@ constexpr const char* k_positions[] = {"top-right", "top-center", "top-left", "b
                                        "bottom-left"};
 constexpr const char* k_ui_appearances[] = {"dark", "light"};
 constexpr const char* k_ui_densities[] = {"compact", "default", "comfortable"};
+constexpr const char* k_clock_formats[] = {"24h", "12h"};
+constexpr const char* k_clock_first_days[] = {"monday", "sunday"};
 
 template <std::size_t N>
 constexpr unsigned count_of(const char* const (&)[N]) {
@@ -480,6 +494,19 @@ const key_desc k_keys[] = {
      count_of(k_ui_densities), 0, LX_FIELD(ui.density)},
     {"ui", "ui-font-size", value_kind::number, k_c, k_live, 10.0, 24.0, nullptr, 0, 0,
      LX_FIELD(ui.ui_font_size)},
+    // [clock] is shell-owned and applied on live config reload.
+    {"clock", "format", value_kind::enumeration, k_s, k_live, 0, 0, k_clock_formats,
+     count_of(k_clock_formats), 0, LX_FIELD(clock.format)},
+    {"clock", "show-seconds", value_kind::boolean, k_s, k_live, 0, 0, nullptr, 0, 0,
+     LX_FIELD(clock.show_seconds)},
+    {"clock", "show-date", value_kind::boolean, k_s, k_live, 0, 0, nullptr, 0, 0,
+     LX_FIELD(clock.show_date)},
+    {"clock", "show-weekday", value_kind::boolean, k_s, k_live, 0, 0, nullptr, 0, 0,
+     LX_FIELD(clock.show_weekday)},
+    {"clock", "first-day", value_kind::enumeration, k_s, k_live, 0, 0, k_clock_first_days,
+     count_of(k_clock_first_days), 0, LX_FIELD(clock.first_day)},
+    {"clock", "week-numbers", value_kind::boolean, k_s, k_live, 0, 0, nullptr, 0, 0,
+     LX_FIELD(clock.week_numbers)},
     {"general", "default-bindings", value_kind::boolean, k_c, k_live, 0, 0, nullptr, 0, 0,
      LX_FIELD(default_bindings)},
 };
@@ -518,7 +545,7 @@ constexpr const char* k_sections[] = {
     "input",      "input.keyboard", "input.touchpad", "input.mouse",   "input.trackpoint",
     "input.device", "cursor",       "focus",          "windows",       "tiling",
     "animations", "workspaces",     "switcher",       "idle",          "background",
-    "panel",      "notifications",  "ui",             "general",       "bindings",
+    "panel",      "notifications",  "ui",             "clock",          "general",       "bindings",
 };
 
 using enum lx::config::action_id;
