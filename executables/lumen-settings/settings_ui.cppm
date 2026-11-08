@@ -141,6 +141,10 @@ public:
         if (load_files)
             load_from_files();
         load_strings();
+        // The query buffer starts empty.
+        query_.storage[0] = '\0';
+        query_.bind();
+        query_.buffer.size = 0;
         // Zed's settings open with the current category expanded.
         expanded_[static_cast<unsigned>(current_)] = true;
     }
@@ -1085,10 +1089,7 @@ void session::load_strings() {
                 number_text(*static_cast<const double*>(field), number_step(rows[i])));
         }
     }
-    // The query buffer starts empty.
-    query_.storage[0] = '\0';
-    query_.bind();
-    query_.buffer.size = 0;
+    // The query is not reset here — the constructor clears it once.
 }
 
 /// The text slot of the integer row `row`, or k_no_row.
@@ -1130,6 +1131,7 @@ void session::load_from_files() {
         return; // a syntax error on disk: the compositor keeps its previous config; the
                 // pane shows the defaults until the file is valid
     config_ = parsed;
+    load_strings();
     if (!where.user_file.path[0])
         return;
     std::snprintf(user_file_, sizeof(user_file_), "%s", where.user_file.path);
@@ -1151,8 +1153,10 @@ void session::reload_effective() {
     cfg::diagnostics d{};
     cfg::config_snapshot parsed{};
     if (cfg::read_file(user_file_, content, why, missing) && !missing &&
-        one.add_layer(user_file_, content) && cfg::parse_config(one, parsed, d))
+        one.add_layer(user_file_, content) && cfg::parse_config(one, parsed, d)) {
         config_ = parsed;
+        load_strings();
+    }
 }
 
 bool session::write_key(unsigned row, const lx::config::edit_value& v) {
