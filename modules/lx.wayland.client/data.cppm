@@ -1,5 +1,7 @@
 module;
 
+#include <wayland-client.h>
+
 // lx.wayland.client:data — data devices on a seat, their offers and this client's sources,
 // for both selections: the clipboard (wl_data_device, which also carries drag and drop) and
 // the primary selection (zwp_primary_selection_device_v1). The kind is chosen at creation;
@@ -146,7 +148,7 @@ public:
     /// the pointer for the drag's length (the device's version 2+; null: the pointer
     /// itself shows the drag).
     void start_drag(data_source& source, surface& origin, std::uint32_t serial,
-                    surface* icon = nullptr);
+                    wl_surface* icon = nullptr);
     /// The drag over this client's surfaces (null: none) and the dropped offer being read.
     [[nodiscard]] data_offer* drag_offer() const { return drag_; }
     [[nodiscard]] data_offer* dropped_offer() const { return dropped_; }

@@ -1,0 +1,37 @@
+# Line endings, stated rather than inferred from whoever cloned the repository.
+#
+# Without this file the checkout's endings follow the machine's `core.autocrlf`, and on
+# Windows that turns every script into a CRLF file: `scripts/run-desktop.sh` then fails with
+# `bash\r: No such file`, and the container and CI builds fail on their own scripts the same
+# way (the `#!` line carries the \r into the interpreter's name). The sources are the same
+# class of problem one step further in — a CRLF `.cppm` is legal C++ but makes every diff
+# against an LF clone show whole files changed.
+#
+# Everything is text and stored LF; only genuinely binary files are exempt.
+
+* text=auto eol=lf
+
+# Never touched: these are compared or passed through byte for byte.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.svg text eol=lf
+*.ico binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.mp4 binary
+*.zip binary
+*.gz binary
+*.xz binary
+
+# Scripts must be executable and LF, or they are not scripts.
+*.sh text eol=lf
+*.py text eol=lf
+
+# Windows-only files that Git's own tooling expects with CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

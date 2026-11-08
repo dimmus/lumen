@@ -532,6 +532,7 @@ const wl_keyboard_listener keyboard_listener = {
         std::printf("key %u %s\n", key, state ? "pressed" : "released");
     },
     [](void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {},
+    [](void*, wl_keyboard*, int32_t, int32_t) {},
 };
 
 int run_window(int argc, char** argv) {

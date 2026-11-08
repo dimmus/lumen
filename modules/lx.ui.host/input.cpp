@@ -227,6 +227,7 @@ void input_router::on_pointer(lx::wayland::seat& seat, const lx::wayland::pointe
     (void)seat;
     if (!root_)
         return;
+    const delivery inside{*this};
     ++stats_.pointer_frames;
     using pf = lx::wayland::pointer_frame;
     if (f.mask & pf::has_leave && !(f.mask & pf::has_enter)) {
@@ -288,6 +289,7 @@ void input_router::on_pointer(lx::wayland::seat& seat, const lx::wayland::pointe
 void input_router::flush_motion() {
     if (!motion_pending_ || !root_)
         return;
+    const delivery inside{*this};
     motion_pending_ = false;
     ++stats_.hit_tests;
     (void)root_->pointer_move(pending_);
@@ -402,6 +404,7 @@ void input_router::on_key(lx::wayland::seat& seat, const lx::wayland::key_event&
     (void)seat;
     if (!root_)
         return;
+    const delivery inside{*this};
     // A key acts where the pointer is now (a shift-click after a move, a scroll by keys).
     flush_motion();
     using lx::wayland::key_state;
@@ -437,6 +440,7 @@ void input_router::on_key(lx::wayland::seat& seat, const lx::wayland::key_event&
 }
 
 void input_router::on_repeat_due(std::uint64_t now) {
+    const delivery inside{*this};
     if (!root_ || repeat_key_ == 0 || repeat_next_ns_ == 0 || now < repeat_next_ns_)
         return;
     ++stats_.repeats;

@@ -606,17 +606,6 @@ using namespace lx::ui;
     return p;
 }
 
-[[nodiscard]] tok lx_ui_icon_token(tok text_token) {
-    switch (text_token) {
-    case tok::text: return tok::icon;
-    case tok::text_muted: return tok::icon_muted;
-    case tok::text_disabled: return tok::icon_disabled;
-    case tok::text_placeholder: return tok::icon_placeholder;
-    case tok::text_accent: return tok::icon_accent;
-    default: return text_token;
-    }
-}
-
 [[nodiscard]] status_colors lx_ui_tint(tint_color t) {
     switch (t) {
     case tint_color::error: return status_tokens(status_kind::error);

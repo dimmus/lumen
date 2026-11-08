@@ -451,12 +451,17 @@ int run_stream(int fd, unsigned node, double seconds, cast_state& s) {
     s.stream = pw_stream_new(core, "lumen-portal-probe",
                              pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
                                                PW_KEY_MEDIA_ROLE, "Screen", nullptr));
-    static const pw_stream_events events = {
-        .version = PW_VERSION_STREAM_EVENTS,
-        .state_changed = on_state_changed,
-        .param_changed = on_param_changed,
-        .process = on_process,
-    };
+    // Filled by assignment rather than by designated initializers: PipeWire's struct keeps
+    // growing, and every event the probe does not handle is a field clang would then warn
+    // about leaving out. Zero is the correct value for all of them.
+    static const pw_stream_events events = [] {
+        pw_stream_events e{};
+        e.version = PW_VERSION_STREAM_EVENTS;
+        e.state_changed = on_state_changed;
+        e.param_changed = on_param_changed;
+        e.process = on_process;
+        return e;
+    }();
     pw_stream_add_listener(s.stream, &s.listener, &events, &s);
     uint8_t buf[1024];
     spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof buf);

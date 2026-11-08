@@ -261,8 +261,15 @@ int main() {
     }
     {
         const auto st = comp.outputs().state(comp.outputs().nth(0));
-        g_want = {st.name, st.position.x, st.position.y, st.mode.width, st.mode.height,
-                  static_cast<int>(st.refresh_mhz)};
+        // Field by field: the struct's later members (the wire scale, the logical size,
+        // the EDID identity) are set just below.
+        g_want = {};
+        g_want.name = st.name;
+        g_want.x = st.position.x;
+        g_want.y = st.position.y;
+        g_want.w = st.mode.width;
+        g_want.h = st.mode.height;
+        g_want.refresh = static_cast<int>(st.refresh_mhz);
         g_want.wire_scale = std::max(1, static_cast<int>(std::ceil(st.scale)));
         g_want.lw = static_cast<int>(std::lround(st.mode.width / st.scale));
         g_want.lh = static_cast<int>(std::lround(st.mode.height / st.scale));

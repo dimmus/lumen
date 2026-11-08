@@ -836,8 +836,6 @@ constexpr VkFormat k_linear_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     }
 }
 
-constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
-
 /// The scissors a draw is recorded with: `scissor` (non-empty), or for a draw the
 /// visibility pass found partly covered (`blit_command::visible`) each visible rect ∩
 /// `scissor` that is not empty. Written to `out`; returns their count (0: nothing to draw).

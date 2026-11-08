@@ -785,18 +785,10 @@ struct run_args {
 }
 
 constexpr const char* k_s7_text[4] = {
-    "Lumen draws this window with its own engine: one primitive stream of rounded quads, "
-    "shadows and atlas sprites, emitted by retained nodes, ordered and batched once, and "
-    "rendered on the CPU, with GLES or with Vulkan into a buffer the compositor samples in "
-    "place.",
-    "When the window changes size the compositor sends a configure; the window lays its text "
-    "out again at the new width, answers with a buffer of that size in the very commit that "
-    "acknowledges it, and draws nothing it did not have to.",
-    "Every paragraph here wraps at the window's width. Narrow it and the lines grow in number; "
-    "widen it and they shorten — the shaping results are kept, and only the line breaks are "
-    "computed again.",
-    "A resize storm is thirty of these in six seconds: the heap must stay flat, no frame may "
-    "take more than twice the median, and the swapchain may allocate once per size it sees.",
+    ("Lumen draws this window with its own engine: one primitive stream of rounded quads, " "shadows and atlas sprites, emitted by retained nodes, ordered and batched once, and " "rendered on the CPU, with GLES or with Vulkan into a buffer the compositor samples in " "place."),
+    ("When the window changes size the compositor sends a configure; the window lays its text " "out again at the new width, answers with a buffer of that size in the very commit that " "acknowledges it, and draws nothing it did not have to."),
+    ("Every paragraph here wraps at the window's width. Narrow it and the lines grow in number; " "widen it and they shorten — the shaping results are kept, and only the line breaks are " "computed again."),
+    ("A resize storm is thirty of these in six seconds: the heap must stay flat, no frame may " "take more than twice the median, and the swapchain may allocate once per size it sees."),
 };
 
 [[nodiscard]] lx::ui::child s7_describe(lx::ui::build_context&) {

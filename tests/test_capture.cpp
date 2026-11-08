@@ -273,7 +273,7 @@ struct client_buffer {
     }
 };
 
-unsigned g_access = 0;
+[[maybe_unused]] unsigned g_access = 0; // read by the checks below only with a pool
 unsigned g_unref = 0;
 
 struct cpu_rig {

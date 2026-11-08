@@ -439,8 +439,6 @@ using lx::compositor::k_deco_glyph_light;
 using lx::compositor::k_deco_title_active;
 using lx::compositor::k_deco_title_inactive;
 
-/// Appended to the title of a window whose client does not answer pings (KWin's wording).
-constexpr const char* k_not_responding_suffix = " (Not Responding)";
 /// The tint of a not-responding window, as `surface_tree::set_root_dim` uses for its
 /// surfaces.
 constexpr lx::color k_dim_tint = lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f);

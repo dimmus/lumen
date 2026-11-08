@@ -316,7 +316,13 @@ void watch_input(bool keys, bool focus, bool buttons) {
                 std::printf("button %s\n", tag_of(pointer_surface));
         },
         [](void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {},
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+        [](void*, wl_pointer*) {},
+        [](void*, wl_pointer*, uint32_t) {},
+        [](void*, wl_pointer*, uint32_t, uint32_t) {},
+        [](void*, wl_pointer*, uint32_t, int32_t) {},
+        [](void*, wl_pointer*, uint32_t, int32_t) {},
+        [](void*, wl_pointer*, uint32_t, uint32_t) {},
+        [](void*, wl_pointer*, wl_fixed_t, wl_fixed_t) {}};
     if (!g.seat)
         return;
     wl_keyboard_add_listener(wl_seat_get_keyboard(g.seat), &kl, nullptr);

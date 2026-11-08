@@ -115,6 +115,32 @@ private:
     return lx::ui::text_block(t, key);
 }
 
+/// The dimmed capture as a sprite over `device` (the surface's pixel size) — whether the
+/// tile is that size or a downscaled stand-in for it. `lx::ui::image` draws pixel-exactly and
+/// at the tile's own size, which is what a picture wants and what a backdrop must not do.
+[[nodiscard]] lx::ui::child backdrop_image(lx::ui::host::surface& surface,
+                                           lx::gfx::atlas_tile_id tile, lx::size2i device,
+                                           lx::ui::element_key key) {
+    lx::ui::image_props p{};
+    p.atlas = &surface.atlas();
+    p.tile = tile;
+    p.pixel_exact = false; // scaled to its bounds
+    lx::ui::style box = lx::ui::style{}
+                            .absolute()
+                            .top(lx::layout::px(0.f))
+                            .left(lx::layout::px(0.f))
+                            .w(lx::layout::px(static_cast<float>(device.width)))
+                            .h(lx::layout::px(static_cast<float>(device.height)));
+    const lx::ui::child content =
+        lx::ui::describe<lx::ui::image_node, lx::ui::image_props>(p, key);
+    const lx::ui::child one[1] = {content};
+    lx::shell::shell_box_props b{};
+    b.control.layout = box;
+    // The key belongs to the sprite inside, not the wrapper: the reconciler matches it
+    // there across frames, and the wrapper is anonymous.
+    return lx::shell::shell_box(b, one);
+}
+
 [[nodiscard]] lx::ui::child overlay_box(lx::ui::style layout, lx::ui::quad_style quad,
                                         std::span<const lx::ui::child> children,
                                         lx::ui::element_key key) {
@@ -531,11 +557,49 @@ lx::gfx::atlas_tile_id overlay::backdrop_tile(view& v) {
     // The capture composed once, at the surface's pixel size (it shows pixel for pixel).
     v.composed = compose(shots_, shot.logical,
                          static_cast<double>(device.width) / static_cast<double>(v.surface.logical_size().width));
-    if (v.composed.empty() || v.composed.width > 2048 || v.composed.height > 2048) {
-        // The atlas caps its RGBA pages at 2048² (two of them): a bigger output, or more
-        // than two captured at once, has no tile.
-        log_overlay.info("DEBUG tile: composed {}x{} rejected", v.composed.width, v.composed.height);
+    if (v.composed.empty()) {
+        log_overlay.info("DEBUG tile: the capture composed to nothing");
         return {};
+    }
+    // The atlas caps an RGBA page at 2048², and a 4K output composes past it. That used to
+    // end the overlay — "overlay backdrop" failed, and the whole interactive screenshot with
+    // it — though 3840×2160 is the ordinary case on the displays this runs on. The tile is
+    // downscaled until it fits and the sprite is stretched over the surface instead: the
+    // backdrop is dimmed and sits behind a selection, so it can be softer than the output.
+    if (v.composed.width > static_cast<int>(lx::gfx::k_atlas_page_max) ||
+        v.composed.height > static_cast<int>(lx::gfx::k_atlas_page_max)) {
+        const double fit = static_cast<double>(lx::gfx::k_atlas_page_max) /
+                           static_cast<double>(std::max(v.composed.width, v.composed.height));
+        const int w = std::max(1, static_cast<int>(std::lround(v.composed.width * fit)));
+        const int h = std::max(1, static_cast<int>(std::lround(v.composed.height * fit)));
+        const image full = std::move(v.composed);
+        v.composed.allocate(w, h);
+        // Box filter: each target pixel is the mean of the source pixels it covers, so an
+        // edge stays visible rather than being dropped by point sampling.
+        for (int y = 0; y < h; ++y) {
+            const int sy0 = static_cast<int>(static_cast<long long>(y) * full.height / h);
+            const int sy1 =
+                std::max(sy0 + 1, static_cast<int>(static_cast<long long>(y + 1) * full.height / h));
+            for (int x = 0; x < w; ++x) {
+                const int sx0 = static_cast<int>(static_cast<long long>(x) * full.width / w);
+                const int sx1 = std::max(
+                    sx0 + 1, static_cast<int>(static_cast<long long>(x + 1) * full.width / w));
+                std::uint32_t r = 0, g = 0, b = 0, a = 0, count = 0;
+                for (int sy = sy0; sy < sy1 && sy < full.height; ++sy)
+                    for (int sx = sx0; sx < sx1 && sx < full.width; ++sx) {
+                        const std::uint32_t c = full.at(sx, sy);
+                        r += (c >> 16) & 0xFFu;
+                        g += (c >> 8) & 0xFFu;
+                        b += c & 0xFFu;
+                        a += (c >> 24) & 0xFFu;
+                        ++count;
+                    }
+                count = count ? count : 1;
+                v.composed.pixels[static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
+                                  static_cast<std::size_t>(x)] =
+                    ((a / count) << 24) | ((r / count) << 16) | ((g / count) << 8) | (b / count);
+            }
+        }
     }
     v.tile_w = device.width;
     v.tile_h = device.height;
@@ -599,7 +663,10 @@ lx::ui::child overlay::build_ui(view& v) {
             finish({.what = overlay_result::kind::failed, .reason = "overlay backdrop"});
             return nullptr;
         }
-        kids[n++] = lx::ui::image(v.surface.atlas(), tile, device, 0xA001u);
+        // Stretched over the whole surface rather than drawn 1:1: a downscaled tile (a 4K
+        // output, above the atlas's 2048 px page) has to cover the same area as a full-size
+        // one, and `composed` is what says which it is.
+        kids[n++] = backdrop_image(v.surface, tile, device, 0xA001u);
         kids[n++] = overlay_box(at(whole), fill_quad(k_dim_quad), {}, 0xA002u);
 
         if (mode_ == mode::select && has_sel_) {
@@ -613,7 +680,7 @@ lx::ui::child overlay::build_ui(view& v) {
                 // The bright capture inside the selection: the same tile in a clipped box,
                 // an inner box at the selection's negated origin carrying the image, so its
                 // pixels line up 1:1 with the surface's.
-                lx::ui::child img[1] = {lx::ui::image(v.surface.atlas(), tile, device, 0xA003u)};
+                lx::ui::child img[1] = {backdrop_image(v.surface, tile, device, 0xA003u)};
                 lx::shell::shell_box_props inner_box{};
                 inner_box.control.layout = at({-sel.x, -sel.y, logical.width, logical.height});
                 lx::ui::child inner[1] = {lx::shell::shell_box(inner_box, img, 0xA004u)};

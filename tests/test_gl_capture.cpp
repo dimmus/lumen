@@ -227,7 +227,7 @@ LUMEN_TEST(gl_capture_reads_back_through_a_pixel_pack_buffer_without_waiting) {
 
 namespace {
 
-unsigned g_unref = 0;
+[[maybe_unused]] unsigned g_unref = 0; // read by the checks below only with a pool
 
 struct engine_rig {
     lx::compositor::capture_shm_guards guards{};

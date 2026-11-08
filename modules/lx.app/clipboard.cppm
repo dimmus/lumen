@@ -178,6 +178,8 @@ private:
     void end_drag(bool moved);
 
     lx::wayland::display* display_ = nullptr;
+    /// `drag_service`'s chooser belongs to this clipboard (`stop` withdraws it).
+    bool chooser_registered_ = false;
     lx::runtime::event_loop* loop_ = nullptr;
     transfer_host* host_ = nullptr;
     channel channels_[2]{};
@@ -207,6 +209,9 @@ private:
     bool drop_ask_ = false;
     /// A dropped offer read as `text/uri-list` rather than text.
     bool drop_uris_ = false;
+    /// The actions the dropped offer's source allowed (`k_dnd_*`), remembered because the
+    /// offer itself is released before the data arrives and an ask drop needs them.
+    std::uint32_t drop_actions_ = lx::wayland::k_dnd_none;
     char own_mime_[48]{};
     drag_stats drag_stats_{};
 };

@@ -6,12 +6,11 @@
 //
 //   popup-probe [socket-name] [--hold SECONDS]   (default 12 s)
 
-module;
-
+// An ordinary translation unit, not a module unit: `main` cannot live in a named module
+// (its linkage must be external). The includes come before the imports, as a TU's
+// import-declarations must.
 #include <stdlib.h>
 #include <unistd.h>
-
-export module lumen.popup_probe;
 
 import std;
 import lx.foundation;
@@ -162,9 +161,9 @@ struct probe {
         // loop's queue is single-producer, so one timer thread posts both).
         std::thread timer{[&loop = loop, open_popup, drop_popup, hold_s] {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            loop.post(lx::runtime::task{open_popup});
+            (void)loop.post(lx::runtime::task{open_popup});
             std::this_thread::sleep_for(std::chrono::seconds(hold_s));
-            loop.post(lx::runtime::task{[&loop, drop_popup] {
+            (void)loop.post(lx::runtime::task{[&loop, drop_popup] {
                 drop_popup();
                 loop.quit(0);
             }});
@@ -181,7 +180,9 @@ struct probe {
 
 } // namespace
 
-int main(int argc, char** argv) {
+namespace {
+
+int run(int argc, char** argv) {
     const char* socket = nullptr;
     int hold = 12;
     for (int i = 1; i < argc; ++i) {
@@ -193,3 +194,8 @@ int main(int argc, char** argv) {
     probe p{};
     return p.run(socket && *socket ? socket : nullptr, hold);
 }
+
+} // namespace
+
+// Keep the entry point at global scope with external linkage.
+int main(int argc, char** argv) { return run(argc, argv); }

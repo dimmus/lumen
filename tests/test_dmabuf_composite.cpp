@@ -29,7 +29,7 @@ constexpr unsigned k_height = 64;
 /// Left half opaque red, right half opaque blue, in little-endian XRGB8888 as a Wayland
 /// client would write it, with `x` in the undefined fourth byte.
 void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsigned stride,
-                  unsigned char x = 255u) {
+                  unsigned char alpha = 255u) {
     for (unsigned y = 0; y < height; ++y) {
         for (unsigned x = 0; x < width; ++x) {
             unsigned char* px = pixels + y * stride + x * 4u;
@@ -37,7 +37,7 @@ void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsign
             px[0] = left ? 0u : 255u;   // B
             px[1] = 0u;                 // G
             px[2] = left ? 255u : 0u;   // R
-            px[3] = x;                  // X/A
+            px[3] = alpha;              // X/A
         }
     }
 }
