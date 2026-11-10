@@ -362,7 +362,7 @@ their own compose handling.
 ## Login session (systemd)
 
 `cmake --install build/release [--prefix DIR]` installs a complete session: `lumen-compositor`,
-`lumen-shell`, `lumen-ctl` and the launcher `lumen-session` in `bin/`; the systemd user units
+`lumen-shell`, `lumen-settings`, `lumen-ctl` and the launcher `lumen-session` in `bin/`; the systemd user units
 `lumen-compositor.service`, `lumen-shell.service` and `lumen-shutdown.target` (systemd's user
 unit directory for `/usr`, else `<prefix>/lib/systemd/user`; `-DLUMEN_SYSTEMD_USER_UNIT_DIR=`
 overrides); `share/wayland-sessions/lumen.desktop` for display managers; and the portal backend

@@ -534,7 +534,7 @@ endif()
 # Every destination is relative to the prefix, so `cmake --install build --prefix DIR`
 # installs a complete, self-consistent tree into DIR (the session files name DIR's paths).
 include(GNUInstallDirs)
-install(TARGETS lumen-compositor lumen-shell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS lumen-compositor lumen-shell lumen-settings RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET lumen-ctl)
     install(TARGETS lumen-ctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
