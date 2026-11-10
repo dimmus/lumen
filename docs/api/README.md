@@ -6,6 +6,15 @@ C++26 module API surface for future implementation. All modules live under `modu
 
 **Version:** `lx::version` — 0.3.0 (API contract)
 
+All `lx.*` module libraries are shared DSOs, installed together in the GNUInstallDirs
+library directory, including generated protocol and enabled optional modules. The shell
+and applications share these engine libraries; application-only UI modules remain static.
+The runtime `VERSION` is `0.3.0` and `SOVERSION` is `0.3`, distinct from the CMake project
+version (`0.1.0`). This pre-stable identifier does not guarantee binary compatibility: build
+and deploy libraries and consumers together using a matching compiler and standard library.
+Origin-relative RUNPATHs resolve the installed runtime closure after prefix relocation;
+the runtime installation does not include a standalone module SDK or portable BMIs.
+
 **Architecture overview:** [architecture.md](architecture.md)
 
 **AI agent instructions:** [../AGENTS.md](../AGENTS.md)

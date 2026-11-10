@@ -283,9 +283,9 @@ Each app (ADR-010 §4.9–§4.10, Phase 4):
   a headless compositor, per tier (ADR-010 §7 Phase 4 "As built", stage 4): an idle window
   wakes 0 times in 10 s; a hover frame allocates nothing on the UI thread; a resize storm keeps
   the heap flat and allocates the swapchain once per size
-- An `lx.app` executable links with `--as-needed`: the module archives carry the compositor's
-  platform libraries (libinput, udev, libwayland-server), which a client never calls and would
-  otherwise map and relocate at every exec
+- An `lx.app` executable links with `--as-needed` to omit unused direct dependencies.
+  Retained module DSOs load their own runtime dependency closure; executable link pruning
+  does not remove a platform library required by one of those DSOs.
 
 Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.app` builds on `lx.ui.host` and
 `lx.ui` (the `lx.ui.builder` fluent API was deleted in ADR-010 Phase 5); the shell and the
@@ -307,6 +307,23 @@ the way `lumen-shell` is. See [Portals](#portals) in §4.
 ---
 
 ## 3. Module layers
+
+All `lx.*` module libraries are shared runtime libraries, including generated protocols and
+optional modules when enabled. Shell and applications use the same installed engine DSOs;
+application-only UI modules remain static archives. The toolchain's `lumen-std` archive is
+compiled as position-independent code for use in the shared libraries.
+
+The runtime library version is `0.3.0`, with SONAME suffix `0.3`, matching the current API
+contract rather than the CMake project version (`0.1.0`). This is an internal, pre-stable
+version identifier, not a binary compatibility promise: build and deploy the Lumen libraries
+and their consumers together with a matching compiler and standard library.
+
+Runtime libraries install in `CMAKE_INSTALL_LIBDIR` and carry `$ORIGIN` RUNPATH so each DSO
+can resolve its sibling dependencies. Installed executables carry an origin-relative path
+from `CMAKE_INSTALL_BINDIR` (or the portal's `CMAKE_INSTALL_LIBEXECDIR`) to that library
+directory. Relative GNUInstallDirs layouts support installation with `--prefix`, `DESTDIR`
+staging and relocation of the installed tree without a build-tree library path or
+`LD_LIBRARY_PATH`. These runtime installs do not provide a standalone C++ module SDK.
 
 Dependency flows **downward** — higher layers never export to lower ones.
 CMake encodes this graph in `cmake/LumenCXXModules.cmake` (`LUMEN_LAYER_*`) and

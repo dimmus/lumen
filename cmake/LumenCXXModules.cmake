@@ -58,7 +58,17 @@ function(lumen_add_module_library target source_dir)
         message(FATAL_ERROR "lumen_add_module_library(${target}): no sources in ${source_dir}")
     endif()
 
-    add_library(${target})
+    add_library(${target} SHARED)
+    # Internal runtime ABI: rebuild the stack together with a matching C++ toolchain.
+    set_target_properties(${target} PROPERTIES
+        VERSION 0.3.0
+        SOVERSION 0.3
+        BUILD_RPATH_USE_ORIGIN ON
+        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH_USE_LINK_PATH FALSE
+    )
+    target_link_options(${target} PRIVATE "LINKER:--enable-new-dtags")
+    set_property(GLOBAL APPEND PROPERTY LUMEN_MODULE_TARGETS ${target})
 
     # CMAKE_BINARY_DIR lives under the source tree (./build), so it cannot share a
     # FILE_SET BASE_DIRS list with CMAKE_SOURCE_DIR — CMake rejects nested bases.
@@ -122,7 +132,7 @@ function(lumen_check_executable_layers target)
             continue()
         endif()
         get_target_property(_dep_type ${_dep} TYPE)
-        if(NOT _dep_type STREQUAL "STATIC_LIBRARY")
+        if(NOT _dep_type STREQUAL "STATIC_LIBRARY" AND NOT _dep_type STREQUAL "SHARED_LIBRARY")
             continue()
         endif()
         if(DEFINED LUMEN_LAYER_${_dep})

@@ -232,17 +232,14 @@ lumen_link_platform_parts(lx.ui.host xkb)
 # (lx.ui.host surfaces with the toplevel role), the clipboard. Application layer.
 lumen_add_module_library(lx.app modules/lx.app
     DEPENDS lx.ui.host lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
-# An application loads only the shared libraries it calls into: the module archives carry the
-# compositor's platform libraries (libinput and its libwacom / GLib / Lua, udev,
-# libwayland-server, libdisplay-info) as link dependencies, which an lx.app client never
-# references. Every library is mapped and relocated at exec, before main: 40 of them cost a
-# client ≈ 6 ms of its start-up on the development host (ADR-010 §7 Phase 4, S10).
+# The clipboard drag icon calls the Wayland client API directly.
+lumen_link_platform_parts(lx.app wayland_client)
+# Drop unused direct link dependencies from application executables. Each retained module
+# DSO still loads its own runtime dependency closure, including its platform libraries.
 target_link_options(lx.app INTERFACE "LINKER:--as-needed")
 
-# Platform APIs link on the module libraries that call them, each with only the parts whose
-# LUMEN_HAS_* its sources test: the archives are static, so whatever a module links reaches
-# every executable importing it (lumen-shell imports lx.gfx through lx.text, and took
-# libinput with its libwacom / GLib / Lua, udev, libwayland-server and libdisplay-info).
+# Platform APIs link on the module DSOs that call them, each with only the parts whose
+# LUMEN_HAS_* its sources test. Consumers load the retained DSOs and their runtime closure.
 lumen_link_platform_parts(lx.wayland.server wayland_server)
 lumen_link_platform_parts(lx.gfx vulkan drm egl)
 lumen_link_platform_parts(lx.drm drm display_info udev)
@@ -310,7 +307,7 @@ lumen_apply_module_properties(lumen-input-probe)
 lumen_link_platform(lumen-input-probe)
 
 # lumen-hello's window tree, a module of its own: test_app_window drives the same tree.
-add_library(lumen-hello-ui)
+add_library(lumen-hello-ui STATIC)
 target_sources(lumen-hello-ui PUBLIC FILE_SET CXX_MODULES TYPE CXX_MODULES
     BASE_DIRS ${CMAKE_SOURCE_DIR} FILES executables/lumen-hello/hello_ui.cppm
     executables/lumen-hello/icon.cppm)
@@ -323,7 +320,7 @@ lumen_check_executable_layers(lumen-hello lx.app)
 
 # lumen-settings' UI module (ADR-013): the schema-driven surface over lx.config + lx.ui;
 # the Varlink health polls live in the :ipc partition (libsystemd, like the control socket).
-add_library(lumen-settings-ui)
+add_library(lumen-settings-ui STATIC)
 set(LUMEN_SETTINGS_UI_SOURCES executables/lumen-settings/settings_ui.cppm
     executables/lumen-settings/ipc.cppm
     executables/lumen-settings/displays.cppm)
@@ -534,6 +531,30 @@ endif()
 # Every destination is relative to the prefix, so `cmake --install build --prefix DIR`
 # installs a complete, self-consistent tree into DIR (the session files name DIR's paths).
 include(GNUInstallDirs)
+# Collect after all optional modules have been declared, including protocol and portal DSOs.
+get_property(_lumen_module_targets GLOBAL PROPERTY LUMEN_MODULE_TARGETS)
+install(TARGETS ${_lumen_module_targets}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# Compute paths between install directories, without embedding the configured prefix.
+file(RELATIVE_PATH _lumen_bin_to_lib "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+file(RELATIVE_PATH _lumen_libexec_to_lib "${CMAKE_INSTALL_FULL_LIBEXECDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
+foreach(_target lumen-compositor lumen-shell lumen-settings lumen-ctl)
+    if(TARGET ${_target})
+        set_target_properties(${_target} PROPERTIES
+            BUILD_RPATH_USE_ORIGIN ON
+            INSTALL_RPATH "$ORIGIN/${_lumen_bin_to_lib}"
+            INSTALL_RPATH_USE_LINK_PATH FALSE)
+        target_link_options(${_target} PRIVATE "LINKER:--enable-new-dtags")
+    endif()
+endforeach()
+if(LUMEN_PORTAL_BUILT)
+    set_target_properties(xdg-desktop-portal-lumen PROPERTIES
+        BUILD_RPATH_USE_ORIGIN ON
+        INSTALL_RPATH "$ORIGIN/${_lumen_libexec_to_lib}"
+        INSTALL_RPATH_USE_LINK_PATH FALSE)
+    target_link_options(xdg-desktop-portal-lumen PRIVATE "LINKER:--enable-new-dtags")
+endif()
 install(TARGETS lumen-compositor lumen-shell lumen-settings RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET lumen-ctl)
     install(TARGETS lumen-ctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

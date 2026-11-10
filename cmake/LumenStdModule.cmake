@@ -58,6 +58,7 @@ target_sources(lumen-std PUBLIC
     BASE_DIRS "${_lumen_std_dir}"
     FILES "${LUMEN_STD_MODULE_SOURCE}")
 set_target_properties(lumen-std PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
     CXX_STANDARD 26
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF

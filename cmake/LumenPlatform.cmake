@@ -254,8 +254,8 @@ endfunction()
 #   udev            libudev                    LUMEN_HAS_UDEV
 #   input           libinput + xkbcommon       LUMEN_HAS_INPUT (+ LUMEN_HAS_LIBINPUT_3FG_DRAG)
 #   egl             EGL, GLESv2, GBM           LUMEN_HAS_EGL
-# Module libraries are static, so a PRIVATE link still reaches every executable that imports
-# them: each module takes exactly the parts whose LUMEN_HAS_* its sources test.
+# Module libraries are shared: each DSO links the platform parts whose LUMEN_HAS_* its
+# sources test, and consumers load those dependencies through that DSO.
 function(lumen_link_platform_parts target)
     foreach(part IN LISTS ARGN)
         if(part STREQUAL "wayland_client")
