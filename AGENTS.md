@@ -24,9 +24,11 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
   unchecked TODO rows as new work without checking whether they are already done.
 - For independent review of a non-trivial change, use the `lumen-reviewer` skill,
   adapted from `.zcode/agents/lumen-reviewer.md`, in a read-only subagent.
-- For a requested gated implementation, use the `lumen-gated-change` skill, adapted
-  from `.zcode/workflows/lumen-gated-change.dwf.ts`; the workflow draft contains the
-  same body. DSH executes the stages through its agent/tools interface, not the Zcode DSL.
+- For a requested gated implementation, use `lumen-gated-change` as the per-task
+  execution contract. For multi-task/parallel work, use `lumen-workflow-orchestrator`:
+  it maps the baseline → implement → independent review → verify → fix → gate lifecycle
+  onto DSH task/agent/workflow tools. Role-specific Lumen skills live in `.agents/skills/`.
+  Skills guide DSH usage but do not create agents, enforce permissions or run CI/hooks.
 - Use Docker for development on this Windows host. Resolve paths from the current
   checkout; Linux host paths and hardware facts in the archive are host-specific.
 - DSH skill adaptations are installed under the user-level `~/.agents/skills/`.

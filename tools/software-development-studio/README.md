@@ -12,7 +12,7 @@ Use software-development-studio to implement <change> in Lumen with review and v
 Use software-studio-review to review <exact diff/base>; do not edit files.
 ```
 
-The coordinator loads `lumen-development-studio` in Lumen. For non-trivial implementation that adapter selects the existing `lumen-gated-change`, `lumen-reviewer`, `lumen-build-run` and `lumen-decisions` skills. Those existing user-level adaptations remain prerequisites; this package does not redistribute or overwrite them. Project memory remains optional for the reusable core and part of Lumen's declared process.
+The coordinator loads `lumen-development-studio` in Lumen. It routes each non-trivial deliverable through project-scoped `lumen-gated-change`; multi-task/parallel delivery also loads `lumen-workflow-orchestrator`. Project role skills cover planning, architecture, implementation, review, testing, QA, evidence analysis, documentation, CI and gating. The host-specific `lumen-build-run` and `lumen-decisions` user adaptations remain prerequisites. Project memory remains optional for the reusable core and part of Lumen's declared process.
 
 ## Install the reusable core for other projects
 
@@ -24,7 +24,7 @@ Run from this checkout in PowerShell:
 ./tools/software-development-studio/install.ps1 -Check
 ```
 
-The default destination is `$DSH_AGENTS_HOME/skills`, or `~/.agents/skills` when that variable is unset. Use `-Destination <skills-root>` for a custom DSH-scanned root. The installer copies only the two generic bundles, including their reference resources. It preflights collisions, leaves identical files alone, and refuses to replace differing files without `-Update`. `-WhatIf` previews writes. `-Check` compares installed files without writing. No files are deleted.
+The default destination is `$DSH_AGENTS_HOME/skills`, or `~/.agents/skills` when that variable is unset. Use `-Destination <skills-root>` for a custom DSH-scanned root. Without optional Lumen switches the installer copies only the two generic bundles, including their reference resources. It preflights collisions, leaves identical files alone, and refuses to replace differing files without `-Update`. `-WhatIf` previews writes. `-Check` compares installed files without writing. No files are deleted.
 
 To also install the Lumen adapter globally, add `-IncludeLumen`; the installer requires the four existing Lumen adaptations in that destination first. The adapter is normally project-scoped, so unrelated projects do not need it. Other machines need their own DSH runtime, required capabilities and project-specific skills; copying the adapter alone does not establish a working Lumen build environment.
 
@@ -59,6 +59,34 @@ Project discovery needs no installation. To copy the testing suite into a user s
 ```
 
 This option also installs the generic studio core and requires the existing `lumen-build-run` adaptation in the destination. It does not overwrite other Lumen skills. Use `-Update` only after reviewing differing installed files. `-IncludeLumen` remains a separate option for the studio adapter. An independent analyst must be a different agent; using two skills in one agent does not create independent review. Skills guide execution and reporting, and do not install automatic hooks or tool permissions.
+
+## Lumen workflow harness
+
+Invoke `lumen-development-studio` normally, or name `lumen-workflow-orchestrator` for parallel delivery. Each task advances independently through baseline → implement → independent review → verify → confirmed fixes → gate. Task A can finish while task B is still implementing. Real dependency edges, candidate identity and shared resources control readiness, not a global phase barrier. A substantial new defect becomes a linked task with its own baseline/worktree; repair loops remain bounded.
+
+The orchestrator's role map selects `lumen-planner`, `lumen-architect`, `lumen-researcher`, `lumen-implementer` (coder/builder), `lumen-reviewer`, `lumen-tester`, `lumen-qa`, `lumen-gatekeeper`, `lumen-doc-writer` and `lumen-ci-manager`, together with the existing test/script/analysis specialists. A role is a focused instruction bundle, not a permanent worker or permission guarantee. One person/agent invoking multiple skills does not establish independent review.
+
+Use the current physical core count, RAM, container quotas and provider budget to bound workers. This host has two physical cores/four logical processors; default to one CPU-heavy build/test worker plus coordination, with useful read-only review/research overlap. Separate worktrees isolate source edits but not CPU/GPU/seats/build directories/package managers. Lead creates one worktree per implementation owner and reserves shared resources. All DSH task IDs, claims/revisions, candidate hashes and artifacts belong in per-task cards. The orchestrator references document exact tool mapping, task receipts, quota/context checkpoints and safe resume.
+
+Models are discovered with `list_subagent_models` at execution time. Pi/Codex/Claude Code are runtime preferences, not model IDs or guaranteed DSH routes. Use an available authenticated adapter when present and report effective route if observable; otherwise use an advertised DSH subagent model with disclosure. Never hide a missing provider, infer quality solely from brand or repeatedly retry a broken adapter.
+
+```text
+Use lumen-development-studio to implement <outcome> with independent task lanes and Lumen gates.
+Use lumen-workflow-orchestrator to plan <tasks>; do not implement yet.
+Resume the Lumen workflow from <task/evidence IDs> and revalidate candidate state before continuing.
+```
+
+For user-level installation of the complete workflow/role/testing suite:
+
+```powershell
+./tools/software-development-studio/install.ps1 -IncludeWorkflow -WhatIf
+./tools/software-development-studio/install.ps1 -IncludeWorkflow -Update
+./tools/software-development-studio/install.ps1 -IncludeWorkflow -Check
+```
+
+Review differences before `-Update`: the workflow option intentionally copies the new project `lumen-gated-change` and `lumen-reviewer` adaptations, plus adapter/roles/testing/core. It requires `lumen-build-run` and `lumen-decisions` already installed; it does not copy credentials, install OpenRig, modify runtime permissions, create GUI plugins, enforce CI, or auto-deploy. Project discovery needs no global installation. `-IncludeLumen` without `-IncludeWorkflow` retains the existing prerequisite check path.
+
+OpenRig-informed design and a concrete Claude Code harness parity/gaps proposal are in `.agents/skills/lumen-workflow-orchestrator/references/claude-code-parity.md`. Skills implement the coordination procedure; automatic hooks, quota monitoring, crash-safe dispatch and hard permission enforcement would require separate DSH runtime/plugin/CI work. These are proposals, not features claimed by these files.
 
 ## Adopt another repository
 
