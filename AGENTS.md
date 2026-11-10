@@ -13,15 +13,22 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
   installation and usage are documented in `tools/software-development-studio/README.md`.
   Small/read-only tasks stay proportional; non-trivial implementations use the existing
   gated process below. Skills guide execution; they do not install automatic hooks.
+- Testing specialists: `lumen-test-agent` selects and runs tests/profilers and installs
+  needed development diagnostics; `lumen-script-runner` covers every repository script
+  and preserves execution evidence; a separate `lumen-test-analyst` interprets results
+  and A/B comparisons. Use them for testing and diagnosis; seat/hardware ownership and
+  the no-degradation rule still apply. Setup is documented in the studio README.
 - Use the `project-memory` skill to query the indexed `.zcode/memories/` archive and
   `.zcode/TODO.md`; read the cited source before acting. These are historical records:
   confirm task/branch status against current ADRs, code and Git history. Do not import
   unchecked TODO rows as new work without checking whether they are already done.
 - For independent review of a non-trivial change, use the `lumen-reviewer` skill,
   adapted from `.zcode/agents/lumen-reviewer.md`, in a read-only subagent.
-- For a requested gated implementation, use the `lumen-gated-change` skill, adapted
-  from `.zcode/workflows/lumen-gated-change.dwf.ts`; the workflow draft contains the
-  same body. DSH executes the stages through its agent/tools interface, not the Zcode DSL.
+- For a requested gated implementation, use `lumen-gated-change` as the per-task
+  execution contract. For multi-task/parallel work, use `lumen-workflow-orchestrator`:
+  it maps the baseline → implement → independent review → verify → fix → gate lifecycle
+  onto DSH task/agent/workflow tools. Role-specific Lumen skills live in `.agents/skills/`.
+  Skills guide DSH usage but do not create agents, enforce permissions or run CI/hooks.
 - Use Docker for development on this Windows host. Resolve paths from the current
   checkout; Linux host paths and hardware facts in the archive are host-specific.
 - DSH skill adaptations are installed under the user-level `~/.agents/skills/`.

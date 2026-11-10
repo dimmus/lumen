@@ -2,6 +2,8 @@
 param(
     [string]$Destination,
     [switch]$IncludeLumen,
+    [switch]$IncludeTesting,
+    [switch]$IncludeWorkflow,
     [switch]$Update,
     [switch]$Check
 )
@@ -15,6 +17,14 @@ $sourceRoot = [IO.Path]::GetFullPath($sourceRoot)
 $Destination = [IO.Path]::GetFullPath($Destination)
 $names = @('software-development-studio', 'software-studio-review')
 if ($IncludeLumen) { $names += 'lumen-development-studio' }
+if ($IncludeTesting -or $IncludeWorkflow) { $names += @('lumen-test-agent', 'lumen-script-runner', 'lumen-test-analyst') }
+if ($IncludeWorkflow) {
+    $names += @('lumen-development-studio', 'lumen-workflow-orchestrator', 'lumen-gated-change',
+        'lumen-planner', 'lumen-architect', 'lumen-researcher', 'lumen-implementer',
+        'lumen-reviewer', 'lumen-tester', 'lumen-qa', 'lumen-gatekeeper',
+        'lumen-doc-writer', 'lumen-ci-manager')
+}
+$names = @($names | Select-Object -Unique)
 # Preflight every file before creating directories or copying anything.
 $copies = @()
 foreach ($name in $names) {
@@ -22,7 +32,8 @@ foreach ($name in $names) {
     if (-not (Test-Path -LiteralPath (Join-Path $bundle 'SKILL.md') -PathType Leaf)) {
         throw "Missing source bundle: $bundle"
     }
-    foreach ($file in Get-ChildItem -LiteralPath $bundle -Recurse -File) {
+    foreach ($file in Get-ChildItem -LiteralPath $bundle -Recurse -File |
+                 Where-Object { $_.FullName -notmatch '[\\/]__pycache__([\\/]|$)' -and $_.Extension -ne '.pyc' }) {
         $relative = [IO.Path]::GetRelativePath($sourceRoot, $file.FullName)
         $target = Join-Path $Destination $relative
         if ($file.FullName -eq $target) { continue }
@@ -44,11 +55,17 @@ foreach ($name in $names) {
         if (-not $exists -or $different) { $copies += [pscustomobject]@{ Source = $file.FullName; Target = $target } }
     }
 }
-if ($IncludeLumen) {
-    foreach ($dependency in @('lumen-gated-change', 'lumen-reviewer', 'lumen-build-run', 'lumen-decisions')) {
+if ($IncludeLumen -or $IncludeWorkflow) {
+    $dependencies = if ($IncludeWorkflow) { @('lumen-build-run', 'lumen-decisions') } else { @('lumen-gated-change', 'lumen-reviewer', 'lumen-build-run', 'lumen-decisions') }
+    foreach ($dependency in $dependencies) {
         if (-not (Test-Path -LiteralPath (Join-Path $Destination "$dependency/SKILL.md") -PathType Leaf)) {
             throw "Lumen prerequisite missing in destination: $dependency. Install the existing Lumen adaptations first, or omit -IncludeLumen to install the reusable core only."
         }
+    }
+}
+if ($IncludeTesting) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Destination 'lumen-build-run/SKILL.md') -PathType Leaf)) {
+        throw 'Testing prerequisite missing in destination: lumen-build-run. Install the existing adaptation first.'
     }
 }
 if ($Check) {
