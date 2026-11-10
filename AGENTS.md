@@ -13,6 +13,11 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
   installation and usage are documented in `tools/software-development-studio/README.md`.
   Small/read-only tasks stay proportional; non-trivial implementations use the existing
   gated process below. Skills guide execution; they do not install automatic hooks.
+- Testing specialists: `lumen-test-agent` selects and runs tests/profilers and installs
+  needed development diagnostics; `lumen-script-runner` covers every repository script
+  and preserves execution evidence; a separate `lumen-test-analyst` interprets results
+  and A/B comparisons. Use them for testing and diagnosis; seat/hardware ownership and
+  the no-degradation rule still apply. Setup is documented in the studio README.
 - Use the `project-memory` skill to query the indexed `.zcode/memories/` archive and
   `.zcode/TODO.md`; read the cited source before acting. These are historical records:
   confirm task/branch status against current ADRs, code and Git history. Do not import

@@ -2,6 +2,7 @@
 param(
     [string]$Destination,
     [switch]$IncludeLumen,
+    [switch]$IncludeTesting,
     [switch]$Update,
     [switch]$Check
 )
@@ -15,6 +16,7 @@ $sourceRoot = [IO.Path]::GetFullPath($sourceRoot)
 $Destination = [IO.Path]::GetFullPath($Destination)
 $names = @('software-development-studio', 'software-studio-review')
 if ($IncludeLumen) { $names += 'lumen-development-studio' }
+if ($IncludeTesting) { $names += @('lumen-test-agent', 'lumen-script-runner', 'lumen-test-analyst') }
 # Preflight every file before creating directories or copying anything.
 $copies = @()
 foreach ($name in $names) {
@@ -49,6 +51,11 @@ if ($IncludeLumen) {
         if (-not (Test-Path -LiteralPath (Join-Path $Destination "$dependency/SKILL.md") -PathType Leaf)) {
             throw "Lumen prerequisite missing in destination: $dependency. Install the existing Lumen adaptations first, or omit -IncludeLumen to install the reusable core only."
         }
+    }
+}
+if ($IncludeTesting) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Destination 'lumen-build-run/SKILL.md') -PathType Leaf)) {
+        throw 'Testing prerequisite missing in destination: lumen-build-run. Install the existing adaptation first.'
     }
 }
 if ($Check) {

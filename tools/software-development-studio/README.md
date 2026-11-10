@@ -4,7 +4,7 @@ A reusable set of DSH skills for evidence-driven software delivery, with Lumen a
 
 ## Use now in Lumen
 
-The repository's `.agents/skills/` is a standard DSH project skill root. DSH discovers the three bundles directly; project bundles take priority over user copies. Ask in ordinary language or select the corresponding skill command:
+The repository's `.agents/skills/` is a standard DSH project skill root. DSH discovers the studio and testing bundles directly; project bundles take priority over user copies. Ask in ordinary language or select the corresponding skill command:
 
 ```text
 Use software-development-studio to plan <change>; do not implement yet.
@@ -29,6 +29,36 @@ The default destination is `$DSH_AGENTS_HOME/skills`, or `~/.agents/skills` when
 To also install the Lumen adapter globally, add `-IncludeLumen`; the installer requires the four existing Lumen adaptations in that destination first. The adapter is normally project-scoped, so unrelated projects do not need it. Other machines need their own DSH runtime, required capabilities and project-specific skills; copying the adapter alone does not establish a working Lumen build environment.
 
 Project source files are authoritative. After editing them, inspect differences and rerun with `-Update`, then `-Check`. Live DSH discovery should see changes without restarting; verify by loading each skill. This is a skill collection, not a named preset in the preset picker.
+
+## Lumen testing specialists
+
+Three complementary project skills cover execution and independent interpretation:
+
+| Skill | Responsibility |
+|---|---|
+| `lumen-test-agent` | CTest/presets, targeted tests, sanitizers, seeded fuzzing, benchmarks, Perfetto/perf/heaptrack and a broad Linux diagnostics catalog; task-needed package setup |
+| `lumen-script-runner` | All 20 repository scripts, source-verified options, prerequisites, side effects, seat ownership, unique logs and reproducible evidence |
+| `lumen-test-analyst` | Read-only independent analysis of provenance, coverage, raw failures, memory/timing evidence and comparable A/B results; actionable findings and next experiments |
+
+Example requests:
+
+```text
+Use lumen-test-agent to select and run tests for <change>, recording uncovered hardware gates.
+Use lumen-script-runner to run <script/groups> and hand the evidence to a separate lumen-test-analyst agent.
+Use lumen-test-analyst to analyze <evidence-directory> against <baseline>; do not edit code.
+```
+
+The testing skill's references contain the test matrix, diagnostics catalog, setup instructions and evidence contract. Its Python helpers check/plan/install selected development tools and capture bounded non-seat command argv, logs, exit status, timestamps and hashes. They do not infer PASS from exit zero or supervise a graphical session. Seat tests still require the coordinator's assigned Linux display/input; Docker software-renderer checks do not establish hardware Vulkan or KMS coverage. The script runner explicitly handles sourced libraries, templates, generators and boot-affecting installer options.
+
+Project discovery needs no installation. To copy the testing suite into a user skill root (including its references/helpers), use the existing installer with `-IncludeTesting`:
+
+```powershell
+./tools/software-development-studio/install.ps1 -IncludeTesting -WhatIf
+./tools/software-development-studio/install.ps1 -IncludeTesting
+./tools/software-development-studio/install.ps1 -IncludeTesting -Check
+```
+
+This option also installs the generic studio core and requires the existing `lumen-build-run` adaptation in the destination. It does not overwrite other Lumen skills. Use `-Update` only after reviewing differing installed files. `-IncludeLumen` remains a separate option for the studio adapter. An independent analyst must be a different agent; using two skills in one agent does not create independent review. Skills guide execution and reporting, and do not install automatic hooks or tool permissions.
 
 ## Adopt another repository
 
