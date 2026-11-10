@@ -25,9 +25,30 @@
 set -u
 
 LUMEN_BINDIR="@LUMEN_BINDIR@"
+LUMEN_DEFAULT_CONFIG="@LUMEN_DEFAULT_CONFIG@"
 PROG="${0##*/}"
 
 say() { echo "$PROG: $*" >&2; }
+
+# Publish only a complete, private copy; a concurrent launch or user edit wins.
+# A subshell keeps the umask and temporary-file traps local to this operation.
+seed_config() (
+  local dir="${XDG_CONFIG_HOME:-}" tmp
+  [[ "$dir" == /* ]] || dir="$HOME/.config"
+  dir="$dir/lumen"
+  local config="$dir/config.toml"
+  [[ -e "$config" || -L "$config" ]] && exit 0
+  umask 077
+  mkdir -p -- "$dir" || exit 1
+  tmp=$(mktemp "$dir/.config.toml.XXXXXX") || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  cat -- "$LUMEN_DEFAULT_CONFIG" >"$tmp" || exit 1
+  # -T also refuses an existing directory or a symlink to one.
+  if ! ln -T -- "$tmp" "$config" 2>/dev/null; then
+    [[ -e "$config" || -L "$config" ]] || exit 1
+  fi
+)
 
 # Never imported into the user manager: per-process, per-terminal or per-login-tool
 # variables, and the display variables the compositor owns.
@@ -269,6 +290,8 @@ fi
 : "${XDG_CURRENT_DESKTOP:=Lumen}"
 : "${XDG_SESSION_DESKTOP:=lumen}"
 export XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE=wayland
+
+seed_config || say "warning: could not create user config.toml; continuing with available configuration"
 
 if ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
   run_fallback

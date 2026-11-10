@@ -383,7 +383,13 @@ ends the session back to the login. `LUMEN_DISPLAY=NAME` picks the socket name (
 
 One file: `~/.config/lumen/config.toml` (`$XDG_CONFIG_HOME`), read over
 `/etc/xdg/lumen/config.toml` (`$XDG_CONFIG_DIRS`) key by key. Without one every default
-applies. `lumen-ctl config defaults` prints the documented file with every key at its
+applies. On first launch, `lumen-session` copies the installed `share/lumen/config.toml`
+to `${XDG_CONFIG_HOME:-$HOME/.config}/lumen/config.toml` before starting the compositor,
+including without systemd. A relative `XDG_CONFIG_HOME` is ignored in favor of `$HOME/.config`,
+as in the configuration reader. Existing files (even empty ones) and symlinks are preserved.
+The new file is private to the user; if creation fails, the launcher warns and continues
+with the available configuration. Installation itself never writes to your home directory.
+`lumen-ctl config defaults` prints the documented file with every key at its
 default (installed as `share/lumen/config.toml`): keyboard layouts, variants, options and
 repeat; touchpad, mouse and trackpoint settings (tap, natural scrolling, acceleration
 profile and speed, left-handed, disable-while-typing, scroll factor; per device with

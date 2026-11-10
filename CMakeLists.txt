@@ -284,6 +284,7 @@ endif()
 # and lumen-session pointing at this build directory. Installed copies are configured at
 # install time instead (cmake/LumenInstallSession.cmake).
 set(LUMEN_BINDIR "${CMAKE_BINARY_DIR}")
+set(LUMEN_DEFAULT_CONFIG "${CMAKE_SOURCE_DIR}/deploy/lumen/config.toml")
 foreach(_unit lumen-compositor.service lumen-shell.service)
     configure_file("${CMAKE_SOURCE_DIR}/deploy/systemd/${_unit}.in"
         "${CMAKE_BINARY_DIR}/share/systemd/user/${_unit}" @ONLY)

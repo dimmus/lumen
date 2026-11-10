@@ -17,7 +17,10 @@ fails=0
 pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1${2:+ — $2}"; fails=$((fails + 1)); }
 
-sed "s|@LUMEN_BINDIR@|$WORK/bin|" "$SRC/scripts/lumen-session.in" >"$WORK/bin/lumen-session"
+cp "$SRC/deploy/lumen/config.toml" "$WORK/default-config.toml"
+sed -e "s|@LUMEN_BINDIR@|$WORK/bin|" \
+    -e "s|@LUMEN_DEFAULT_CONFIG@|$WORK/default-config.toml|" \
+    "$SRC/scripts/lumen-session.in" >"$WORK/bin/lumen-session"
 chmod +x "$WORK/bin/lumen-session"
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -41,6 +44,8 @@ case "$1" in
   reset-failed|stop) ;;
   start)
     if [[ "$2" == lumen-compositor.service ]]; then
+      cmp -s "${XDG_CONFIG_HOME:-$HOME/.config}/lumen/config.toml" "$FAKE_STATE/../default-config.toml" &&
+        touch "$S/config-ready"
       # The compositor exports its variables; a clean exit unsets them, a crash does not.
       setvar WAYLAND_DISPLAY=lumen-0; setvar LUMEN_SOCKET=/run/x/lumen-0.varlink
       setvar XDG_SESSION_TYPE=wayland
@@ -64,6 +69,8 @@ EOF
 # Fallback binaries: the compositor serves until its socket file is removed.
 cat >"$WORK/bin/lumen-compositor" <<'EOF'
 #!/usr/bin/env bash
+cmp -s "${XDG_CONFIG_HOME:-$HOME/.config}/lumen/config.toml" "$FAKE_STATE/../default-config.toml" &&
+  touch "$FAKE_STATE/config-ready"
 echo "compositor $*" >>"$FAKE_STATE/log"
 sleep 2
 EOF
@@ -107,6 +114,12 @@ if (( rc == 0 )) && diff -q "$STATE/env" "$STATE/env-before" >/dev/null; then
   pass "environment restored exactly after the session"
 else
   fail "environment restored exactly after the session" "rc=$rc; $(diff "$STATE/env-before" "$STATE/env" | tr '\n' ' ')"
+fi
+if [[ -e "$STATE/config-ready" && $(stat -c %a "$WORK/config/lumen/config.toml") == 600 ]] &&
+   [[ -z $(compgen -G "$WORK/config/lumen/.config.toml.*") ]]; then
+  pass "complete private default config created before systemd compositor, temporary file removed"
+else
+  fail "first-launch default config"
 fi
 during="$STATE/env-during"
 if grep -qx 'FOO=new' "$during" && grep -qx 'BAR=fresh' "$during" && grep -qx 'LANG=C.UTF-8' "$during" &&
@@ -182,6 +195,7 @@ fi
 # 6. No user manager: the compositor and the shell are run directly, and the autostart
 #    entries meant for this desktop are started.
 reset_state
+rm -f "$WORK/config/lumen/config.toml"
 touch "$STATE/no-manager"
 mkdir -p "$WORK/config/autostart" "$WORK/xdg/autostart"
 cat >"$WORK/bin/autostart-probe" <<'EOS'
@@ -214,6 +228,8 @@ if grep -q '^compositor lumen-7' "$STATE/log" && grep -q '^shell WAYLAND_DISPLAY
 else
   fail "fallback" "rc=$rc $(tr '\n' '|' <"$STATE/log")"
 fi
+[[ -e "$STATE/config-ready" ]] && pass "default config created before fallback compositor" ||
+  fail "fallback default config"
 sleep 0.3
 if grep -qx 'autostart one' "$STATE/log" && grep -qx 'autostart lumen-only' "$STATE/log" &&
    grep -qx 'autostart second-desktop' "$STATE/log" &&
@@ -240,6 +256,94 @@ if (( rc == 0 )) && [[ $(grep -c '^login-shell' "$STATE/log") == 1 ]]; then
 else
   fail "login shell re-exec" "rc=$rc $(tr '\n' '|' <"$STATE/log")"
 fi
+
+# 8. Existing files, including empty files and dangling symlinks, are never replaced.
+for kind in custom empty symlink dangling directory; do
+  reset_state
+  config="$WORK/config/lumen/config.toml"
+  rm -f "$config"
+  case "$kind" in
+    custom) echo '# keep my config' >"$config" ;;
+    empty) : >"$config" ;;
+    symlink) ln -s "$WORK/default-config.toml" "$config" ;;
+    dangling) ln -s "$WORK/missing-config" "$config" ;;
+    directory) mkdir "$config" ;;
+  esac
+  before=$(stat -c '%i:%s:%Y' "$config")
+  run_session "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+  if (( $? == 0 )) && [[ $(stat -c '%i:%s:%Y' "$config") == "$before" ]]; then
+    pass "existing $kind config preserved"
+  else
+    fail "existing $kind config preserved"
+  fi
+  [[ "$kind" == directory ]] && rmdir "$config"
+done
+
+# 9. Explicit XDG paths (including spaces) and the HOME fallback are respected.
+for location in custom home relative; do
+  reset_state
+  if [[ "$location" == custom ]]; then
+    dest="$WORK/custom config/lumen/config.toml"
+    run_session XDG_CONFIG_HOME="$WORK/custom config" "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+  else
+    dest="$WORK/home/.config/lumen/config.toml"
+    xdg_home=""
+    [[ "$location" == relative ]] && xdg_home="relative-config"
+    rm -f "$dest"
+    run_session HOME="$WORK/home" XDG_CONFIG_HOME="$xdg_home" "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+  fi
+  if (( $? == 0 )) && cmp -s "$dest" "$WORK/default-config.toml"; then
+    pass "$location config path respected"
+  else
+    fail "$location config path respected"
+  fi
+done
+
+# 10. Directory and template failures warn, clean up and still start the session.
+for failure in directory template link; do
+  reset_state
+  config="$WORK/config/lumen/config.toml"
+  rm -f "$config"
+  case "$failure" in
+    directory) echo blocked >"$WORK/blocked" ;;
+    template) mv "$WORK/default-config.toml" "$WORK/default-config.saved" ;;
+    link) printf '#!/bin/sh\nexit 1\n' >"$WORK/bin/ln"; chmod +x "$WORK/bin/ln" ;;
+  esac
+  if [[ "$failure" == directory ]]; then
+    run_session XDG_CONFIG_HOME="$WORK/blocked" "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+  else
+    run_session "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+  fi
+  rc=$?
+  if (( rc == 0 )) && grep -q 'warning: could not create user config.toml' "$STATE/out" &&
+     grep -q -- '--wait start lumen-compositor.service' "$STATE/log" &&
+     [[ ! -e "$config" && -z $(compgen -G "$WORK/config/lumen/.config.toml.*") ]]; then
+    pass "$failure failure warns and continues without a partial config or temporary file"
+  else
+    fail "$failure failure handling" "rc=$rc"
+  fi
+  [[ "$failure" == template ]] && mv "$WORK/default-config.saved" "$WORK/default-config.toml"
+  [[ "$failure" == link ]] && rm -f "$WORK/bin/ln"
+done
+
+# 11. A user file appearing after the initial check wins publication.
+reset_state
+cat >"$WORK/bin/ln" <<'EOF'
+#!/usr/bin/env bash
+printf '# concurrent user config\n' >"${XDG_CONFIG_HOME}/lumen/config.toml"
+exec /bin/ln "$@"
+EOF
+chmod +x "$WORK/bin/ln"
+run_session "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+rc=$?
+if (( rc == 0 )) && grep -qx '# concurrent user config' "$WORK/config/lumen/config.toml" &&
+   ! grep -q 'warning: could not create' "$STATE/out" &&
+   [[ -z $(compgen -G "$WORK/config/lumen/.config.toml.*") ]]; then
+  pass "concurrent user config wins without clobbering or leaving a temporary file"
+else
+  fail "concurrent config publication" "rc=$rc"
+fi
+rm -f "$WORK/bin/ln"
 
 echo "$fails failed"
 (( fails == 0 ))

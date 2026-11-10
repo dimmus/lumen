@@ -24,6 +24,7 @@ else()
     set(_sysconf "${_prefix}/etc")
 endif()
 set(_data "${_prefix}/${LUMEN_DATADIR_REL}")
+set(LUMEN_DEFAULT_CONFIG "${_data}/lumen/config.toml")
 
 file(MAKE_DIRECTORY "${LUMEN_STAGE_DIR}")
 function(lumen_stage src name)
