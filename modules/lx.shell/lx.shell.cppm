@@ -1611,7 +1611,7 @@ void lx::shell::shell_app::open_calendar(const panel_widget_event& e, output_rec
 
 void lx::shell::shell_app::on_calendar_settings(unsigned serial) {
     ensure_catalog();
-    const desktop_entry* entry = catalog_.find("lumen-settings.desktop");
+    const desktop_entry* entry = catalog_.find("org.lumen.Settings.desktop");
     if (!entry || !entry->listed()) {
         show_notice("Lumen Settings is not installed");
         return;
