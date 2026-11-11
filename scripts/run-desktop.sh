@@ -82,6 +82,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${LUMEN_BUILD_DIR:-${ROOT}/build/release}"
+[[ "$BUILD" == /* ]] || BUILD="$PWD/$BUILD"
 COMP="${BUILD}/lumen-compositor"
 SHELL_BIN="${BUILD}/lumen-shell"
 
@@ -142,6 +143,9 @@ run_systemd_session() {
     s_bin="$BUILD"; s_units="$BUILD/share/systemd/user"
     s_dbus="$BUILD/share/dbus-1/services"; s_portals="$BUILD/share/xdg-desktop-portal"
   fi
+  # lumen-session imports these into the user manager and restores them on exit.
+  export PATH="$s_bin:$PATH"
+  export XDG_DATA_DIRS="${s_dbus%/dbus-1/services}:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
   for f in "$s_bin/lumen-session" "$s_bin/lumen-ctl" "$s_bin/lumen-compositor" \
            "$s_bin/lumen-shell" "$s_units/lumen-compositor.service" \
            "$s_units/lumen-shell.service" "$s_units/lumen-shutdown.target"; do
@@ -392,6 +396,10 @@ if (( SYSTEMD_MODE )); then
   run_systemd_session
   exit $?
 fi
+
+# Make this build's applications discoverable alongside the shell.
+export PATH="$BUILD:$PATH"
+export XDG_DATA_DIRS="$BUILD/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
 # ── Preconditions ────────────────────────────────────────────────────────────
 for bin in "$COMP" $( (( WITH_SHELL )) && echo "$SHELL_BIN"); do
