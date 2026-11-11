@@ -256,8 +256,10 @@ int client_main(int fd) {
     auto* surface = popup.host_surface();
     const bool presented = opened && wait_for(loop,[&]{return surface->timeline().first_presented_ns != 0;},5000);
     const auto cfg = popup.popup_parent().popup().last_configure();
-    verify("valid press serial opens anchored popup",presented && popup.is_open() &&
-               cfg.geometry.width == lx::shell::k_calendar_width && cfg.geometry.height == lx::shell::k_calendar_height,
+    verify("valid press serial opens below the panel with an anchored popup",presented && popup.is_open() &&
+               cfg.geometry.width == lx::shell::k_calendar_width && cfg.geometry.height == lx::shell::k_calendar_height &&
+               cfg.geometry.x == anchor.x + (anchor.width - lx::shell::k_calendar_width) / 2 &&
+               cfg.geometry.y == anchor.y + anchor.height + 4,
            std::format("serial {} geometry {}x{}+{}+{}",serial,cfg.geometry.width,cfg.geometry.height,cfg.geometry.x,cfg.geometry.y));
     const auto initial = popup.model();
     const auto initial_selected = initial.selected;
