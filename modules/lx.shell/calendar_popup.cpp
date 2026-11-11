@@ -20,7 +20,7 @@ import :clock;
 namespace {
 
 constexpr lx::trace::category log_calendar{"shell.calendar"};
-constexpr int k_calendar_popup_gap = 12;
+constexpr int k_calendar_popup_gap = 8;
 constexpr int k_calendar_popup_right_inset = 12;
 
 // A host can run a surface's first frame directly from its configure/frame source.
@@ -135,8 +135,8 @@ bool lx::shell::calendar_popup::open(lx::ui::host::layer_role& layer, lx::rect2i
     lx::wayland::positioner_desc pos{};
     pos.size = {k_calendar_width, k_calendar_height};
     pos.anchor_rect = {anchor.x, anchor.y, std::max(1, anchor.width), std::max(1, anchor.height)};
-    pos.anchor = 2;      // bottom
-    pos.gravity = 2;      // align popup top below the anchor
+    pos.anchor = 7;      // bottom-right
+    pos.gravity = 8;     // align popup top-right below the anchor
     pos.offset = {-k_calendar_popup_right_inset, k_calendar_popup_gap};
     pos.constraint_adjustment = 1 | 2 | 8; // slide-x, slide-y, flip-y
     if (auto made = role_.create(surface_, layer, pos); !made) {

@@ -258,8 +258,8 @@ int client_main(int fd) {
     const auto cfg = popup.popup_parent().popup().last_configure();
     verify("valid press serial opens below the panel with an anchored popup",presented && popup.is_open() &&
                cfg.geometry.width == lx::shell::k_calendar_width && cfg.geometry.height == lx::shell::k_calendar_height &&
-               cfg.geometry.x == anchor.x + (anchor.width - lx::shell::k_calendar_width) / 2 - 12 &&
-               cfg.geometry.y == anchor.y + anchor.height + 12,
+               cfg.geometry.x == anchor.x + anchor.width - lx::shell::k_calendar_width - 12 &&
+               cfg.geometry.y == anchor.y + anchor.height + 8,
            std::format("serial {} geometry {}x{}+{}+{}",serial,cfg.geometry.width,cfg.geometry.height,cfg.geometry.x,cfg.geometry.y));
     const auto initial = popup.model();
     const auto initial_selected = initial.selected;
