@@ -15,6 +15,7 @@ import lx.runtime;
 import lx.scene;
 import lx.text;
 import lx.ui;
+import lx.shell;
 
 namespace {
 
@@ -40,7 +41,7 @@ child describe_menu_rows(build_context&) {
     const auto label_at = [&](int /*row*/, const char* text) {
         text_block_props t{};
         t.text = text;
-        t.font = {"Sans", 10.f, lx::text::weight::normal, lx::text::style::normal};
+        t.font = lx::shell::menu_font();
         t.wrap = lx::text::text_wrap::none;
         t.ellipsize = true;
         t.context = active_ui_resources().text;
@@ -63,6 +64,15 @@ child describe_menu_rows(build_context&) {
                          .h(px(static_cast<float>(4 * (row_h + 2) + 2 * pad)));
     const child kids[4] = {rows[0], rows[1], rows[2], rows[3]};
     return control(list, kids);
+}
+
+LUMEN_TEST(popup_font_uses_active_theme_family_and_ui_scale) {
+    const lx::text::font_desc font = lx::shell::menu_font();
+    const auto& themed = active_theme().fonts();
+    LUMEN_CHECK((font.family == nullptr && themed.ui_family[0] == '\0') ||
+                (font.family && std::strcmp(font.family, themed.ui_family) == 0));
+    LUMEN_CHECK(font.size_pt ==
+                text_size_px(text_size::ui, active_theme(), ui_rem_px()) * 0.75f);
 }
 
 LUMEN_TEST(menu_row_labels_keep_their_rect_widths) {
