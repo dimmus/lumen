@@ -135,7 +135,7 @@ bool lx::shell::calendar_popup::open(lx::ui::host::layer_role& layer, lx::rect2i
     pos.size = {k_calendar_width, k_calendar_height};
     pos.anchor_rect = {anchor.x, anchor.y, std::max(1, anchor.width), std::max(1, anchor.height)};
     pos.anchor = 2;      // bottom
-    pos.gravity = 1;      // popup grows down from the anchor
+    pos.gravity = 2;      // align popup top below the anchor
     pos.offset = {0, k_calendar_popup_gap};
     pos.constraint_adjustment = 1 | 2 | 8; // slide-x, slide-y, flip-y
     if (auto made = role_.create(surface_, layer, pos); !made) {

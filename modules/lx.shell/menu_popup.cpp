@@ -256,7 +256,7 @@ void menu_key_of(const lx::ui::key_event& e, unsigned& sym, char* utf8) {
 /// xdg_positioner anchor / gravity enum values.
 constexpr std::uint32_t pos_anchor_bottom_left = 6, pos_anchor_bottom_right = 7,
                          pos_gravity_bottom_right = 8, pos_anchor_bottom = 2,
-                         pos_gravity_top = 1;
+                         pos_gravity_bottom = 2;
 /// constraint_adjustment bits: slide_x 1, slide_y 2, flip_x 4, flip_y 8.
 constexpr std::uint32_t k_submenu_constraints = 4 | 2 | 1;
 constexpr std::uint32_t k_panel_popup_constraints = 1 | 2 | 8;
@@ -266,7 +266,7 @@ constexpr std::uint32_t k_tip_constraints = k_panel_popup_constraints;
 void position_panel_popup(lx::wayland::positioner_desc& pos, lx::rect2i anchor) {
     pos.anchor_rect = {anchor.x, anchor.y, std::max(1, anchor.width), std::max(1, anchor.height)};
     pos.anchor = pos_anchor_bottom;
-    pos.gravity = pos_gravity_top;
+    pos.gravity = pos_gravity_bottom;
     pos.offset = {0, k_panel_popup_gap};
     pos.constraint_adjustment = k_panel_popup_constraints;
 }
