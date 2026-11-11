@@ -590,7 +590,7 @@ private:
     lx::rect2i tooltip_cell_{};
     /// What the open menu is for: a tray item's (its key), the history, a notification's
     /// further actions (its id); and on which output's panel.
-    enum class menu_kind : unsigned char { none, tray, history, actions, launcher };
+    enum class menu_kind : unsigned char { none, tray, history, actions, launcher, session };
     menu_kind menu_kind_ = menu_kind::none;
     /// The launcher menu's entry and the catalog generation it belongs to.
     unsigned launcher_menu_entry_ = 0;
