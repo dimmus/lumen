@@ -929,7 +929,6 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
     }
     if (!down && logout_pressed_) {
         logout_pressed_ = false;
-        logout_pressed_serial_ = 0;
         dirty_ = true;
         if (on_logout && widget_fn_) {
             panel_widget_event e{};
@@ -940,6 +939,7 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
                       committed_.cell_h};
             widget_fn_(e, widget_user_);
         }
+        logout_pressed_serial_ = 0;
         return;
     }
     // Apps: press and release on the button toggles the launcher.
