@@ -286,17 +286,17 @@ LUMEN_TEST(logout_button_takes_the_right_end_and_leaves_entries_the_rest) {
     LUMEN_CHECK(l.logout_w == 0 && l.count == 6);
 }
 
-LUMEN_TEST(logout_button_hit_hover_and_armed_flags) {
+LUMEN_TEST(logout_icon_hit_and_hover_flags) {
     static lx::shell::panel_layout l;
     task_model& m = snapshot_of(2);
     const double bx = 1000 - 4 - lx::shell::k_logout_width + 10;
     lx::shell::layout_panel(m, 1000, 32, bx, 16, {}, l,
-                            lx::shell::panel_logout{true, true, false});
+                            lx::shell::panel_logout{true, false});
     LUMEN_CHECK(lx::shell::panel_hit_logout(l, bx, 16));
     LUMEN_CHECK(!lx::shell::panel_hit_logout(l, bx, 1));   // above the row
     LUMEN_CHECK(!lx::shell::panel_hit_logout(l, 10, 16));  // an entry
     LUMEN_CHECK(lx::shell::panel_hit(l, bx, 16) == -1);    // never counted as an entry
-    LUMEN_CHECK(l.logout_flags == (lx::shell::logout_hover | lx::shell::logout_armed));
+    LUMEN_CHECK(l.logout_flags == lx::shell::logout_hover);
 }
 
 LUMEN_TEST(arming_the_logout_button_damages_only_the_button) {
@@ -304,7 +304,7 @@ LUMEN_TEST(arming_the_logout_button_damages_only_the_button) {
     task_model& m = snapshot_of(3);
     lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, a, lx::shell::panel_logout{true});
     lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, b,
-                            lx::shell::panel_logout{true, true, false});
+                            lx::shell::panel_logout{true, false});
     lx::rect2i r[8];
     LUMEN_CHECK(lx::shell::panel_diff(a, b, r, 8) == 1);
     LUMEN_CHECK(r[0].x == b.logout_x && r[0].width == b.logout_w);

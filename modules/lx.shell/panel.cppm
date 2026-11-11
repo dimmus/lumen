@@ -47,8 +47,8 @@ inline constexpr int k_entry_min_width = 48;
 inline constexpr int k_entry_max_width = 220;
 /// Room for the "+k" label of entries that do not fit.
 inline constexpr int k_panel_more_width = 44;
-/// The logout button at the right end.
-inline constexpr int k_logout_width = 84;
+/// The logout icon at the right end.
+inline constexpr int k_logout_width = 28;
 /// The Apps button (opens the launcher) at the left end.
 inline constexpr int k_apps_width = 64;
 /// The privacy indicator (design-app-compat-capture CI1): a red dot left of the logout
@@ -166,19 +166,15 @@ struct panel_cell {
     unsigned flags = 0;
 };
 
-/// The logout button's input to a layout. Two clicks log out: the first arms it ("Confirm?"),
-/// the second sends the request; moving off the button disarms it. No timer, so nothing
-/// runs while the panel is idle, and a stray click cannot end the session.
+/// The logout icon's input to a layout.
 struct panel_logout {
     bool shown = false; // the compositor supports zlm_shell_v1.request_logout
-    bool armed = false;
     bool pressed = false;
 };
 
 enum panel_logout_flag : unsigned {
     logout_hover = 1u << 0,
     logout_pressed = 1u << 1,
-    logout_armed = 1u << 2,
 };
 
 /// The Apps button's input to a layout: `open` latches it while the launcher is up.
@@ -359,7 +355,7 @@ struct panel_widgets_source {
     void* user = nullptr;
 };
 
-/// Input on the tray or the notification indicator, for the shell to act on.
+/// Input on panel indicators and the logout icon, for the shell to act on.
 struct panel_widget_event {
     enum class kind : unsigned char {
         /// A button released on the tray cell it went down on.
@@ -371,6 +367,7 @@ struct panel_widget_event {
         /// A button released on the notification indicator.
         bell_click,
         clock_click,
+        logout_click,
     } what = kind::tray_click;
     unsigned key = 0;
     /// BTN_LEFT, BTN_RIGHT, BTN_MIDDLE.
@@ -553,7 +550,7 @@ private:
     task_handle pressed_{};
     bool logout_hovered_ = false;
     bool logout_pressed_ = false;
-    bool logout_armed_ = false;
+    unsigned logout_pressed_serial_ = 0;
     bool apps_hovered_ = false;
     bool apps_shown_ = false;
     bool apps_open_ = false;
@@ -749,11 +746,11 @@ private:
 void lx::shell::panel::pointer_enter(double x, double y) { pointer_motion(x, y); }
 
 void lx::shell::panel::pointer_leave() {
-    if (pressed_ || logout_pressed_ || logout_armed_ || apps_pressed_)
+    if (pressed_ || logout_pressed_ || apps_pressed_)
         dirty_ = true;
     pressed_ = {};
     logout_pressed_ = false;
-    logout_armed_ = false;
+    logout_pressed_serial_ = 0;
     apps_pressed_ = false;
     notice_pressed_ = false;
     if (ws_pressed_ >= 0 || tray_pressed_ || bell_pressed_ || clock_pressed_ || clock_hovered_)
@@ -784,9 +781,6 @@ void lx::shell::panel::pointer_motion(double x, double y) {
     if (on_logout != logout_hovered_) {
         logout_hovered_ = on_logout;
         dirty_ = true;
-        // Moving off the armed button cancels: confirmation is one deliberate gesture.
-        if (!on_logout)
-            logout_armed_ = false;
     }
     const bool on_apps = panel_hit_apps(committed_, x, y);
     if (on_apps != apps_hovered_) {
@@ -926,6 +920,28 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
     }
     if (button != k_btn_left)
         return;
+    const bool on_logout = panel_hit_logout(committed_, px, py);
+    if (down && on_logout) {
+        logout_pressed_ = true;
+        logout_pressed_serial_ = serial;
+        dirty_ = true;
+        return;
+    }
+    if (!down && logout_pressed_) {
+        logout_pressed_ = false;
+        logout_pressed_serial_ = 0;
+        dirty_ = true;
+        if (on_logout && widget_fn_) {
+            panel_widget_event e{};
+            e.what = panel_widget_event::kind::logout_click;
+            e.button = button;
+            e.serial = logout_pressed_serial_;
+            e.cell = {committed_.logout_x, committed_.cell_y, committed_.logout_w,
+                      committed_.cell_h};
+            widget_fn_(e, widget_user_);
+        }
+        return;
+    }
     // Apps: press and release on the button toggles the launcher.
     const bool on_apps = panel_hit_apps(committed_, px, py);
     if (down && on_apps) {
@@ -965,27 +981,6 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
         notice_pressed_ = false;
         if (on_notice)
             set_notice(nullptr);
-        return;
-    }
-    const bool on_logout = panel_hit_logout(committed_, px, py);
-    if (down && on_logout) {
-        logout_pressed_ = true;
-        dirty_ = true;
-        return;
-    }
-    if (!down && logout_pressed_) {
-        logout_pressed_ = false;
-        dirty_ = true;
-        if (!on_logout || !bridge_)
-            return;
-        if (!logout_armed_) {
-            logout_armed_ = true; // first click: "Confirm?"
-            log_panel.debug("logout armed");
-            return;
-        }
-        logout_armed_ = false;
-        log_panel.info("logout requested");
-        bridge_->request_logout();
         return;
     }
     const int hit = panel_hit(committed_, px, py);
@@ -1114,8 +1109,6 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
         out.logout_w = k_logout_width;
         out.logout_x = width - k_panel_pad - k_logout_width;
         reserve = k_logout_width + k_panel_gap;
-        if (logout.armed)
-            out.logout_flags |= logout_armed;
         if (logout.pressed)
             out.logout_flags |= logout_pressed;
         if (in_box(px, py, out.logout_x, out.logout_w, out.cell_y, out.cell_h))
@@ -1479,7 +1472,7 @@ void lx::shell::panel::relayout() {
                    (clock_pressed_ ? bell_flag_pressed : 0u);
     std::snprintf(clock_text_, sizeof(clock_text_), "%s", clock.text);
     layout_panel(bridge_->model(), width(), k_panel_height, pointer_x_, pointer_y_, pressed_,
-                 next_, panel_logout{bridge_->can_logout(), logout_armed_, logout_pressed_},
+                 next_, panel_logout{bridge_->can_logout(), logout_pressed_},
                  panel_apps{apps_shown_, apps_open_, apps_pressed_},
                  panel_notice{notice_[0] != '\0', notice_rev_}, filter_,
                  bridge_->capture_active(), &ws_input_, &tray_input_, tray_pressed_, bell,
@@ -1885,12 +1878,10 @@ lx::ui::child lx::shell::panel::build_ui() {
                 .justify_center(),
             dot);
     }
-    // The logout button: the first click arms it ("Confirm?"), the second ends the session.
+    // The logout icon opens the session menu.
     if (l.logout_w > 0) {
-        const bool armed = (l.logout_flags & logout_armed) != 0;
-        const lx::ui::child text[1] = {panel_text(armed ? "Confirm?" : "Log out",
-                                                  armed ? k_text_focused : k_text_more, false,
-                                                  0x7700u)};
+        const lx::ui::child icon[1] = {
+            lx::ui::icon_view(lx::ui::icon::log_out, 16.f, lx::ui::tok::icon)};
         kids[n++] = panel_button(lx::ui::style{}
                                      .absolute()
                                      .top(cell_y)
@@ -1899,10 +1890,8 @@ lx::ui::child lx::shell::panel::build_ui() {
                                      .h(cell_h)
                                      .flex_row()
                                      .items_center()
-                                     .px(lx::layout::px(8.f))
-                                     .overflow_hidden(),
-                                 armed ? lx::ui::tok::error : lx::ui::tok::none, text, this,
-                                 0x7701u);
+                                     .justify_center(),
+                                 lx::ui::tok::none, icon, this, 0x7701u);
     }
 
     // The root: the panel's background over everything, the cells placed on it.

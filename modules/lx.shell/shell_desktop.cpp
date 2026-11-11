@@ -726,6 +726,12 @@ void lx::shell::shell_app::on_menu_activate(int id) {
             note_server_.action_invoked(note, key.c_str(), nullptr, now);
         return;
     }
+    case menu_kind::session:
+        if (id == 1) {
+            menu_.close();
+            bridge_.request_logout();
+        }
+        return;
     case menu_kind::launcher: {
         const unsigned entry = launcher_menu_entry_;
         const bool current = launcher_menu_gen_ == catalog_.generation();
@@ -829,6 +835,29 @@ void lx::shell::shell_app::open_tray_menu(unsigned key, std::vector<menu_entry> 
 void lx::shell::shell_app::on_widget(const panel_widget_event& e, output_record& o) {
     constexpr unsigned k_left = 0x110, k_right = 0x111, k_middle = 0x112;
     switch (e.what) {
+    case panel_widget_event::kind::logout_click: {
+        if (e.button != k_left || !e.serial || !o.bar || !o.bar->popup_parent().valid())
+            return;
+        if (calendar_.is_open())
+            close_calendar();
+        if (menu_.is_open())
+            menu_.close();
+        menu_entry item{};
+        item.label = "Log out";
+        item.id = 1;
+        o.bar->set_menu_keyboard(true);
+        menu_kind_ = menu_kind::session;
+        menu_output_ = o.name;
+        if (!menu_.open(
+                o.bar->popup_parent(), e.cell, {std::move(item)}, e.serial,
+                [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
+                [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); }, nullptr, this,
+                "session")) {
+            o.bar->set_menu_keyboard(false);
+            menu_kind_ = menu_kind::none;
+        }
+        return;
+    }
     case panel_widget_event::kind::clock_click:
         // The calendar opens on a left click and takes no other button: no menu, no
         // activation token, so it returns here rather than falling through to the tray.
