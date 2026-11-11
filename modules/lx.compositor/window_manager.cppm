@@ -6248,6 +6248,7 @@ lx::compositor::window_manager::make_ghost(const toplevel_record& rec) {
             f.set_visible(frame->is_visible());
             f.geometry = frame->geometry;
             f.extents = frame->extents;
+            f.palette = frame->palette;
             f.shown = frame->shown;
             f.active = frame->active;
             for (unsigned b = 0; b < 3; ++b)

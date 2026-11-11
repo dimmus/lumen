@@ -380,6 +380,25 @@ LUMEN_TEST(bundled_files_and_builtin_match_the_compiler) {
     LUMEN_CHECK(lx::ui::ui_rem_px() == 16.f);
 }
 
+LUMEN_TEST(shared_reader_loads_custom_compiled_paths) {
+    const auto bytes = compile("One Light");
+    char path[] = "/tmp/lumen-custom-theme-XXXXXX";
+    const int fd = ::mkstemp(path);
+    LUMEN_CHECK(fd >= 0);
+    LUMEN_CHECK(::write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+    ::close(fd);
+    auto loaded = lx::ui::load_theme_file(path);
+    LUMEN_CHECK(loaded.has_value());
+    LUMEN_CHECK(loaded->rgba8(tok::panel_background) ==
+                lx::ui::theme::builtin(lx::ui::appearance::light).rgba8(tok::panel_background));
+    const auto before = lx::ui::active_theme().rgba8(tok::panel_background);
+    ::unlink(path);
+    LUMEN_CHECK(!lx::ui::load_theme_file(path));
+    LUMEN_CHECK(lx::ui::active_theme().rgba8(tok::panel_background) == before);
+    const auto source = lx::ui::builtin_theme_source(bytes, bytes, "test");
+    LUMEN_CHECK(source.find("module lx.theme;") != std::string::npos);
+}
+
 LUMEN_TEST(load_rejects_truncated_wrong_magic_and_version) {
     const std::vector<std::uint8_t> good = compile("One Dark");
     const auto code_of = [](const lx::result<lx::ui::theme>& r) {

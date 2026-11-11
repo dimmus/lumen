@@ -138,15 +138,17 @@ lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation)
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
     DEPENDS lx.gfx lx.scheduler lx.runtime lx.sync)
-lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.layout lx.a11y)
+lumen_add_module_library(lx.theme modules/lx.theme DEPENDS lx.foundation lx.gfx lx.runtime lx.trace)
+lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.layout lx.a11y lx.theme)
 # Compiled themes (ADR-010 §4.8) and bundled Lucide icons (§5.5): found in the build tree, an
 # install relative to the executable, or the configured install (LUMEN_THEME_DIR /
 # LUMEN_ICON_DIR override both). Icons are rasterised by librsvg, dlopen'd on first use as
 # lx.shell does: headers only, no link edge.
-target_compile_definitions(lx.ui PRIVATE
+target_compile_definitions(lx.theme PRIVATE
     LUMEN_THEME_DIR_BUILD="${CMAKE_BINARY_DIR}/themes"
     LUMEN_THEME_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/themes"
-    LUMEN_THEME_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/themes"
+    LUMEN_THEME_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/themes")
+target_compile_definitions(lx.ui PRIVATE
     LUMEN_ICON_DIR_BUILD="${CMAKE_SOURCE_DIR}/assets/icons/lucide"
     LUMEN_ICON_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/icons/lucide"
     LUMEN_ICON_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/icons/lucide")
@@ -181,7 +183,7 @@ add_custom_target(lumen-themes ALL DEPENDS ${LUMEN_THEME_OUTPUTS})
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
     DEPENDS lx.foundation lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
-    DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
+    DEPENDS lx.wayland.server lx.gfx lx.theme lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
 # lumen-shell's connection, registry, outputs, seat and surfaces are lx.wayland.client's and its
 # loop is lx::runtime::event_loop (ADR-010 Phase 5). The extension globals it binds itself
 # (zlm_shell_v1, ext-workspace, ext-idle-notify, wlr-output-power, ext-background-effect) and
@@ -1583,7 +1585,7 @@ if(LUMEN_BUILD_TESTS)
     # ADR-010 §4.8, §5: the theme compiler over the bundled Zed themes, the .lxtheme format,
     # styles, styled boxes, the theme watcher and Lucide icons (SKIP without librsvg).
     add_executable(test_ui_theme tests/test_ui_theme.cpp)
-    target_link_libraries(test_ui_theme PRIVATE lx.ui lx.scene lx.gfx lx.runtime)
+    target_link_libraries(test_ui_theme PRIVATE lx.ui lx.theme lx.scene lx.gfx lx.runtime)
     lumen_apply_module_properties(test_ui_theme)
     lumen_link_platform(test_ui_theme)
     target_include_directories(test_ui_theme PRIVATE tests)

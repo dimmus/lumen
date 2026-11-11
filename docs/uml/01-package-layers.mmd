@@ -20,6 +20,7 @@ flowchart TB
         GFX["lx::gfx"]
         TEXT["lx::text"]
         LAYOUT["lx::layout"]
+        THEME["lx::theme"]
     end
 
     subgraph Platform["Platform Layer"]
@@ -59,6 +60,10 @@ flowchart TB
     UI --> SCENE
     UI --> TEXT
     UI --> LAYOUT
+    UI --> THEME
+    COMP --> THEME
+    THEME --> GFX
+    THEME --> RT
     SHELL --> POLICY
     SHELL --> TEXT
     POLICY --> WLPROT

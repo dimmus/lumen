@@ -2,7 +2,7 @@
 // Do not edit: rerun the tool (see tools/lumen-theme/main.cpp). test_ui_theme checks that
 // these bytes are what the build compiles from the bundled theme files.
 
-module lx.ui;
+module lx.theme;
 
 import std;
 

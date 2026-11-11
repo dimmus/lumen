@@ -1,9 +1,9 @@
 // lumen-theme: compiles a theme family in Zed's JSON schema into Lumen's .lxtheme format
 // (ADR-010 §4.8) through lx::ui::theme_compiler. The build runs it over the bundled
 // assets/themes/one/one.json (One Dark, One Light); `--emit-cpp` regenerates
-// modules/lx.ui/theme_builtin.cpp, the copies compiled into lx.ui:
+// modules/lx.theme/theme_builtin.cpp, the copies compiled into lx.theme:
 //
-//   ./build/release/lumen-theme --emit-cpp modules/lx.ui/theme_builtin.cpp \
+//   ./build/release/lumen-theme --emit-cpp modules/lx.theme/theme_builtin.cpp \
 //       assets/themes/one/one.json
 
 #include <stdio.h>

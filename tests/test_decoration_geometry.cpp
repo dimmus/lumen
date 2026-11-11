@@ -15,6 +15,8 @@ import lx.gfx;
 import lx.runtime;
 import lx.scene;
 import lx.compositor;
+import lx.theme;
+import lx.config;
 
 using namespace lx::compositor;
 
@@ -507,6 +509,59 @@ published publish(lx::scene::scene_graph& scene, double scale, unsigned frame) {
 // its × — no tick in between (the manager's tick only lays titles out), no atlas staged first.
 // And when the window reaches an output of a scale not seen before, the × at that scale is
 // rasterised as the manager learns the scale: the next frame published draws it.
+LUMEN_TEST(theme_palette_recolors_existing_and_future_frames) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    decoration_manager manager{};
+    lx::scene::scene_graph scene{};
+    surface_tree tree{};
+    lx::scene::output_view_config view{};
+    view.logical = {0, 0, 400, 300};
+    view.projection = {{0, 0}, 1.0, {400, 300}};
+    scene.set_output_view(0, view);
+    manager.bind(tree, scene);
+    auto rec = decorated_record();
+    manager.sync(rec);
+    manager.set_active(rec.id);
+    const frame_node* node = manager.node(rec.id);
+    LUMEN_CHECK(node && node->shown);
+    LUMEN_CHECK(scene.commit_frame(0, 1)); // clear initial view / mapping damage
+    LUMEN_CHECK(scene.pending_damage().empty());
+    for (auto mode : {lx::ui::appearance::dark, lx::ui::appearance::light}) {
+        const auto& theme = lx::ui::theme::builtin(mode);
+        const auto palette = decoration_palette_of(theme);
+        manager.set_palette(palette);
+        LUMEN_CHECK(node->palette == palette);
+        const auto pixels = composite_frame(*node, 400, 300);
+        LUMEN_CHECK(pixels.at(rec.geometry.x + 20, rec.geometry.y - 14) == palette.title_active);
+        LUMEN_CHECK(pixels.at(rec.geometry.x - 1, rec.geometry.y + 20) == palette.border_active);
+        const auto rgba = theme.rgba8(lx::ui::tok::text);
+        LUMEN_CHECK(palette.text_active == (((rgba & 255u) << 16) | (rgba & 0xff00u) | ((rgba >> 16) & 255u)));
+    }
+    decoration_palette custom{};
+    custom.title_active = 0x123456u;
+    custom.border_active = 0x654321u;
+    custom.text_active = 0x334455u;
+    manager.set_palette(custom);
+    const auto pixels = composite_frame(*node, 400, 300);
+    LUMEN_CHECK(pixels.at(rec.geometry.x + 20, rec.geometry.y - 14) == 0x123456u);
+    LUMEN_CHECK(!scene.pending_damage().full && scene.pending_damage().count > 0);
+    for (unsigned i = 0; i < scene.pending_damage().count; ++i) {
+        const auto r = scene.pending_damage().rects[i];
+        // No palette change damages the centre of the client area.
+        LUMEN_CHECK(!(r.x <= 190 && r.y <= 160 && r.x + r.width > 190 && r.y + r.height > 160));
+    }
+    auto before = lx::config::default_config();
+    auto after = before;
+    after.ui.appearance = lx::config::ui_appearance::light;
+    LUMEN_CHECK(diff_config(before, after) == cfg_ui);
+    after = before;
+    std::snprintf(after.ui.theme, sizeof(after.ui.theme), "%s", "/tmp/custom.lxtheme");
+    LUMEN_CHECK(diff_config(before, after) == cfg_ui);
+    manager.on_destroyed(rec.id, rec.surface);
+    manager.sync(rec);
+    LUMEN_CHECK(manager.node(rec.id)->palette == custom);
+}
+
 LUMEN_TEST(managed_frame_draws_its_fills_and_close_from_the_first_snapshot) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     chrome_atlas atlas{};

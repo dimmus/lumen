@@ -310,10 +310,6 @@ unsigned panel_diff(const panel_layout& from, const panel_layout& to, lx::rect2i
 /// describer and the re-arms from `request_repaint` both name it.
 [[nodiscard]] lx::ui::child panel_describe(lx::ui::build_context& ctx);
 
-/// The panel's background over a blur (`[panel] blur`): the opaque one at 72 %, premultiplied.
-inline constexpr std::uint32_t k_panel_translucent_bg = 0xB8161619u;
-inline constexpr std::uint32_t k_panel_opaque_bg = 0xFF1E1E22u;
-
 struct panel_globals {
     /// The shell's lx.ui.host context (null: the panel cannot be created).
     lx::ui::host::context* ui = nullptr;
@@ -421,6 +417,8 @@ public:
     void filter_changed() { dirty_ = true; }
     /// The clock's minute passed: its text changed, redraw.
     void clock_changed() { dirty_ = true; }
+    /// An accepted theme reload must repaint an otherwise idle panel.
+    void theme_changed() { dirty_ = true; request_repaint(); }
     /// The workspace indicator's source (none: no indicator).
     void set_workspaces(panel_ws_source source) {
         ws_source_ = source;
@@ -528,8 +526,8 @@ private:
     panel_globals g_{};
     /// ext_background_effect_surface_v1* while blurred.
     void* effect_ = nullptr;
-    /// The panel's background: opaque, or translucent (premultiplied) over the blur.
-    std::uint32_t bg_ = k_panel_opaque_bg;
+    /// Keep the theme background at 72% opacity over blur, opaque otherwise.
+    bool blurred_ = false;
     policy_bridge* bridge_ = nullptr;
     lx::ui::host::surface surface_{};
     lx::ui::host::layer_role role_{};
@@ -629,18 +627,10 @@ private:
     lx::shell::panel* previous_;
 };
 
-/// `abgr` (0xAARRGGBB, the panels' old constants) as a straight-alpha colour.
-[[nodiscard]] constexpr lx::color panel_color(std::uint32_t argb) {
-    return lx::color::rgb(static_cast<float>((argb >> 16) & 0xFF) / 255.f,
-                          static_cast<float>((argb >> 8) & 0xFF) / 255.f,
-                          static_cast<float>(argb & 0xFF) / 255.f,
-                          static_cast<float>((argb >> 24) & 0xFF) / 255.f);
-}
-
-constexpr lx::color k_text = panel_color(0xFFE6E6E6u);
-constexpr lx::color k_text_focused = panel_color(0xFFFFFFFFu);
-constexpr lx::color k_text_more = panel_color(0xFFA8A8ACu);
-constexpr lx::color k_text_warning = panel_color(0xFFF0B45Au);
+constexpr lx::ui::tok k_text = lx::ui::tok::text;
+constexpr lx::ui::tok k_text_focused = lx::ui::tok::text;
+constexpr lx::ui::tok k_text_more = lx::ui::tok::text_muted;
+constexpr lx::ui::tok k_text_warning = lx::ui::tok::warning;
 constexpr lx::text::font_desc k_panel_font{"Sans", 10.f, lx::text::weight::normal,
                                            lx::text::style::normal};
 constexpr lx::text::font_desc k_panel_font_bold{"Sans", 8.f, lx::text::weight::bold,
@@ -1562,12 +1552,12 @@ namespace {
 }
 
 /// One line of text in the panel's font, ellipsized at its box.
-[[nodiscard]] lx::ui::child panel_text(const char* text, lx::color color, bool bold,
+[[nodiscard]] lx::ui::child panel_text(const char* text, lx::ui::tok color, bool bold,
                                        lx::ui::element_key key) {
     lx::ui::text_block_props t{};
     t.text = text;
     t.font = bold ? k_panel_font_bold : k_panel_font;
-    t.color = color;
+    t.color = lx::ui::active_theme().color(color);
     t.wrap = lx::text::text_wrap::none;
     t.ellipsize = true;
     t.context = lx::ui::active_ui_resources().text;
@@ -1728,7 +1718,7 @@ lx::ui::child lx::shell::panel::build_ui() {
                         lx::ui::tok::element_disabled, lx::ui::radius::sm, {&glyph, 1u});
                 }
             }
-            const lx::color label_color =
+            const lx::ui::tok label_color =
                 (c.flags & (cell_not_responding | cell_minimized)) ? k_text_more
                 : (c.flags & cell_focused)                         ? k_text_focused
                                                                    : k_text;
@@ -1898,7 +1888,8 @@ lx::ui::child lx::shell::panel::build_ui() {
     panel_root_props root{};
     root.flex.style.width = lx::layout::percent(100.f);
     root.flex.style.height = lx::layout::percent(100.f);
-    root.flex.fill = panel_color(bg_);
+    root.flex.fill = lx::ui::active_theme().color(lx::ui::tok::panel_background);
+    root.flex.fill.a = blurred_ ? 0.72f : 1.f;
     root.mouse = &root_mouse;
     root.user = this;
     return lx::ui::with_children(lx::ui::describe<panel_root_node, panel_root_props>(root, 0x7000u),
@@ -1987,8 +1978,7 @@ lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& 
     // here and stay for the surface's life.
     const bool blur = g_.background_effect != nullptr;
     so.opaque = !blur;
-    if (blur)
-        bg_ = k_panel_translucent_bg;
+    blurred_ = blur;
     so.frame_records = false;
     if (auto made = surface_.create(*g_.ui, so); !made) {
         log_panel.error(made.get_error());

@@ -2998,9 +2998,8 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
         update_panel_blur();
     }
     // ── [ui]: the interface look, live for the shell ──
-    if (!same_str(c.ui.theme, file_ui_theme_.c_str()) ||
-        c.ui.appearance != ui_appearance_ || c.ui.density != ui_density_ ||
-        c.ui.ui_font_size != ui_font_size_) {
+    // Reload even an unchanged custom path: its compiled bytes may have changed.
+    {
         file_ui_theme_ = c.ui.theme;
         ui_appearance_ = c.ui.appearance;
         ui_density_ = c.ui.density;
@@ -3033,6 +3032,9 @@ void lx::shell::shell_app::apply_ui() {
     case lx::config::ui_density_kind::regular:
     default: set_ui_density(lx::ui::density::standard); break;
     }
+    for (auto& output : outputs_)
+        if (output->bar)
+            output->bar->theme_changed();
     // ui_font_size needs the engine's live font settings (a theme reload carries them);
     // until then it applies to applications at their start (LUMEN_THEME's rule).
     log_config.info("ui: theme \"{}\" density {} font-size {:.0f} px", name,

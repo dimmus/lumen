@@ -1017,6 +1017,69 @@ int main() {
             check(wait_generation(g + 4) && log7.applied && log7.errors == 0 &&
                       log7.warnings == 1,
                   "reload: the layout removed, the error is gone");
+            // A forced reload refreshes a same-path compiled theme in both processes:
+            // unchanged config bytes still reach the shell with the accepted generation.
+            const std::string themed = std::string(k_base) + "[ui]\ntheme = \"one-light\"\n";
+            write_config(themed.c_str());
+            comp.request_reload();
+            check(wait_generation(g + 5) && log7.generation == g + 5,
+                  "reload: theme selection reaches the shell");
+            comp.request_reload();
+            check(wait_generation(g + 6) && log7.generation == g + 6 && log7.applied,
+                  "reload: forced unchanged theme bytes reach the shell again");
+            // Park the sole worker before reload, saturate UI, then prove theme completion
+            // survives that queue being full. Every wait is bounded and always releases it.
+            static std::atomic<bool> blocker_entered{false};
+            static std::atomic<bool> release_blocker{false};
+            static std::atomic<bool> worker_fence{false};
+            blocker_entered.store(false, std::memory_order_relaxed);
+            release_blocker.store(false, std::memory_order_relaxed);
+            worker_fence.store(false, std::memory_order_relaxed);
+            auto& executor = comp.executor();
+            check(executor.post(lx::runtime::affinity::worker, [] {
+                blocker_entered.store(true, std::memory_order_release);
+                for (unsigned i = 0; i < 400 && !release_blocker.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                // If the test timed out, the bounded wait exits without wedging the strand.
+            }), "reload: worker blocker posted");
+            bool entered = false;
+            for (unsigned i = 0; i < 100 && !blocker_entered.load(std::memory_order_acquire); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            entered = blocker_entered.load(std::memory_order_acquire);
+            check(entered, "reload: worker blocker entered before reload");
+            unsigned filled = 0;
+            bool reload_started = false;
+            bool fence_posted = false;
+            bool reached_fence = false;
+            {
+                // Keep the pump out until the worker has completed theme loading and drained
+                // a later fence; it cannot consume the full UI queue before that point.
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+                comp.request_reload();
+                comp.run_posted_ui_tasks();
+                while (executor.post(lx::runtime::affinity::ui, [] {}))
+                    ++filled;
+                check(filled > 0, "reload: UI completion queue saturated");
+                reload_started = true;
+                release_blocker.store(true, std::memory_order_release);
+                for (unsigned i = 0; i < 400 && !worker_fence.load(std::memory_order_acquire); ++i)
+                    if (executor.post(lx::runtime::affinity::worker, [] {
+                            worker_fence.store(true, std::memory_order_release);
+                        })) {
+                        fence_posted = true;
+                        break;
+                    } else {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                for (unsigned i = 0; i < 400 && !worker_fence.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                reached_fence = worker_fence.load(std::memory_order_acquire);
+            }
+            check(reload_started && entered && fence_posted && reached_fence,
+                  "reload: worker finished theme load while UI completion queue stayed full");
+            check(wait_generation(g + 7) && log7.generation == g + 7,
+                  "reload: durable completion applies after saturated UI queue drains");
             unsetenv("NOTIFY_SOCKET");
             ::close(ns);
             std::remove(notify_path.c_str());

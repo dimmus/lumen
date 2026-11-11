@@ -29,6 +29,7 @@ enum config_change : unsigned {
     cfg_windows = 1u << 7,  ///< [windows], [tiling], [animations]
     cfg_workspaces = 1u << 8,
     cfg_outputs = 1u << 9, ///< [[output]]
+    cfg_ui = 1u << 10,     ///< [ui], including the server-side decoration palette
 };
 
 [[nodiscard]] unsigned diff_config(const lx::config::config_snapshot& a,

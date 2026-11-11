@@ -11,7 +11,7 @@ import std;
 import lx.foundation;
 import lx.gfx;
 
-import :theme;
+import lx.theme;
 import :theme_defaults;
 
 // ── The theme compiler (ADR-010 §4.8) ─────────────────────────────────────────────────
@@ -964,7 +964,7 @@ std::string lx::ui::builtin_theme_source(std::span<const std::uint8_t> dark,
     s += origin;
     s += ".\n// Do not edit: rerun the tool (see tools/lumen-theme/main.cpp). test_ui_theme checks that\n"
          "// these bytes are what the build compiles from the bundled theme files.\n\n"
-         "module lx.ui;\n\nimport std;\n\nnamespace {\n\n";
+         "module lx.theme;\n\nimport std;\n\nnamespace {\n\n";
     const auto array = [&s](const char* name, std::span<const std::uint8_t> bytes) {
         s += "alignas(8) constexpr std::uint8_t ";
         s += name;

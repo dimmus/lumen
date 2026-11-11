@@ -87,6 +87,9 @@ unsigned diff_config(const cfg::config_snapshot& a, const cfg::config_snapshot& 
                   a.outputs[i].render_scale != b.outputs[i].render_scale;
     if (outputs)
         c |= cfg_outputs;
+    if (std::strcmp(a.ui.theme, b.ui.theme) || a.ui.appearance != b.ui.appearance ||
+        a.ui.density != b.ui.density || a.ui.ui_font_size != b.ui.ui_font_size)
+        c |= cfg_ui;
     if (a.idle.policy != b.idle.policy || a.idle.blank_after != b.idle.blank_after ||
         a.idle.blank_locked_after != b.idle.blank_locked_after ||
         std::strcmp(a.idle.lock_command, b.idle.lock_command) ||

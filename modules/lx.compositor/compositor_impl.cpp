@@ -32,6 +32,7 @@ import lx.session;
 import lx.health;
 import lx.config;
 import lx.text;
+import lx.theme;
 
 module lx.compositor;
 
@@ -1446,6 +1447,16 @@ struct compositor_impl {
         xcursor_theme themes[k_cursor_scales]{};
     };
     std::unique_ptr<cursor_job> cursor_job_{};
+    struct theme_job {
+        lx::config::ui_settings settings{};
+        decoration_palette palette{};
+        lx::error error{};
+        bool ok = false;
+    };
+    std::unique_ptr<theme_job> theme_job_{};
+    /// Durable worker completion, independent of the bounded UI task queue.
+    std::atomic<bool> theme_ready_{false};
+    std::unique_ptr<runtime::event_source> theme_source_{};
     /// Why the configured keymap does not compile; empty while it is the one in use. Each
     /// generation reports it (and an accepted one compiles it again: a layout installed
     /// since then is picked up), so the problem stays visible until it is fixed.
@@ -1487,6 +1498,9 @@ struct compositor_impl {
     void finish_keymap_job();
     void start_cursor_job();
     void finish_cursor_job();
+    void start_theme_job();
+    void finish_theme_job();
+    void drain_theme_job();
     void config_job_done();
     /// The generation is applied (or rejected): log, tell the shell, the control socket,
     /// systemd; run a queued reload.
@@ -1850,6 +1864,21 @@ private:
     void (*after_)(void*) = nullptr;
     void* user_ = nullptr;
     bool ready_ = false;
+};
+
+/// Queue-independent theme completion: prepare observes readiness even before run starts.
+class theme_completion_source final : public lx::runtime::event_source {
+public:
+    explicit theme_completion_source(compositor_impl& impl) : impl_{&impl} {}
+    bool prepare(lx::runtime::clock_time& timeout) override {
+        const bool ready = check();
+        timeout = ready ? 0 : -1;
+        return ready;
+    }
+    bool check() override { return impl_->theme_ready_.load(std::memory_order_acquire); }
+    bool dispatch() override { impl_->drain_theme_job(); return true; }
+private:
+    compositor_impl* impl_;
 };
 
 /// The control socket's sd-event loop (and the user bus attached to it) as one source of
@@ -2941,6 +2970,8 @@ void compositor_impl::notify_capture_completions() {
 }
 
 void compositor_impl::after_dispatch_callback() {
+    if (active)
+        active->drain_theme_job();
     if (active && active->screenshot_requested_.exchange(false, std::memory_order_acq_rel)) {
         // Every pixel of every output repainted into the slot that is read back.
         ++active->screenshot_count_;
@@ -4276,6 +4307,9 @@ void compositor_impl::apply_initial_config() {
         keymap_default_ = true;
         report_keymap_error();
     }
+    config_busy_ = true;
+    ++config_jobs_; // hold the initial generation until its synchronous setup is complete
+    start_theme_job();
     apply_repeat();
     install_bindings();
     apply_focus_policy();
@@ -4306,8 +4340,8 @@ void compositor_impl::apply_initial_config() {
         loop.add_source(config_watch_source_.get());
     }
     config_bytes_generation_ = config_.generation();
-    // Generation 1 is reported like any other (the log; the shell asks for it on bind).
-    finish_config_generation();
+    // Generation 1 is reported once all setup and any theme job have completed.
+    config_job_done();
 }
 
 void compositor_impl::config_watch_callback() {
@@ -4348,9 +4382,12 @@ void compositor_impl::run_config_reload(bool force) {
     if (r.what == config_state::outcome::unchanged)
         return;
     config_busy_ = true;
+    ++config_jobs_; // synchronous fallback jobs cannot finish this generation early
     if (r.what == config_state::outcome::accepted) {
-        if (r.bytes_changed)
-            config_bytes_generation_ = config_.generation();
+        // Every accepted generation refreshes compiled bytes, even at the same path.
+        // Forward the same generation to the shell, including forced unchanged reloads.
+        config_bytes_generation_ = config_.generation();
+        start_theme_job();
         if (r.changes & cfg_repeat)
             apply_repeat();
         if (r.changes & cfg_pointer)
@@ -4378,8 +4415,7 @@ void compositor_impl::run_config_reload(bool force) {
         // Rejected: the configuration in use stays, and so does its keymap problem.
         report_keymap_error();
     }
-    if (config_jobs_ == 0)
-        finish_config_generation();
+    config_job_done();
 }
 
 void compositor_impl::report_keymap_error() {
@@ -4401,6 +4437,59 @@ bool config_post_worker(compositor_impl& self, void (*fn)(void*), void* arg) {
     return runtime::executor::global().post(runtime::affinity::worker, runtime::task{fn, arg});
 }
 } // namespace
+
+void compositor_impl::start_theme_job() {
+    // Resolve the directory cache on UI before any worker can read it.
+    (void)lx::ui::theme_dir();
+    theme_job_ = std::make_unique<theme_job>();
+    theme_job_->settings = config_.current().ui;
+    ++config_jobs_;
+    const auto work = [](void* u) {
+        auto* self = static_cast<compositor_impl*>(u);
+        theme_job& j = *self->theme_job_;
+        const auto mode = j.settings.appearance == lx::config::ui_appearance::light
+                              ? lx::ui::appearance::light : lx::ui::appearance::dark;
+        const std::string_view name{j.settings.theme};
+        if (name.empty() || name == "one-dark" || name == "one-light") {
+            const auto selected = name == "one-light" ? lx::ui::appearance::light
+                                : name == "one-dark" ? lx::ui::appearance::dark : mode;
+            j.palette = decoration_palette_of(lx::ui::theme::builtin(selected));
+            j.ok = true;
+        } else if (auto loaded = lx::ui::load_theme_file(j.settings.theme)) {
+            j.palette = decoration_palette_of(*loaded);
+            j.ok = true;
+        } else {
+            j.error = loaded.get_error();
+        }
+        if (lx::runtime::current_affinity() == lx::runtime::affinity::worker) {
+            self->theme_ready_.store(true, std::memory_order_release);
+            self->loop.wake();
+        } else {
+            self->finish_theme_job();
+        }
+    };
+    if (!config_post_worker(*this, work, this))
+        work(this);
+}
+
+void compositor_impl::drain_theme_job() {
+    runtime::assert_affinity(runtime::affinity::ui);
+    if (theme_ready_.exchange(false, std::memory_order_acquire))
+        finish_theme_job();
+}
+
+void compositor_impl::finish_theme_job() {
+    auto job = std::move(theme_job_);
+    if (job->ok) {
+        decorations_.set_palette(job->palette);
+        // Damage from set_palette must be presented even when every client is idle.
+        request_frame(outputs.live_mask());
+    } else {
+        log_config.warn("ui.theme: \"{}\" does not load ({}) — keeping the palette shown",
+                        job->settings.theme, job->error.message);
+    }
+    config_job_done();
+}
 
 void compositor_impl::start_keymap_job() {
     keymap_job_ = std::make_unique<keymap_job>();
@@ -9106,6 +9195,11 @@ void compositor_impl::stop_threads() {
 
     if (render_thread.joinable()) render_thread.join();
     if (worker_thread.joinable()) worker_thread.join();
+    if (theme_source_) {
+        loop.remove_source(theme_source_.get());
+        theme_source_.reset();
+    }
+    theme_ready_.store(false, std::memory_order_relaxed);
     runtime::executor::global().render_strand().set_waker(nullptr, nullptr);
     runtime::executor::global().worker_strand().set_waker(nullptr, nullptr);
 }
@@ -10012,6 +10106,10 @@ lx::result<void> compositor::start() {
             impl_);
         impl_->loop.add_source(impl_->logind_source.get());
     }
+    if (impl_->loop.source_count() >= impl_->loop.source_capacity())
+        return lx::make_error(lx::io_err::broken_pipe, "no event source slot for theme completion");
+    impl_->theme_source_ = std::make_unique<detail::theme_completion_source>(*impl_);
+    impl_->loop.add_source(impl_->theme_source_.get());
     impl_->loop.set_after_dispatch(&detail::compositor_impl::after_dispatch_callback);
 
     impl_->start_threads();
@@ -10172,8 +10270,10 @@ void compositor::run_posted_ui_tasks() {
     if (impl_)
         impl_->handle_reload_request();
     runtime::executor::global().drain(runtime::affinity::ui);
-    if (impl_)
+    if (impl_) {
+        impl_->drain_theme_job();
         impl_->flush_output_heads();
+    }
 }
 
 const output_config& compositor::persisted_outputs() const { return impl_->outcfg_.config(); }

@@ -7,6 +7,7 @@ import lx.gfx;
 import lx.trace;
 import lx.scene;
 import lx.text;
+import lx.theme;
 
 export module lx.compositor:decoration;
 
@@ -56,6 +57,22 @@ inline constexpr std::uint32_t k_deco_button_pressed = 0x4A4A54u;
 /// The close glyph's colours, and the title text's (active, inactive).
 inline constexpr std::uint32_t k_deco_glyph_light = 0xF2F2F2u;
 inline constexpr std::uint32_t k_deco_glyph_dim = 0xA8A8ACu;
+
+/// Plain sRGB RGB bytes, independent of theme storage. Defaults preserve hand-built nodes.
+struct decoration_palette {
+    std::uint32_t title_active = k_deco_title_active;
+    std::uint32_t title_inactive = k_deco_title_inactive;
+    std::uint32_t border_active = k_deco_border_active;
+    std::uint32_t border_inactive = k_deco_border_inactive;
+    std::uint32_t button_hover = k_deco_button_hover;
+    std::uint32_t button_pressed = k_deco_button_pressed;
+    std::uint32_t text_active = k_deco_glyph_light;
+    std::uint32_t text_inactive = k_deco_glyph_dim;
+    [[nodiscard]] bool operator==(const decoration_palette&) const = default;
+};
+
+/// Resolves compiled tokens once, off the draw path; no widget dependency.
+[[nodiscard]] decoration_palette decoration_palette_of(const lx::ui::theme& theme);
 
 /// Visible frame around the client's window geometry.
 struct frame_extents {
@@ -270,6 +287,7 @@ public:
 
     lx::rect2i geometry{};
     frame_extents extents{};
+    decoration_palette palette{};
     bool shown = false;
     bool active = false;
     /// Per title-bar button (indexed by `button_index(zone)`): its hover / pressed look.
@@ -299,6 +317,8 @@ public:
     static constexpr unsigned k_max = toplevel_manager::k_max;
 
     void bind(surface_tree& tree, scene::scene_graph& scene);
+    /// Recolours all existing and future frames; damages shown strips, never client content.
+    void set_palette(decoration_palette palette);
     /// The compositor's text atlas the titles and close glyphs are rasterised into (the render
     /// thread's UI renderer, or the lowered path's backend, draws from it). Without one no
     /// title or close glyph is drawn.
@@ -385,6 +405,7 @@ private:
     /// 256-byte title, and the whole table was resident from start-up.
     lx::sparse_slots<slot, k_max> slots_{};
     lx::toplevel_id active_{};
+    decoration_palette palette_{};
     bool any_dirty_ = false;
     bool warned_no_text_ = false;
     std::unique_ptr<chrome_text> text_{};
@@ -461,6 +482,18 @@ constexpr lx::color k_dim_tint = lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f);
 } // namespace
 
 // ── Pure helpers ───────────────────────────────────────────────────────────
+
+lx::compositor::decoration_palette
+lx::compositor::decoration_palette_of(const lx::ui::theme& theme) {
+    const auto rgb = [&](lx::ui::tok token) {
+        const auto c = theme.rgba8(token);
+        return ((c & 0xffu) << 16) | (c & 0xff00u) | ((c >> 16) & 0xffu);
+    };
+    using lx::ui::tok;
+    return {rgb(tok::title_bar_background), rgb(tok::title_bar_inactive_background),
+            rgb(tok::border_focused), rgb(tok::border), rgb(tok::ghost_element_hover),
+            rgb(tok::ghost_element_active), rgb(tok::text), rgb(tok::text_muted)};
+}
 
 lx::compositor::frame_extents lx::compositor::extents_for(decoration_mode mode, bool maximized) {
     if (mode != decoration_mode::server)
@@ -882,7 +915,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         }
         out.push_quad(q, r, out.orders().assign(r));
     };
-    const std::uint32_t border = active ? k_deco_border_active : k_deco_border_inactive;
+    const std::uint32_t border = active ? palette.border_active : palette.border_inactive;
     // Borders: left and right full height, top and bottom between them.
     if (extents.left > 0)
         push_fill({f.x, f.y, extents.left, f.height}, border);
@@ -894,7 +927,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         push_fill({g.x, g.y + g.height, g.width, extents.bottom}, border);
 
     const lx::rect2i title = title_rect(g);
-    push_fill(title, active ? k_deco_title_active : k_deco_title_inactive);
+    push_fill(title, active ? palette.title_active : palette.title_inactive);
     const double vs = ctx.projection.scale > 0.0 ? ctx.projection.scale : 1.0;
     const lx::rect2i bar = project(title);
 
@@ -963,7 +996,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
             // them, and the batch stays one draw per page.
             const std::uint32_t order = out.orders().assign(span);
             const gfx::packed_rgba fg = gfx::premultiplied_half(
-                deco_fill_color(active ? k_deco_glyph_light : k_deco_glyph_dim, dimmed));
+                deco_fill_color(active ? palette.text_active : palette.text_inactive, dimmed));
             const gfx::packed_rgba white = gfx::premultiplied_half(
                 deco_fill_color(0xFFFFFFu, dimmed));
             bool stale = false;
@@ -993,7 +1026,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
     // minus and the square (the restore pair when maximized) are 1 px strokes.
     const auto button_rgb = [&](deco_zone zone) -> std::uint32_t {
         const bool light = active || buttons[button_index(zone)] != deco_button::normal;
-        return light ? k_deco_glyph_light : k_deco_glyph_dim;
+        return light ? palette.text_active : palette.text_inactive;
     };
     const auto button_fill = [&](deco_zone zone) {
         const deco_button st = buttons[button_index(zone)];
@@ -1004,7 +1037,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         // One quad, its radius half its side: a circle at any scale, anti-aliased by the
         // primitive renderer (or the lowered path's rounded blit).
         push_fill({r.x + (r.width - d) / 2, r.y + (r.height - d) / 2, d, d},
-                  st == deco_button::pressed ? k_deco_button_pressed : k_deco_button_hover,
+                  st == deco_button::pressed ? palette.button_pressed : palette.button_hover,
                   true, bar);
     };
     button_fill(deco_zone::minimize);
@@ -1036,7 +1069,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
             const int fx = cx - front / 2, fy = cy - front / 2 + 1;
             outline({fx + 2, fy - 2, front, front});
             push_fill({fx + w, fy + w, front - 2 * w, front - 2 * w},
-                      active ? k_deco_title_active : k_deco_title_inactive, false, bar);
+                      active ? palette.title_active : palette.title_inactive, false, bar);
             outline({fx, fy, front, front});
         } else {
             outline({cx - s / 2, cy - s / 2, s, s});
@@ -1054,7 +1087,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         const lx::rect2i at{static_cast<int>(box[0]), static_cast<int>(box[1]), cg->size, cg->size};
         if (!push_glyph(cg->tile, false, box, bar,
                         gfx::premultiplied_half(
-                            deco_fill_color(light_close ? k_deco_glyph_light : k_deco_glyph_dim,
+                            deco_fill_color(light_close ? palette.text_active : palette.text_inactive,
                                             dimmed)),
                         out.orders().assign(at)))
             text->note_stale();
@@ -1065,6 +1098,17 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
 }
 
 // ── decoration_manager ─────────────────────────────────────────────────────
+
+void lx::compositor::decoration_manager::set_palette(decoration_palette palette) {
+    if (palette_ == palette)
+        return;
+    palette_ = palette;
+    for (auto& s : slots_)
+        if (s.used) {
+            s.node.palette = palette_;
+            damage_strips(s.node);
+        }
+}
 
 void lx::compositor::decoration_manager::bind(surface_tree& tree, scene::scene_graph& scene) {
     tree_ = &tree;
@@ -1094,6 +1138,7 @@ lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
             r.width = 0;
             r.glyphs.clear();
         }
+        s.node.palette = palette_;
         s.node.dimmed = false;
         s.node.geometry = {};
         s.node.extents = {};

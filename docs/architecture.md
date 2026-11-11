@@ -333,7 +333,15 @@ Shared WM vocabulary (`lx::toplevel_state`, `lx::placement`) lives in
 `lx.foundation` so the compositor can describe toplevel state without depending
 on `lx.shell.policy`. Policy implementations stay in the desktop layer.
 `lx.ui` is also desktop-layer: shell and apps both consume it; only
-`lx.app` sits above. `lx.ui.host` (lx.ui on Wayland surfaces: the per-thread context and the
+`lx.app` sits above. `lx.theme` is the Graphics-layer compiled-theme reader shared by
+the compositor and toolkit: it retains the `lx::ui` public namespace, re-exported by
+`lx.ui:theme`. The JSON compiler remains `lx.ui:theme.compile`; generated builtin bytes
+belong to `lx.theme`. Server-side frames receive a plain palette resolved from the same
+compiled tokens as the shell panel. Configuration theme I/O runs on the compositor worker
+and the accepted palette lands on UI through a durable atomic-ready event source,
+damaging existing frame strips; failed loads keep the previous palette. Every accepted
+configuration generation refreshes the compiled theme and forwards its bytes to the shell,
+including forced reloads whose configuration text is unchanged. `lx.ui.host` (lx.ui on Wayland surfaces: the per-thread context and the
 role-agnostic surfaces) is desktop-layer too, so the shell and the portal can build on it
 without depending on the application framework.
 
@@ -368,6 +376,7 @@ flowchart TB
         GFX["lx.gfx"]
         TEXT["lx.text"]
         LAY["lx.layout"]
+        THEME["lx.theme (compiled themes)"]
     end
 
     subgraph L2["Platform layer"]
@@ -406,6 +415,10 @@ flowchart TB
     COMP --> CSURF --> GFX
     COMP --> SCENE --> GFX
     UI --> SCENE
+    UI --> THEME
+    COMP --> THEME
+    THEME --> GFX
+    THEME --> RT
     WLS --> SESS
     COMP --> HEALTH
     COMP --> CONFIG
@@ -427,7 +440,7 @@ flowchart TB
 | **Foundation** | Types, errors, handles, WM vocabulary | `result<T>`, `toplevel_id`, `toplevel_state`, `placement` |
 | **Runtime** | Event loop, thread routing, logging | `executor`, `event_loop`, `logger` |
 | **Platform** | OS / kernel / Wayland wire | `server::bind`, `kms_device::open`, protocols |
-| **Graphics** | Vulkan RHI, text, layout (`lx.text` rasterises glyphs into `lx.gfx:atlas`, so it depends on `lx.gfx`; `lx.layout:flex` is the UI's flexbox, on `lx.foundation` only) | `dmabuf_importer`, `solve_flex`, `scene_graph` |
+| **Graphics** | Shared compiled-theme reader (`lx.theme`, namespace `lx::ui` retained), Vulkan RHI, text, layout (`lx.text` rasterises glyphs into `lx.gfx:atlas`, so it depends on `lx.gfx`; `lx.layout:flex` is the UI's flexbox, on `lx.foundation` only) | `dmabuf_importer`, `solve_flex`, `scene_graph` |
 | **Compositor** | Display server integration | `tick_ui` / `tick_render`, `shell_bridge` |
 | **Desktop** | WM policy, shell UI, shared widget toolkit and its Wayland host | `policy_bridge`, `stacking_policy`, `lx.ui`, `lx::ui::host::context` / `surface` |
 | **Application** | End-user programs on the app framework | `lx::application`, `lx::app::window` |
