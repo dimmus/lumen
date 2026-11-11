@@ -30,10 +30,15 @@ constexpr int k_menu_arrow = 24;
 constexpr std::uint32_t k_menu_text = 0xFFECECEEu;
 constexpr std::uint32_t k_menu_text_selected = 0xFFFFFFFFu;
 constexpr std::uint32_t k_menu_text_dim = 0xFF8C8C94u;
-constexpr lx::text::font_desc k_menu_font{"Sans", 10.f, lx::text::weight::normal,
-                                          lx::text::style::normal};
-constexpr lx::text::font_desc k_menu_header_font{"Sans", 9.f, lx::text::weight::bold,
-                                                 lx::text::style::normal};
+[[nodiscard]] lx::text::font_desc menu_header_font() {
+    return lx::shell::menu_font(lx::text::weight::bold, lx::ui::text_size::small);
+}
+
+[[nodiscard]] int tooltip_title_height() {
+    const float size = lx::ui::text_size_px(lx::ui::text_size::small, lx::ui::active_theme(),
+                                            lx::ui::ui_rem_px());
+    return std::max(18, static_cast<int>(std::ceil(size * 1.5f)));
+}
 
 namespace keysym {
 constexpr unsigned up = 0xff52, down = 0xff54, left = 0xff51, right = 0xff53;
@@ -133,13 +138,23 @@ private:
 
 // ── The pure layout (as always) ───────────────────────────────────────────────
 
+lx::text::font_desc lx::shell::menu_font(lx::text::weight weight, lx::ui::text_size size) {
+    const auto& theme = lx::ui::active_theme();
+    const char* family = theme.fonts().ui_family[0] ? theme.fonts().ui_family : nullptr;
+    return {family, lx::ui::text_size_px(size, theme, lx::ui::ui_rem_px()) * 0.75f, weight,
+            lx::text::style::normal};
+}
+
 namespace {
 
-[[nodiscard]] int menu_text_width(const char* s) {
-    lx::text::shaped_line line{};
-    if (!lx::text::shape_line(s, k_menu_font, line))
-        return 0;
-    return line.width_px > 0 ? line.width_px : 0;
+[[nodiscard]] int menu_text_width(const char* text,
+                                  const lx::text::font_desc& font) {
+    lx::text::text_layout layout{};
+    layout.set_text(text ? text : "");
+    layout.set_font(font);
+    layout.set_wrap(lx::text::text_wrap::none);
+    const lx::result<void> updated = layout.update();
+    return updated ? std::max(0, layout.bounding_size().width) : 0;
 }
 
 [[nodiscard]] lx::ui::style at(lx::rect2i r) {
@@ -311,7 +326,10 @@ void lx::shell::layout_menu(const std::vector<menu_entry>& items,
     for (const menu_entry& e : items) {
         if (out.count >= k_menu_max_rows)
             break;
-        const int h = e.separator ? k_menu_separator_h : k_menu_row_h;
+        const int themed_row_h = std::max(k_menu_row_h, static_cast<int>(std::ceil(
+            lx::ui::text_size_px(lx::ui::text_size::ui, lx::ui::active_theme(),
+                                 lx::ui::ui_rem_px()) * 1.625f)));
+        const int h = e.separator ? k_menu_separator_h : themed_row_h;
         out.row[out.count++] = {k_menu_pad, y, 0, h};
         y += h;
         if (e.separator || !text_width)
@@ -366,10 +384,13 @@ bool lx::shell::menu_popup::open_level(unsigned index, lx::ui::host::popup_role*
     l.items = items;
     l.selected = -1;
     l.dirty = true;
+    lx::text::font_desc font = menu_font();
     layout_menu(
         *items,
-        [](const char* s, void*) { return menu_text_width(s); },
-        nullptr, l.rows);
+        [](const char* s, void* user) {
+            return menu_text_width(s, *static_cast<const lx::text::font_desc*>(user));
+        },
+        &font, l.rows);
     lx::ui::host::surface_options so{};
     so.describe = &menu_describe;
     so.size = {l.rows.width, l.rows.height};
@@ -471,10 +492,13 @@ void lx::shell::menu_popup::replace_items(std::vector<menu_entry> items) {
     level& l = level_[0];
     l.items = &root_;
     const int w = l.rows.width, h = l.rows.height;
+    lx::text::font_desc font = menu_font();
     layout_menu(
         root_,
-        [](const char* s, void*) { return menu_text_width(s); },
-        nullptr, l.rows);
+        [](const char* s, void* user) {
+            return menu_text_width(s, *static_cast<const lx::text::font_desc*>(user));
+        },
+        &font, l.rows);
     // The surface keeps its size (a popup cannot grow without a reposition): rows that do
     // not fit are dropped.
     l.rows.width = w;
@@ -723,12 +747,12 @@ lx::ui::child lx::shell::menu_popup::build_ui(unsigned index) {
         // {6, 0, 20, h}; an icon at its own 16-px square, 4 in from the row).
         if (e.toggle_kind == menu_entry::toggle::check && e.toggled) {
             parts[p++] = menu_text_at({6, 0, k_menu_indicator - 8, r.height}, "\xE2\x9C\x93",
-                                      color, k_menu_font, mnemonic_attrs("", -1, mnemonic_scratch_),
+                                      color, menu_font(), mnemonic_attrs("", -1, mnemonic_scratch_),
                                       0x9101'0000u + index * 128 + i, 0x9101'8000u + index * 128 + i);
         } else if (e.toggle_kind == menu_entry::toggle::radio) {
             parts[p++] = menu_text_at({6, 0, k_menu_indicator - 8, r.height},
                                       e.toggled ? "\xE2\x97\x8F" : "\xE2\x97\x8B", color,
-                                      k_menu_font, mnemonic_attrs("", -1, mnemonic_scratch_),
+                                      menu_font(), mnemonic_attrs("", -1, mnemonic_scratch_),
                                       0x9102'0000u + index * 128 + i, 0x9102'8000u + index * 128 + i);
         } else if (!e.icon_name.empty()) {
             if (const lx::gfx::atlas_tile_id tile = icon_tile(index, e.icon_name.c_str(), icon_px);
@@ -749,10 +773,10 @@ lx::ui::child lx::shell::menu_popup::build_ui(unsigned index) {
         // 16 past it — the canvas's own arithmetic.
         int right = static_cast<int>(r.width) - (e.submenu ? k_menu_arrow : 8);
         if (!e.shortcut.empty()) {
-            const int sw = menu_text_width(e.shortcut.c_str());
+            const int sw = menu_text_width(e.shortcut.c_str(), menu_font());
             if (sw > 0 && right - sw > k_menu_indicator + 24) {
                 parts[p++] = menu_text_at({right - sw, 0, sw, r.height}, e.shortcut.c_str(),
-                                          k_menu_text_dim, k_menu_font,
+                                          k_menu_text_dim, menu_font(),
                                           mnemonic_attrs("", -1, mnemonic_scratch_),
                                           0x9106'0000u + index * 128 + i,
                                           0x9106'8000u + index * 128 + i);
@@ -764,13 +788,14 @@ lx::ui::child lx::shell::menu_popup::build_ui(unsigned index) {
             const std::string label = menu_label(e.label, &mn);
             parts[p++] = menu_text_at(
                 {k_menu_indicator, 0, right - k_menu_indicator, r.height}, label.c_str(), color,
-                e.header ? k_menu_header_font : k_menu_font, mnemonic_attrs(label, mn, mnemonic_scratch_),
+                e.header ? menu_header_font() : menu_font(),
+                mnemonic_attrs(label, mn, mnemonic_scratch_),
                 0x9104'0000u + index * 128 + i, 0x9104'8000u + index * 128 + i);
         }
         if (e.submenu)
             parts[p++] = menu_text_at({static_cast<int>(r.width) - k_menu_arrow + 6, 0,
                                        k_menu_arrow - 6, r.height},
-                                      "\xE2\x96\xB8", color, k_menu_font,
+                                      "\xE2\x96\xB8", color, menu_font(),
                                       mnemonic_attrs("", -1, mnemonic_scratch_),
                                       0x9107'0000u + index * 128 + i,
                                       0x9107'8000u + index * 128 + i);
@@ -857,11 +882,11 @@ bool lx::shell::tooltip_popup::open(lx::ui::host::layer_role& layer, lx::rect2i 
     title_ = std::string{title};
     body_ = std::string{text};
     constexpr int k_tip_w = 320, k_tip_pad = 8;
-    const int tw = title_.empty() ? 0 : menu_text_width(title_.c_str());
+    const int tw = title_.empty() ? 0 : menu_text_width(title_.c_str(), menu_header_font());
     int bh = 0;
     if (!body_.empty()) {
         lx::text::wrapped_text w{};
-        if (lx::text::wrap_text(body_, {}, k_menu_font, k_tip_w - 2 * k_tip_pad, 4, w) &&
+        if (lx::text::wrap_text(body_, {}, menu_font(), k_tip_w - 2 * k_tip_pad, 4, w) &&
             w.line_count > 0)
             bh = static_cast<int>(w.line_count) * w.line_height_px;
         text_ = w;
@@ -870,7 +895,8 @@ bool lx::shell::tooltip_popup::open(lx::ui::host::layer_role& layer, lx::rect2i 
     int w = (tw > body_w ? tw : body_w) + 2 * k_tip_pad + 2;
     w = w > k_tip_w ? k_tip_w : (w < 40 ? 40 : w);
     width_ = w;
-    height_ = k_tip_pad * 2 + (title_.empty() ? 0 : 18) + (bh > 0 ? bh + (title_.empty() ? 0 : 2) : 0);
+    const int title_h = title_.empty() ? 0 : tooltip_title_height();
+    height_ = k_tip_pad * 2 + title_h + (bh > 0 ? bh + (title_.empty() ? 0 : 2) : 0);
     lx::ui::host::surface_options so{};
     so.describe = &tooltip_describe;
     so.size = {width_, height_};
@@ -905,18 +931,19 @@ lx::ui::child lx::shell::tooltip_popup::build_ui() {
     unsigned n = 0;
     int y = 8;
     if (!title_.empty()) {
-        const lx::ui::child title[1] = {menu_text(title_.c_str(), k_menu_text, k_menu_header_font,
+        const lx::ui::child title[1] = {menu_text(title_.c_str(), k_menu_text, menu_header_font(),
                                                   0x9200u,
                                                   mnemonic_attrs("", -1, mnemonic_scratch_))};
         shell_box_props tb{};
-        tb.control.layout = at({8, y, width_ - 16, 18}).overflow_hidden();
+        const int title_h = tooltip_title_height();
+        tb.control.layout = at({8, y, width_ - 16, title_h}).overflow_hidden();
         kids[n++] = shell_box(tb, title, 0x9201u);
-        y += 20;
+        y += title_h + 2;
     }
     if (!body_.empty()) {
         lx::ui::text_block_props t{};
         t.text = body_.c_str();
-        t.font = k_menu_font;
+        t.font = menu_font();
         t.color = shell_color(k_menu_text);
         t.wrap = lx::text::text_wrap::word;
         t.max_lines = 4;

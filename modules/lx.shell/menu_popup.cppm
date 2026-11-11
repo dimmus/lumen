@@ -55,6 +55,11 @@ struct menu_entry {
     std::vector<menu_entry> children;
 };
 
+/// The generic popup's UI font at the requested theme size and weight.
+[[nodiscard]] lx::text::font_desc menu_font(
+    lx::text::weight weight = lx::text::weight::normal,
+    lx::ui::text_size size = lx::ui::text_size::ui);
+
 /// A label without its mnemonic marks, and the mnemonic's byte offset in it (-1: none).
 [[nodiscard]] std::string menu_label(std::string_view label, int* mnemonic = nullptr);
 
