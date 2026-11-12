@@ -615,12 +615,26 @@ int client_main(const char* tier_name, int fd) {
     {
         const lx::rect2i ra = query_rect(parent, std::string{"record "} + k_app_a);
         const lx::rect2i rb = query_rect(parent, std::string{"record "} + k_app_b);
-        // Points only one window covers whatever their order: A's top-left, B's bottom-right
-        // (the compositor cascades B over A).
-        const lx::point2i pa{ra.x + 8, ra.y + 8};
-        const lx::point2i pb{rb.x + rb.width - 8, rb.y + rb.height - 8};
-        const bool apart = !(pa.x >= rb.x && pa.x < rb.x + rb.width && pa.y >= rb.y && pa.y < rb.y + rb.height) &&
-                           !(pb.x >= ra.x && pb.x < ra.x + ra.width && pb.y >= ra.y && pb.y < ra.y + ra.height);
+        // Points only one window covers whatever their order. The cascade centres the
+        // window that maps first and steps the second past it — and which of the two that
+        // is follows the order the client's first buffer commits land, which the gl tier
+        // does not promise. A fixed corner of each only works for one of the two
+        // placements; take the first corner of each that the other window does not cover
+        // (8 px in), and fail when no such corner exists.
+        const auto only_in = [](lx::rect2i r, lx::rect2i other) {
+            const lx::point2i corners[4] = {{r.x + 8, r.y + 8},
+                                            {r.x + r.width - 8, r.y + r.height - 8},
+                                            {r.x + 8, r.y + r.height - 8},
+                                            {r.x + r.width - 8, r.y + 8}};
+            for (const lx::point2i c : corners)
+                if (!(c.x >= other.x && c.x < other.x + other.width && c.y >= other.y &&
+                      c.y < other.y + other.height))
+                    return c;
+            return lx::point2i{-1, -1};
+        };
+        const lx::point2i pa = only_in(ra, rb);
+        const lx::point2i pb = only_in(rb, ra);
+        const bool apart = pa.x >= 0 && pb.x >= 0;
         // Pointer routed by target: from outside both, into A, then into B.
         (void)parent.call("move 2 790");
         (void)run_until([&] { return !a.surface.input().pointer_inside() && !b.surface.input().pointer_inside(); },
