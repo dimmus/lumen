@@ -971,7 +971,7 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_input_serials COMMAND test_input_serials)
 
     add_executable(test_dnd_grab tests/test_dnd_grab.cpp)
-    target_link_libraries(test_dnd_grab PRIVATE lx.compositor)
+    target_link_libraries(test_dnd_grab PRIVATE lx.compositor lx.input lx.wayland.server)
     lumen_apply_module_properties(test_dnd_grab)
     lumen_link_platform(test_dnd_grab)
     target_include_directories(test_dnd_grab PRIVATE tests)
