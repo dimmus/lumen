@@ -516,10 +516,12 @@ lumen-compositor [socket-name] [-f fps]
 
 **Socket path:** `$XDG_RUNTIME_DIR/lumen-0` (default name `lumen-0`).
 
-**Environments (binding):** development runs in the vmware Arch VM (this host, vmwgfx —
-GL path, no hardware Vulkan) natively, or on the iritur notebook for hardware Vulkan in
-sessions the user hosts over SSH. Never containers; never headless compositor
-verification (seat smokes via `--join-seat-session` instead). Worktree builds:
+**Environments (binding):** two hosts share the hostname `iritur` — detect which one you
+are on before seat/injection/measurement work (`ls /sys/class/drm/card*/device/driver`:
+vmwgfx → VM; i915+nouveau → notebook). The vmware VM runs the GL path (no hardware
+Vulkan); the notebook has hasvk hardware Vulkan and injects via `scripts/uinput-mouse.py`
+(+ `LUMEN_SMOKE_SCALE=1`). Never containers; never headless compositor verification (seat
+smokes via `--join-seat-session` instead). Worktree builds:
 `cmake --preset release -S <worktree> -B <worktree>/build/test -DLUMEN_BUILD_TESTS=ON`
 after copying `protocols/upstream` in. Verified commands, seat/input-injection
 procedures, noise families and measurement discipline live in

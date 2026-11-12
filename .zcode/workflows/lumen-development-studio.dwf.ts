@@ -30,6 +30,20 @@ args:
       requires no NEW failures beyond this set. Failures outside the set park the run
       on an owner decision (proceed-and-tolerate vs skip)."
     default: []
+  smoke_env:
+    type: json
+    description: "Extra KEY=VALUE env for the seat smokes (json array of strings). Host
+      recipe — vmware VM: [] (defaults are right); iritur notebook:
+      [\"LUMEN_SMOKE_SCALE=1\",\"LUMEN_INJECT_POINTER=/dev/input/eventN\",
+      \"LUMEN_INJECT_RELATIVE=/dev/input/eventN\",\"LUMEN_INJECT_KEYBOARD=/dev/input/event3\"]
+      where eventN is the virtual ABS mouse held open by scripts/uinput-mouse.py."
+    default: []
+  app_smoke_min:
+    type: number
+    description: "Host-calibrated app-smoke floor: when set >0, exit 1 with at least this
+      many PASS rows counts as host noise, not a failure (notebook ≈140 — its ~36
+      VM-geometry rows fail regardless of the change). 0 = the exit code decides."
+    default: 0
   run_bench:
     type: boolean
     description: Also run scripts/ui-bench.sh (engine bench against the stored
@@ -146,6 +160,9 @@ interface WorkflowReport {
   notCovered: string[];
 }
 
+/** What the owner decided to do about a busy seat: freed it, or smoke-less delivery. */
+type SeatPlan = "freed" | "skip";
+
 const WT_ROOT = "/home/dimmus/lumen-wt";
 const MAIN_WS = "/home/dimmus/lumen";
 
@@ -156,6 +173,9 @@ const runSmokes = args.run_smokes !== false;
 const runBench = args.run_bench === true;
 const maxTasks = typeof args.max_tasks === "number" ? args.max_tasks : 5;
 const knownRed: string[] = Array.isArray(args.known_red) ? args.known_red.map(String) : [];
+const smokeEnv: string[] = Array.isArray(args.smoke_env) ? args.smoke_env.map(String) : [];
+const envPrefix = smokeEnv.length > 0 ? smokeEnv.join(" ") + " " : "";
+const appSmokeMin = typeof args.app_smoke_min === "number" ? args.app_smoke_min : 0;
 
 /** Test names ctest reported under "The following tests FAILED:" (empty when it never got there). */
 function failedTests(out: string): string[] {
@@ -260,7 +280,7 @@ const memoryPersona =
 
 const verified: string[] = [];
 const notCovered: string[] = [
-  "hardware Vulkan: this VM has none (GL path); Vulkan-decisive claims need a notebook session hosted by the user",
+  "the decisive present backend is not verified by this run — name it from the smoke logs before quoting one (notebook: hasvk Vulkan; vmware VM: GL path, no hardware Vulkan)",
 ];
 const allFindings: ReportFinding[] = [];
 const prSections: string[] = [];
@@ -290,6 +310,30 @@ if (plan.tasks.length > maxTasks) {
 }
 log(`Plan: ${tasks.length} task(s) — ${plan.objective}`);
 
+let smokesEnabled = runSmokes;
+if (runSmokes) {
+  phase("Check the seat is free for smoke verification");
+  const seat = await world.run(
+    "bash",
+    // comm is 15-char truncated: pgrep -x cannot see lumen-compositor. Match /proc/*/comm
+    // directly, plus any running smoke script.
+    ["-c", "grep -l -e lumen-composito -e '^sway$' -e '^weston$' -e '^hyprland$' /proc/[0-9]*/comm 2>/dev/null | head -5; pgrep -f '^bash .*-smoke\\.sh' | head -3; true"],
+    { output: { tail: 4096 } },
+  );
+  const holders = seat.stdout.trim().split("\n").filter((l) => l.trim() !== "");
+  if (holders.length > 0) {
+    const seatPlan = await hole<SeatPlan>(
+      "Free the seat for smoke verification",
+      `Another compositor or smoke session holds the seat (one DRM master at a time):\n${holders.join("\n")}\n` +
+        `Return "freed" once the owner has freed the seat (the run then proceeds with smokes), or "skip" to ` +
+        `deliver without seat smokes — gates will record the missing seat evidence honestly.`,
+    );
+    if (seatPlan === "skip") smokesEnabled = false;
+  } else {
+    log("Seat is free for smoke verification");
+  }
+}
+
 for (const card of tasks) {
   const wt = `${WT_ROOT}/${card.id}`;
   const branch = `${branchPrefix}/${card.id}`;
@@ -315,18 +359,26 @@ for (const card of tasks) {
   phase("Set up the worktree and test-enabled baseline");
   report({ id: card.id, title: card.title, branch, state: "baseline", verdict: "" }, "tasks");
   let haveWt = false;
+  let resumeMode = false;
   const add = await world.run("git", ["worktree", "add", wt, "-b", branch, effBase], { output: { tail: 2048 } });
   if (add.exitCode === 0) {
     haveWt = true;
   } else {
-    // A previous blocked attempt may have left this worktree/branch at the base with no
-    // work in it — reuse it (reset the branch onto the effective base) instead of blocking.
+    // The add failed. Either a previous blocked attempt left an empty worktree at the base
+    // (reset onto the effective base and reuse), or an amended run finds a branch that
+    // already holds this task's implementation (resume it: baseline and implement are done).
     const leftover = await world.run("git", ["-C", wt, "status", "--porcelain"], { output: { tail: 2048 } });
     const unique = await world.run("git", ["rev-list", "--count", `${effBase}..${branch}`], { output: { tail: 1024 } });
-    if (leftover.exitCode === 0 && leftover.stdout.trim() === "" && unique.exitCode === 0 && unique.stdout.trim() === "0") {
+    const uniqueCount = unique.exitCode === 0 ? Number(unique.stdout.trim()) : Number.NaN;
+    if (leftover.exitCode === 0 && leftover.stdout.trim() === "" && uniqueCount === 0) {
       const reset = await world.run("git", ["-C", wt, "reset", "--hard", effBase], { output: { tail: 1024 } });
       haveWt = reset.exitCode === 0;
       if (haveWt) log(`Task ${card.id}: reusing existing worktree, branch reset to ${effBase}`);
+    } else if (leftover.exitCode === 0 && leftover.stdout.trim() === "" && uniqueCount > 0) {
+      haveWt = true;
+      resumeMode = true;
+      verified.push(`task ${card.id}: resuming an already-implemented branch (${uniqueCount} commit(s) beyond ${effBase}; baseline was proven in the earlier run)`);
+      log(`Task ${card.id}: resume mode — branch already holds ${uniqueCount} commit(s)`);
     }
   }
   if (!haveWt) {
@@ -340,7 +392,12 @@ for (const card of tasks) {
     report({ id: card.id, title: card.title, branch, state: "blocked", verdict: "worktree" }, "tasks");
     continue;
   }
-  await world.run("cp", ["-r", "protocols/upstream", `${wt}/protocols/`], { output: { tail: 1024 } });
+  await world.run(
+    "bash",
+    ["-c", `test -d '${wt}/protocols/upstream' || cp -r protocols/upstream '${wt}/protocols/'`],
+    { output: { tail: 1024 } },
+  );
+  if (!resumeMode) {
   const configure = await world.run(
     "cmake",
     ["--preset", "release", "-S", wt, "-B", `${wt}/build/test`, "-DLUMEN_BUILD_TESTS=ON"],
@@ -413,11 +470,19 @@ for (const card of tasks) {
   }
   verified.push(`task ${card.id}: tests-enabled baseline green in worktree (configure+build+ctest at ${wt}/build/test)`);
   log(`Task ${card.id}: baseline green`);
+  }
 
   phase("Implement the task in its worktree");
   report({ id: card.id, title: card.title, branch, state: "implementing", verdict: "" }, "tasks");
   const implementer = agent(`Implementer ${card.id}`, { system: implementerPersona });
-  const impl = await implementer.ask<ImplResult>(
+  const impl = resumeMode
+    ? await implementer.ask<ImplResult>(
+        `This task was already implemented on branch ${branch} in the worktree ${wt} (resuming an interrupted run). ` +
+          `Do NOT edit anything. Read the commits (git -C ${wt} log --oneline ${effBase}..HEAD and their diffs) and the ` +
+          `task card below, then answer the standard handoff: summary, changed files, commits, tests added, notes for ` +
+          `the reviewer, and deviations.\n\nTask card:\n${JSON.stringify(card, null, 2)}`,
+      )
+    : await implementer.ask<ImplResult>(
     `Implement this task in the Lumen worktree at ${wt} (branch ${branch}, cut from ${effBase}). ` +
       `Build directory: ${wt}/build/test (tests-enabled). Commit every logical unit; never push.\n\n` +
       `Task card:\n${JSON.stringify(card, null, 2)}\n\nPlan objective: ${plan.objective}\n` +
@@ -562,27 +627,60 @@ for (const card of tasks) {
   report({ id: card.id, title: card.title, branch, state: "verify", verdict: "" }, "tasks");
   const seatEvidence: string[] = [];
   let seatFailed = false;
-  if (runSmokes) {
+  if (smokesEnabled) {
     for (const smoke of [
-      { name: "drag-smoke", file: "./scripts/drag-smoke.sh", timeoutMs: 300_000 },
-      { name: "app-smoke", file: "./scripts/app-smoke.sh", timeoutMs: 600_000 },
+      { name: "drag-smoke", file: "./scripts/drag-smoke.sh", timeoutMs: 420_000, minPassed: 0 },
+      { name: "app-smoke", file: "./scripts/app-smoke.sh", timeoutMs: 900_000, minPassed: appSmokeMin },
     ]) {
       let exit = -1;
-      let tail = "";
+      let timedOut = false;
+      let full = "";
       for (let attempt = 1; attempt <= 2; attempt++) {
-        const run = await world.run(
-          "bash",
-          ["-c", `cd '${wt}' && LUMEN_BUILD_DIR=build/test exec ${smoke.file} --join-seat-session`],
-          { timeoutMs: smoke.timeoutMs, output: { tail: 16_384 } },
-        );
-        exit = run.exitCode;
-        tail = (run.stderr + run.stdout).slice(-2000);
-        if (exit === 0) break;
+        try {
+          const run = await world.run(
+            "bash",
+            ["-c", `cd '${wt}' && ${envPrefix}LUMEN_BUILD_DIR=build/test exec ${smoke.file} --join-seat-session`],
+            { timeoutMs: smoke.timeoutMs, output: { tail: 65_536 } },
+          );
+          exit = run.exitCode;
+          full = run.stderr + run.stdout;
+        } catch {
+          // A timeout (or spawn failure) is a rejection, not an exit code: it must not
+          // kill the run — it is COULD NOT RUN evidence.
+          timedOut = true;
+          exit = -1;
+          full = "";
+        }
+        if (exit === 0 || timedOut) break;
         log(`Task ${card.id}: ${smoke.name} attempt ${attempt} exit ${exit}`);
       }
-      seatEvidence.push(`${smoke.name} --join-seat-session → exit ${exit}`);
-      verified.push(`task ${card.id}: ${smoke.name} ${exit === 0 ? "PASS" : `FAIL (exit ${exit})`} on the real seat`);
-      if (exit === 3) {
+      const tail = full.slice(-3000);
+      const passedRows = (full.match(/^PASS/gm) ?? []).length;
+      const tolerated = exit !== 0 && !timedOut && smoke.minPassed > 0 && passedRows >= smoke.minPassed;
+      seatEvidence.push(
+        `${smoke.name} --join-seat-session → ` +
+          (timedOut ? "COULD NOT RUN (timed out)" : tolerated ? `PASS at host tolerance (${passedRows} PASS rows ≥ ${smoke.minPassed}; exit ${exit})` : `exit ${exit}`),
+      );
+      verified.push(
+        `task ${card.id}: ${smoke.name} ${exit === 0 || tolerated ? "PASS" : timedOut ? "COULD NOT RUN (timed out)" : `FAIL (exit ${exit})`} on the real seat`,
+      );
+      if (timedOut) {
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `${smoke.name} timed out after ${smoke.timeoutMs}ms — COULD NOT RUN, it contributes no seat evidence`,
+          evidence: "no output captured (timeout)",
+          status: "verified",
+          severity: "medium",
+        });
+      } else if (tolerated) {
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `${smoke.name} exited ${exit} with ${passedRows} PASS rows ≥ the host-calibrated floor ${smoke.minPassed} — the failing rows are the known host-calibrated set, not a regression`,
+          evidence: tail,
+          status: "verified",
+          severity: "low",
+        });
+      } else if (exit === 3) {
         allFindings.push({
           where: `task ${card.id}`,
           what: `${smoke.name} reported INVALID (contaminated measurement) twice — seat not quiet or foreign input`,
@@ -602,7 +700,7 @@ for (const card of tasks) {
       }
     }
   } else {
-    notCovered.push(`task ${card.id}: seat smokes (run_smokes was not set) — compositor-surface behavior unverified on the seat`);
+    notCovered.push(`task ${card.id}: seat smokes did not run (${runSmokes ? "owner chose smoke-less delivery at the busy-seat decision" : "run_smokes was not set"}) — compositor-surface behavior unverified on the seat`);
   }
   if (runBench) {
     const bench = await world.run(

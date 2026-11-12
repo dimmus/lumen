@@ -22,7 +22,9 @@ Execution rules:
 - **Seat discipline**: compositor/display/input verification runs on the real seat via
   `--join-seat-session`; headless `--virtual-outputs` runs are not evidence for that
   surface. One compositor holds DRM master at a time: before and after every seat run,
-  check `pgrep -x lumen-compositor`, `pgrep -f "^bash .*-smoke\.sh"` and `/proc/loadavg`.
+  check `grep -l lumen-composito /proc/[0-9]*/comm` (`pgrep -x lumen-compositor` never
+  matches — comm is truncated to 15 chars), `pgrep -f "^bash .*-smoke\.sh"` and
+  `/proc/loadavg`.
 - **Serialization**: never run benches or smokes while another build or smoke runs on
   this 2-core host.
 - **A/B**: performance questions get interleaved A/B (same pin, `setarch -R`, ≥3 rounds,

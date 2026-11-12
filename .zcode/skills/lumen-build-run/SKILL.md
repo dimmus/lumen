@@ -10,21 +10,32 @@ Full-fidelity sources: `.zcode/memories/lumen-host-build-run-env.md`,
 
 ## Environments (binding)
 
-- **Dev VM** (this host, primary): kernel "fastvm", VMware SVGA/vmwgfx, 2 cores, 15 GB RAM,
-  Arch, clang, ccache, sudo NOPASSWD. **No hardware Vulkan** — lavapipe (software) only, so
+Two hosts share the hostname `iritur` — **detect which one you are on before any seat,
+injection or measurement work**: `ls /sys/class/drm/card*/device/driver` (vmwgfx → VM;
+i915+nouveau → notebook) or `/proc/bus/input/devices` (VMware devices vs Synaptics/HP).
+The VM facts and the notebook facts below do NOT transfer between hosts.
+
+- **Dev VM** (vmware): kernel "fastvm", VMware SVGA/vmwgfx, 2 cores, 15 GB RAM, Arch,
+  clang, ccache, sudo NOPASSWD. **No hardware Vulkan** — lavapipe (software) only, so
   the compositor runs the **GL path** (EGL/GLES on GBM, renderer "SVGA3D"); that is
-  intended. A Vulkan gain usually cannot be measured here — say so instead of claiming one.
-  No vkms module → `test_kms_vulkan_scanout` always soft-skips. No uinput module.
-- **Notebook `iritur`** (real hardware): Intel HD 5500 (hasvk 1.3.354, eDP 3200×1800@2x,
-  `/dev/dri/card2`) + GTX 950M (NVK; never force the GL tier on it — nouveau cannot compile
-  Lumen's GLES UI shaders). Sessions run with the user connected to the notebook over SSH,
-  tty1 logged in (logind session 1) for `--join-seat-session`. No SSH route to it exists
-  from this VM — when hardware-Vulkan evidence is needed, ask the user to host the session
-  on the notebook. `ui-bench.sh` keys baselines by hostname+CPU digest (`iritur-168b7c` VM,
+  intended. A Vulkan gain usually cannot be measured there — say so instead of claiming
+  one. No vkms module → `test_kms_vulkan_scanout` always soft-skips. No uinput module →
+  injection writes to the real nodes: event2 = **absolute** VMware mouse (ABS 0..65535),
+  event3 = relative, event1 = AT keyboard.
+- **Notebook `iritur`** (real hardware; agent sessions run on it directly over the
+  user's SSH connection): Intel HD 5500 (hasvk 1.3.354, eDP 3200×1800@2x) + GTX 950M
+  (NVK; never force the GL tier on it — nouveau cannot compile Lumen's GLES UI shaders).
+  **Hardware Vulkan is the decisive backend here.** Injection: `sudo python3
+  scripts/uinput-mouse.py --output 3200x1800` (hold it open — closing the fd destroys
+  the device), then `LUMEN_INJECT_POINTER`/`LUMEN_INJECT_RELATIVE` = its printed node,
+  `LUMEN_INJECT_KEYBOARD=/dev/input/event3`, `LUMEN_SMOKE_SCALE=1`. app-smoke exits 1
+  with ~140 PASS rows (~36 rows embed the VM's geometry — host noise, not regressions).
+  The user may keep a Lumen desktop logged in on tty1 (session 1) — it holds DRM master;
+  seat work needs it stopped (ask the owner first); the tty1 login itself stays.
+- **Never containers**: no Docker, on any host. UI/desktop development runs natively on
+  one of the two hosts above; a container has no seat, no KMS master, no input.
+- `ui-bench.sh` keys baselines by hostname+CPU digest (`iritur-168b7c` VM,
   `iritur-08fd3c` notebook); baselines never compare across hosts.
-- **Never containers**: no Docker, on any host. UI/desktop development runs in this VM
-  natively or on real hardware; a container has no seat, no KMS master, no input, and its
-  results are not evidence for Lumen's surface.
 
 ## Build
 
@@ -76,9 +87,12 @@ instances — a headless run is not evidence for that surface (unit ctest and th
   ```bash
   bash -c 'echo $$ | sudo tee /sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/cgroup.procs >/dev/null; exec ./scripts/tty-smoke.sh'
   ```
-- One compositor holds DRM master at a time: check `pgrep -x lumen-compositor` and
-  `pgrep -f "^bash .*-smoke\.sh"` (plain `pgrep -f smoke.sh` matches your own shell), and
-  `/proc/loadavg`, before and after seat work.
+- One compositor holds DRM master at a time: check
+  `grep -l lumen-composito /proc/[0-9]*/comm` (**never `pgrep -x lumen-compositor` — comm
+  is truncated to 15 chars, so the name never matches**), `pgrep -f "^bash .*-smoke\.sh"`
+  (plain `pgrep -f smoke.sh` matches your own shell), and `/proc/loadavg`, before and
+  after seat work. `loginctl list-sessions` shows whether a user desktop session on tty1
+  holds the seat.
 - Input injection without uinput: `scripts/inject-input.py` — writes `input_event` structs
   to the existing nodes as root. event2 = **absolute** VMware mouse (ABS 0..65535),
   event3 = relative, event1 = AT keyboard. On the notebook: `scripts/uinput-mouse.py`

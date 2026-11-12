@@ -60,8 +60,9 @@ authorization, never during verification.
   checks does not analyze them; the gatekeeper is read-only. Repeated skill invocations by
   one agent are not independent stages.
 - **Serialize the seat**: one compositor, one smoke, one bench at a time on this 2-core
-  host; check `pgrep -x lumen-compositor`, `pgrep -f "^bash .*-smoke\.sh"`, `/proc/loadavg`
-  before/after. Never measure while another session builds.
+  host; check `grep -l lumen-composito /proc/[0-9]*/comm` (pgrep -x cannot see
+  lumen-compositor — comm truncates at 15 chars), `pgrep -f "^bash .*-smoke\.sh"`,
+  `/proc/loadavg` before/after. Never measure while another session builds.
 - **No weakening to pass**: never edit a test, golden, threshold or baseline to make a
   change pass; that is a critical finding against the change, not a repair.
 - **Environmental failure**: one rerun discounts known noise (see lumen-build-run);
