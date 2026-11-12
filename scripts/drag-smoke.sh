@@ -437,8 +437,11 @@ for _ in $(seq 1 100); do
   (( $(grep -cE "compositor\.wm: map id=" "$COMP_LOG") > MAPS_BEFORE )) && break
   sleep 0.05
 done
+# On timeout the count never moved, and tail -1 below would hand back an earlier square's
+# map id (never empty, so a -n guard on JID could not fire) — fail on the count itself.
+(( $(grep -cE "compositor\.wm: map id=" "$COMP_LOG") > MAPS_BEFORE )) || {
+  echo "FAIL: the --toplevel-drag square did not map"; cat "$SQ2_LOG"; exit 2; }
 JID=$(grep -E "compositor\.wm: map id=" "$COMP_LOG" | tail -1 | sed -E 's/.*map id=([0-9]+).*/\1/')
-[[ -n "$JID" ]] || { echo "FAIL: the --toplevel-drag square did not map"; cat "$SQ2_LOG"; exit 2; }
 settle "$JID"
 begin j
 read -r X Y W H < <(geom "$JID")
