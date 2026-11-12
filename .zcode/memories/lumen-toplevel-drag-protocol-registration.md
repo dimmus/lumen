@@ -1,6 +1,6 @@
 ---
 name: lumen-toplevel-drag-protocol-registration
-description: "2026-11-12: staging xdg-toplevel-drag-v1 (wayland-protocols 1.49) registered as lx.wayland.protocols.toplevel_drag (worktree commit d95abb1, manifest block only, no global advertised); suite 133 non-bench with only the owner-tolerated known-red {ui_gallery, test_task_model}; gate BLOCKED solely because seat smokes ran with the scripts' default LUMEN_BUILD_DIR=build/release (absent in the worktree) and died at binary preflight — rerun with LUMEN_BUILD_DIR=build/test."
+description: "2026-11-12: staging xdg-toplevel-drag-v1 (wayland-protocols 1.49) registered as lx.wayland.protocols.toplevel_drag (worktree commit d95abb1, manifest block only, no global advertised); suite 133 non-bench with only the owner-tolerated known-red {ui_gallery, test_task_model}; seat rerun with LUMEN_BUILD_DIR=build/test on the notebook — drag-smoke PASS, app-smoke exit 1 = documented ~140-PASS notebook baseline; review dedup dropped 578e08c (≡ d4e96d5); gate READY."
 metadata:
   node_type: memory
   type: project
@@ -50,9 +50,32 @@ landed on the main tree in parallel and is NOT an ancestor):
   19:37) or `cmake --build --preset release` in the worktree first. Still owed as of this
   record.
 
+Update 2026-11-12 evening (gate pass; everything below re-verified this pass): the owed
+seat rerun ran with `LUMEN_BUILD_DIR=<wt>/build/test` on the **notebook**, not the VM —
+`readlink /sys/class/drm/card*/device/driver` → i915+nouveau and the logs show eDP-1
+3200x1800 (Sharp panel), so the 20:00 section's "vmware VM" label was wrong for this
+workflow (harness 5642621 added host detection for exactly this). drag-smoke
+`--join-seat-session` → `VERDICT: PASS` (10 PASS / 0 FAIL rows, compositor exit=0,
+`drag-smoke-logs/run.log`). app-smoke → exit 1 = the documented notebook baseline, not a
+regression: 141 PASS / 35 FAIL rows (`grep -c 'FAIL'` says 36 — one hit is the
+`VERDICT: FAIL` line itself), families = geometry/want-value rows embedding the VM's
+geometry, portal frontend Z2–Z6, screenshot-less capture rows (Y/Q/O: "no screenshot"),
+PSI "critical pressure" on the clean-log row — build-run SKILL.md:31-32: "app-smoke exits
+1 with ~140 PASS rows". No A/B was required: `grep -ri toplevel_drag modules/ executables/`
+→ 0 hits, the change has no runtime path. Gate verdict: **READY**. Review round: the
+branch briefly carried 578e08c, patch-identical to d4e96d5 already on zcode/agent-harness;
+fixed by resetting the branch back to d95abb1 (`git cherry -v zcode/agent-harness HEAD` →
+only `+ d95abb1…`); the docs fix lives on the harness branch (main-tree
+lumen-build-run SKILL.md:53 now reads "133 non-bench … (138 registered incl. bench)").
+Artifacts re-verified: 307 TUs carry `LUMEN_PROTOCOL_XDG_TOPLEVEL_DRAG_V1` in
+`build/test/compile_commands.json`; `build/test/generated/GeneratedProtocols.cmake:741-746`
+registers the module; the glue `.o` exists; the fetched XML is cmp-identical to the pinned
+1.49-tag clone (`/tmp/wp149-check`).
+
 Disproven theories: "exit 2 from a smoke = compositor/seat failure" — it was the binary
 preflight; read run.log before interpreting exit codes. "Suite green = 138 passing" —
-138 is the registered total including bench; the gating suite is 133.
+138 is the registered total including bench; the gating suite is 133. "This workflow ran
+on the vmware VM" — host detection and the eDP-1/3200x1800 log rows prove the notebook.
 
 **Why:** two traps in one small task — a manifest-only change still gates on seat smokes,
 and smoke scripts silently pick a build dir the worktree doesn't have, producing
@@ -62,6 +85,9 @@ plausible-looking exit codes that mean nothing.
 `LUMEN_BUILD_DIR=<worktree>/build/test` or build `build/release` first; check
 `run.log` for the preflight FAIL line before citing a smoke result. Quote suite results as
 "133 non-bench (138 registered)", with failures judged against the owner-tolerated known-red
-set. Merge 578e08c (or re-apply its two-file doc fix) so the main tree's skill matches.
+set. Judge app-smoke exit 1 against the host first (host detection, then the skill's
+documented baseline for that host) before calling it a failure. The 578e08c/d4e96d5 dedup
+is done — the doc fix lives on zcode/agent-harness as d4e96d5; when merging the task
+branch, expect only d95abb1 to be new.
 Related: [[lumen-zcode-agent-harness]], [[lumen-app-smoke-known-noise]],
-[[lumen-host-build-run-env]].
+[[lumen-host-build-run-env]], [[lumen-notebook-hw]].

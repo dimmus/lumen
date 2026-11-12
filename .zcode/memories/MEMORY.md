@@ -17,4 +17,4 @@
 - [Render scale (HiDPI supersampling)](lumen-render-scale.md) — merged PR #70; area filter kept by user choice
 - [PRIME offload in launcher](lumen-prime-offload.md) — PrefersNonDefaultGPU via switcheroo/DRI_PRIME, merged PR #71 2026-10-29; notebook check pending; lx.shell.cppm is CRLF
 - [ZCode agent harness](lumen-zcode-agent-harness.md) — 2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; release preset registers 1 ctest — gate on build/test (138)
-- [Toplevel drag protocol registration](lumen-toplevel-drag-protocol-registration.md) — 2026-11-12: xdg-toplevel-drag-v1 manifest block (d95abb1, glue only); suite 133 non-bench, known-red tolerated; gate BLOCKED — worktree seat smokes died at build/release preflight, rerun with LUMEN_BUILD_DIR=build/test
+- [Toplevel drag protocol registration](lumen-toplevel-drag-protocol-registration.md) — 2026-11-12: xdg-toplevel-drag-v1 manifest block (d95abb1, glue only); suite 133 non-bench, known-red tolerated; drag-smoke PASS / app-smoke exit 1 = documented notebook baseline; smoke trap LUMEN_BUILD_DIR, review dedup 578e08c≡d4e96d5; gate READY
