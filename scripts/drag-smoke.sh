@@ -51,6 +51,10 @@
 #   h  frame-perfect resize over b–d: one configure in flight, every committed geometry
 #      matches its configure, no frame without one
 #   i  client killed mid-grab (Super-drag)                       → grab ends, compositor lives
+#   j  xdg-toplevel-drag: press inside a --toplevel-drag square, drag (+240,+160)
+#      → the square's own data-device drag moves its window with the pointer
+#      (xdg_toplevel_drag_v1.attach), it lands at start+delta on the release, the
+#      drag ends (no_target cancel) with no leftover grab
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -418,8 +422,36 @@ sleep 0.4
 ALIVE=0; kill -0 "$COMP_PID" 2>/dev/null && ALIVE=1
 finish alive=$ALIVE
 
+# j — xdg-toplevel-drag-v1: a second square in --toplevel-drag mode. Its interior press
+# starts a wl_data_device drag with the press's own serial; the source's
+# xdg_toplevel_drag_v1 has the square's toplevel attached, so the compositor moves the
+# window with the pointer for the drag's life. Judged from both sides: the WM's
+# toplevel-drag geometry lines against the injected delta, the dnd wire's start/cancel,
+# and lumen-square's press -> toplevel-drag / dnd cancelled stdout lines.
+MAPS_BEFORE=$(grep -cE "compositor\.wm: map id=" "$COMP_LOG")
+# Appends: scenario f's square2 lines must survive for its verdict (a fresh `>` would
+# truncate them); begin j's offsets separate this square's lines from those.
+WAYLAND_DISPLAY="$SOCKET" "$SQUARE" --toplevel-drag >>"$SQ2_LOG" 2>&1 &
+SQ2_PID=$!
+for _ in $(seq 1 100); do
+  (( $(grep -cE "compositor\.wm: map id=" "$COMP_LOG") > MAPS_BEFORE )) && break
+  sleep 0.05
+done
+JID=$(grep -E "compositor\.wm: map id=" "$COMP_LOG" | tail -1 | sed -E 's/.*map id=([0-9]+).*/\1/')
+[[ -n "$JID" ]] || { echo "FAIL: the --toplevel-drag square did not map"; cat "$SQ2_LOG"; exit 2; }
+settle "$JID"
+begin j
+read -r X Y W H < <(geom "$JID")
+CX=$((X + W / 2)); CY=$((Y + H / 2))
+inject drag "$CX" "$CY" $((CX + 240)) $((CY + 160)) --button left --steps 60
+settle "$JID"
+finish id="$JID" dx=240 dy=160
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 kill -TERM "$SQ1_PID" 2>/dev/null; wait "$SQ1_PID" 2>/dev/null; SQ1_RC=$?; SQ1_PID=""
+if [[ -n "$SQ2_PID" ]]; then
+  kill -TERM "$SQ2_PID" 2>/dev/null; wait "$SQ2_PID" 2>/dev/null; SQ2_PID=""
+fi
 stop_compositor
 stop_watch
 rm -f "$SOCKET_PATH" "$LOCK_PATH"
@@ -448,7 +480,7 @@ inj = [json.loads(l) for l in read("inject.jsonl") if l.startswith("{")]
 scen = {s["name"]: s for s in (json.loads(l) for l in read("scenarios.jsonl"))}
 
 R = lambda p: re.compile(r"compositor\.wm: " + p)
-GEOM = R(r"(?:geometry|map) id=(\d+) (?:app_id=\S* )?x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+)(?: cause=(\w+) serial=(\d+))?")
+GEOM = R(r"(?:geometry|map) id=(\d+) (?:app_id=\S* )?x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+)(?: cause=([\w-]+) serial=(\d+))?")
 CFG = R(r"configure id=(\d+) serial=(\d+) w=(-?\d+) h=(-?\d+) states=(\S+) edges=(\d+) watchdog=(\d)")
 ACK = R(r"ack id=(\d+) serial=(\d+)$")
 GBEGIN = R(r"grab begin id=(\d+) mode=(\w+) edges=(\d+) source=(\w+)")
@@ -776,6 +808,55 @@ if s:
     record("i client killed mid-grab", ok,
            f"grab end reason={e[-1].group(3) if e else '-'}, unmapped={unmapped}, "
            f"compositor alive={s.get('alive') == 1}")
+
+# ── j: xdg-toplevel-drag-v1 — the window follows the data-device drag ──────
+# The drag is a wl_data_device drag (no wm grab), so the verdict reads the dnd wire's own
+# lines: one start for the press's serial, the toplevel-drag attach, geometry updates with
+# cause=toplevel-drag that walk the origin to the injected delta, the no_target cancel of
+# the release, and the detach that ends the move. The client side corroborates: the press
+# took the toplevel-drag path and the source saw the drag end; the release itself must not
+# reach the client (the DnD grab swallows held buttons).
+s = need("j")
+if s:
+    tid = int(s.get("id", 0))
+    g0, g1 = geometry_before(tid, s["comp"][0]), geometry_before(tid, s["comp"][1])
+    starts = [m for _, m in matches(re.compile(r"compositor\.dnd: dnd start client="),
+                                    comp, rng(s))]
+    rejected = len([1 for _, m in matches(re.compile(r"compositor\.dnd: dnd start rejected"),
+                                          comp, rng(s))])
+    attach = [m for _, m in matches(R(r"toplevel-drag attach id=(\d+)"), comp, rng(s))
+              if int(m.group(1)) == tid]
+    detach = [i for i, m in matches(R(r"toplevel-drag detach id=(\d+)"), comp, rng(s))
+              if int(m.group(1)) == tid]
+    moves = [(i, m) for i, m in matches(GEOM, comp, rng(s))
+             if int(m.group(1)) == tid and m.group(6) == "toplevel-drag"]
+    cancels = len([1 for _, m in matches(re.compile(r"compositor\.dnd: dnd cancelled .*"
+                                                    r"cause=no_target"), comp, rng(s))])
+    b, e = grab_lines(s, tid)
+    dx, dy = g1[0] - g0[0], g1[1] - g0[1]
+    # Following, not teleporting: with a positive delta the origin advances monotonically
+    # across the drag's geometry updates (equal steps allowed — rounding).
+    xs = [int(m.group(2)) for _, m in moves]
+    ys = [int(m.group(3)) for _, m in moves]
+    monotone = (all(x2 >= x1 for x1, x2 in zip(xs, xs[1:])) and
+                all(y2 >= y1 for y1, y2 in zip(ys, ys[1:])))
+    # The move ended with the drag: nothing moves after the detach.
+    after_detach = bool(detach and moves and moves[-1][0] > detach[0])
+    took_path = [l for l in client_lines(s, "sq2", "press") if "-> toplevel-drag" in l]
+    saw_end = client_lines(s, "sq2", "dnd cancelled")
+    leaked = client_lines(s, "sq2", "release")
+    ok = (len(starts) == 1 and rejected == 0 and len(attach) == 1 and len(detach) == 1
+          and len(moves) >= 3 and monotone and not after_detach
+          and cancels == 1 and not b and not e
+          and abs(dx - s["dx"]) <= 2 and abs(dy - s["dy"]) <= 2 and g0[2:] == g1[2:]
+          and took_path and saw_end and not leaked)
+    record("j xdg-toplevel-drag move", ok,
+           f"origin {g0[:2]} -> {g1[:2]} (delta {dx:+d},{dy:+d}, want {s['dx']:+d},{s['dy']:+d}), "
+           f"size {g0[2]}x{g0[3]} kept={g0[2:] == g1[2:]}; {len(moves)} toplevel-drag geometry "
+           f"updates (monotone={monotone}, after detach={after_detach}); dnd start={len(starts)} "
+           f"rejected={rejected} attach={len(attach)} detach={len(detach)} "
+           f"cancel(no_target)={cancels} wm-grabs={len(b)}; client: press->toplevel-drag "
+           f"{len(took_path)}, dnd cancelled {len(saw_end)}, leaked releases {len(leaked)}")
 
 # ── Whole run ──────────────────────────────────────────────────────────────
 # Warnings fail the run, except the 600-frame budget summaries: on a host whose GPU
