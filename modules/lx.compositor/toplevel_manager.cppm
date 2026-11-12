@@ -145,6 +145,10 @@ struct toplevel_record {
     bool initial_configure_sent = false;
     bool ever_acked = false;
     bool mapped = false;
+    /// Bumped at every unmap: xdg-toplevel-drag-v1's attach tells "attached and never
+    /// unmapped" (a toplevel_attached error) from "unmapped — auto-detached" (a re-attach
+    /// the XML asks for) by comparing it with the epoch its drag object stored.
+    unsigned unmap_epoch = 0;
 
     // ── xdg-decoration (zxdg_toplevel_decoration_v1) ──
     /// The live decoration object (`wl_resource*`), or null.

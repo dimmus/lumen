@@ -75,6 +75,10 @@
 #include "color-management-v1-client-protocol.h"
 #define LUMEN_TEST_COLOR_MANAGEMENT 1
 #endif
+#ifdef LUMEN_PROTOCOL_XDG_TOPLEVEL_DRAG_V1
+#include "xdg-toplevel-drag-v1-client-protocol.h"
+#define LUMEN_TEST_TOPLEVEL_DRAG 1
+#endif
 #if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3) && \
     defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2) && \
     defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
@@ -126,6 +130,9 @@ struct client {
     /// The wl_output global (not bound by `connect`).
     uint32_t output_name = 0;
     uint32_t output_version = 0;
+#ifdef LUMEN_TEST_TOPLEVEL_DRAG
+    xdg_toplevel_drag_manager_v1* drag_manager = nullptr;
+#endif
 #ifdef LUMEN_TEST_PRIMARY_SELECTION
     zwp_primary_selection_device_manager_v1* psm = nullptr;
 #endif
@@ -194,6 +201,11 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
         c->output_name = name;
         c->output_version = version;
     }
+#ifdef LUMEN_TEST_TOPLEVEL_DRAG
+    else if (std::strcmp(iface, xdg_toplevel_drag_manager_v1_interface.name) == 0)
+        c->drag_manager = static_cast<xdg_toplevel_drag_manager_v1*>(
+            wl_registry_bind(registry, name, &xdg_toplevel_drag_manager_v1_interface, 1));
+#endif
 #ifdef LUMEN_TEST_PRIMARY_SELECTION
     else if (std::strcmp(iface, zwp_primary_selection_device_manager_v1_interface.name) == 0)
         c->psm = static_cast<zwp_primary_selection_device_manager_v1*>(wl_registry_bind(
@@ -694,6 +706,22 @@ void inject_escape() {
     g_comp->inject_key(k);
     k.pressed = false;
     g_comp->inject_key(k);
+    g_comp->wayland().flush();
+}
+
+/// One UI tick: a toplevel drag's window move is applied per tick (the interactive-grab
+/// shape), as is the drag icon's.
+void pump_tick() {
+    std::lock_guard<std::mutex> hold(*g_dispatch_lock);
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    static unsigned long long tick_frame = 1'000'000;
+    lx::scheduler::frame_tick t{};
+    t.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    t.delta_seconds = 1.0 / 30.0;
+    t.frame_index = static_cast<unsigned>(++tick_frame);
+    g_comp->tick_ui(t);
     g_comp->wayland().flush();
 }
 
@@ -2399,6 +2427,418 @@ int main() {
         if (b.c.display)
             wl_display_disconnect(b.c.display);
     }
+
+#ifdef LUMEN_TEST_TOPLEVEL_DRAG
+    // ── xdg-toplevel-drag-v1: a drag that moves a window with the pointer ──
+
+    expect("toplevel-drag: get_xdg_toplevel_drag twice for one source",
+           "xdg_toplevel_drag_manager_v1", XDG_TOPLEVEL_DRAG_MANAGER_V1_ERROR_INVALID_SOURCE,
+           [](client& c) {
+               wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               wl_data_source_offer(src, "text/plain");
+               (void)xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+               (void)xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+           });
+    expect("toplevel-drag: a source marked for a toplevel drag is no selection",
+           "wl_data_source", WL_DATA_SOURCE_ERROR_INVALID_SOURCE, [](client& c) {
+               wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               wl_data_source_offer(src, "text/plain");
+               (void)xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+               wl_data_device_set_selection(dd, src, 1);
+           });
+    expect("toplevel-drag: attach while a toplevel is attached", "xdg_toplevel_drag_v1",
+           XDG_TOPLEVEL_DRAG_V1_ERROR_TOPLEVEL_ATTACHED, [](client& c) {
+               window w{};
+               map_window(c, w);
+               wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               wl_data_source_offer(src, "text/plain");
+               xdg_toplevel_drag_v1* drag =
+                   xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+               xdg_toplevel_drag_v1_attach(drag, w.toplevel, 0, 0);
+               xdg_toplevel_drag_v1_attach(drag, w.toplevel, 4, 4);
+           });
+    {
+        // A destructor request removes the client-side proxy at once, so the error on it
+        // carries no interface (finish's "[destroyed]").
+        static dnd_peer p{};
+        expect("toplevel-drag: destroy before the drag ended", "[destroyed]",
+               XDG_TOPLEVEL_DRAG_V1_ERROR_ONGOING_DRAG, [](client& c) {
+                   p = {};
+                   p.c = c;
+                   p.respond = false;
+                   dnd_setup(p);
+                   dnd_press(p, 20, 20);
+                   p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+                   wl_data_source_add_listener(p.source, &dp_src_listener, &p);
+                   wl_data_source_offer(p.source, "text/plain");
+                   wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+                   xdg_toplevel_drag_v1* drag =
+                       xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager,
+                                                                          p.source);
+                   xdg_toplevel_drag_v1_attach(drag, p.win.toplevel, 0, 0);
+                   wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr,
+                                             p.press_serial);
+                   (void)wl_display_roundtrip(c.display);
+                   xdg_toplevel_drag_v1_destroy(drag);
+               });
+        // The press outlived the connection: give the seat its release.
+        inject_left(false);
+    }
+
+    // The mark clears with the drag object: a source whose object was destroyed before any
+    // drag began can still start one — nothing of the dead object is reached.
+    {
+        static dnd_peer p{};
+        p = {};
+        const bool up = connect(p.c) && p.c.drag_manager;
+        if (up)
+            dnd_setup(p);
+        dnd_press(p, 20, 20);
+        p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        wl_data_source_add_listener(p.source, &dp_src_listener, &p);
+        wl_data_source_offer(p.source, "text/plain");
+        wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                 WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        xdg_toplevel_drag_v1* drag =
+            xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(p.c.drag_manager, p.source);
+        xdg_toplevel_drag_v1_destroy(drag); // no drag began: allowed
+        (void)wl_display_roundtrip(p.c.display);
+        wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr, p.press_serial);
+        const bool clean_start = wl_display_roundtrip(p.c.display) >= 0 &&
+                                 wl_display_get_error(p.c.display) == 0;
+        const bool dragging = [&] {
+            std::lock_guard<std::mutex> hold(*g_dispatch_lock);
+            return g_comp->windows().drag_active();
+        }();
+        inject_left(false);
+        (void)wl_display_roundtrip(p.c.display);
+        check("toplevel-drag: a drag object destroyed before any drag clears the mark",
+              up && clean_start && dragging,
+              "drag active=" + std::to_string(dragging) + " source " + joined(p.events));
+        if (p.c.display)
+            wl_display_disconnect(p.c.display);
+    }
+
+    // Behaviour, with input injected. Dragging an existing window (attach after start):
+    // a's own window moves with the pointer and is no drag target; b, another window, is.
+    // a maps last, so `newest_window` is a's window.
+    {
+        static dnd_peer a{}, b{};
+        a = {};
+        b = {};
+        a.respond = false;
+        const bool up = connect(a.c) && connect(b.c) && a.c.drag_manager;
+        if (up) {
+            dnd_setup(b);
+            dnd_setup(a);
+        }
+        dnd_press(a, 20, 20);
+        a.source = wl_data_device_manager_create_data_source(a.c.ddm);
+        wl_data_source_add_listener(a.source, &dp_src_listener, &a);
+        wl_data_source_offer(a.source, "text/plain");
+        wl_data_source_set_actions(a.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                 WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        xdg_toplevel_drag_v1* drag =
+            xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(a.c.drag_manager, a.source);
+        wl_data_device_start_drag(a.dd, a.source, a.win.surface, nullptr, a.press_serial);
+        (void)wl_display_roundtrip(a.c.display);
+        // Before the attach the origin window is the first target (one `enter`); the
+        // attach that follows takes it out of the selection for the rest of the drag.
+        const unsigned enters_before = std::count(a.events.begin(), a.events.end(), "enter");
+        xdg_toplevel_drag_v1_attach(drag, a.win.toplevel, 0, 0);
+        (void)wl_display_roundtrip(a.c.display);
+        (void)wl_display_roundtrip(b.c.display);
+
+        const lx::rect2i g0 = a.geometry;
+        inject_move(g0.x + 20 + 34, g0.y + 20 + 21);
+        pump_tick();
+        const lx::rect2i g1 = newest_window();
+        inject_move(g0.x + 20 + 46, g0.y + 20 + 16);
+        pump_tick();
+        (void)wl_display_roundtrip(a.c.display);
+        const lx::rect2i g2 = newest_window();
+        const bool moved = g1.x - g0.x == 34 && g1.y - g0.y == 21 && g2.x - g0.x == 46 &&
+                           g2.y - g0.y == 16;
+
+        // Another window is a target as usual: `enter` when the pointer crosses onto it.
+        int bx = 0, by = 0;
+        for (const auto [cx, cy] :
+             {std::pair{b.geometry.x + b.geometry.width - 6, b.geometry.y + b.geometry.height - 6},
+              std::pair{b.geometry.x + 5, b.geometry.y + b.geometry.height - 6},
+              std::pair{b.geometry.x + b.geometry.width - 6, b.geometry.y + 5}})
+            if (!in_rect(g2, cx, cy)) {
+                bx = cx;
+                by = cy;
+                break;
+            }
+        a.events.clear();
+        b.events.clear();
+        inject_move(bx, by);
+        pump_tick();
+        (void)wl_display_roundtrip(b.c.display);
+        const bool target = in_order(b.events, {"enter"}) && b.events.size() >= 1;
+        // Onto the desktop (b left), then back onto the attached window where it now sits:
+        // over its own attached window a hears no `enter` — not even a new target.
+        inject_move(b.geometry.x + 400, b.geometry.y + 100);
+        pump_tick();
+        (void)wl_display_roundtrip(b.c.display);
+        const lx::rect2i g3 = newest_window();
+        inject_move(g3.x + 100, g3.y + 75);
+        pump_tick();
+        (void)wl_display_roundtrip(b.c.display);
+        (void)wl_display_roundtrip(a.c.display);
+        const bool excluded =
+            std::count(a.events.begin(), a.events.end(), "enter") == 0 &&
+            in_order(b.events, {"enter", "leave"}) &&
+            std::count(b.events.begin(), b.events.end(), "enter") == 1;
+
+        // The release ends the move where it is (cancelled: no target at the release
+        // point), and the drag object may then be destroyed.
+        const lx::rect2i g4 = newest_window();
+        inject_left(false);
+        pump_tick();
+        const lx::rect2i g5 = newest_window();
+        (void)wl_display_roundtrip(a.c.display);
+        xdg_toplevel_drag_v1_destroy(drag);
+        const bool clean = wl_display_roundtrip(a.c.display) >= 0 &&
+                           wl_display_get_error(a.c.display) == 0 &&
+                           in_order(a.events, {"cancelled"});
+        check("toplevel-drag: the attached window follows the pointer and stops at release",
+              up && moved && g4.x == g5.x && g4.y == g5.y,
+              "0=" + std::to_string(g0.x) + "," + std::to_string(g0.y) + " 1=" +
+                  std::to_string(g1.x) + "," + std::to_string(g1.y) + " 2=" +
+                  std::to_string(g2.x) + "," + std::to_string(g2.y) + " 4=" +
+                  std::to_string(g4.x) + "," + std::to_string(g4.y) + " 5=" +
+                  std::to_string(g5.x) + "," + std::to_string(g5.y));
+        check("toplevel-drag: the attached window is no drag target; another window is",
+              up && enters_before == 1 && target && excluded,
+              "enters before attach=" + std::to_string(enters_before) + " target " +
+                  joined(b.events) + " | a " + joined(a.events));
+        check("toplevel-drag: destroy after the drag ended succeeds", up && clean,
+              "source " + joined(a.events));
+        if (b.c.display)
+            wl_display_disconnect(b.c.display);
+        if (a.c.display)
+            wl_display_disconnect(a.c.display);
+    }
+
+    // A drop ends it the same way: destroy after dnd_drop_performed succeeds.
+    {
+        static dnd_peer a{}, b{};
+        a = {};
+        b = {};
+        a.respond = false;
+        const bool up = connect(a.c) && connect(b.c) && a.c.drag_manager;
+        if (up) {
+            dnd_setup(b);
+            dnd_setup(a);
+        }
+        dnd_press(a, 20, 20);
+        a.source = wl_data_device_manager_create_data_source(a.c.ddm);
+        wl_data_source_add_listener(a.source, &dp_src_listener, &a);
+        wl_data_source_offer(a.source, "text/plain");
+        wl_data_source_set_actions(a.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                 WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        xdg_toplevel_drag_v1* drag =
+            xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(a.c.drag_manager, a.source);
+        wl_data_device_start_drag(a.dd, a.source, a.win.surface, nullptr, a.press_serial);
+        (void)wl_display_roundtrip(a.c.display);
+        xdg_toplevel_drag_v1_attach(drag, a.win.toplevel, 0, 0);
+        (void)wl_display_roundtrip(a.c.display);
+        const lx::rect2i g0 = a.geometry;
+        int bx = 0, by = 0;
+        for (const auto [cx, cy] :
+             {std::pair{b.geometry.x + b.geometry.width - 6, b.geometry.y + b.geometry.height - 6},
+              std::pair{b.geometry.x + 5, b.geometry.y + b.geometry.height - 6},
+              std::pair{b.geometry.x + b.geometry.width - 6, b.geometry.y + 5}})
+            if (!in_rect(g0, cx, cy)) {
+                bx = cx;
+                by = cy;
+                break;
+            }
+        inject_move(bx, by);
+        pump_tick();
+        (void)wl_display_roundtrip(b.c.display);
+        (void)wl_display_roundtrip(a.c.display);
+        const lx::rect2i g1 = newest_window();
+        inject_left(false);
+        pump_tick();
+        (void)wl_display_roundtrip(b.c.display);
+        (void)wl_display_roundtrip(a.c.display);
+        const lx::rect2i g2 = newest_window();
+        const bool dropped = in_order(b.events, {"enter", "drop", "leave"}) &&
+                             in_order(a.events, {"drop_performed"}) &&
+                             std::count(a.events.begin(), a.events.end(), "cancelled") == 0;
+        xdg_toplevel_drag_v1_destroy(drag);
+        const bool clean = wl_display_roundtrip(a.c.display) >= 0 &&
+                           wl_display_get_error(a.c.display) == 0;
+        check("toplevel-drag: a drop ends the move; destroy after dnd_drop_performed works",
+              up && dropped && g1.x != g0.x && g2.x == g1.x && g2.y == g1.y && clean,
+              "0=" + std::to_string(g0.x) + "," + std::to_string(g0.y) + " 1=" +
+                  std::to_string(g1.x) + "," + std::to_string(g1.y) + " source " +
+                  joined(a.events));
+        if (b.c.display)
+            wl_display_disconnect(b.c.display);
+        if (a.c.display)
+            wl_display_disconnect(a.c.display);
+    }
+
+    // The detachable-window workflow: attach a toplevel that is not mapped yet, before
+    // start_drag; it maps mid-drag at the hotspot plus the attach offset and follows.
+    {
+        static dnd_peer p{};
+        p = {};
+        const bool up = connect(p.c) && p.c.drag_manager;
+        if (up)
+            dnd_setup(p);
+        dnd_press(p, 20, 20);
+        p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        wl_data_source_add_listener(p.source, &dp_src_listener, &p);
+        wl_data_source_offer(p.source, "text/plain");
+        wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                 WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        xdg_toplevel_drag_v1* drag =
+            xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(p.c.drag_manager, p.source);
+        window w2{};
+        w2.surface = wl_compositor_create_surface(p.c.compositor);
+        w2.xdg = xdg_wm_base_get_xdg_surface(p.c.wm_base, w2.surface);
+        xdg_surface_add_listener(w2.xdg, &xdg_listener, &w2.cfg);
+        w2.toplevel = xdg_surface_get_toplevel(w2.xdg);
+        xdg_toplevel_drag_v1_attach(drag, w2.toplevel, 10, 7);
+        wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr, p.press_serial);
+        (void)wl_display_roundtrip(p.c.display);
+        configure_and_map(p.c, w2.surface, w2.xdg, w2.cfg, 120, 90);
+        (void)wl_display_roundtrip(p.c.display);
+        const lx::rect2i g0 = p.geometry; // the press point's window
+        const lx::rect2i g1 = newest_window();
+        const bool placed = g1.x == g0.x + 20 - 10 && g1.y == g0.y + 20 - 7 &&
+                            g1.width == 120 && g1.height == 90;
+        inject_move(g0.x + 20 + 25, g0.y + 20 + 11);
+        pump_tick();
+        const lx::rect2i g2 = newest_window();
+        inject_left(false);
+        pump_tick();
+        const lx::rect2i g3 = newest_window();
+        (void)wl_display_roundtrip(p.c.display);
+        xdg_toplevel_drag_v1_destroy(drag);
+        const bool clean = wl_display_roundtrip(p.c.display) >= 0 &&
+                           wl_display_get_error(p.c.display) == 0;
+        check("toplevel-drag: a window attached unmapped maps at the hotspot plus the offset",
+              up && placed && g2.x - g1.x == 25 && g2.y - g1.y == 11 && g3.x == g2.x &&
+                  g3.y == g2.y && clean,
+              "mapped=" + std::to_string(g1.x) + "," + std::to_string(g1.y) + " " +
+                  std::to_string(g1.width) + "x" + std::to_string(g1.height) + " moved=" +
+                  std::to_string(g2.x) + "," + std::to_string(g2.y) + " ended=" +
+                  std::to_string(g3.x) + "," + std::to_string(g3.y));
+        if (p.c.display)
+            wl_display_disconnect(p.c.display);
+    }
+
+    // An unmap auto-detaches: the drag goes on, the remapped window stays put until
+    // attach is issued again.
+    {
+        static dnd_peer p{};
+        p = {};
+        const bool up = connect(p.c) && p.c.drag_manager;
+        if (up)
+            dnd_setup(p);
+        dnd_press(p, 20, 20);
+        p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        wl_data_source_add_listener(p.source, &dp_src_listener, &p);
+        wl_data_source_offer(p.source, "text/plain");
+        wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                 WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        xdg_toplevel_drag_v1* drag =
+            xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(p.c.drag_manager, p.source);
+        wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr, p.press_serial);
+        (void)wl_display_roundtrip(p.c.display);
+        xdg_toplevel_drag_v1_attach(drag, p.win.toplevel, 0, 0);
+        (void)wl_display_roundtrip(p.c.display);
+        const lx::rect2i g0 = p.geometry;
+        inject_move(g0.x + 20 + 30, g0.y + 20 + 12);
+        pump_tick();
+        const lx::rect2i g1 = newest_window();
+        const bool moved = g1.x - g0.x == 30 && g1.y - g0.y == 12;
+        // Unmap (null buffer), remap: the window is placed anew and does not follow.
+        wl_surface_attach(p.win.surface, nullptr, 0, 0);
+        wl_surface_commit(p.win.surface);
+        (void)wl_display_roundtrip(p.c.display);
+        configure_and_map(p.c, p.win.surface, p.win.xdg, p.win.cfg, 200, 150);
+        (void)wl_display_roundtrip(p.c.display);
+        const lx::rect2i g2 = newest_window();
+        inject_move(g2.x + 20 + 15, g2.y + 20 + 9);
+        pump_tick();
+        const lx::rect2i g3 = newest_window();
+        const bool detached = g3.x == g2.x && g3.y == g2.y;
+        // Attach again: the re-attach the XML asks for, and the window follows once more.
+        xdg_toplevel_drag_v1_attach(drag, p.win.toplevel, 0, 0);
+        (void)wl_display_roundtrip(p.c.display);
+        inject_move(g2.x + 20 + 15 + 6, g2.y + 20 + 9 + 4);
+        pump_tick();
+        const lx::rect2i g4 = newest_window();
+        inject_left(false);
+        pump_tick();
+        (void)wl_display_roundtrip(p.c.display);
+        xdg_toplevel_drag_v1_destroy(drag);
+        const bool clean = wl_display_roundtrip(p.c.display) >= 0 &&
+                           wl_display_get_error(p.c.display) == 0;
+        check("toplevel-drag: an unmap auto-detaches; a remap needs a new attach",
+              up && moved && detached && g4.x - g3.x == 6 && g4.y - g3.y == 4 && clean,
+              "0=" + std::to_string(g0.x) + "," + std::to_string(g0.y) + " 1=" +
+                  std::to_string(g1.x) + "," + std::to_string(g1.y) + " remap=" +
+                  std::to_string(g2.x) + "," + std::to_string(g2.y) + " after-move=" +
+                  std::to_string(g3.x) + "," + std::to_string(g3.y) + " reattached=" +
+                  std::to_string(g4.x) + "," + std::to_string(g4.y));
+        if (p.c.display)
+            wl_display_disconnect(p.c.display);
+    }
+
+    // Destroying the data_source mid-attach is undefined per the XML — the compositor
+    // survives it: the drag ends, the window stops, the object may be destroyed.
+    {
+        static dnd_peer p{};
+        p = {};
+        const bool up = connect(p.c) && p.c.drag_manager;
+        if (up)
+            dnd_setup(p);
+        dnd_press(p, 20, 20);
+        p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        wl_data_source_add_listener(p.source, &dp_src_listener, &p);
+        wl_data_source_offer(p.source, "text/plain");
+        wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                                                 WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+        xdg_toplevel_drag_v1* drag =
+            xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(p.c.drag_manager, p.source);
+        wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr, p.press_serial);
+        (void)wl_display_roundtrip(p.c.display);
+        xdg_toplevel_drag_v1_attach(drag, p.win.toplevel, 0, 0);
+        (void)wl_display_roundtrip(p.c.display);
+        const lx::rect2i g0 = p.geometry;
+        inject_move(g0.x + 20 + 10, g0.y + 20 + 10);
+        pump_tick();
+        const lx::rect2i g1 = newest_window();
+        wl_data_source_destroy(p.source);
+        p.source = nullptr;
+        (void)wl_display_roundtrip(p.c.display);
+        inject_move(g0.x + 20 + 50, g0.y + 20 + 40);
+        pump_tick();
+        const lx::rect2i g2 = newest_window();
+        inject_left(false); // the seat's held press: its release reached no client anyway
+        xdg_toplevel_drag_v1_destroy(drag);
+        const bool clean = wl_display_roundtrip(p.c.display) >= 0 &&
+                           wl_display_get_error(p.c.display) == 0;
+        check("toplevel-drag: destroying the source mid-attach ends the move, no crash",
+              up && g1.x - g0.x == 10 && g1.y - g0.y == 10 && g2.x == g1.x && g2.y == g1.y &&
+                  clean,
+              "0=" + std::to_string(g0.x) + "," + std::to_string(g0.y) + " 1=" +
+                  std::to_string(g1.x) + "," + std::to_string(g1.y) + " after=" +
+                  std::to_string(g2.x) + "," + std::to_string(g2.y));
+        if (p.c.display)
+            wl_display_disconnect(p.c.display);
+    }
+#endif
 
 #ifdef LUMEN_TEST_ACTIVATION
     // ── xdg-activation ──

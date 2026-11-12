@@ -259,6 +259,8 @@ void cancel_drag(const char* cause) {
     if (src && log_dnd.enabled(lx::trace::level::debug)) {
         log_dnd.debug("dnd cancelled source={} cause={}", res_id(src->resource), cause);
     }
+    // xdg-toplevel-drag-v1: the attached toplevel keeps its final position.
+    toplevel_drag_ended();
     drag = {};
 }
 
@@ -316,6 +318,9 @@ bool op_drop(void*, lx::compositor::dnd_end_reason& why) {
     }
     // Then `leave` (wlroots, Mutter, Weston); the offer stays live for receive and finish.
     send_leave(client);
+    // xdg-toplevel-drag-v1: dnd_drop_performed went out — the attached toplevel's final
+    // position stands, and its drag object may be destroyed.
+    toplevel_drag_ended();
     drag = {};
     return true;
 }
@@ -400,6 +405,9 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
     // The origin's implicit grab ends (leave), and the surface under the pointer — usually the
     // origin itself — becomes the first target at once.
     wm->begin_drag();
+    // xdg-toplevel-drag-v1: the source's drag object, when one exists, is the drag's from
+    // here — an attached toplevel starts moving with the pointer.
+    toplevel_drag_started(src);
 }
 
 void dnd_offer_accept(xfer_offer* o, uint32_t, const char* mime) {
@@ -535,6 +543,9 @@ void dnd_source_destroyed(xfer_source* s) {
     leave_target();
     inert_drag_offers(s, nullptr);
     drag = {};
+    // xdg-toplevel-drag-v1: destroying the source mid-attach is undefined per the XML —
+    // the compositor ends the move with the drag (the object survives, inert).
+    toplevel_drag_ended();
     if (g_ctx && g_ctx->dnd)
         g_ctx->dnd->end(lx::compositor::dnd_end_reason::source_destroyed);
 }

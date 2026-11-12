@@ -265,6 +265,8 @@ void source_destroy_resource(wl_resource* r) {
         deliver_to_client(s->family, focus_client, "clear");
         data_control_selection_changed(s->family);
     }
+    // Its xdg_toplevel_drag_v1 object, if any, must forget the source before it goes.
+    toplevel_drag_source_destroyed(s);
     delete s;
 }
 
@@ -475,6 +477,13 @@ void xfer_set_selection(xfer_device* dev, wl_resource* source_res, uint32_t seri
         // A source that declared drag-and-drop actions is a drag source.
         wl_resource_post_error(src->resource, WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
                                "drag-and-drop source used as selection");
+        return;
+    }
+    if (src && src->toplevel_drag) {
+        // xdg-toplevel-drag-v1: "Attempting to use the source other than for drag-and-drop
+        // ... will raise an invalid_source error" — get_xdg_toplevel_drag marked this one.
+        wl_resource_post_error(src->resource, WL_DATA_SOURCE_ERROR_INVALID_SOURCE,
+                               "toplevel-drag source used as selection");
         return;
     }
     if (src)
