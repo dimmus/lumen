@@ -5,34 +5,47 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
 
 **Read first:** [docs/architecture.md](docs/architecture.md)
 
-### DSH project context
+### ZCode agent harness (authoritative)
 
-- The reusable Software Development Studio entry point is `software-development-studio`.
-  Lumen's studio adapter is `lumen-development-studio`; use it for studio planning and
-  coordinated delivery. Project skills live in `.agents/skills/`; setup, reusable
-  installation and usage are documented in `tools/software-development-studio/README.md`.
-  Small/read-only tasks stay proportional; non-trivial implementations use the existing
-  gated process below. Skills guide execution; they do not install automatic hooks.
-- Testing specialists: `lumen-test-agent` selects and runs tests/profilers and installs
-  needed development diagnostics; `lumen-script-runner` covers every repository script
-  and preserves execution evidence; a separate `lumen-test-analyst` interprets results
-  and A/B comparisons. Use them for testing and diagnosis; seat/hardware ownership and
-  the no-degradation rule still apply. Setup is documented in the studio README.
+- The project's agent harness lives under `.zcode/`: role agents in `.zcode/agents/*.md`
+  (planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher,
+  architect, doc-writer — dispatch via the Agent tool; the studio workflow embeds the
+  same personas), knowledge skills in `.zcode/skills/` (`lumen-build-run`,
+  `lumen-testing`, `lumen-decisions`, `lumen-memory-writer`, `lumen-studio`), and saved
+  dynamic workflows in `.zcode/workflows/` (`lumen-development-studio` for non-trivial or
+  multi-task delivery, `lumen-gated-change` for one bounded task, `lumen-compositor-bench`
+  for speed/memory comparison against sway/weston/hyprland). Start with CreateWorkflow
+  (`saved:`), repair a live run with AmendWorkflow, resume stopped runs with
+  ResumeWorkflowRun; `lumen-studio` documents the routing.
+- The DSH-era skills in `.agents/skills/` and `tools/software-development-studio/` are
+  kept as reference only. Where they disagree with `.zcode/`, `.zcode/` wins — notably
+  on environments (no Docker) and verification (no headless compositor runs).
 - Use the `project-memory` skill to query the indexed `.zcode/memories/` archive and
   `.zcode/TODO.md`; read the cited source before acting. These are historical records:
   confirm task/branch status against current ADRs, code and Git history. Do not import
   unchecked TODO rows as new work without checking whether they are already done.
-- For independent review of a non-trivial change, use the `lumen-reviewer` skill,
-  adapted from `.zcode/agents/lumen-reviewer.md`, in a read-only subagent.
-- For a requested gated implementation, use `lumen-gated-change` as the per-task
-  execution contract. For multi-task/parallel work, use `lumen-workflow-orchestrator`:
-  it maps the baseline → implement → independent review → verify → fix → gate lifecycle
-  onto DSH task/agent/workflow tools. Role-specific Lumen skills live in `.agents/skills/`.
-  Skills guide DSH usage but do not create agents, enforce permissions or run CI/hooks.
-- Use Docker for development on this Windows host. Resolve paths from the current
-  checkout; Linux host paths and hardware facts in the archive are host-specific.
-- DSH skill adaptations are installed under the user-level `~/.agents/skills/`.
-  Keep `.zcode/` sources as the original references.
+  Write new records with `lumen-memory-writer` (important changes, measured evidence,
+  research results, test/bench/smoke outcomes, fuckups and solutions, new findings) —
+  the studio workflow does this automatically at each task's end.
+- For independent review of a non-trivial change, use the `lumen-reviewer` agent
+  (read-only, `.zcode/agents/lumen-reviewer.md`).
+- Binding owner rules for all agent-driven work:
+  - **No containers, ever.** Build and run in the vmware Arch VM (this host) natively or
+    on real hardware — the notebook for hardware Vulkan, in sessions the user hosts over
+    SSH. Never Docker/WSL for Lumen work.
+  - **No headless compositor verification.** Compositor/display/input behavior is proven
+    on the real seat (`--join-seat-session` smokes, DRM master, input injection) — never
+    on `--virtual-outputs` instances. Unit ctest and the in-process `ui-bench` engine
+    bench are supplementary evidence. Every change is reviewed and tested; new
+    functionality gets tests that exercise it.
+  - **One git worktree per task** (under `../lumen-wt/`, branch `zcode/task/<id>` or as
+    agreed), logically complete changes committed separately with detailed messages;
+    PR text is assembled per task and **the user decides on push**.
+  - **Ask when deviating** — from a skill, a settled decision, a plan, or any rule here:
+    surface the question instead of improvising.
+  - The no-degradation rule (§1.2) governs everything: any measured regression stops the
+    task and the A/B evidence goes to the user before keeping, working around or
+    accepting it.
 
 ---
 
@@ -485,8 +498,14 @@ When you change architecture or public API contracts, update **in the same PR/ch
 ./scripts/fetch-protocols.sh
 
 # Configure & build (Linux)
-cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++
-cmake --build build
+cmake --preset release
+cmake --build --preset release
+
+# The tests-enabled build — the ONLY one that can gate a change
+# (the plain release preset sets LUMEN_BUILD_TESTS=OFF → ctest sees 1 test)
+cmake --preset release -B build/test -DLUMEN_BUILD_TESTS=ON
+cmake --build build/test -j2
+ctest --test-dir build/test --output-on-failure -LE bench
 
 # Debug logging
 LUMEN_LOG=debug ./build/lumen-compositor
@@ -497,9 +516,14 @@ lumen-compositor [socket-name] [-f fps]
 
 **Socket path:** `$XDG_RUNTIME_DIR/lumen-0` (default name `lumen-0`).
 
-Host-specific facts (vmwgfx VM has no hardware Vulkan → GL path; DRM master from SSH; input
-injection; smoke suites and their known environmental noise; the interleaved-A/B
-measurement discipline) live in `.zcode/skills/lumen-build-run/SKILL.md`.
+**Environments (binding):** development runs in the vmware Arch VM (this host, vmwgfx —
+GL path, no hardware Vulkan) natively, or on the iritur notebook for hardware Vulkan in
+sessions the user hosts over SSH. Never containers; never headless compositor
+verification (seat smokes via `--join-seat-session` instead). Worktree builds:
+`cmake --preset release -S <worktree> -B <worktree>/build/test -DLUMEN_BUILD_TESTS=ON`
+after copying `protocols/upstream` in. Verified commands, seat/input-injection
+procedures, noise families and measurement discipline live in
+`.zcode/skills/lumen-build-run/SKILL.md`.
 
 ---
 
