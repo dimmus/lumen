@@ -21,7 +21,7 @@ superseded by this skill): `.agents/skills/lumen-test-agent/references/test-matr
 
 | Change surface | Required evidence |
 | --- | --- |
-| Any code | Tests-enabled ctest suite green (`build/test`, 138 tests — the `release` preset has none) |
+| Any code | Tests-enabled ctest suite green (`build/test`, 133 non-bench tests as of 2026-11, 138 registered incl. bench — the `release` preset has none); on a tree with a tolerated known-red set, green = no new failures beyond it (see `lumen-build-run`) |
 | New functionality | New tests exercising it, in the same change |
 | Compositor, display, input, shell, protocols | + seat smokes: `drag-smoke.sh --join-seat-session` and `app-smoke.sh --join-seat-session` (quiet host, one DRM master) |
 | Rendering/perf-relevant | + interleaved A/B `ui-bench` (≥3 rounds, both binaries pinned) vs the base; FAIL p50 +25 %, WARN p50 +10 %/p95 +25 % |

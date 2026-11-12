@@ -39,12 +39,17 @@ cmake --build --preset release      # ~526 ninja steps, ~15 min cold on 2 cores
 ```bash
 cmake --preset release -S . -B build/test -DLUMEN_BUILD_TESTS=ON
 cmake --build build/test -j2
-ctest --test-dir build/test --output-on-failure -LE bench   # 138 tests as of 2026-11
+ctest --test-dir build/test --output-on-failure -LE bench   # 133 non-bench tests as of 2026-11 (138 registered incl. bench)
 ```
 
 The plain `release` preset sets `LUMEN_BUILD_TESTS=OFF` → `ctest` on `build/release` sees
 **one** test (`scanner_golden`). A "suite green" claim from `build/release` is invalid
-evidence. `-S <tree>` works from any cwd, so the same line configures a worktree:
+evidence. "Suite green" on the tests-enabled build means **no new failures beyond the
+owner-tolerated known-red set** of that tree — as of 2026-11 the dev tree carries
+`ui_gallery` + `test_task_model` (logout-popup test expectations, ui-gallery golden drift
+after the theme restyle; the studio workflow tracks the set via its `known_red` arg). One
+rerun discounts flakes; a repeated failure of the same test is reportable.
+`-S <tree>` works from any cwd, so the same line configures a worktree:
 
 ```bash
 cmake --preset release -S ../lumen-wt/<task> -B ../lumen-wt/<task>/build/test -DLUMEN_BUILD_TESTS=ON
