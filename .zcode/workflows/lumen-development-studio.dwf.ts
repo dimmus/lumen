@@ -265,6 +265,9 @@ const notCovered: string[] = [
 const allFindings: ReportFinding[] = [];
 const prSections: string[] = [];
 const readyBranches: string[] = [];
+/** Per-task branch and gate verdict, so dependent tasks can chain onto READY predecessors. */
+const branchOf = new Map<string, string>();
+const verdictOf = new Map<string, string>();
 
 artifact.board("tasks", {
   title: "Studio tasks",
@@ -290,15 +293,47 @@ log(`Plan: ${tasks.length} task(s) — ${plan.objective}`);
 for (const card of tasks) {
   const wt = `${WT_ROOT}/${card.id}`;
   const branch = `${branchPrefix}/${card.id}`;
+  verdictOf.set(card.id, "BLOCKED");
+
+  // Chain onto the last READY dependency: its branch carries everything this task builds on.
+  const depIds = card.dependsOn;
+  const unreadyDeps = depIds.filter((d) => verdictOf.get(d) !== "READY");
+  if (unreadyDeps.length > 0) {
+    allFindings.push({
+      where: `task ${card.id}`,
+      what: `dependency not READY: ${unreadyDeps.join(", ")} — this task is skipped, nothing lost`,
+      evidence: `dependsOn ${JSON.stringify(depIds)}`,
+      status: "verified",
+      severity: "medium",
+    });
+    report({ id: card.id, title: card.title, branch, state: "blocked", verdict: "dependency" }, "tasks");
+    continue;
+  }
+  const lastDep = depIds.length > 0 ? depIds[depIds.length - 1] : undefined;
+  const effBase = lastDep !== undefined ? (branchOf.get(lastDep) ?? base) : base;
 
   phase("Set up the worktree and test-enabled baseline");
   report({ id: card.id, title: card.title, branch, state: "baseline", verdict: "" }, "tasks");
-  const add = await world.run("git", ["worktree", "add", wt, "-b", branch, base], { output: { tail: 2048 } });
-  if (add.exitCode !== 0) {
+  let haveWt = false;
+  const add = await world.run("git", ["worktree", "add", wt, "-b", branch, effBase], { output: { tail: 2048 } });
+  if (add.exitCode === 0) {
+    haveWt = true;
+  } else {
+    // A previous blocked attempt may have left this worktree/branch at the base with no
+    // work in it — reuse it (reset the branch onto the effective base) instead of blocking.
+    const leftover = await world.run("git", ["-C", wt, "status", "--porcelain"], { output: { tail: 2048 } });
+    const unique = await world.run("git", ["rev-list", "--count", `${effBase}..${branch}`], { output: { tail: 1024 } });
+    if (leftover.exitCode === 0 && leftover.stdout.trim() === "" && unique.exitCode === 0 && unique.stdout.trim() === "0") {
+      const reset = await world.run("git", ["-C", wt, "reset", "--hard", effBase], { output: { tail: 1024 } });
+      haveWt = reset.exitCode === 0;
+      if (haveWt) log(`Task ${card.id}: reusing existing worktree, branch reset to ${effBase}`);
+    }
+  }
+  if (!haveWt) {
     allFindings.push({
       where: `task ${card.id}`,
       what: `could not create worktree/branch ${branch} at ${wt}: ${add.stderr.trim().split("\n").pop() ?? ""}`,
-      evidence: `git worktree add ${wt} -b ${branch} ${base} → exit ${add.exitCode}`,
+      evidence: `git worktree add ${wt} -b ${branch} ${effBase} → exit ${add.exitCode}`,
       status: "verified",
       severity: "medium",
     });
@@ -383,7 +418,7 @@ for (const card of tasks) {
   report({ id: card.id, title: card.title, branch, state: "implementing", verdict: "" }, "tasks");
   const implementer = agent(`Implementer ${card.id}`, { system: implementerPersona });
   const impl = await implementer.ask<ImplResult>(
-    `Implement this task in the Lumen worktree at ${wt} (branch ${branch}, cut from ${base}). ` +
+    `Implement this task in the Lumen worktree at ${wt} (branch ${branch}, cut from ${effBase}). ` +
       `Build directory: ${wt}/build/test (tests-enabled). Commit every logical unit; never push.\n\n` +
       `Task card:\n${JSON.stringify(card, null, 2)}\n\nPlan objective: ${plan.objective}\n` +
       `After implementing, commit anything left over and answer with your summary, changed files, ` +
@@ -396,7 +431,7 @@ for (const card of tasks) {
         `(or revert scratch), then confirm; reply with the final commit list only.`,
     );
   }
-  const commitList = await world.run("git", ["-C", wt, "log", "--oneline", `${base}..HEAD`], { output: { tail: 4096 } });
+  const commitList = await world.run("git", ["-C", wt, "log", "--oneline", `${effBase}..HEAD`], { output: { tail: 4096 } });
   log(`Task ${card.id}: implemented, ${impl.commits.length} commit(s)`);
 
   phase("Build and test the change");
@@ -446,7 +481,7 @@ for (const card of tasks) {
   const reviewer = agent(`Reviewer ${card.id}`, { system: reviewerPersona });
   const review = await reviewer.ask<Review>(
     `Review the committed change on branch ${branch} in the worktree ${wt} — the diff is ` +
-      `\`git -C ${wt} diff ${base}..HEAD\` (plus anything untracked). Task card:\n${JSON.stringify(card, null, 2)}\n\n` +
+      `\`git -C ${wt} diff ${effBase}..HEAD\` (plus anything untracked). Task card:\n${JSON.stringify(card, null, 2)}\n\n` +
       `Author's notes:\n${impl.notesForReviewer}\n\nCommits:\n${commitList.stdout.trim()}\n\n` +
       `Report every real finding with quoted evidence; approving takes evidence, objecting is the useful move.`,
   );
@@ -537,7 +572,7 @@ for (const card of tasks) {
       for (let attempt = 1; attempt <= 2; attempt++) {
         const run = await world.run(
           "bash",
-          ["-c", `cd '${wt}' && exec ${smoke.file} --join-seat-session`],
+          ["-c", `cd '${wt}' && LUMEN_BUILD_DIR=build/test exec ${smoke.file} --join-seat-session`],
           { timeoutMs: smoke.timeoutMs, output: { tail: 16_384 } },
         );
         exit = run.exitCode;
@@ -594,7 +629,7 @@ for (const card of tasks) {
   const packet = {
     card,
     branch,
-    base,
+    base: effBase,
     worktree: wt,
     implementation: { summary: impl.summary, commits: impl.commits, testsAdded: impl.testsAdded, deviations: impl.deviations },
     review: { verdict: postFixVerdict, confirmed: confirmed.length, refuted: refuted.length, confirmedFindings: confirmed },
@@ -620,6 +655,8 @@ for (const card of tasks) {
     });
   }
   if (gate.verdict === "READY") readyBranches.push(branch);
+  branchOf.set(card.id, branch);
+  verdictOf.set(card.id, gate.verdict);
   report({ id: card.id, title: card.title, branch, state: gate.verdict === "READY" ? "done" : "blocked", verdict: gate.verdict }, "tasks");
   log(`Task ${card.id}: gate ${gate.verdict}`);
 
