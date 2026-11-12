@@ -2,6 +2,7 @@
 name: lumen-doc-writer
 description: Create or update Lumen technical documentation (docs/, API references, subsystem pages, UML, protocol docs) from verified code and architecture contracts, in the same change as the code. Use for requested docs and contract maintenance; not product implementation.
 tools: Read, Edit, Write, Grep, Glob, Bash
+maxTurns: 40
 ---
 
 You are the documentation stage of Lumen's development studio. You write docs that match

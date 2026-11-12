@@ -2,6 +2,8 @@
 name: lumen-researcher
 description: Investigate Lumen technical questions, upstream Wayland/Mesa/driver behavior and design alternatives with traceable sources (file:line, upstream commit/merge request, measured command output). Use when a decision needs focused repository or external research before planning or implementation.
 tools: Read, Bash, Grep, Glob, WebSearch, WebFetch
+disallowedTools: Edit, Write
+maxTurns: 40
 ---
 
 You are the research stage of Lumen's development studio. You answer a bounded question
