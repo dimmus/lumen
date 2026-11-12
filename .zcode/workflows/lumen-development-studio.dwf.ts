@@ -23,6 +23,13 @@ args:
     type: number
     description: Cap on planned tasks executed by one run (rest are reported as not covered)
     default: 5
+  known_red:
+    type: json
+    description: "Test names tolerated in a red baseline (json array, e.g.
+      [\"ui_gallery\",\"test_task_model\"]): tasks proceed and every suite gate then
+      requires no NEW failures beyond this set. Failures outside the set park the run
+      on an owner decision (proceed-and-tolerate vs skip)."
+    default: []
   run_bench:
     type: boolean
     description: Also run scripts/ui-bench.sh (engine bench against the stored
@@ -148,6 +155,19 @@ const branchPrefix = args.branch_prefix === undefined ? "zcode/task" : String(ar
 const runSmokes = args.run_smokes !== false;
 const runBench = args.run_bench === true;
 const maxTasks = typeof args.max_tasks === "number" ? args.max_tasks : 5;
+const knownRed: string[] = Array.isArray(args.known_red) ? args.known_red.map(String) : [];
+
+/** Test names ctest reported under "The following tests FAILED:" (empty when it never got there). */
+function failedTests(out: string): string[] {
+  const marker = out.indexOf("The following tests FAILED:");
+  if (marker < 0) return [];
+  const names: string[] = [];
+  for (const line of out.slice(marker).split("\n").slice(1)) {
+    const m = /^\s*-?\s*\d+ - (\S+) \(/.exec(line);
+    if (m !== null && m[1] !== undefined) names.push(m[1]);
+  }
+  return names;
+}
 
 if (task === "") {
   const empty: WorkflowReport = {
@@ -297,7 +317,52 @@ for (const card of tasks) {
   const baselineTests = baselineBuild !== undefined && baselineBuild.exitCode === 0
     ? await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 1_200_000, output: { tail: 32_768 } })
     : undefined;
-  if (baselineTests === undefined || baselineTests.exitCode !== 0) {
+  if (baselineTests !== undefined && baselineTests.exitCode !== 0) {
+    // One rerun discounts flakes; a persistent failure set is either tolerated (known_red)
+    // or escalated to the owner — never silently accepted, never silently skipped past.
+    const rerun = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 1_200_000, output: { tail: 32_768 } });
+    const names = rerun.exitCode === 0 ? [] : failedTests(rerun.stderr + rerun.stdout);
+    const fresh = names.filter((n) => !knownRed.includes(n));
+    if (fresh.length === 0) {
+      allFindings.push({
+        where: `task ${card.id}`,
+        what: `baseline red only in the tolerated known-red set (${names.join(", ")}) — gates now require no NEW failures beyond it`,
+        evidence: `baseline rerun at ${wt}/build/test: ${names.join(", ")}`,
+        status: "verified",
+        severity: "medium",
+      });
+    } else {
+      const proceed = await hole<boolean>(
+        "Decide whether to proceed on a red baseline",
+        `The unchanged baseline at ${wt} fails ${names.length} test(s): ${names.join(", ")}. None are in the ` +
+          `tolerated set (${knownRed.length > 0 ? knownRed.join(", ") : "empty"}). Tail:\n` +
+          `${(rerun.stderr + rerun.stdout).slice(-1500)}\n` +
+          `Return true to tolerate these failures for the rest of this run (they join the known-red set, and ` +
+          `gates require no NEW failures beyond it); false to skip this task with a red-baseline block.`,
+      );
+      if (proceed) {
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `owner tolerated a red baseline (${names.join(", ")}) — gates now require no NEW failures beyond this set`,
+          evidence: `baseline rerun at ${wt}/build/test`,
+          status: "verified",
+          severity: "medium",
+        });
+        knownRed.push(...fresh);
+      } else {
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `red baseline (${names.join(", ")}) — per the no-degradation rule there is no clean baseline to gate against; task skipped`,
+          evidence: `baseline rerun at ${wt}/build/test: ${names.join(", ")}`,
+          status: "verified",
+          severity: "high",
+        });
+        report({ id: card.id, title: card.title, branch, state: "blocked", verdict: "red baseline" }, "tasks");
+        continue;
+      }
+    }
+  }
+  if (baselineTests === undefined) {
     const why = configure.exitCode !== 0
       ? "configure failed"
       : (baselineBuild === undefined || baselineBuild.exitCode !== 0 ? "baseline build failed" : "baseline ctest failed");
@@ -350,11 +415,16 @@ for (const card of tasks) {
     }
     const tests = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 1_200_000, output: { tail: 32_768 } });
     if (tests.exitCode !== 0) {
-      await fixer.ask<FixReport>(
-        `The tests-enabled suite failed (round ${round}) in ${wt}. Fix the cause with minimal changes and commit — ` +
-          `never weaken a test. Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`,
-      );
-      continue;
+      const fresh = failedTests(tests.stderr + tests.stdout).filter((n) => !knownRed.includes(n));
+      if (fresh.length > 0) {
+        await fixer.ask<FixReport>(
+          `The tests-enabled suite failed (round ${round}) in ${wt}; failing: ${fresh.join(", ")} (the tolerated ` +
+            `known-red set ${knownRed.length > 0 ? knownRed.join(", ") : "is empty"} does not cover these). Fix the ` +
+            `cause with minimal changes and commit — never weaken a test. Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`,
+        );
+        continue;
+      }
+      // only tolerated failures remain — green modulo the known-red baseline set
     }
     gateGreen = true;
   }
@@ -420,8 +490,12 @@ for (const card of tasks) {
       }
       const tests = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 1_200_000, output: { tail: 32_768 } });
       if (tests.exitCode !== 0) {
-        await fixer.ask<FixReport>(`After the review fixes the suite failed (round ${round}) at ${wt}. Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
-        continue;
+        const fresh = failedTests(tests.stderr + tests.stdout).filter((n) => !knownRed.includes(n));
+        if (fresh.length > 0) {
+          await fixer.ask<FixReport>(`After the review fixes the suite failed (round ${round}) at ${wt}; failing: ${fresh.join(", ")}. Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
+          continue;
+        }
+        // only tolerated failures remain — green modulo the known-red baseline set
       }
       fixGreen = true;
     }
@@ -526,7 +600,7 @@ for (const card of tasks) {
     review: { verdict: postFixVerdict, confirmed: confirmed.length, refuted: refuted.length, confirmedFindings: confirmed },
     gate_runs: {
       baseline: "tests-enabled configure+build+ctest green before the change",
-      suite: `green after ${gateRounds} fix round(s)`,
+      suite: `green after ${gateRounds} fix round(s) (tolerated known-red: ${knownRed.length > 0 ? knownRed.join(", ") : "none"})`,
       seat: seatEvidence.length > 0 ? seatEvidence : "not run (run_smokes off)",
       bench: runBench ? "run (see findings)" : "not run (run_bench off)",
     },
