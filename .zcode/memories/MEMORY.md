@@ -16,3 +16,4 @@
 - [Notebook test hardware](lumen-notebook-hw.md) — HP: HD 5500 (hasvk) + GTX 950M (NVK), 3200x1800@2, lis3lv02d; PRs #64-68 from its runs; vkmark after fixes
 - [Render scale (HiDPI supersampling)](lumen-render-scale.md) — merged PR #70; area filter kept by user choice
 - [PRIME offload in launcher](lumen-prime-offload.md) — PrefersNonDefaultGPU via switcheroo/DRI_PRIME, merged PR #71 2026-10-29; notebook check pending; lx.shell.cppm is CRLF
+- [ZCode agent harness](lumen-zcode-agent-harness.md) — 2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; release preset registers 1 ctest — gate on build/test (138)
