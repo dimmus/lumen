@@ -790,10 +790,12 @@ void start_toplevel_drag(app& a, uint32_t serial) {
     wl_data_source_offer(a.drag_source, "text/plain");
     a.toplevel_drag = xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(a.drag_manager,
                                                                          a.drag_source);
-    wl_data_device_start_drag(a.data_device, a.drag_source, a.surface, nullptr, serial);
+    // Attach before start_drag, the workflow the protocol spells out for dragging an
+    // existing window (XML: "attaches the existing toplevel before starting the drag").
     xdg_toplevel_drag_v1_attach(a.toplevel_drag, a.toplevel,
                                 static_cast<int32_t>(a.pointer_x),
                                 static_cast<int32_t>(a.pointer_y));
+    wl_data_device_start_drag(a.data_device, a.drag_source, a.surface, nullptr, serial);
 }
 
 #endif // LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
