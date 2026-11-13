@@ -88,6 +88,27 @@ struct wm_grab {
     int zone_output = -1;
 };
 
+/// The toplevel an xdg-toplevel-drag-v1 drag moves (xdg_toplevel_drag_v1.attach). Not a
+/// `wm_grab`: the DnD drag owns the pointer (the third pointer mode), and this only moves
+/// one window with it, once per tick — a plain move, no snap zones, no drag-to-restore
+/// (the toplevel-drag semantics; KWin and Hyprland move by pointer delta the same way).
+/// UI affinity. Set while the drag runs (an attach that precedes start_drag sets it too,
+/// from the start); cleared when the drag ends, or the window unmaps or is destroyed
+/// (auto-detach: a remap needs a new attach).
+struct wm_dragged_window {
+    lx::toplevel_id toplevel{};
+    /// attach's offset: the point of the window geometry the pointer hotspot holds when
+    /// the window maps mid-drag (xdg_surface.set_window_geometry coordinates). A mapped
+    /// window keeps its position instead; only the pointer's delta moves it.
+    lx::point2i offset{};
+    /// The move's anchor, as `wm_grab`'s start: window origin and pointer at the attach,
+    /// or at the map of a window that maps mid-drag.
+    lx::point2i start{};
+    double start_x = 0.0;
+    double start_y = 0.0;
+    bool motion_pending = false;
+};
+
 /// config.toml [windows] (design-session-and-wm C.2, K.3–K.5).
 struct wm_window_config {
     /// A move dropped at an outer edge of the layout snaps (halves, quarters, maximize).
@@ -591,6 +612,16 @@ public:
     /// until release, the origin client gets `wl_pointer.leave`, and the surface under the
     /// pointer becomes the first drag target without waiting for motion.
     void begin_drag();
+    /// xdg_toplevel_drag_v1.attach: while the drag runs, `toplevel` moves with the pointer
+    /// (once per tick, as an interactive move). `offset` is the attach offset — the point of
+    /// the window geometry the hotspot holds for a window that maps mid-drag; a window
+    /// already mapped keeps its position. The wire calls this at the attach and again when
+    /// a drag that was attached before start_drag begins.
+    void drag_toplevel_attach(lx::toplevel_id toplevel, lx::point2i offset);
+    /// The drag ended (dropped, cancelled, the source or its client gone), or the attached
+    /// toplevel unmapped or was destroyed (auto-detach): the window stops where it is —
+    /// its final position is "as if a xdg_toplevel_move operation ended".
+    void drag_toplevel_detach();
 
     // ── Interactive move/resize: one executor, three entry points ──
 
@@ -759,6 +790,9 @@ private:
     /// Applies the coalesced grab motion: a move is an origin change (no texture work), a
     /// resize updates the desired configure size, which the single-in-flight rule throttles.
     void apply_grab();
+    /// Applies the coalesced xdg-toplevel-drag-v1 motion: the whole pointer delta since the
+    /// anchor, one `move_window` (an origin change only, as an interactive move).
+    void apply_drag_window();
     /// Moves a mapped window to global geometry origin `p`, damaging old and new rects
     /// separately and telling the shell.
     void move_window(toplevel_record& rec, lx::point2i p, const char* cause);
@@ -889,6 +923,8 @@ private:
     button_binding_fn button_binding_ = nullptr;
     void* button_binding_user_ = nullptr;
     wm_grab grab_{};
+    /// The xdg-toplevel-drag-v1 window of the running drag (see `wm_dragged_window`).
+    wm_dragged_window drag_window_{};
     /// Buttons whose press never reached a client (the Super binding, presses during a
     /// grab): their release must not reach one either.
     std::uint64_t swallowed_mask_ = 0;
@@ -2942,6 +2978,19 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
         rec.geometry.y = p.y + ext.top;
     }
 
+    // A window attached to the running drag (xdg-toplevel-drag-v1) maps at the hotspot
+    // plus the attach offset: the point of its window geometry the pointer holds. That is
+    // the detachable-window workflow — the client attaches a new toplevel before mapping
+    // it, and the grabbed content appears under the cursor. Anchored here; from now only
+    // the pointer's delta moves it.
+    if (drag_active() && drag_window_.toplevel == rec.id && seat_) {
+        rec.geometry.x = round_delta(seat_->pointer_x()) - drag_window_.offset.x;
+        rec.geometry.y = round_delta(seat_->pointer_y()) - drag_window_.offset.y;
+        drag_window_.start = {rec.geometry.x, rec.geometry.y};
+        drag_window_.start_x = seat_->pointer_x();
+        drag_window_.start_y = seat_->pointer_y();
+    }
+
     toplevels_->set_mapped(rec.id, true);
     // A new window of a client already known not to answer pings is shown as such too.
     rec.not_responding = liveness_ && liveness_->not_responding(rec.client);
@@ -3053,6 +3102,14 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
             return;
     }
 
+    // The xdg-toplevel-drag-v1 window auto-detaches when it unmaps ("this request has to
+    // be called again if the window should be attached after it is remapped"); its final
+    // position stands. The drag itself goes on. The unmap epoch moves for the wire's
+    // attach rule (still attached, or detached by this unmap).
+    ++rec->unmap_epoch;
+    if (drag_window_.toplevel == id)
+        drag_window_ = {};
+
     // Its popups go first (popup_done, top-down): none may stay on screen without it.
     if (popups_)
         popups_->on_parent_unmapped(rec->surface, "parent-unmapped");
@@ -3156,6 +3213,10 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
 void lx::compositor::window_manager::on_destroyed(lx::toplevel_id id) {
     if (!toplevels_ || !id)
         return;
+    // A toplevel-drag attachment names a window that never mapped too: cleared here as an
+    // unmap would (on_unmap below only runs for a mapped one).
+    if (drag_window_.toplevel == id)
+        drag_window_ = {};
     if (const auto* rec = toplevels_->find(id); rec && rec->mapped)
         on_unmap(id, "destroyed");
     if (const auto* rec = toplevels_->find(id); rec && popups_)
@@ -3211,6 +3272,10 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
     // snapshot (and, with the cursor plane, the same atomic commit) as the pointer.
     if (grab_.mode != grab_mode::none && grab_.motion_pending)
         apply_grab();
+    // The xdg-toplevel-drag-v1 window likewise: once per tick, in the snapshot that carries
+    // the pointer (and the drag icon). No wm_grab is engaged — the drag owns the pointer.
+    if (drag_window_.toplevel && drag_window_.motion_pending)
+        apply_drag_window();
     // The drag icon likewise: once per tick, in the snapshot that carries the pointer.
     if (dnd_)
         dnd_->on_tick();
@@ -3229,7 +3294,8 @@ bool lx::compositor::window_manager::needs_tick() const {
     if (anim_.active())
         return true;
     if (rehit_pending_ || stacking_dirty_ || tiling_dirty_ ||
-        (grab_.mode != grab_mode::none && grab_.motion_pending))
+        (grab_.mode != grab_mode::none && grab_.motion_pending) ||
+        (drag_window_.toplevel && drag_window_.motion_pending))
         return true;
     if (surfaces_ && surfaces_->layout_changed())
         return true;
@@ -3659,6 +3725,10 @@ void lx::compositor::window_manager::on_pointer_motion(unsigned time_ms) {
     // target or a focus change. No client has pointer focus meanwhile.
     if (drag_active()) {
         drag_hit(time_ms, true);
+        // The xdg-toplevel-drag-v1 window follows the recorded position, as an interactive
+        // grab's does: applied once per tick, never per event.
+        if (drag_window_.toplevel)
+            drag_window_.motion_pending = true;
         return;
     }
 
@@ -4145,9 +4215,12 @@ void lx::compositor::window_manager::drag_hit(unsigned time_ms, bool send_motion
     const double px = seat_->pointer_x();
     const double py = seat_->pointer_y();
     // Not `pointer_hit`: popup owner-events ended with the drag. The icon layer is never
-    // hit ("the input region is ignored").
+    // hit ("the input region is ignored"); neither is the xdg-toplevel-drag-v1 window —
+    // "the attached window does not participate in the selection of the drag target"
+    // (its subsurfaces and popups are part of it: `h.id` names the window they belong to).
     wm_hit h{};
-    if (hit_test(px, py, h) && h.target == hit_target::surface && h.surface_resource) {
+    if (hit_test(px, py, h) && h.target == hit_target::surface && h.surface_resource &&
+        !(drag_window_.toplevel && h.id == drag_window_.toplevel)) {
         dnd_target t{};
         t.surface_resource = h.surface_resource;
         t.surface = h.surface;
@@ -4474,6 +4547,60 @@ void lx::compositor::window_manager::apply_grab() {
         return;
     grab_.last_target = target;
     rec->desired.size = target;
+}
+
+void lx::compositor::window_manager::drag_toplevel_attach(lx::toplevel_id toplevel,
+                                                          lx::point2i offset) {
+    drag_window_ = {};
+    drag_window_.toplevel = toplevel;
+    drag_window_.offset = offset;
+    if (seat_) {
+        drag_window_.start_x = seat_->pointer_x();
+        drag_window_.start_y = seat_->pointer_y();
+    }
+    // A window already mapped keeps where it is: the pointer's delta moves it from there,
+    // as xdg_toplevel.move would. One that maps mid-drag is placed and anchored at its map.
+    if (auto* rec = toplevels_ ? toplevels_->find_mut(toplevel) : nullptr; rec && rec->mapped)
+        drag_window_.start = {rec->geometry.x, rec->geometry.y};
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("toplevel-drag attach id={} offset={},{} x={} y={}", toplevel.id(),
+                     offset.x, offset.y, drag_window_.start.x, drag_window_.start.y);
+    }
+}
+
+void lx::compositor::window_manager::drag_toplevel_detach() {
+    if (!drag_window_.toplevel)
+        return;
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("toplevel-drag detach id={}", drag_window_.toplevel.id());
+    }
+    drag_window_ = {};
+}
+
+void lx::compositor::window_manager::apply_drag_window() {
+    lx::trace::scoped_span span{"compositor.wm", "apply_drag_window"};
+    drag_window_.motion_pending = false;
+    if (!drag_active() || !seat_ || !toplevels_)
+        return;
+    auto* rec = toplevels_->find_mut(drag_window_.toplevel);
+    if (!rec || !rec->mapped)
+        return; // unmapped or gone: auto-detached, nothing moves
+    // The whole delta from the anchor in one piece, as the interactive move applies it:
+    // rounding cannot accumulate, and a size the client committed mid-drag is respected
+    // (only the origin follows the pointer).
+    const int dx = round_delta(seat_->pointer_x() - drag_window_.start_x);
+    const int dy = round_delta(seat_->pointer_y() - drag_window_.start_y);
+    const lx::point2i at{drag_window_.start.x + dx, drag_window_.start.y + dy};
+    if (at.x == rec->geometry.x && at.y == rec->geometry.y)
+        return;
+    // The frame stays reachable as an xdg_toplevel.move keeps it — "the final position is
+    // determined as if a xdg_toplevel_move operation ended". Nothing else of the move
+    // machinery applies: a plain move, no snap zones, no drag-to-restore.
+    const frame_extents ext = extents_of(*rec);
+    const lx::point2i p = constrain_on_output(
+        usable_area(pointer_output()),
+        frame_rect({at.x, at.y, rec->geometry.width, rec->geometry.height}, ext));
+    move_window(*rec, {p.x + ext.left, p.y + ext.top}, "toplevel-drag");
 }
 
 void lx::compositor::window_manager::end_grab(grab_end_reason reason) {

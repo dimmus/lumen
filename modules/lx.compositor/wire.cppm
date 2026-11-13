@@ -456,6 +456,7 @@ constexpr unsigned k_max_xfer_offers = 512;
 constexpr unsigned k_max_offers_per_client = 32;
 
 struct xfer_offer;
+struct toplevel_drag_obj;
 
 /// How a source is told to write (`send`) and that it lost the selection (`cancelled`):
 /// what differs between a wl_data_source, a primary-selection source and a data-control
@@ -490,6 +491,10 @@ struct xfer_source {
     bool finished = false;
     /// Intrusive list of the live offers of this source.
     xfer_offer* offers = nullptr;
+    /// xdg-toplevel-drag-v1: the object this source was given to (get_xdg_toplevel_drag
+    /// marks it; at most one — a source is usable once). From then on it is a
+    /// drag-and-drop source only: set_selection with it is a protocol error.
+    toplevel_drag_obj* toplevel_drag = nullptr;
     bool live = false;
 };
 
@@ -1002,6 +1007,24 @@ void dnd_source_destroyed(xfer_source* source);
 /// A client is gone (the server's client-destroyed hook).
 void dnd_client_destroyed(wl_client* client);
 void install_dnd(protocol_context& ctx);
+
+// ── wire_toplevel_drag.cpp (xdg-toplevel-drag-v1, staging) ─────────────────
+
+/// The drag of `source` began (dnd_start_drag): its xdg_toplevel_drag_v1 object, when one
+/// exists, is the drag's — an attached toplevel starts moving with the pointer. A no-op
+/// without the toplevel-drag glue (no source can be marked then).
+void toplevel_drag_started(xfer_source* source);
+/// The drag ended — dropped, cancelled, the source or its client gone: the attached
+/// toplevel keeps its final position ("as if a xdg_toplevel_move operation ended"). A
+/// no-op without the glue.
+void toplevel_drag_ended();
+/// The source is going (source_destroy_resource, before it is deleted): its drag object,
+/// when one still holds it, forgets it — the mark and the object clear each other, so
+/// neither can dangle whichever dies first. A no-op without the glue.
+void toplevel_drag_source_destroyed(xfer_source* source);
+/// Defined only when the toplevel-drag glue exists (a staging protocol); wire_install.cpp
+/// calls it under the same `LUMEN_PROTOCOL_*` guard.
+void bind_toplevel_drag_manager(wayland::client_connection& client, unsigned id, int version);
 /// Defined only when the primary-selection glue exists (a P1 protocol); wire_install.cpp
 /// calls them under the same `LUMEN_PROTOCOL_*` guard.
 void bind_primary_selection_manager(wayland::client_connection& client, unsigned id,

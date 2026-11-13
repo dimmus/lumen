@@ -427,6 +427,33 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         else()
             message(STATUS "cursor-shape-v1.xml not found — lumen-square builds without resize cursors")
         endif()
+        # xdg-toplevel-drag-v1 (staging): lumen-square --toplevel-drag starts a data-device
+        # drag whose attached toplevel the compositor moves with the pointer. Client glue
+        # generated the same way as the cursor-shape one above.
+        set(LUMEN_TOPLEVEL_DRAG_XML "${CMAKE_SOURCE_DIR}/protocols/upstream/staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml")
+        if(EXISTS "${LUMEN_TOPLEVEL_DRAG_XML}")
+            add_custom_command(
+                OUTPUT "${LUMEN_CLOUDS_GEN}/xdg-toplevel-drag-v1-client-protocol.h"
+                COMMAND "${WAYLAND_SCANNER_EXE}" client-header "${LUMEN_TOPLEVEL_DRAG_XML}"
+                        "${LUMEN_CLOUDS_GEN}/xdg-toplevel-drag-v1-client-protocol.h"
+                DEPENDS "${LUMEN_TOPLEVEL_DRAG_XML}"
+                VERBATIM
+            )
+            add_custom_command(
+                OUTPUT "${LUMEN_CLOUDS_GEN}/xdg-toplevel-drag-v1-protocol.c"
+                COMMAND "${WAYLAND_SCANNER_EXE}" private-code "${LUMEN_TOPLEVEL_DRAG_XML}"
+                        "${LUMEN_CLOUDS_GEN}/xdg-toplevel-drag-v1-protocol.c"
+                DEPENDS "${LUMEN_TOPLEVEL_DRAG_XML}"
+                VERBATIM
+            )
+            target_sources(lumen-square PRIVATE
+                "${LUMEN_CLOUDS_GEN}/xdg-toplevel-drag-v1-protocol.c"
+                "${LUMEN_CLOUDS_GEN}/xdg-toplevel-drag-v1-client-protocol.h"
+            )
+            target_compile_definitions(lumen-square PRIVATE LUMEN_SQUARE_HAS_TOPLEVEL_DRAG)
+        else()
+            message(STATUS "xdg-toplevel-drag-v1.xml not found — lumen-square builds without --toplevel-drag")
+        endif()
         target_include_directories(lumen-square PRIVATE "${LUMEN_CLOUDS_GEN}")
         lumen_link_platform(lumen-square)
 
@@ -971,7 +998,7 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_input_serials COMMAND test_input_serials)
 
     add_executable(test_dnd_grab tests/test_dnd_grab.cpp)
-    target_link_libraries(test_dnd_grab PRIVATE lx.compositor)
+    target_link_libraries(test_dnd_grab PRIVATE lx.compositor lx.input lx.wayland.server)
     lumen_apply_module_properties(test_dnd_grab)
     lumen_link_platform(test_dnd_grab)
     target_include_directories(test_dnd_grab PRIVATE tests)

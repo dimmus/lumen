@@ -3,6 +3,8 @@
 // reasons, Escape, the source-less drag that stays inside its client, the modifier-chosen
 // user action, the icon following the pointer once per tick with its accumulated offset,
 // and no allocation on the per-motion path. A real surface tree and scene, no Wayland.
+// The last case widens that to the whole drag path through the window manager: the
+// xdg-toplevel-drag-v1 window is marked by the motion and moved once per tick, alloc-free.
 #include "lumen_test.hpp"
 
 import std;
@@ -10,6 +12,8 @@ import lx.foundation;
 import lx.runtime;
 import lx.gfx;
 import lx.scene;
+import lx.input;
+import lx.wayland.server;
 import lx.compositor;
 
 using lx::compositor::dnd_end_reason;
@@ -134,6 +138,68 @@ struct fixture {
 };
 
 std::unique_ptr<fixture> make_fixture() { return std::make_unique<fixture>(); }
+
+/// The drag with its window manager around it: the same surface tree and scene, the wire's
+/// optional parts absent (no popups, frames or layer-shell; no outputs, so placement falls
+/// back to the nominal 1920x1080 desktop) and a shell bridge over an unbound server, whose
+/// emits are no-ops. What this adds over `fixture` is the WM side of
+/// xdg-toplevel-drag-v1: the motion that marks the dragged toplevel pending and the tick
+/// that moves it once — the paths `window_manager` runs per event and per frame.
+struct wm_fixture : fixture {
+    lx::wayland::server server{};
+    lx::compositor::shell_bridge shell{server};
+    lx::compositor::toplevel_manager tops{};
+    lx::compositor::input_router router{};
+    lx::input::seat seat{};
+    lx::compositor::output_manager outputs{};
+    lx::scene::container_node windows_layer{};
+    lx::compositor::window_manager wm{};
+
+    wm_fixture() {
+        (void)scene.root().add(&windows_layer);
+        wm.bind(tops, surfaces, tree, scene, windows_layer, router, seat, shell, outputs);
+        wm.set_dnd(&grab);
+    }
+    ~wm_fixture() {
+        // The tree is a base member, destroyed after the WM: its unmap hook must not point
+        // at the WM anymore by then.
+        tree.set_unmap_hook(nullptr, nullptr);
+    }
+
+    /// A mapped toplevel `w`x`h`, mapped the way the wire maps one: a committed buffer, a
+    /// record, the initial commit and the buffer commit that places and maps it. Where it
+    /// lands is the cascade's choice; read it back with `geometry`.
+    lx::toplevel_id window(unsigned n, int w, int h) {
+        const lx::surface_id s = sid(n);
+        LUMEN_CHECK(surfaces.register_surface(s, &res_a));
+        LUMEN_CHECK(tree.add_surface(s));
+        const lx::buffer_id b{next_buffer++};
+        surfaces.register_shm(b, static_cast<unsigned>(w), static_cast<unsigned>(h),
+                              static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));
+        lx::compositor::surface_commit c{};
+        c.surface = s;
+        c.buffer = b;
+        c.damage = {0, 0, w, h};
+        LUMEN_CHECK(static_cast<bool>(surfaces.on_commit(std::move(c))));
+        tree.set_has_buffer(s, true);
+        LUMEN_CHECK(tree.make_root(s, root_kind::toplevel));
+        auto created = tops.create(lx::client_id{1}, s, &res_a, &res_a, &res_a);
+        LUMEN_CHECK(static_cast<bool>(created));
+        const lx::toplevel_id id = created ? *created : lx::toplevel_id{};
+        wm.on_initial_commit(id);
+        lx::compositor::toplevel_commit_info info{};
+        info.has_buffer = true;
+        info.surface_size = {w, h};
+        info.tree_bbox = {0, 0, w, h};
+        wm.on_toplevel_commit(id, info);
+        return id;
+    }
+
+    lx::rect2i geometry(lx::toplevel_id id) const {
+        const auto* rec = tops.find(id);
+        return rec ? rec->geometry : lx::rect2i{};
+    }
+};
 
 } // namespace
 
@@ -314,6 +380,58 @@ LUMEN_TEST(dnd_motion_and_tick_do_not_allocate) {
     LUMEN_CHECK(motion_allocs == 0);
     LUMEN_CHECK(tick_allocs == 0);
     LUMEN_CHECK(f->w.motion_calls > 1900);
+}
+
+LUMEN_TEST(dnd_dragged_toplevel_motion_and_tick_do_not_allocate) {
+    auto f = std::make_unique<wm_fixture>();
+    // The window the drag moves, and where the cascade placed it. The pointer starts 40,30
+    // inside it — the attach offset — and every position below is relative to that anchor,
+    // so the pointer stays at that point of the window wherever the drag carries it.
+    const lx::toplevel_id win = f->window(7, 120, 80);
+    const lx::rect2i g0 = f->geometry(win);
+    LUMEN_CHECK(g0.width == 120 && g0.height == 80);
+    f->seat.set_pointer_position(g0.x + 40.0, g0.y + 30.0);
+    f->grab.begin(lx::client_id{1}, false, {}, g0.x + 40.0, g0.y + 30.0);
+    f->wm.begin_drag();
+    // begin_drag makes the surface under the pointer the first target (the origin window
+    // itself); the attach takes it out of the target selection from here on.
+    LUMEN_CHECK(f->w.focus_calls == 1 && f->w.focus_res == &f->res_a);
+    f->wm.drag_toplevel_attach(win, {40, 30});
+    f->wm.on_pointer_motion(0);
+    f->wm.on_tick(1'000'000'000); // the first move warms whatever the scene keeps
+
+    // Motion only records: the window does not move until a tick applies it, whole-delta.
+    f->seat.set_pointer_position(g0.x + 60.0, g0.y + 50.0);
+    f->wm.on_pointer_motion(1);
+    LUMEN_CHECK(f->geometry(win).x == g0.x && f->geometry(win).y == g0.y);
+    f->wm.on_tick(1'016'666'667);
+    LUMEN_CHECK(f->geometry(win).x == g0.x + 20 && f->geometry(win).y == g0.y + 20);
+
+    g_allocs.store(0);
+    g_counting.store(true);
+    for (int i = 0; i < 2000; ++i) {
+        f->seat.set_pointer_position(g0.x + 60.0 + i * 0.05, g0.y + 50.0 + i * 0.05);
+        f->wm.on_pointer_motion(static_cast<unsigned>(i));
+    }
+    const unsigned motion_allocs = g_allocs.load();
+    g_allocs.store(0);
+    for (int i = 0; i < 200; ++i) {
+        f->seat.set_pointer_position(g0.x + 160.5 + i * 0.5, g0.y + 150.5 + i * 0.5);
+        f->wm.on_pointer_motion(static_cast<unsigned>(i));
+        f->wm.on_tick(2'000'000'000 + i * 16'666'667);
+    }
+    g_counting.store(false);
+    const unsigned tick_allocs = g_allocs.load();
+    std::printf("    allocations: motion=%u tick=%u\n", motion_allocs, tick_allocs);
+    LUMEN_CHECK(motion_allocs == 0);
+    LUMEN_CHECK(tick_allocs == 0);
+    // It followed exactly: the whole delta from the anchor (pointer 220, 220 past it at the
+    // last tick), rounded once per tick — never accumulated per event.
+    LUMEN_CHECK(f->geometry(win).x == g0.x + 220 && f->geometry(win).y == g0.y + 220);
+    // And the wire heard nothing of it: the focus begin_drag gave the window ended with the
+    // attach, and no motion ever named the dragged window a target.
+    LUMEN_CHECK(f->w.focus_calls == 2 && f->w.focus_res == nullptr);
+    LUMEN_CHECK(f->w.motion_calls == 0);
 }
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

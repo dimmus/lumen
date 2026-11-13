@@ -113,6 +113,9 @@ module;
 #ifdef LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1
 #include "xdg-toplevel-icon-v1-server-protocol.h"
 #endif
+#ifdef LUMEN_PROTOCOL_XDG_TOPLEVEL_DRAG_V1
+#include "xdg-toplevel-drag-v1-server-protocol.h"
+#endif
 #ifdef LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1
 #include "xdg-system-bell-v1-server-protocol.h"
 #endif
@@ -601,6 +604,16 @@ void install_core(protocol_context& ctx) {
                                 .privileged = false,
                                 .interface_desc = &xdg_wm_dialog_v1_interface},
                                &bind_wm_dialog);
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_DRAG_V1) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+    // xdg-toplevel-drag-v1: a drag's window moves with the pointer (KWin, Hyprland). A
+    // per-window feature like xdg-dialog, not session-wide: every client may bind it.
+    if (ctx.wm)
+        ctx.server->add_global({.interface_name = "xdg_toplevel_drag_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &xdg_toplevel_drag_manager_v1_interface},
+                               &bind_toplevel_drag_manager);
 #endif
 #if defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     // xdg-toplevel-icon-v1: icons snapshotted into sealed memfds for the shell's panel.

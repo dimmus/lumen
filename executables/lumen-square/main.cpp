@@ -12,11 +12,16 @@
 //   commit size=<w>x<h>
 //   pointer enter x=<x> y=<y>        pointer leave
 //   press button=<code> x=<x> y=<y> -> move | -> resize edges=<n> | -> none
+//                                     | -> toplevel-drag (with --toplevel-drag)
 //   release button=<code>
 //   cursor shape=<name>
 //   sub commit size=<w>x<h>          (with --sub / --sub-desync)
+//   dnd offer mime=<mime>            dnd enter / dnd leave / dnd drop (with --toplevel-drag)
+//   dnd target mime=<mime>|none      dnd cancelled | dnd drop performed | dnd finished
+//   dnd send mime=<mime>             dnd action=<n>
 //
 //   lumen-square [-t seconds] [--sub | --sub-desync] [--destroy-parent-first]
+//                [--toplevel-drag]
 //
 // --sub adds a 32 px strip along the top as a wl_subsurface at 0,0, full window width. It
 // is synchronized: every resize commits the strip at the new width first and the parent
@@ -26,6 +31,15 @@
 // it desynchronized instead: its commits apply on their own. --destroy-parent-first tears
 // down in the order parent wl_surface before the child's wl_subsurface (role objects still
 // before their surfaces), which a compositor must survive without an error.
+//
+// --toplevel-drag changes what an interior left press does: instead of xdg_toplevel.move it
+// starts a drag-and-drop — a wl_data_source marked by
+// xdg_toplevel_drag_manager_v1.get_xdg_toplevel_drag, wl_data_device.start_drag with the
+// press's own serial, then xdg_toplevel_drag_v1.attach on this window's toplevel with the
+// pointer's surface-local position as the offset (xdg-toplevel-drag-v1's workflow for
+// dragging an existing window). The compositor then moves the window with the pointer for
+// the drag's life; releasing without an accepting target ends it with wl_data_source
+// cancelled, printed as `dnd cancelled`. The band's resize presses are unchanged.
 //
 // Behaviour that matters for a frame-perfect compositor:
 //   - A configure is acked in the same dispatch as the commit of a buffer of exactly the
@@ -61,6 +75,9 @@
 #include "xdg-shell-client-protocol.h"
 #ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
 #include "cursor-shape-v1-client-protocol.h"
+#endif
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+#include "xdg-toplevel-drag-v1-client-protocol.h"
 #endif
 
 namespace {
@@ -110,6 +127,17 @@ struct app {
 #ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     wp_cursor_shape_manager_v1* cursor_manager = nullptr;
     wp_cursor_shape_device_v1* cursor_device = nullptr;
+#endif
+
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+    // --toplevel-drag: the data device, and the source/drag pair of the running drag.
+    bool toplevel_drag_mode = false;
+    wl_data_device_manager* ddm = nullptr;
+    wl_data_device* data_device = nullptr;
+    xdg_toplevel_drag_manager_v1* drag_manager = nullptr;
+    wl_data_source* drag_source = nullptr;
+    xdg_toplevel_drag_v1* toplevel_drag = nullptr;
+    wl_data_offer* drag_offer = nullptr; // the drag's offer while this surface is its target
 #endif
 
     wl_surface* surface = nullptr;
@@ -461,6 +489,12 @@ const xdg_wm_base_listener wm_base_listener = {wm_base_ping};
 
 // ── pointer ─────────────────────────────────────────────────────────────────
 
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+// Defined with the drag-and-drop listeners below (an interior press in --toplevel-drag
+// mode starts the data-device drag instead of xdg_toplevel.move).
+void start_toplevel_drag(app& a, uint32_t serial);
+#endif
+
 void update_cursor(app& a) {
 #ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     if (!a.cursor_device || !a.pointer_inside)
@@ -548,6 +582,10 @@ void pointer_button(void* data, wl_pointer*, uint32_t serial, uint32_t, uint32_t
     if (edges != 0) {
         std::printf("-> resize edges=%u\n", edges);
         xdg_toplevel_resize(a.toplevel, a.seat, serial, edges);
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+    } else if (a.toplevel_drag_mode) {
+        start_toplevel_drag(a, serial);
+#endif
     } else {
         std::printf("-> move\n");
         xdg_toplevel_move(a.toplevel, a.seat, serial);
@@ -618,6 +656,150 @@ void seat_capabilities(void* data, wl_seat* seat, uint32_t caps) {
 void seat_name(void*, wl_seat*, const char*) {}
 const wl_seat_listener seat_listener = {seat_capabilities, seat_name};
 
+// ── drag and drop (--toplevel-drag) ─────────────────────────────────────────
+
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+
+void dnd_offer_offer(void*, wl_data_offer*, const char* mime) {
+    std::printf("dnd offer mime=%s\n", mime);
+}
+void dnd_offer_source_actions(void*, wl_data_offer*, uint32_t) {}
+void dnd_offer_action(void*, wl_data_offer*, uint32_t) {}
+const wl_data_offer_listener dnd_offer_listener = {
+    dnd_offer_offer,
+    dnd_offer_source_actions,
+    dnd_offer_action,
+};
+
+void device_data_offer(void* data, wl_data_device*, wl_data_offer* offer) {
+    wl_data_offer_add_listener(offer, &dnd_offer_listener, data);
+}
+
+// The square is never a drop target by design (it answers no offer), but it does see its
+// own drag's offers while it is the surface under the pointer.
+void device_enter(void* data, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t,
+                  wl_data_offer* offer) {
+    auto& a = *static_cast<app*>(data);
+    if (a.drag_offer && a.drag_offer != offer)
+        wl_data_offer_destroy(a.drag_offer);
+    a.drag_offer = offer;
+    std::printf("dnd enter\n");
+}
+
+void device_leave(void* data, wl_data_device*) {
+    auto& a = *static_cast<app*>(data);
+    if (a.drag_offer) {
+        wl_data_offer_destroy(a.drag_offer);
+        a.drag_offer = nullptr;
+    }
+    std::printf("dnd leave\n");
+}
+
+void device_motion(void*, wl_data_device*, uint32_t, wl_fixed_t, wl_fixed_t) {}
+void device_drop(void*, wl_data_device*) { std::printf("dnd drop\n"); }
+void device_selection(void* data, wl_data_device*, wl_data_offer* offer) {
+    auto& a = *static_cast<app*>(data);
+    if (offer && offer != a.drag_offer)
+        wl_data_offer_destroy(offer); // someone else's clipboard: not this demo's business
+}
+const wl_data_device_listener data_device_listener = {
+    device_data_offer,
+    device_enter,
+    device_leave,
+    device_motion,
+    device_drop,
+    device_selection,
+};
+
+// The data device needs both the manager and the seat, which arrive in advertisement
+// order: created when the later of the two is bound (the attach_cursor_device shape).
+void attach_data_device(app& a) {
+    if (a.ddm && a.seat && !a.data_device) {
+        a.data_device = wl_data_device_manager_get_data_device(a.ddm, a.seat);
+        wl_data_device_add_listener(a.data_device, &data_device_listener, &a);
+    }
+}
+
+// The drag ended (cancelled, or finished after a drop): the drag object may be destroyed
+// now and the source is single-use, so both go. The next press makes a fresh pair.
+void end_toplevel_drag(app& a) {
+    if (a.toplevel_drag) {
+        xdg_toplevel_drag_v1_destroy(a.toplevel_drag);
+        a.toplevel_drag = nullptr;
+    }
+    if (a.drag_source) {
+        wl_data_source_destroy(a.drag_source);
+        a.drag_source = nullptr;
+    }
+}
+
+void source_target(void*, wl_data_source*, const char* mime) {
+    std::printf("dnd target mime=%s\n", mime ? mime : "none");
+}
+
+void source_send(void*, wl_data_source*, const char* mime, int32_t fd) {
+    constexpr char payload[] = "lumen-square\n";
+    (void)!write(fd, payload, sizeof payload - 1);
+    close(fd);
+    std::printf("dnd send mime=%s\n", mime);
+}
+
+void source_cancelled(void* data, wl_data_source*) {
+    auto& a = *static_cast<app*>(data);
+    std::printf("dnd cancelled\n");
+    end_toplevel_drag(a);
+}
+
+void source_drop_performed(void*, wl_data_source*) { std::printf("dnd drop performed\n"); }
+
+void source_finished(void* data, wl_data_source*) {
+    auto& a = *static_cast<app*>(data);
+    std::printf("dnd finished\n");
+    end_toplevel_drag(a);
+}
+
+void source_action(void*, wl_data_source*, uint32_t action) {
+    std::printf("dnd action=%u\n", action);
+}
+
+const wl_data_source_listener source_listener = {
+    source_target,
+    source_send,
+    source_cancelled,
+    source_drop_performed,
+    source_finished,
+    source_action,
+};
+
+// An interior press in --toplevel-drag mode: the press's own serial starts a drag-and-drop
+// whose source carries an xdg_toplevel_drag_v1, and this window's toplevel is attached to
+// it with the pointer's surface-local position as the offset — the detachable-window
+// protocol's workflow for dragging an existing window. The compositor moves the window
+// with the pointer until the drag ends; the button's release reaches no client, so the
+// end is read from the source's events (dnd cancelled / dnd drop performed + dnd finished).
+void start_toplevel_drag(app& a, uint32_t serial) {
+    std::printf("-> toplevel-drag\n");
+    if (!a.ddm || !a.data_device || !a.drag_manager || !a.seat) {
+        std::fprintf(stderr, "lumen-square: no wl_data_device_manager, wl_seat or "
+                             "xdg_toplevel_drag_manager_v1 — the drag cannot start\n");
+        return;
+    }
+    end_toplevel_drag(a); // a leftover pair of a drag whose end event never arrived
+    a.drag_source = wl_data_device_manager_create_data_source(a.ddm);
+    wl_data_source_add_listener(a.drag_source, &source_listener, &a);
+    wl_data_source_offer(a.drag_source, "text/plain");
+    a.toplevel_drag = xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(a.drag_manager,
+                                                                         a.drag_source);
+    // Attach before start_drag, the workflow the protocol spells out for dragging an
+    // existing window (XML: "attaches the existing toplevel before starting the drag").
+    xdg_toplevel_drag_v1_attach(a.toplevel_drag, a.toplevel,
+                                static_cast<int32_t>(a.pointer_x),
+                                static_cast<int32_t>(a.pointer_y));
+    wl_data_device_start_drag(a.data_device, a.drag_source, a.surface, nullptr, serial);
+}
+
+#endif // LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+
 // ── registry ────────────────────────────────────────────────────────────────
 
 void registry_global(void* data, wl_registry* registry, uint32_t name, const char* interface,
@@ -639,6 +821,19 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
         a.seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, name, &wl_seat_interface, std::min(version, 5u)));
         wl_seat_add_listener(a.seat, &seat_listener, &a);
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+        attach_data_device(a);
+    } else if (a.toplevel_drag_mode &&
+               std::strcmp(interface, wl_data_device_manager_interface.name) == 0 && !a.ddm) {
+        // Version 3: wl_data_source.set_actions and the dnd events of this demo need it.
+        a.ddm = static_cast<wl_data_device_manager*>(
+            wl_registry_bind(registry, name, &wl_data_device_manager_interface, std::min(version, 3u)));
+        attach_data_device(a);
+    } else if (a.toplevel_drag_mode &&
+               std::strcmp(interface, xdg_toplevel_drag_manager_v1_interface.name) == 0) {
+        a.drag_manager = static_cast<xdg_toplevel_drag_manager_v1*>(
+            wl_registry_bind(registry, name, &xdg_toplevel_drag_manager_v1_interface, 1));
+#endif
 #ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     } else if (std::strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         a.cursor_manager = static_cast<wp_cursor_shape_manager_v1*>(
@@ -665,6 +860,26 @@ void destroy_app(app& a) {
     for (auto& s : a.slots)
         destroy_slot(s);
     release_pointer(a);
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+    // The drag's pair before the devices: a source destroyed mid-drag ends it (the
+    // compositor detaches the window), which makes the drag object's destructor legal.
+    if (a.drag_offer)
+        wl_data_offer_destroy(a.drag_offer);
+    if (a.drag_source)
+        wl_data_source_destroy(a.drag_source);
+    if (a.toplevel_drag)
+        xdg_toplevel_drag_v1_destroy(a.toplevel_drag);
+    if (a.data_device) {
+        if (wl_data_device_get_version(a.data_device) >= WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+            wl_data_device_release(a.data_device);
+        else
+            wl_data_device_destroy(a.data_device);
+    }
+    if (a.drag_manager)
+        xdg_toplevel_drag_manager_v1_destroy(a.drag_manager);
+    if (a.ddm)
+        wl_data_device_manager_destroy(a.ddm);
+#endif
 #ifdef LUMEN_SQUARE_HAS_CURSOR_SHAPE
     if (a.cursor_manager)
         wp_cursor_shape_manager_v1_destroy(a.cursor_manager);
@@ -712,6 +927,7 @@ int main(int argc, char* argv[]) {
     bool sub = false;
     bool sub_desync = false;
     bool destroy_parent_first = false;
+    bool toplevel_drag = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             duration = std::atof(argv[++i]);
@@ -722,9 +938,17 @@ int main(int argc, char* argv[]) {
             sub_desync = true;
         } else if (std::strcmp(argv[i], "--destroy-parent-first") == 0) {
             destroy_parent_first = true;
+        } else if (std::strcmp(argv[i], "--toplevel-drag") == 0) {
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+            toplevel_drag = true;
+#else
+            std::fprintf(stderr, "lumen-square: --toplevel-drag needs the xdg-toplevel-drag-v1 "
+                                 "glue (protocols/upstream was missing at build time)\n");
+            return 2;
+#endif
         } else {
             std::fprintf(stderr, "usage: lumen-square [-t seconds] [--sub | --sub-desync] "
-                                 "[--destroy-parent-first]\n");
+                                 "[--destroy-parent-first] [--toplevel-drag]\n");
             return 2;
         }
     }
@@ -752,6 +976,9 @@ int main(int argc, char* argv[]) {
     a.sub_enabled = sub;
     a.sub_desync = sub_desync;
     a.destroy_parent_first = destroy_parent_first;
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+    a.toplevel_drag_mode = toplevel_drag;
+#endif
     a.display = wl_display_connect(nullptr);
     if (!a.display) {
         std::fprintf(stderr, "lumen-square: cannot connect to a Wayland display\n");
@@ -769,6 +996,14 @@ int main(int argc, char* argv[]) {
     }
     if (!a.seat)
         std::fprintf(stderr, "lumen-square: no wl_seat — the window cannot be dragged\n");
+#ifdef LUMEN_SQUARE_HAS_TOPLEVEL_DRAG
+    if (a.toplevel_drag_mode && (!a.ddm || !a.data_device || !a.drag_manager)) {
+        std::fprintf(stderr, "lumen-square: --toplevel-drag needs wl_data_device_manager, "
+                             "wl_seat and xdg_toplevel_drag_manager_v1\n");
+        destroy_app(a);
+        return 1;
+    }
+#endif
 
     a.surface = wl_compositor_create_surface(a.compositor);
     if (a.sub_enabled) {

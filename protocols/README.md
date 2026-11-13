@@ -82,6 +82,11 @@ composite backend draws it (GL ES 3, Vulkan) and none on the CPU path. color-man
 (wp_color_manager_v1 version 3, rendering-performance.md "Colour management") offers
 parametric image descriptions where the backend draws them (Vulkan, GL with highp, CPU) and
 the outputs' SDR sRGB description always; ICC and Windows-scRGB are not offered.
+xdg-toplevel-drag-v1 (staging) is served like xdg-dialog — a per-window feature, an
+unprivileged global every client may bind: a `wl_data_source`'s drag moves the toplevel
+attached to its `xdg_toplevel_drag_v1` with the pointer (KWin and Hyprland semantics — a
+plain move, no snap zones), the attached window is no drag target, and the move ends with
+the drag.
 
 Sources: `[upstream]` (wayland, wayland-protocols at `wayland_protocols_tag`), `[wlr]`
 (wlr-protocols), and `[wlroots]` — wlroots' own `protocol/` directory at a release tag
