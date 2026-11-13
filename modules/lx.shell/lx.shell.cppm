@@ -2879,8 +2879,11 @@ void lx::shell::shell_app::teardown() {
     if (cursor_shape_)
         wp_cursor_shape_manager_v1_destroy(static_cast<wp_cursor_shape_manager_v1*>(cursor_shape_));
 #ifdef LUMEN_SHELL_BACKGROUND_EFFECT
-    // The panels' effect objects stay valid without it (they go with the panels).
-    if (background_effect_)
+    // The panels' effect objects stay valid without it (they go with the panels). The
+    // manager rides `client_`'s connection: when client_.connect() failed after the
+    // manager was bound (a roundtrip error mid-connect), its failure path already
+    // disconnected — the proxy went with the display and must not be destroyed again.
+    if (background_effect_ && client_.connected())
         ext_background_effect_manager_v1_destroy(
             static_cast<ext_background_effect_manager_v1*>(background_effect_));
     background_effect_ = nullptr;
