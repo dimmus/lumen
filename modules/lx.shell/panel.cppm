@@ -454,10 +454,10 @@ public:
     /// Keyboard interactivity on_demand while one of its menus is open (the menu's grab
     /// then takes the keyboard), none otherwise. Committed at once.
     void set_menu_keyboard(bool on);
-    /// The manager (`ext_background_effect_manager_v1`) the panel is to be translucent
-    /// over, or null for opaque. Read at `create` (the surface's buffers are picked there):
-    /// a later change takes effect when the panel is created again. Logs once.
-    void set_blur(void* manager);
+    /// Whether the panel is translucent over a blur of what is behind it: the buffers and
+    /// the blur effect were picked for that at `create` — a change is a create again (the
+    /// shell re-creates its panels when the config's `[panel] blur` flips).
+    [[nodiscard]] bool blurred() const { return blurred_; }
     /// The compositor closed the layer surface (its output went away) or the surface
     /// failed: the shell should exit and be restarted.
     [[nodiscard]] bool closed() const { return closed_; }
@@ -1951,17 +1951,6 @@ void lx::shell::panel::set_menu_keyboard(bool on) {
         return;
     surface_.commit_state();
 }
-
-void lx::shell::panel::set_blur(void* manager) {
-    if (manager == g_.background_effect)
-        return;
-    g_.background_effect = manager;
-    // The buffers were picked at create; a change takes effect when the panel is created
-    // again. Logged once so a config reload is not silent about it.
-    if (surface_.valid())
-        log_panel.warn("panel blur changed after create: it applies to the next panel");
-}
-
 
 lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge,
                                           unsigned output_slot) {

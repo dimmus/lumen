@@ -196,6 +196,16 @@ public:
                                         std::uint32_t serial, bool entered) override;
         void on_unrouted_key(lx::wayland::seat& s, const lx::wayland::key_event& e) override;
     };
+    /// The views' connection's globals the shell binds itself: the panels' background-effect
+    /// manager, on the very connection the panel surfaces live on — `get_background_effect`
+    /// names one of those surfaces, and an object id resolves only on the connection that
+    /// owns it (a manager bound on the raw connection would marshal a foreign id and kill
+    /// that connection with `unknown object`).
+    struct client_globals final : lx::wayland::global_handler {
+        shell_app* app = nullptr;
+        void on_global(lx::wayland::display& d, std::uint32_t name, const char* interface,
+                       std::uint32_t version) override;
+    };
 
 private:
     friend struct events;
@@ -306,6 +316,8 @@ private:
     /// The output's first done (or the setup, for outputs bound before it): its panel and
     /// its power control.
     void output_ready(output_record& o);
+    /// The output's panel, made at `output_ready` and again when the panel blur changes.
+    void create_panel(output_record& o);
     /// The output's global went: its panel and objects go.
     void remove_output(unsigned name);
     void destroy_output(output_record& o);
@@ -514,7 +526,9 @@ private:
     void* viewporter_ = nullptr;   // wp_viewporter*
     void* fractional_ = nullptr;   // wp_fractional_scale_manager_v1*
     void* single_pixel_ = nullptr; // wp_single_pixel_buffer_manager_v1*
-    /// ext_background_effect_manager_v1* and whether it offers blur (its capabilities).
+    /// ext_background_effect_manager_v1* — bound on the views' connection (`client_`):
+    /// `get_background_effect` names a panel surface, and an object id resolves only on the
+    /// connection that owns it — and whether it offers blur (its capabilities).
     void* background_effect_ = nullptr;
     bool blur_offered_ = false;
     /// config.toml `[panel] blur`: the panels translucent over a blur, where offered.
@@ -523,12 +537,11 @@ private:
     [[nodiscard]] void* panel_blur_manager() const {
         return panel_blur_ && blur_offered_ ? background_effect_ : nullptr;
     }
-    /// Every panel as `panel_blur_manager` says (the key or the capability changed).
-    void update_panel_blur() {
-        for (auto& o : outputs_)
-            if (o->bar)
-                o->bar->set_blur(panel_blur_manager());
-    }
+    /// Every panel as `panel_blur_manager` says (the key or the capability changed). The
+    /// opaque/translucent buffer choice and the blur effect are made at `panel::create`,
+    /// so a change makes the panels again; one that says the same leaves them alone (a
+    /// repeat capabilities event, a config reload that keeps blur).
+    void rebuild_panels();
     /// Written by a finished background render (`background::after_dispatch` then).
     int bg_notify_fd_ = -1;
     void* idle_notifier_ = nullptr;      // ext_idle_notifier_v1*
@@ -556,6 +569,7 @@ private:
     double axis_accum_ = 0.0;
     unsigned last_key_serial_ = 0;
     view_input view_input_{};
+    client_globals client_globals_{};
     /// When the switcher's hold began (its open delay is measured from here).
     long long switcher_hold_ns_ = 0;
     pending_token tokens_[k_max_tokens]{};
@@ -1141,25 +1155,6 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         a.viewporter_ = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
     } else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         a.fractional_ = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
-#ifdef LUMEN_SHELL_BACKGROUND_EFFECT
-    } else if (std::strcmp(iface, ext_background_effect_manager_v1_interface.name) == 0) {
-        // The panels' blur (`[panel] blur`); what it offers comes with the bind.
-        a.background_effect_ =
-            wl_registry_bind(reg, name, &ext_background_effect_manager_v1_interface, 1);
-        static const ext_background_effect_manager_v1_listener k_effect_listener = {
-            .capabilities = [](void* data, ext_background_effect_manager_v1*, uint32_t flags) {
-                // May come after the configuration: the panels follow it either way.
-                auto& app = *static_cast<shell_app*>(data);
-                app.blur_offered_ = (flags & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR) != 0;
-                if (app.panel_blur_ && !app.blur_offered_)
-                    log_config.info("panel.blur: the compositor offers no blur here; the "
-                                    "panel stays opaque");
-                app.update_panel_blur();
-            }};
-        ext_background_effect_manager_v1_add_listener(
-            static_cast<ext_background_effect_manager_v1*>(a.background_effect_),
-            &k_effect_listener, &a);
-#endif
 #ifdef LUMEN_SHELL_SINGLE_PIXEL
     } else if (std::strcmp(iface, wp_single_pixel_buffer_manager_v1_interface.name) == 0) {
         // A colour background is one pixel the viewport stretches: nothing to render or hold.
@@ -1174,6 +1169,38 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         a.power_manager_ = wl_registry_bind(reg, name, &zwlr_output_power_manager_v1_interface, 1);
 #endif
     }
+}
+
+void lx::shell::shell_app::client_globals::on_global(lx::wayland::display& d,
+                                                     std::uint32_t name, const char* iface,
+                                                     std::uint32_t version) {
+#ifdef LUMEN_SHELL_BACKGROUND_EFFECT
+    if (std::strcmp(iface, ext_background_effect_manager_v1_interface.name) != 0 ||
+        app->background_effect_)
+        return;
+    // The panels' blur (`[panel] blur`); what it offers comes with the bind. The manager
+    // rides the views' connection — the one the panel surfaces belong to.
+    auto* manager = static_cast<ext_background_effect_manager_v1*>(
+        wl_registry_bind(static_cast<wl_registry*>(d.native_registry()), name,
+                         &ext_background_effect_manager_v1_interface, min_version(version, 1)));
+    static const ext_background_effect_manager_v1_listener k_effect_listener = {
+        .capabilities = [](void* data, ext_background_effect_manager_v1*, uint32_t flags) {
+            // May come after the configuration: the panels follow it either way.
+            auto& app = *static_cast<shell_app*>(data);
+            app.blur_offered_ = (flags & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR) != 0;
+            if (app.panel_blur_ && !app.blur_offered_)
+                log_config.info("panel.blur: the compositor offers no blur here; the "
+                                "panel stays opaque");
+            app.rebuild_panels();
+        }};
+    app->background_effect_ = manager;
+    ext_background_effect_manager_v1_add_listener(manager, &k_effect_listener, app);
+#else
+    (void)d;
+    (void)name;
+    (void)iface;
+    (void)version;
+#endif
 }
 
 void lx::shell::shell_app::events::seat_caps(void* data, wl_seat* seat, uint32_t caps) {
@@ -1440,6 +1467,12 @@ void lx::shell::shell_app::output_ready(output_record& o) {
     }
     if (!panels_enabled_ || o.bar)
         return;
+    create_panel(o);
+}
+
+/// The output's panel: made at its output's first done, and made again when the panel
+/// blur changes (the buffers and the blur effect are picked at create).
+void lx::shell::shell_app::create_panel(output_record& o) {
     o.bar = std::make_unique<panel>();
     o.bar->set_apps(true, launcher_.is_open());
     o.bar->set_action_handler(
@@ -1509,6 +1542,29 @@ void lx::shell::shell_app::output_ready(output_record& o) {
         attach_widgets(o);
     outputs_moved();
 }
+
+void lx::shell::shell_app::rebuild_panels() {
+    const bool blur = panel_blur_manager() != nullptr;
+    // The popups parented to a panel go with it (the calendar, a tray menu, a tooltip);
+    // a press on the going panel is no press.
+    close_calendar();
+    menu_.close();
+    tooltip_.close();
+    for (auto& o : outputs_) {
+        if (!o->bar || o->bar->blurred() == blur)
+            continue;
+        if (o->bar.get() == pointer_panel_) {
+            pointer_panel_ = nullptr;
+            pointer_target_ = pointer_target::none;
+        }
+        if (pending_menu_output_ == o->name)
+            pending_menu_key_ = 0;
+        o->bar->destroy();
+        o->bar.reset();
+        create_panel(*o);
+    }
+}
+
 lx::shell::panel_clock lx::shell::shell_app::clock_state() {
     panel_clock c{};
     std::snprintf(c.text, sizeof(c.text), "%s", clock_text_);
@@ -2411,7 +2467,11 @@ int lx::shell::shell_app::run() {
     }
     display_ = d;
     // The views (launcher, panels, background, switcher, bell) draw through their own
-    // lx.wayland.client connection; the raw one keeps zlm_shell_v1 and the seat.
+    // lx.wayland.client connection; the raw one keeps zlm_shell_v1 and the seat. The
+    // handler set before the connect hears its globals as they are announced (the
+    // panels' background-effect manager is bound there, on the panels' own connection).
+    client_globals_.app = this;
+    client_.set_global_handler(&client_globals_);
     if (auto connected = client_.connect({.name = config_.display}); !connected) {
         log_shell.error(connected.get_error());
         close(sfd);
@@ -2995,7 +3055,7 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
     // ── panel ──
     if (c.panel.blur != panel_blur_) {
         panel_blur_ = c.panel.blur;
-        update_panel_blur();
+        rebuild_panels();
     }
     // ── [ui]: the interface look, live for the shell ──
     // Reload even an unchanged custom path: its compiled bytes may have changed.

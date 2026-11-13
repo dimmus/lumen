@@ -42,6 +42,10 @@
 #include "xdg-system-bell-v1-client-protocol.h"
 #define LUMEN_TEST_V6 1
 #endif
+#ifdef LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1
+#include "ext-background-effect-v1-client-protocol.h"
+#define LUMEN_TEST_BACKGROUND_EFFECT 1
+#endif
 #endif
 #include <stdint.h>
 #include <stddef.h>
@@ -350,6 +354,119 @@ int main() {
     check(drawn.count == 2 && (drawn.cells[1].flags & lx::shell::cell_focused) &&
               !(drawn.cells[0].flags & lx::shell::cell_focused),
           "the focused entry is highlighted");
+
+#ifdef LUMEN_TEST_BACKGROUND_EFFECT
+    // ── [panel] blur: the effect manager rides the connection the panel surfaces do ──
+    // The shell binds ext_background_effect_manager_v1 on its views' connection (its
+    // global handler there), because get_background_effect names that connection's
+    // surface: a manager bound on another connection marshals a foreign object id, and
+    // the server kills that connection for it — the shell's crash loop at session start
+    // with blur on. A live blur toggle is a destroy + create of the panel: the buffers
+    // and the blur effect are picked at create.
+    {
+        static unsigned effect_caps = 0;
+        static bool effect_caps_seen = false;
+        struct effect_globals final : lx::wayland::global_handler {
+            void* manager = nullptr; // ext_background_effect_manager_v1*
+            void on_global(lx::wayland::display& d, std::uint32_t name, const char* iface,
+                           std::uint32_t version) override {
+                if (std::strcmp(iface, ext_background_effect_manager_v1_interface.name) != 0 ||
+                    manager)
+                    return;
+                manager = wl_registry_bind(static_cast<wl_registry*>(d.native_registry()), name,
+                                           &ext_background_effect_manager_v1_interface,
+                                           version ? 1u : version);
+                static const ext_background_effect_manager_v1_listener caps = {
+                    .capabilities = [](void*, ext_background_effect_manager_v1*, uint32_t f) {
+                        effect_caps = f;
+                        effect_caps_seen = true;
+                    }};
+                ext_background_effect_manager_v1_add_listener(
+                    static_cast<ext_background_effect_manager_v1*>(manager), &caps, nullptr);
+            }
+        };
+        static lx::wayland::display blur_display;
+        static effect_globals effects;
+        blur_display.set_global_handler(&effects);
+        check(static_cast<bool>(blur_display.connect({.name = k_socket, .track_outputs = false})),
+              "blur: the views' connection connects, its globals heard as announced");
+        check(effects.manager && effect_caps_seen,
+              "blur: the effect manager binds on the views' connection; capabilities "
+              "arrive with the bind");
+        std::printf("      (effect capabilities: 0x%x)\n", effect_caps);
+        static lx::runtime::event_loop blur_loop;
+        static lx::ui::host::context blur_host;
+        check(static_cast<bool>(blur_host.start(blur_display, blur_loop,
+                                                {.watch_theme = 0, .async_icons = false})),
+              "blur: a ui host context starts on that connection");
+
+        static lx::shell::panel blur_panel;
+        check(static_cast<bool>(blur_panel.create({.ui = &blur_host}, bridge, ~0u)),
+              "blur: a panel creates opaque (no manager)");
+        (void)blur_display.roundtrip();
+        blur_panel.after_dispatch();
+        (void)blur_display.roundtrip();
+        check(!blur_panel.blurred() && blur_panel.committed().width > 0,
+              "blur: the opaque panel commits its row");
+
+        // The crash mechanism, kept as the negative: the same request through a manager
+        // bound on ANOTHER connection carries this surface's id where it does not
+        // resolve — the server ends that connection (unknown object / invalid
+        // arguments), which is what killed the shell six times per session start.
+        {
+            wl_display* foreign = wl_display_connect(k_socket);
+            check(foreign != nullptr, "blur: another connection connects");
+            struct found_effect {
+                uint32_t name = 0;
+            } fe{};
+            static const wl_registry_listener find_effect = {
+                [](void* d, wl_registry*, uint32_t name, const char* i, uint32_t) {
+                    if (std::strcmp(i, ext_background_effect_manager_v1_interface.name) == 0)
+                        static_cast<found_effect*>(d)->name = name;
+                },
+                [](void*, wl_registry*, uint32_t) {}};
+            wl_registry* fr = wl_display_get_registry(foreign);
+            wl_registry_add_listener(fr, &find_effect, &fe);
+            (void)wl_display_roundtrip(foreign);
+            check(fe.name != 0, "blur: the other connection finds the manager global");
+            auto* mgr = static_cast<ext_background_effect_manager_v1*>(
+                wl_registry_bind(fr, fe.name, &ext_background_effect_manager_v1_interface, 1));
+            (void)ext_background_effect_manager_v1_get_background_effect(
+                mgr, static_cast<wl_surface*>(blur_panel.surface()));
+            (void)wl_display_roundtrip(foreign);
+            check(wl_display_get_error(foreign) != 0,
+                  "blur: a manager on another connection cannot name this surface — its "
+                  "connection is killed (the crash loop's marshal)");
+            wl_display_disconnect(foreign);
+        }
+
+        // The live toggle at the panel level, both ways: destroy + create picks the
+        // buffers (and the effect) again; the connection stays healthy.
+        blur_panel.destroy();
+        check(static_cast<bool>(blur_panel.create({.ui = &blur_host,
+                                                   .background_effect = effects.manager},
+                                                  bridge, ~0u)),
+              "blur: the panel re-creates translucent over a blur (the manager of its own "
+              "connection)");
+        (void)blur_display.roundtrip();
+        blur_panel.after_dispatch();
+        (void)blur_display.roundtrip();
+        check(blur_panel.blurred() && !blur_display.failed() &&
+                  blur_panel.committed().width > 0 &&
+                  blur_panel.committed().height == lx::shell::k_panel_height,
+              "blur: the blurred panel commits its row, the connection healthy");
+        blur_panel.destroy();
+        check(static_cast<bool>(blur_panel.create({.ui = &blur_host}, bridge, ~0u)),
+              "blur: the panel re-creates opaque again (the toggle's other way)");
+        (void)blur_display.roundtrip();
+        blur_panel.after_dispatch();
+        (void)blur_display.roundtrip();
+        check(!blur_panel.blurred() && !blur_display.failed() &&
+                  blur_panel.committed().width > 0,
+              "blur: the opaque panel commits its row again");
+        blur_panel.destroy();
+    }
+#endif
 
     // Deltas.
     xdg_toplevel_set_title(one.toplevel, "one renamed");
