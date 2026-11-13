@@ -11,6 +11,13 @@ whenToUse: A non-trivial Lumen change or multi-task request that must go through
   bounded task → lumen-gated-change instead; cross-compositor benchmarking →
   lumen-compositor-bench.
 args:
+  app_smoke_min:
+    type: number
+    description: "Host-calibrated app-smoke floor: when set >0, exit 1 with at least
+      this many PASS rows counts as host noise, not a failure (notebook ≈140 —
+      its ~36 VM-geometry rows fail regardless of the change). 0 = the exit code
+      decides."
+    default: 0
   base:
     type: string
     description: Git ref (commit/branch) each task worktree is cut from
@@ -19,31 +26,17 @@ args:
     type: string
     description: Branch prefix; each task gets <prefix>/<task-id> (must not already exist)
     default: zcode/task
+  known_red:
+    type: json
+    description: 'Test names tolerated in a red baseline (json array, e.g.
+      ["ui_gallery","test_task_model"]): tasks proceed and every suite gate then
+      requires no NEW failures beyond this set. Failures outside the set park
+      the run on an owner decision (proceed-and-tolerate vs skip).'
+    default: "[]"
   max_tasks:
     type: number
     description: Cap on planned tasks executed by one run (rest are reported as not covered)
     default: 5
-  known_red:
-    type: json
-    description: "Test names tolerated in a red baseline (json array, e.g.
-      [\"ui_gallery\",\"test_task_model\"]): tasks proceed and every suite gate then
-      requires no NEW failures beyond this set. Failures outside the set park the run
-      on an owner decision (proceed-and-tolerate vs skip)."
-    default: []
-  smoke_env:
-    type: json
-    description: "Extra KEY=VALUE env for the seat smokes (json array of strings). Host
-      recipe — vmware VM: [] (defaults are right); iritur notebook:
-      [\"LUMEN_SMOKE_SCALE=1\",\"LUMEN_INJECT_POINTER=/dev/input/eventN\",
-      \"LUMEN_INJECT_RELATIVE=/dev/input/eventN\",\"LUMEN_INJECT_KEYBOARD=/dev/input/event3\"]
-      where eventN is the virtual ABS mouse held open by scripts/uinput-mouse.py."
-    default: []
-  app_smoke_min:
-    type: number
-    description: "Host-calibrated app-smoke floor: when set >0, exit 1 with at least this
-      many PASS rows counts as host noise, not a failure (notebook ≈140 — its ~36
-      VM-geometry rows fail regardless of the change). 0 = the exit code decides."
-    default: 0
   run_bench:
     type: boolean
     description: Also run scripts/ui-bench.sh (engine bench against the stored
@@ -55,6 +48,14 @@ args:
       task's verification (needs a quiet host: one DRM master, no other
       session)"
     default: true
+  smoke_env:
+    type: json
+    description: 'Extra KEY=VALUE env for the seat smokes (json array of strings).
+      Host recipe — vmware VM: [] (defaults are right); iritur notebook:
+      ["LUMEN_SMOKE_SCALE=1","LUMEN_INJECT_POINTER=/dev/input/eventN","LUMEN_INJECT_RELATIVE=/dev/input/eventN","LUMEN_INJECT_KEYBOARD=/dev/input/event3"]
+      where eventN is the virtual ABS mouse held open by
+      scripts/uinput-mouse.py.'
+    default: "[]"
   task:
     type: string
     description: "The request to deliver: what you would tell the studio (feature,
@@ -233,15 +234,22 @@ const reviewerPersona =
   "logging conventions, hot-path rules (no heap churn, no info+ logs per frame), minimal diff, and " +
   "the no-degradation rule: unasked-for surface and evidence-free performance claims are findings; " +
   "missing tests for new functionality is a finding. You are read-only: do not edit any file. " +
-  "Cite path:line and quote the lines you read. Report only real findings — an empty list must mean " +
-  "you found nothing, not that you looked nowhere.";
+  "Cite path:line and quote the lines you read. Every finding must carry a minimal reading list — " +
+  "exact path:line ranges and, where a command shows it, that one command — the confirmer works " +
+  "from that list alone and must not need to re-derive the change. Report only real findings — an " +
+  "empty list must mean you found nothing, not that you looked nowhere.";
 
 const confirmerPersona =
   "You are an independent verifier in Lumen's development studio. You are given one review finding " +
-  "and must decide, from the evidence alone and by reading the worktree's code yourself, whether it " +
-  "is real. Reproduce it from the cited lines; check surrounding context the reviewer may have " +
-  "missed; run a narrow check only if a command decides it. You are read-only: do not edit any file. " +
-  "If the evidence does not hold up, say so — a false finding must not survive this stage.";
+  "and must decide, from its cited evidence and your own reading of those exact lines in the worktree, " +
+  "whether it is real. You are a bounded auditor, not a second reviewer: open the cited path:line first " +
+  "and confirm from those lines and their immediate context; allow yourself at most ONE targeted " +
+  "follow-up (the diff command you are given, or one adjacent file) when the cited lines alone cannot " +
+  "decide. Never re-derive the whole change, re-read unrelated modules, or search the web — the " +
+  "reviewer already did that work, and the ask tells you which files changed. If your budget cannot " +
+  "decide it, return holds=false with reason=\"inconclusive from cited evidence\" and name the one read " +
+  "that would decide it — an honest inconclusive beats a grind. You are read-only: do not edit any " +
+  "file. If the evidence does not hold up, say so — a false finding must not survive this stage.";
 
 const fixerPersona =
   "You fix build failures, test failures and confirmed review findings in ONE assigned Lumen git " +
@@ -261,7 +269,10 @@ const gatekeeperPersona =
   "tests-enabled suite counts (a plain release build has NO unit tests — a suite claim from it is " +
   "invalid), seat-smoke results for compositor/display/input surface, A/B numbers for perf changes, " +
   "tests covering new functionality. Missing required evidence is a hold, not a pass; environmental " +
-  "unavailability never converts to success. Decide exactly one: READY (acceptance met, evidence " +
+  "unavailability never converts to success. You audit the packet with targeted reads and commands " +
+  "(the cited files, the suite counts, the smoke logs) — you do not re-review the whole change; when " +
+  "something would need that, say so in your reasons instead of performing it. Decide exactly one: " +
+  "READY (acceptance met, evidence " +
   "independent and complete, nothing regressed) / NOT_READY (a gate is confirmed violated) / " +
   "BLOCKED (evidence missing, invalid or not comparable). READY certifies the gate only — never " +
   "permission to merge, publish or push.";
@@ -500,7 +511,7 @@ for (const card of tasks) {
   log(`Task ${card.id}: implemented, ${impl.commits.length} commit(s)`);
 
   phase("Build and test the change");
-  const fixer = agent(`Fixer ${card.id}`, { system: fixerPersona });
+  const fixer = agent(`Fixer ${card.id}`, { system: fixerPersona, budget: { webSearch: 0 } });
   let gateGreen = false;
   let gateRounds = 0;
   for (let round = 1; round <= 3 && !gateGreen; round++) {
@@ -543,7 +554,7 @@ for (const card of tasks) {
 
   phase("Independent review of the diff");
   report({ id: card.id, title: card.title, branch, state: "review", verdict: "" }, "tasks");
-  const reviewer = agent(`Reviewer ${card.id}`, { system: reviewerPersona });
+  const reviewer = agent(`Reviewer ${card.id}`, { system: reviewerPersona, budget: { webSearch: 0 } });
   const review = await reviewer.ask<Review>(
     `Review the committed change on branch ${branch} in the worktree ${wt} — the diff is ` +
       `\`git -C ${wt} diff ${effBase}..HEAD\` (plus anything untracked). Task card:\n${JSON.stringify(card, null, 2)}\n\n` +
@@ -559,8 +570,23 @@ for (const card of tasks) {
   }
   const confirmations = await Promise.all(
     capped.map((f, i) =>
-      agent(`Confirmer ${card.id} ${i + 1}`, { system: confirmerPersona })
-        .ask<Confirmation>(`Decide whether this finding is real, from the evidence alone, in the worktree ${wt}:\n${JSON.stringify(f)}`),
+      // Low-severity findings (doc/style level) confirm on the cheap model; the evidence
+      // still decides. Repo-only stage: zero web budget, no search wandering.
+      agent(
+        `Confirmer ${card.id} ${i + 1}`,
+        f.severity === "low"
+          ? { system: confirmerPersona, model: "GLM-5.3-Flash", budget: { webSearch: 0 } }
+          : { system: confirmerPersona, budget: { webSearch: 0 } },
+      ).ask<Confirmation>(
+        `Decide whether this finding is real — from its cited evidence, by reading those exact lines.\n\n` +
+          `Change under review: "${card.title}" on branch ${branch} (diff base ${effBase}). Changed files:\n` +
+          `${impl.changedFiles.length > 0 ? impl.changedFiles.join("\n") : "(see git log)"}\n\n` +
+          `Finding:\n${JSON.stringify(f, null, 2)}\n\n` +
+          `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
+          `(e.g. \`git -C ${wt} diff ${effBase}..HEAD -- <the cited path>\`); do not re-derive the change. ` +
+          `If that budget cannot decide it, return holds=false with reason "inconclusive from cited evidence" ` +
+          `and the one read that would decide it. Report exactly what you read.`,
+      ),
     ),
   );
   const confirmed: Finding[] = [];
@@ -570,7 +596,7 @@ for (const card of tasks) {
     if (c !== undefined && c.holds) confirmed.push(f);
     else refuted.push(f);
     report(
-      { ...f, status: c !== undefined && c.holds ? "verified" : "unconfirmed", task: card.id },
+      { ...f, status: c !== undefined && c.holds ? "verified" : "unconfirmed", task: card.id, note: c !== undefined ? c.reason : "no confirmation returned" },
     );
   });
 
@@ -739,7 +765,7 @@ for (const card of tasks) {
     },
     seat_failed: seatFailed,
   };
-  const gate = await agent(`Gatekeeper ${card.id}`, { system: gatekeeperPersona }).ask<GateVerdict>(
+  const gate = await agent(`Gatekeeper ${card.id}`, { system: gatekeeperPersona, budget: { webSearch: 0 } }).ask<GateVerdict>(
     `Gate this finished Lumen task. Verify the packet against the worktree at ${wt} yourself ` +
       `(read the diff, the tests, the suite definition) before deciding.\n\n${JSON.stringify(packet, null, 2)}`,
   );
@@ -759,7 +785,7 @@ for (const card of tasks) {
   log(`Task ${card.id}: gate ${gate.verdict}`);
 
   phase("Write the memory record and the PR text");
-  const memory = await agent(`Memory writer ${card.id}`, { system: memoryPersona, model: "GLM-5.3-Flash" }).ask<MemoryRecord>(
+  const memory = await agent(`Memory writer ${card.id}`, { system: memoryPersona, model: "GLM-5.3-Flash", budget: { webSearch: 0 } }).ask<MemoryRecord>(
     `Write the memory record for this finished Lumen task (main checkout ${MAIN_WS}; the worktree at ${wt} ` +
       `holds the evidence — cite its commits). Record what was built, the decisions and their reasons, the ` +
       `measured/tested evidence, any fuckups and their fixes, and host findings. Packet:\n${JSON.stringify(packet, null, 2)}\n` +

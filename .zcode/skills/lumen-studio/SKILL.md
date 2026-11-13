@@ -65,3 +65,14 @@ ad-hoc multi-agent chats. Pass paths, not file contents, across agent boundaries
 runs with `AmendWorkflow` + `path` edits, never full re-submissions. Reuse the
 `lumen-decisions`/`lumen-build-run` skills instead of re-deriving their facts. Don't spawn
 a confirmer on a finding a command already decided.
+
+**Bounded auditors** (learned from the xdg-toplevel-drag run, where one bare-ask
+confirmation of a heavy finding cost 3.9M tokens — the subagent bootstrapped its whole
+context from zero, overflowed, and re-read after compaction): confirmers and gatekeepers
+verify *cited evidence*, they never re-derive the change. The workflow guarantees this by
+construction — the reviewer must emit a reading list (path:line + the one command) per
+finding, the confirmer's ask carries the changed-file list and the exact diff command,
+follow-ups are capped at one, an honest `inconclusive` return beats a grind, and repo-only
+stages (confirmer/reviewer/fixer/gatekeeper/memory) run with zero web-search budget;
+low-severity findings confirm on GLM-5.3-Flash. Keep these properties when editing the
+workflows.

@@ -5,11 +5,11 @@ description: "The gated change workflow for Lumen: baseline build+ctest on the
   findings, then the final full-suite gate (optionally drag-smoke/app-smoke and
   ui-bench). Ports the multi-agent pattern the Claude sessions used for every
   significant Lumen change."
-whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor) that
-  must pass the no-degradation rule: run when the user asks for a gated workflow
-  for one Lumen change. For multi-task requests or full studio delivery (worktrees,
-  commits, PR text, memory records) use lumen-development-studio instead. Not for
-  small fixes or doc-only edits."
+whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
+  that must pass the no-degradation rule: run when the user asks for a gated
+  workflow for one Lumen change. For multi-task requests or full studio delivery
+  (worktrees, commits, PR text, memory records) use lumen-development-studio
+  instead. Not for small fixes or doc-only edits."
 args:
   branch:
     type: string
@@ -111,13 +111,21 @@ const reviewerPersona =
   "without new evidence is itself a finding. Review for correctness, layering, thread affinity, error " +
   "and logging conventions, hot-path rules (no heap churn, no info+ logs per frame), and the " +
   "no-degradation rule: every perf-relevant claim needs evidence, and unasked-for features are findings. " +
-  "You are read-only: do not edit any file. Cite path:line and quote the lines you read.";
+  "Cite path:line and quote the lines you read. Every finding must carry a minimal reading list — " +
+  "exact path:line ranges and, where a command shows it, that one command — the confirmer works from " +
+  "that list alone and must not need to re-derive the change. " +
+  "You are read-only: do not edit any file.";
 
 const confirmerPersona =
-  "You are the verify stage of Lumen's gated change workflow. You are given one review finding and " +
-  "must decide, from the evidence alone and by reading the code in the repository yourself, whether " +
-  "it is real. Reproduce it from the cited lines; check the surrounding context the reviewer may have " +
-  "missed; run a narrow check only if a command decides it. You are read-only: do not edit any file. " +
+  "You are the verify stage of Lumen's gated change workflow. You are given one review finding " +
+  "and must decide, from its cited evidence and your own reading of those exact lines in the " +
+  "repository, whether it is real. You are a bounded auditor, not a second reviewer: open the cited " +
+  "path:line first and confirm from those lines and their immediate context; allow yourself at most " +
+  "ONE targeted follow-up (the diff command you are given, or one adjacent file) when the cited " +
+  "lines alone cannot decide. Never re-derive the whole change, re-read unrelated modules, or " +
+  "search the web — the reviewer already did that work. If your budget cannot decide it, return " +
+  "holds=false with reason=\"inconclusive from cited evidence\" and name the one read that would " +
+  "decide it — an honest inconclusive beats a grind. You are read-only: do not edit any file. " +
   "If the evidence does not hold up, say so — a false finding must not survive this stage.";
 
 const fixerPersona =
@@ -212,7 +220,7 @@ const impl = await implementer.ask<ImplResult>(
 );
 log(`Implemented; ${impl.changedFiles.length} files touched`);
 
-const fixer = agent("fixer", { system: fixerPersona });
+const fixer = agent("fixer", { system: fixerPersona, budget: { webSearch: 0 } });
 let gateGreen = false;
 let gateRounds = 0;
 
@@ -246,7 +254,7 @@ if (!gateGreen) {
 verified.push(`change green after ${gateRounds} fix round(s): tests-enabled build+ctest in build/test`);
 
 phase("Review the diff");
-const reviewer = agent("reviewer", { system: reviewerPersona });
+const reviewer = agent("reviewer", { system: reviewerPersona, budget: { webSearch: 0 } });
 const review = await reviewer.ask<Review>(
   `Review the uncommitted change on branch ${branch} (git diff HEAD plus untracked files) against ` +
     `this task:\n\n${task}\n\nThe author's notes:\n${impl.notesForReviewer}\n\nReport every real ` +
@@ -261,8 +269,14 @@ const refuted: Finding[] = [];
 for (let i = 0; i < review.findings.length; i++) {
   const finding = review.findings[i];
   if (finding === undefined) continue;
-  const confirmation = await agent(`confirmer-${i + 1}`, { system: confirmerPersona }).ask<Confirmation>(
-    `Decide whether this finding is real, from the evidence alone:\n${JSON.stringify(finding)}`,
+  const confirmation = await agent(`confirmer-${i + 1}`, { system: confirmerPersona, budget: { webSearch: 0 } }).ask<Confirmation>(
+    `Decide whether this finding is real — from its cited evidence, by reading those exact lines.\n\n` +
+      `Change under review: the uncommitted diff on branch ${branch} (git diff HEAD plus untracked files).\n\n` +
+      `Finding:\n${JSON.stringify(finding, null, 2)}\n\n` +
+      `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
+      `(e.g. git diff HEAD -- <the cited path>); do not re-derive the change. If that budget cannot ` +
+      `decide it, return holds=false with reason "inconclusive from cited evidence" and the one read ` +
+      `that would decide it. Report exactly what you read.`,
   );
   if (confirmation.holds) confirmed.push(finding);
   else refuted.push(finding);
