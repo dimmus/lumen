@@ -40,9 +40,28 @@ Measured/verified facts that motivated the workflow shapes:
   GitHub releases — newest published 3.17.2); the bundled dynamic-workflows skill is
   the authoritative surface and is byte-identical between 3.18.1/3.18.2.
 
-**Why:** a future session would otherwise re-derive the whole harness split, re-discover
-the release-preset test trap, or follow the stale Docker/headless guidance in the DSH
-skills — each of which silently invalidates verification evidence.
+2026-11-13 (token-efficiency lesson from the xdg-toplevel-drag studio run): a confirmer
+given a bare `JSON.stringify(finding)` ask spent **3.9M tokens on one finding** (23× a
+cheap confirmation) — it bootstrapped its whole context from zero, overflowed, and after
+compaction re-read the worktree ("lost the task, recovered it") ; the gatekeeper ground
+the same way (4.3M tokens / 32 min). Fix (commit 91f61e2, both gated workflows):
+verification stages are **bounded auditors by construction** — reviewer findings must
+carry a reading list (path:line + the one command), the confirmer ask carries the
+changed-file list and exact diff command with a one-follow-up cap and an honest
+`inconclusive` return, gatekeepers audit the packet instead of re-reviewing, repo-only
+stages get webSearch budget 0, and low-severity findings confirm on GLM-5.3-Flash.
+
+**Why (token lesson):** subagents asked to "verify" without working context will re-derive
+the entire change to feel certain, and compaction makes them pay twice; the ask must carry
+the context and cap the procedure. **Why (harness split):** a future session would
+otherwise re-derive the whole harness split, re-discover the release-preset test trap, or
+follow the stale Docker/headless guidance in the DSH skills — each of which silently
+invalidates verification evidence.
+
+**How to apply (token lesson):** any future workflow stage that verifies someone else's
+output gets a warm ask (what changed, where, the one command) + an explicit follow-up
+budget + an honest-inconclusive escape hatch. Never ship a bare `JSON.stringify(x)`
+verification ask.
 
 **How to apply:** route work per `.zcode/skills/lumen-studio/SKILL.md` (studio workflow
 for non-trivial/multi-task, gated-change for one task, compositor-bench for comparisons,
