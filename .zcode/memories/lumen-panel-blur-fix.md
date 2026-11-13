@@ -1,6 +1,6 @@
 ---
 name: lumen-panel-blur-fix
-description: "2026-11-13/14 notebook seat fix (worktree panel-blur-fix, b8d9277..73564e6): the [panel] blur crash loop fixed at both roots — ext_background_effect_manager_v1 binds on the views' (ui_host) connection via a pre-connect global_handler, and a live blur change rebuilds the panels; first-ever hasvk blur pixels proven (stripes std 127.5→0.00 inside the topbar, live toggle 180 208 px bounded exactly to the strip, 0 restarts); drag-smoke PASS, app-smoke 144/145 vs baseline 138 (28 rows fail in all three = host noise), ctest 131/133; gate BLOCKED ×2 — the 23:57 smokes exit 2 on the stale-binary sweep, and the 00:27/00:48 rebuilt final-HEAD re-runs (drag PASS a–j, app-smoke 141 PASS ≥140, delta = Z2–Z5 portal rows + the N8 flake) stayed uncommitted in gitignored logs without prechecks, so they are not gate evidence; unblock = commit them under evidence/ with per-session prechecks, re-gate"
+description: "2026-11-13/14 notebook seat fix (worktree panel-blur-fix, b8d9277..0fee8ab): the [panel] blur crash loop fixed at both roots — ext_background_effect_manager_v1 binds on the views' (ui_host) connection via a pre-connect global_handler, and a live blur change rebuilds the panels; first-ever hasvk blur pixels proven (stripes std 127.5→0.00 inside the topbar, live toggle 180 208 px bounded exactly to the strip, 0 restarts); drag-smoke PASS, app-smoke 144/145 vs baseline 138 (28 rows fail in all three = host noise), ctest 131/133; gate BLOCKED ×2 (stale-binary sweep exit 2; final-HEAD re-runs left uncommitted in gitignored logs without prechecks) then READY round 3 — 0fee8ab committed the gate-time smokes under evidence/smokes/gate/ with per-session prechecks (drag PASS 01:12, app-smoke 141 PASS ≥140, Z portal family flipped), 2026-11-14"
 metadata:
   node_type: memory
   type: project
@@ -11,12 +11,13 @@ eDP 3200×1800 @2x logical 1600×900 — the seat that diagnosed the crash loop,
 [[lumen-raise-the-bar-repro-diagnose]]). Worktree
 `/home/dimmus/lumen-wt/panel-blur-fix`, branch `zcode/task/panel-blur-fix` on main
 **b8d9277**; commits **e77499a** (the fix) + **25d9bb4** (seat evidence) + review fixes
-**cd6a576**, **766bd4a**, **73564e6**; diff confined to modules/lx.shell (lx.shell.cppm
-+123/−, panel.cppm 19 lines), tests/test_shell_bridge.cpp (+117) and evidence/ (97
-files, +7046/−45 — confinement re-checked with
+**cd6a576**, **766bd4a**, **73564e6** + gate evidence **0fee8ab**; diff confined to
+modules/lx.shell (lx.shell.cppm +123/−, panel.cppm 19 lines), tests/test_shell_bridge.cpp
+(+117) and evidence/ (375 files at 0fee8ab) — confinement re-checked with
 `git diff --name-only b8d9277..HEAD | grep -v '^evidence/\|^tests/\|^modules/lx.shell/'`
-→ empty). Gate verdict **BLOCKED** (below). Anchors re-read and numbers re-run by the
-memory writer the day after unless marked packet-sourced.
+→ empty. Gate verdict **BLOCKED** twice (below) then **READY** (third round, 2026-11-14).
+Anchors re-read and numbers re-run by the memory writer the day after unless marked
+packet-sourced.
 
 **Fix 1 — the cross-connection marshal (the crash loop):**
 - `ext_background_effect_manager_v1` is now bound on the **views' connection** (the
@@ -140,11 +141,42 @@ empty; the committed `evidence/final-precheck.txt` is 23:15:01 — it belongs to
   `3c70e17e0c43ad517b91fb120fb6dae11d2cc862a63104ae8017b055470febc6`, no lumen
   processes running, worktree clean at 73564e6.
 
+**Update 2026-11-14 (third gate round — READY; task closed):** the round-2 unblock was
+executed exactly as named. **0fee8ab** (2026-11-14 01:33:50 +0500, "evidence: gate-time
+seat smokes against final HEAD") committed the runs under `evidence/smokes/gate/` —
+`drag-smoke-logs/` + `app-smoke-logs/` (run.log, compositor.log, inject.jsonl,
+per-scenario artifacts) and per-session prechecks (`precheck-drag-smoke.txt`,
+`precheck-app-smoke.txt`); worktree clean at 0fee8ab. Numbers below re-run by the
+memory writer from the committed files unless marked gate-sourced:
+- drag-smoke at 01:12:11 (precheck loadavg 0.90/0.33/0.24, "ok: no
+  lumen-compositor"): **VERDICT: PASS** — the first PASS seat run against final HEAD
+  that is also committed evidence.
+- app-smoke: **141 `^PASS` / 35 `^FAIL`** (≥140 envelope met; VERDICT: FAIL expected —
+  the smoke config runs blur=false, so the changed path is inert there). N8 **PASS**;
+  the FAIL set = the 25 known-noise rows + **Z1–Z7**, of which Z2–Z5 returned
+  `response None` — the portal-frontend environmental family
+  ([[lumen-app-smoke-known-noise]]) that flips between runs of the same binaries.
+- Precheck-wrapper discrepancy, disclosed and disproven: the gate-time prechecks came
+  from a wrapper that prints `WARN: a smoke is already running` — a line the committed
+  `evidence/seat-precheck.sh` does not contain (grepped; zero matches). Contamination
+  is excluded: the 01:23:10 precheck reads loadavg **0.25/0.25/0.25**, and the inject
+  `t_us` spans are strictly serialized — drag 115054.65–115068.61 s vs app
+  115713.12–116343.80 s, **644 s apart** (re-derived this session from the committed
+  inject.jsonl).
+- Gate verdict **READY**: all six acceptance items independently verified (gate
+  decoded the PNGs itself — 180,253 toggle px / 912-px startup flash vs the README's
+  threshold-counted 180,208 / 582, same substance; re-ran `test_shell_bridge` 105/0;
+  parsed all four app-smoke logs row-level; re-hashed config.toml; checked no
+  compositor running). Host discipline re-verified by the memory writer on the main
+  host: config.toml sha256 `3c70e17e…febc6` (byte-identical restore), no lumen
+  processes running.
+
 Disproven theories (closed; do not re-chase): capability ordering (blur_offered_ true
 at create) and hasvk lazy-pipeline failure — the card refuted both before the fix, and
 the pipeline has now actually rendered blurred pixels. "N8 +1 = regression from the
 bind" — one-shot at connect, and the smoke's config has blur=false; flake per the
-rerun rule.
+rerun rule. "The gate-time smokes were contaminated by a concurrent session" — the
+WARN-wrapper line aside, loadavg 0.25 and the 644 s inject-span gap disprove overlap.
 
 **Why:** a Wayland object id is only meaningful on the connection that owns it — any
 manager a view needs must be bound on the view's connection (a per-connection
