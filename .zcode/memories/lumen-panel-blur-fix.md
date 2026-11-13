@@ -1,6 +1,6 @@
 ---
 name: lumen-panel-blur-fix
-description: "2026-11-13 notebook seat fix (worktree panel-blur-fix, b8d9277..73564e6): the [panel] blur crash loop fixed at both roots — ext_background_effect_manager_v1 now binds on the views' (ui_host) connection via a global_handler installed before client_.connect(), and a live blur change rebuilds the panels; first-ever hasvk blur pixels proven (stripes std 127.5→0.00 inside the topbar vs ~35.7 for plain alpha, live toggle 180 208 px bounded exactly to the strip, 0 restarts); drag-smoke PASS, app-smoke 144/145 vs baseline 138 (31 rows fail in both runs, 28 in all three = host noise), ctest 131/133; gate BLOCKED — the 23:57 gate-time smokes exit 2 on the stale-binary sweep (lumen-compositor 22:33 vs cd6a576's 23:49 source) and never ran against final HEAD"
+description: "2026-11-13/14 notebook seat fix (worktree panel-blur-fix, b8d9277..73564e6): the [panel] blur crash loop fixed at both roots — ext_background_effect_manager_v1 binds on the views' (ui_host) connection via a pre-connect global_handler, and a live blur change rebuilds the panels; first-ever hasvk blur pixels proven (stripes std 127.5→0.00 inside the topbar, live toggle 180 208 px bounded exactly to the strip, 0 restarts); drag-smoke PASS, app-smoke 144/145 vs baseline 138 (28 rows fail in all three = host noise), ctest 131/133; gate BLOCKED ×2 — the 23:57 smokes exit 2 on the stale-binary sweep, and the 00:27/00:48 rebuilt final-HEAD re-runs (drag PASS a–j, app-smoke 141 PASS ≥140, delta = Z2–Z5 portal rows + the N8 flake) stayed uncommitted in gitignored logs without prechecks, so they are not gate evidence; unblock = commit them under evidence/ with per-session prechecks, re-gate"
 metadata:
   node_type: memory
   type: project
@@ -109,6 +109,37 @@ source commit. Unblock without touching source: `cmake --build build/test -j2` i
 worktree, re-run both `--join-seat-session` smokes with the same precheck discipline,
 commit the logs under evidence/, re-gate.
 
+**Update 2026-11-14 (second gate round — BLOCKED again; every number below re-run this
+date):** the remediation was half-done. The worktree *was* rebuilt (lumen-shell binary
+23:51:59, lumen-compositor relinked 00:26:48 — `find modules -type f -newer
+build/test/lumen-compositor` empty, so the mtime sweep passes now) and both smokes
+**did** re-run against final HEAD 73564e6 — the first seat runs against final HEAD —
+but the results stayed in the gitignored log dirs (`/drag-smoke-logs/` `.gitignore:16`,
+`/app-smoke-logs/` `:18`; proven with `git check-ignore -v`), were never committed under
+evidence/, and neither session captured a precheck (`find … -iname '*precheck*'` →
+empty; the committed `evidence/final-precheck.txt` is 23:15:01 — it belongs to the
+22:33-era sessions, not these).
+- drag-smoke `drag-smoke-logs/run.log` (mtime 00:27:08): rows a–j all PASS,
+  `VERDICT: PASS (warnings: g latency)` — exactly the final-HEAD PASS the gate needed,
+  uncaptured (log header also carries a `WARN: another session is running
+  (WAYLAND_DISPLAY='lumen-0')` preflight note; it ran anyway and passed).
+- app-smoke `app-smoke-logs/run.log` (00:48:26): **141 `^PASS` / 35 `^FAIL`** rows
+  (≥140 envelope met), `VERDICT: FAIL`, run-row first error the `critical pressure`
+  WARN — found exactly once in **all four** app-smoke logs including the committed
+  baseline. The delta vs the committed 144-PASS change run closes exactly: Z2–Z5 newly
+  FAIL (the interactive portal rows returned `response None` — no chooser, no stream;
+  Z1/Z6/Z7 fail in both runs) and N8 PASS (the documented flake): 144−4+1 = 141.
+  Z1–Z7 = the portal-frontend environmental family
+  (.zcode/skills/lumen-decisions/SKILL.md:91).
+- Gate verdict #2 **BLOCKED** on exactly this: the packet's `gate_runs.seat` still
+  cites the 22:33–23:13 pre-cd6a576 runs and cites nothing from 00:27/00:48. The
+  unblock is unchanged — commit the gate-time logs under evidence/ **with per-session
+  prechecks** (or re-run under the precheck discipline), point `gate_runs.seat` at the
+  final-HEAD runs, re-gate. Nothing else needs redoing.
+- Clean-state re-verified 2026-11-14: config.toml sha256
+  `3c70e17e0c43ad517b91fb120fb6dae11d2cc862a63104ae8017b055470febc6`, no lumen
+  processes running, worktree clean at 73564e6.
+
 Disproven theories (closed; do not re-chase): capability ordering (blur_offered_ true
 at create) and hasvk lazy-pipeline failure — the card refuted both before the fix, and
 the pipeline has now actually rendered blurred pixels. "N8 +1 = regression from the
@@ -120,7 +151,9 @@ manager a view needs must be bound on the view's connection (a per-connection
 `global_handler` installed before `connect()` is the pattern). And a smoke gate that
 refuses to run stale is right to refuse, but it means **any commit that touches a
 header's mtime invalidates the seat evidence** — the gate-time runs are the ones that
-count, not the ones that went PASS earlier the same evening.
+count, not the ones that went PASS earlier the same evening, and they only count once
+they are committed with their prechecks: an uncommitted rerun rotting in a gitignored
+`*-logs/` dir is invisible to `git status` and is not evidence.
 
 **How to apply:** for the next view-side protocol global, copy the
 `client_globals_`/`set_global_handler` pattern (lx.shell.cppm:2474) — never bind a
@@ -129,7 +162,11 @@ at create (opaque vs blurred), a config change means destroy+re-create, as
 `rebuild_panels()` does — mirror `rebuild_backgrounds()`. Before any gate-time smoke,
 `cmake --build build/test -j2` even if you believe your change cannot affect the
 binary under test — the sweep is mtime-based over modules/; expect exit 2 with the
-"older than" line as the tell. Judge app-smoke deltas only after reading the baseline's
+"older than" line as the tell. Finish the rerun in the same breath: tee
+`seat-precheck.sh` per session, copy `drag-smoke-logs/` + `app-smoke-logs/run.log` into
+evidence/ and commit (the dirs are gitignored — check with `git status --ignored`), and
+make the packet's `gate_runs.seat` name those runs; a gate must hold on any seat claim
+older than the last source commit. Judge app-smoke deltas only after reading the baseline's
 own captured precheck for load, and attribute rows with a full-scenario-row parse
 (`^(PASS|FAIL)\s+(\S+)`), not a first-token grep. Recognize the crash loop on sight:
 shell `invalid arguments for <manager>.<request>` + compositor `unknown object (N)` for
