@@ -5,10 +5,11 @@ description: "The gated change workflow for Lumen: baseline build+ctest on the
   findings, then the final full-suite gate (optionally drag-smoke/app-smoke and
   ui-bench). Ports the multi-agent pattern the Claude sessions used for every
   significant Lumen change."
-whenToUse: "A non-trivial Lumen change (feature, optimization, refactor) that
-  must pass the no-degradation rule: run when the user asks for a gated workflow
-  for a Lumen change, or asks to implement something with
-  review+verification+gate. Not for small fixes or doc-only edits."
+whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
+  that must pass the no-degradation rule: run when the user asks for a gated
+  workflow for one Lumen change. For multi-task requests or full studio delivery
+  (worktrees, commits, PR text, memory records) use lumen-development-studio
+  instead. Not for small fixes or doc-only edits."
 args:
   branch:
     type: string
@@ -16,7 +17,7 @@ args:
     default: zcode/gated-change
   run_bench:
     type: boolean
-    description: Also run scripts/ui-bench.sh (headless p50/p95 gate against the
+    description: Also run scripts/ui-bench.sh (engine bench p50/p95 gate against the
       stored baseline) in the final gate
     default: false
   run_smokes:
@@ -110,13 +111,21 @@ const reviewerPersona =
   "without new evidence is itself a finding. Review for correctness, layering, thread affinity, error " +
   "and logging conventions, hot-path rules (no heap churn, no info+ logs per frame), and the " +
   "no-degradation rule: every perf-relevant claim needs evidence, and unasked-for features are findings. " +
-  "You are read-only: do not edit any file. Cite path:line and quote the lines you read.";
+  "Cite path:line and quote the lines you read. Every finding must carry a minimal reading list — " +
+  "exact path:line ranges and, where a command shows it, that one command — the confirmer works from " +
+  "that list alone and must not need to re-derive the change. " +
+  "You are read-only: do not edit any file.";
 
 const confirmerPersona =
-  "You are the verify stage of Lumen's gated change workflow. You are given one review finding and " +
-  "must decide, from the evidence alone and by reading the code in the repository yourself, whether " +
-  "it is real. Reproduce it from the cited lines; check the surrounding context the reviewer may have " +
-  "missed; run a narrow check only if a command decides it. You are read-only: do not edit any file. " +
+  "You are the verify stage of Lumen's gated change workflow. You are given one review finding " +
+  "and must decide, from its cited evidence and your own reading of those exact lines in the " +
+  "repository, whether it is real. You are a bounded auditor, not a second reviewer: open the cited " +
+  "path:line first and confirm from those lines and their immediate context; allow yourself at most " +
+  "ONE targeted follow-up (the diff command you are given, or one adjacent file) when the cited " +
+  "lines alone cannot decide. Never re-derive the whole change, re-read unrelated modules, or " +
+  "search the web — the reviewer already did that work. If your budget cannot decide it, return " +
+  "holds=false with reason=\"inconclusive from cited evidence\" and name the one read that would " +
+  "decide it — an honest inconclusive beats a grind. You are read-only: do not edit any file. " +
   "If the evidence does not hold up, say so — a false finding must not survive this stage.";
 
 const fixerPersona =
@@ -144,7 +153,11 @@ if (stamp.exitCode !== 0) {
     return blocked;
   }
 }
-const configure = await world.run("cmake", ["--preset", "release"], { timeoutMs: 600_000, output: { tail: 8192 } });
+const configure = await world.run(
+  "cmake",
+  ["--preset", "release", "-B", "build/test", "-DLUMEN_BUILD_TESTS=ON"],
+  { timeoutMs: 600_000, output: { tail: 8192 } },
+);
 if (configure.exitCode !== 0) {
   const blocked: WorkflowReport = {
     conclusion: "CMake configure of the baseline failed; nothing else ran.",
@@ -154,13 +167,13 @@ if (configure.exitCode !== 0) {
   };
   return blocked;
 }
-const baselineBuild = await world.run("cmake", ["--build", "--preset", "release"], {
+const baselineBuild = await world.run("cmake", ["--build", "build/test", "-j2"], {
   timeoutMs: 1_200_000,
   output: { tail: 32_768 },
 });
 const baselineTests =
   baselineBuild.exitCode === 0
-    ? await world.run("ctest", ["--preset", "release"], { timeoutMs: 900_000, output: { tail: 32_768 } })
+    ? await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } })
     : undefined;
 if (baselineBuild.exitCode !== 0 || baselineTests === undefined || baselineTests.exitCode !== 0) {
   const red: WorkflowReport = {
@@ -173,7 +186,7 @@ if (baselineBuild.exitCode !== 0 || baselineTests === undefined || baselineTests
   };
   return red;
 }
-verified.push("baseline green before any change: cmake --build --preset release + ctest --preset release");
+verified.push("baseline green before any change: cmake --build build/test (tests-enabled) + ctest --test-dir build/test -LE bench");
 log("Baseline is green; creating the working branch");
 
 phase("Create the working branch");
@@ -207,14 +220,14 @@ const impl = await implementer.ask<ImplResult>(
 );
 log(`Implemented; ${impl.changedFiles.length} files touched`);
 
-const fixer = agent("fixer", { system: fixerPersona });
+const fixer = agent("fixer", { system: fixerPersona, budget: { webSearch: 0 } });
 let gateGreen = false;
 let gateRounds = 0;
 
 phase("Build and test the change");
 for (let round = 1; round <= 3 && !gateGreen; round++) {
   gateRounds = round;
-  const build = await world.run("cmake", ["--build", "--preset", "release"], {
+  const build = await world.run("cmake", ["--build", "build/test", "-j2"], {
     timeoutMs: 1_200_000,
     output: { tail: 32_768 },
   });
@@ -222,7 +235,7 @@ for (let round = 1; round <= 3 && !gateGreen; round++) {
     await fixer.ask(`The build failed (round ${round}). Fix it with minimal changes. Tail of the output:\n${(build.stderr + build.stdout).slice(-4000)}`);
     continue;
   }
-  const tests = await world.run("ctest", ["--preset", "release"], { timeoutMs: 900_000, output: { tail: 32_768 } });
+  const tests = await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
   if (tests.exitCode !== 0) {
     await fixer.ask(`The tests failed (round ${round}). Fix them with minimal changes. Tail of the output:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
     continue;
@@ -238,10 +251,10 @@ if (!gateGreen) {
   };
   return red;
 }
-verified.push(`change green after ${gateRounds} fix round(s): cmake --build --preset release + ctest --preset release`);
+verified.push(`change green after ${gateRounds} fix round(s): tests-enabled build+ctest in build/test`);
 
 phase("Review the diff");
-const reviewer = agent("reviewer", { system: reviewerPersona });
+const reviewer = agent("reviewer", { system: reviewerPersona, budget: { webSearch: 0 } });
 const review = await reviewer.ask<Review>(
   `Review the uncommitted change on branch ${branch} (git diff HEAD plus untracked files) against ` +
     `this task:\n\n${task}\n\nThe author's notes:\n${impl.notesForReviewer}\n\nReport every real ` +
@@ -256,8 +269,14 @@ const refuted: Finding[] = [];
 for (let i = 0; i < review.findings.length; i++) {
   const finding = review.findings[i];
   if (finding === undefined) continue;
-  const confirmation = await agent(`confirmer-${i + 1}`, { system: confirmerPersona }).ask<Confirmation>(
-    `Decide whether this finding is real, from the evidence alone:\n${JSON.stringify(finding)}`,
+  const confirmation = await agent(`confirmer-${i + 1}`, { system: confirmerPersona, budget: { webSearch: 0 } }).ask<Confirmation>(
+    `Decide whether this finding is real — from its cited evidence, by reading those exact lines.\n\n` +
+      `Change under review: the uncommitted diff on branch ${branch} (git diff HEAD plus untracked files).\n\n` +
+      `Finding:\n${JSON.stringify(finding, null, 2)}\n\n` +
+      `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
+      `(e.g. git diff HEAD -- <the cited path>); do not re-derive the change. If that budget cannot ` +
+      `decide it, return holds=false with reason "inconclusive from cited evidence" and the one read ` +
+      `that would decide it. Report exactly what you read.`,
   );
   if (confirmation.holds) confirmed.push(finding);
   else refuted.push(finding);
@@ -275,7 +294,7 @@ if (confirmed.length > 0) {
   );
   gateGreen = false;
   for (let round = 1; round <= 2 && !gateGreen; round++) {
-    const build = await world.run("cmake", ["--build", "--preset", "release"], {
+    const build = await world.run("cmake", ["--build", "build/test", "-j2"], {
       timeoutMs: 1_200_000,
       output: { tail: 32_768 },
     });
@@ -283,7 +302,7 @@ if (confirmed.length > 0) {
       await fixer.ask(`After applying review fixes the build failed (round ${round}). Tail:\n${(build.stderr + build.stdout).slice(-4000)}`);
       continue;
     }
-    const tests = await world.run("ctest", ["--preset", "release"], { timeoutMs: 900_000, output: { tail: 32_768 } });
+    const tests = await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
     if (tests.exitCode !== 0) {
       await fixer.ask(`After applying review fixes the tests failed (round ${round}). Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
       continue;
@@ -303,8 +322,8 @@ if (confirmed.length > 0) {
 }
 
 phase("Final gate: the full suite, and hand over the report");
-const finalTests = await world.run("ctest", ["--preset", "release"], { timeoutMs: 900_000, output: { tail: 32_768 } });
-verified.push("final gate: ctest --preset release green on the finished change");
+const finalTests = await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
+verified.push("final gate: tests-enabled ctest green on the finished change (build/test, bench label excluded)");
 let smokeNote = "drag-smoke and app-smoke not run (run_smokes was not set)";
 let benchNote = "ui-bench not run (run_bench was not set)";
 if (finalTests.exitCode === 0 && runSmokes) {
@@ -314,7 +333,11 @@ if (finalTests.exitCode === 0 && runSmokes) {
   smokeNote = `drag-smoke ${drag.exitCode === 0 ? "passed" : "FAILED"}, app-smoke ${app.exitCode === 0 ? "passed" : "FAILED"} (with --join-seat-session)`;
 }
 if (finalTests.exitCode === 0 && runBench) {
-  const bench = await world.run("./scripts/ui-bench.sh", [], { timeoutMs: 1_800_000, output: { tail: 32_768 } });
+  const bench = await world.run(
+    "bash",
+    ["-c", "LUMEN_BUILD_DIR=build/test exec ./scripts/ui-bench.sh"],
+    { timeoutMs: 1_800_000, output: { tail: 32_768 } },
+  );
   benchNote =
     bench.exitCode === 0
       ? "ui-bench gate passed (FAIL on p50 +25%, WARN on p50 +10% or p95 +25% against the stored baseline)"
