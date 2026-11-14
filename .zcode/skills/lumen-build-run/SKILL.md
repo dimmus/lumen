@@ -32,10 +32,11 @@ The VM facts and the notebook facts below do NOT transfer between hosts.
   `LUMEN_INJECT_POINTER`/`LUMEN_INJECT_RELATIVE`/`LUMEN_INJECT_KEYBOARD` still override),
   with `LUMEN_SMOKE_SCALE=1`. A holder started from an older `uinput-mouse.py` creates a
   mouse without REL_X/REL_Y: app-smoke says so up front and R1/R4 and W1/W2/W4 cannot
-  pass — restart the holder from the current script. app-smoke exits 1 with ~150 PASS
-  rows; the remaining FAIL rows on this host are the Vulkan backend's own gaps — the
-  SIGUSR1 debug read-back is GL-only and window (toplevel) capture needs the GL or CPU
-  backend (`wire_capture.cpp`) — not geometry, not regressions. The user may keep a Lumen
+  pass — restart the holder from the current script. app-smoke reports 158 PASS with 15
+  WARN and 4 FAIL rows: the WARNs are capabilities the Vulkan composite path lacks (the
+  SIGUSR1 debug read-back is GL-only; window capture and capture dma-buf are not on
+  Vulkan — `wire_capture.cpp`), named in each row; the FAILs are the Z portal rows (same
+  gaps) and the PSI clean-log row. The user may keep a Lumen
   desktop logged in on tty1 (session 1) — it holds DRM master; seat work needs it stopped
   (ask the owner first); the tty1 login itself stays.
 - **Never containers**: no Docker, on any host. UI/desktop development runs natively on

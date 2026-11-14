@@ -18,16 +18,15 @@ current when an item closes.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
-- [ ] **app-smoke on the Vulkan backend** (the host-calibration half closed 2026-11-14,
-  `smoke-bench-harness-green`): the harness no longer embeds the dev VM's geometry — rows
-  derive from the parsed output, the logged frame rect and the logged output identity, the
-  injector is pixel-exact on 1:1 virtual axes, and the virtual mouse carries REL_X/REL_Y.
-  The remaining notebook FAIL rows are the **Vulkan backend's own gaps**, not harness debt:
-  the SIGUSR1 debug read-back is GL-only (`write_screenshot`, lx.compositor.cppm) — S2 T4
-  T7 L2 L3 Q4 O2 O6 M1 N6 Y1 (+Z1); window (toplevel) capture refuses on Vulkan
-  (`wire_capture.cpp`) — Y2 Y5 Q6 (+Z6 Z7); capture dmabuf buffers are GL-only — Y4-dmabuf.
-  Closing them needs product work (Vulkan read-back + window capture), a harness
-  substitution where one exists, or an owner decision to mark them backend-limited.
+- [ ] **Vulkan capture green** (replaces the portal task, owner decision 2026-11-14): make
+  the Vulkan composite path serve what its GL/CPU siblings do, so the app-smoke rows that
+  now WARN naming the gap turn into real PASSes — the SIGUSR1 debug read-back (GL path
+  only, `compositor_impl.cpp` `write_screenshot`): S2 T4 T7 L2 L3 Q4 O2 O6 M1 N6 Y1 and
+  Z1; window (toplevel) capture (refused in `wire_capture.cpp` `create_session`): Y2 Y5
+  Q6, Z6, Z7; capture dma-buf buffers (GL-only, same file): Y4 `into dmabuf`. The harness
+  half closed 2026-11-14 in `smoke-bench-harness-green` (host-aware geometry, injector
+  pixel-exactness, REL-capable virtual mouse, the backend-limited WARNs and the A/B
+  evidence under `evidence/2026-11-14-ui-bench-ab/`).
 - [x] **Frame-callback / repaint-lead misses for fast-answering clients** (2026-11-03
   found, 2026-11-04 fixed): a wl_surface.frame-driven client answering in ~0.1 ms got
   46–53 fps with ~25 % of frames a period late, while ticks cost 0.4 ms and health said
