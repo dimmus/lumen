@@ -10,6 +10,9 @@ compile_commands.json
 # Fetched upstream protocols (run scripts/fetch-protocols.sh)
 /protocols/upstream/
 
+# Gate/seat-smoke captures — local evidence only, never merged to main
+/evidence/
+
 # Diagnostic output from scripts/input-smoke.sh and lumen-input-probe
 /input-smoke-logs/
 # ... and from scripts/drag-smoke.sh
