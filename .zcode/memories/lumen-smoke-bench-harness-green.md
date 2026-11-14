@@ -1,6 +1,6 @@
 ---
 name: lumen-smoke-bench-harness-green
-description: "2026-11-14 notebook harness task (worktree smoke-bench-harness-green, f1d619f..143237a, gate NOT_READY on provisioning not code): injection nodes autodetect by device name (inject-devices.sh, LUMEN_INJECT_* still overrides; REL-capable uinput mouse), binary freshness from the build system (build-fresh.sh; the dwfrun-5eff3d6b mtime false-trip killed), host-aware app-smoke geometry (VM 1914x924 rows gone), 15 backend-limited WARNs naming the Vulkan capture gap (owner decision), quiet-CPU 10 us PM-QoS + performance-governor hold with fail-closed verify and 5 iritur-08fd3c baselines re-recorded; seat app-smoke 158 PASS/15 WARN/4 FAIL twice, suite 132/134; vulkan bench bimodality survives the CPU hold (S2 frame p50 71.0 vs 36.7 us) and the committed gate run was env-pinned to a pre-REL holder (150/15/12)"
+description: "2026-11-14 notebook harness task (worktree smoke-bench-harness-green, f1d619f..28e2ef3, final gate NOT_READY on evidence overwrite): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = the acceptance-level seat evidence committed in aaedada (158/15/4 + zero-warning drag) was OVERWRITTEN by 28e2ef3 with dirty non-conforming re-runs (app-smoke 154/15/8 FAIL incl. Z2-Z5, drag g-latency WARN, prechecks 'smoke already running')"
 metadata:
   node_type: memory
   type: project
@@ -85,8 +85,8 @@ build-run skill, evidence/ — **no compiled code**.
   {ui_gallery, test_task_model} (ctest at final HEAD per the gate verdict — not re-run
   by me; smoke_harness was).
 
-**Gate verdict NOT_READY — all three blockers are provisioning/re-run remedies, no code
-repairs named.** (1) The committed final-HEAD seat run
+**Round-1 gate verdict NOT_READY (superseded by the rounds 2–3 section below) — all
+three blockers were provisioning/re-run remedies, no code repairs named.** (1) The committed final-HEAD seat run
 (evidence/smokes/gate/app-smoke-logs/run.log, 143237a) is **env-pinned to the
 coordinator's pre-REL holder** (line 1: `pointer /dev/input/event16
 (LUMEN_INJECT_POINTER)`; the header NOTE names the missing REL) → VERDICT FAIL, 150
@@ -113,27 +113,102 @@ A/B discipline before the next vulkan bench verdict.
 root-caused to C-state/schedutil modes and removed on --backend none by the hold
 ([[lumen-ui-bench-noise-and-g7]]'s discipline found it). "G5 mallinfo2 growth is Lumen
 code" — driver-side under kernel 7.2.15, present in the pre-task binary. "Newest-source
-mtime" as a freshness oracle — disproven by dwfrun-5eff3d6b. NOT disproven, open: the
-vulkan backend's residual bimodality under the hold.
+mtime" as a freshness oracle — disproven by dwfrun-5eff3d6b. "The vulkan ~2x mode is
+hasvk's CPU workers escaping the held core" — refuted by the all-core interleaved A/B
+(rounds/s2-B-1..4) and by `ps -L` showing no such threads. "MSR 0x620 refuses writes on
+this host" — retracted (bb59b9a); same-value write succeeds. NOT disproven, open: the
+mode itself — wandering, vulkan-only, ~2x on memory-bound stages, onset not
+reproducible; holding it via a raised UNCORE_RATIO_LIMIT min_ratio is untried.
+
+## Rounds 2–3, 2026-11-14 later the same day (worktree HEAD now **28e2ef3**)
+
+- **BLOCKER 2 — the vulkan ~2x mode, root-caused to what it is NOT (b5eac2b,
+  evidence/2026-11-14-ui-bench-vulkan-ab/):** the prime hypothesis (hasvk rasterizes on
+  the CPU; its workers escape the held core) is **refuted by the mandated interleaved
+  A/B** — rounds/s2-A-1..4 (cpu3-only hold) 71.0/70.5/78.2/72.2 µs vs rounds/s2-B-1..4
+  (all-CPU performance hold) 73.6/70.1/71.0/53.1 µs, "no effect: refuted"
+  (rounds-summary.txt); `ps -L` shows no hasvk worker threads at all. Also excluded by
+  named instruments: core clock (APERF/MPERF @2 Hz constant), package heat (forced-heat
+  rounds came back fast 37.3/36.1), iGPU rps pin (rps_min_freq_mhz=RP0 cut the gpu stage
+  **81→30 µs and nothing on the CPU side**, README:44-45), SMT sibling, PM-QoS, process
+  memory state; `--backend none` is immune through a slow vulkan era (26.31 vs 27.28 µs,
+  rounds/s2-none-check.json). The mode stands characterized: wandering, vulkan-only ~2x
+  on memory-bound stages, onset not reproducible; the knob that would hold it is MSR 0x620.
+- **Fuckup + fix (bb59b9a):** the A/B README had recorded 0x620 (UNCORE_RATIO_LIMIT) as
+  "refuses writes (EIO)" — no transcript existed and the claim does not reproduce: it
+  reads 0x71b on all four CPUs (min_ratio 7 — a floor allowed to dwell low — max 27) and
+  a same-value write succeeds (lockdown `[none]`, no allow_writes filter); whether a
+  *raised* min_ratio holds the state is **untested** (not changed on the owner's host) —
+  an open, untried avenue the record had wrongly closed. Reword commits
+  00883d6/aaedada/4b3b438 supersede 9f7dc94/c186b50/637e638 with byte-identical trees
+  (hash-compared in review); b5eac2b's own message still carries the old claim (history
+  immutable, superseded in-repo).
+- **The gate-side fix (b5eac2b + d2dc06f + b082338):** scripts/bench-warmup.sh (sourced
+  at scripts/ui-bench.sh:494) warms the host into the baseline's pole before measuring —
+  unmeasured S2 probe, settle threshold = baseline S2 frame p50 × 1.15, bounded
+  full-length warm-up rounds, **exit 2 if it will not settle** (the quiet-CPU hold's
+  fail-closed pattern); the --client path warms too (:664) against the tier's headless
+  baseline via a backward-compatible REF arg. 16 new hermetic checks incl. the
+  previously-never-observed exit-2 refusal (asserted from a fake bench's run log);
+  `bash tests/smoke_harness.sh` = **48 ok / PASS** (ran it this session at 28e2ef3).
+  Exit criterion met in committed artifacts: gate-vulkan-{1,2,3}.out all `EXIT=0`, warm-up
+  probes 41.276/35.971/37.076 ≤ 42.25, gate-results JSONs S2 frame p50
+  **36.06/40.158/35.883 µs** vs baseline 36.74, only the 4 known-open G5 warnings. The
+  mode + warm-up gate are documented in the build-run skill (:180-191, "check for the
+  `== host warm-up` lines").
+- **BLOCKER 1 — committed good, then overwritten (the round-3 fuckup):** aaedada
+  committed the acceptance-level seat evidence — clean precheck 22:14:56 "ok: no smoke
+  running", holder pid 1766725 bound by autodetect (event17), `LUMEN_INJECT_* vars in
+  env: 0`; app-smoke **158 PASS / 15 WARN / 4 FAIL** (only Z1 Z6 Z7 + PSI red, verified
+  via `git show aaedada:...run.log`); drag-smoke bare `VERDICT: PASS`, zero warnings.
+  **28e2ef3 (23:32) then replaced evidence/smokes/gate/ wholesale with dirty re-runs that
+  miss the acceptance level**: app-smoke-logs/run.log = 154 PASS / 15 WARN / 8 FAIL
+  (`VERDICT: FAIL`) with portal rows **Z2–Z5 red** on top of the tolerated four;
+  drag-smoke-logs/run.log ends `VERDICT: PASS (warnings: g latency)` (row g p95 38.9 ms
+  > 37.3 ms); precheck-drag-smoke.txt (23:11:02) and precheck-app-smoke.txt
+  (23:11:22/23:22:02) each record `WARN: a smoke is already running` — a dirty host, so
+  the verdicts are unattributable. The runs did bind event17 by autodetect (run.log
+  line 1, no env pin) — provisioning half right, host state and outcome not.
+  evidence/smokes/gate/README.md still claims the aaedada numbers (:10, :15) — the tree
+  now contradicts itself.
+- **Gate verdict at 28e2ef3: NOT_READY again; remediation narrow** — re-run the two seat
+  smokes at final HEAD on a clean host (precheck must show "ok: no smoke running"),
+  commit only acceptance-conforming runs (app-smoke 158/15/4 with only Z1/Z6/Z7+PSI red;
+  drag zero-warning), fix or drop the stale README. No code, bench evidence or review
+  fix needs revisiting; suite 132/134 corroborated by the worktree's
+  Testing/Temporary/LastTestsFailed.log (the tolerated pair — this worktree is based on
+  pre-unit-pair-green code, [[lumen-unit-pair-green]] fixed the pair on its own branch;
+  not re-run this session). Host: a leaked PM-QoS holder from a one-off A/B driver was
+  found and killed during final host-state verification; governors, i915 rps and
+  MSR 0x620 verified back at boot values.
 
 **Why:** a harness gate is only as strong as its provisioning — every acceptance blocker
 at gate time came from the environment (a stale env pin overriding the new autodetect, an
 uncommitted passing run, a CPU mode the hold does not cover on vulkan), not from the code
 under test; and each oracle must match the dependency it guards (the build system's own
-up-to-date determination, not mtimes; the baseline's own growth, not zero).
+up-to-date determination, not mtimes; the baseline's own growth, not zero). Two more:
+design around a claimed hardware failure only after reproducing it (the 0x620 EIO was
+never demonstrated, and the gate's design justified itself with it); and committed
+evidence must never be overwritten by a worse run — the gate reads the tree's latest
+commit, not git history, and 28e2ef3 turned a READY tree into a self-contradicting one.
 
 **How to apply:** on the notebook never set `LUMEN_INJECT_*` — let inject-devices.sh
 autodetect, and ensure the uinput holder was started from a tree ≥ f1d619f (else restart
 scripts/uinput-mouse.py) or R1/R4/W1/W2/W4 fail with no REL deltas. Gate-time seat runs
-must be committed under evidence/ with per-session prechecks **and the same provisioning
-as the acceptance runs** — env-pinning the injection nodes in the gate invocation
-silently reverts the autodetect. Use scripts/build-fresh.sh for freshness; never
-newest-source mtime. Before believing a vulkan ui-bench FAIL, re-run per
-[[lumen-ui-bench-noise-and-g7]] (interleaved A/B, setarch -R, ≥3 rounds) — the bimodal
-mode survived the hold in 1 of 3 gate runs on 2026-11-14. Judge app-smoke deltas by FAIL
-row IDs against a same-host prior log; the 15-WARN contract stands until
-vulkan-capture-green lands (TODO.md:21); suite expectation is 132/134 with tolerated
-{ui_gallery, test_task_model}.
+must be committed under evidence/ with per-session prechecks showing a **clean host**
+("ok: no smoke running") **and the same provisioning as the acceptance runs**; commit
+only runs that meet the acceptance level, and when re-running for evidence, replace the
+README numbers too. Use scripts/build-fresh.sh for freshness; never newest-source mtime.
+Never bench vulkan without the warm-up gate (ui-bench.sh does it automatically — look for
+the `== host warm-up` lines; exit 2 = host would not settle, not a code regression).
+Before diagnosing the ~2x mode further, start from the untried avenue: a raised
+UNCORE_RATIO_LIMIT min_ratio via MSR 0x620 (writable on this host; untested whether the
+hardware honors it), per [[lumen-ui-bench-noise-and-g7]] discipline (interleaved A/B,
+setarch -R, ≥3 rounds). Judge app-smoke deltas by FAIL row IDs against a same-host prior
+log; the 15-WARN contract stands until vulkan-capture-green lands (TODO.md:21); suite
+expectation in this worktree (base 7c3e3a1) is 132/134 with tolerated
+{ui_gallery, test_task_model} — the pair is fixed on the unit-pair-green branch, so
+rebase expectations accordingly.
 
 Related: [[lumen-close-ghost-fix]] (exit-2 trap, run-dir trampling — both fixed here),
 [[lumen-panel-blur-fix]] (commit-the-gate-smokes rule, N8 flake),
