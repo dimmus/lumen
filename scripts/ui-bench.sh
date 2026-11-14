@@ -632,6 +632,13 @@ fi
 day="$(date +%Y%m%d)"
 driver="$backend"
 
+runner=()
+if command -v setarch >/dev/null; then
+  runner=(setarch "$(uname -m)" -R)
+else
+  echo "NOTE: setarch not found — heap layout differs per run, expect a few percent of spread"
+fi
+
 # ── --client: S1 S5 S7 S9 S10 as lx.app windows against a headless compositor ─
 if [[ "$client" -eq 1 ]]; then
   tier="$backend"
@@ -649,6 +656,12 @@ if [[ "$client" -eq 1 ]]; then
   [[ "$warmup_given" -eq 1 ]] && args+=(--warmup "$warmup")
   [[ -n "$pin" ]] && args+=(--pin-client "$pin")
   quiet_cpu_start "$pin"
+  # The measured-state warm-up, as the headless path (bench-warmup.sh): client gl and
+  # vulkan tiers render through a compositor on the same backends whose wandering ~2x
+  # mode moves every memory-bound stage, and the client rows (S1 S5 S7 S9 S10) carry
+  # no S2 frame p50 to settle against — so the tier's headless S2 baseline is the
+  # settle reference; with no headless baseline either, the warm-up skips as before.
+  warm_host "$tier" "${ROOT}/tests/bench/baseline/${host}-${tier}.json"
   echo "== lumen-ui-bench --client: tier=${tier} load=$(cut -d' ' -f1 /proc/loadavg) -> ${out#"$ROOT"/}"
   rc=0
   "$BENCH" "${args[@]}" || rc=$?
@@ -756,13 +769,6 @@ while [[ -e "$out" ]]; do
   out="${results_dir}/${day}-${sha}${dirty}-${n}.json"
   n=$((n + 1))
 done
-
-runner=()
-if command -v setarch >/dev/null; then
-  runner=(setarch "$(uname -m)" -R)
-else
-  echo "NOTE: setarch not found — heap layout differs per run, expect a few percent of spread"
-fi
 
 frames_for() {
   case "$1" in

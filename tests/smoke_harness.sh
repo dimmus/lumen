@@ -203,6 +203,20 @@ contains "the refusal names the pole and the threshold" "$out" \
       "73.0 us against the baseline's 36.74 us (settle threshold 42.25)"
 check "refused after 3 probes and 2 warm-up rounds, no more" 5 "$(wc -l <"$FAKE_LOG")"
 
+printf '[{"scenario": "S2", "stages": {"frame": {"samples": 36000, "p50": 20.0}}}]' >"$TMP/ref-fast.json"
+compare="$TMP/ref-fast.json"
+: >"$FAKE_LOG"; printf '30.0\n' >"$FAKE_SEQ"
+out="$(warm_host vulkan "$ref" 2>&1)"; rc=$?
+check "an explicit settle reference beats --compare" 0 $rc
+contains "its threshold comes from the argument (36.74 -> 42.25), not --compare's 23.00" \
+      "$out" "settles at <= 42.25"
+check "and settles on probe 1 only against that larger threshold" "probe-1.json 30.0" "$(cat "$FAKE_LOG")"
+: >"$FAKE_LOG"; printf '21.0\n' >"$FAKE_SEQ"
+out="$(warm_host vulkan 2>&1)"; rc=$?
+check "without one, --compare stays the settle reference" 0 $rc
+contains "its threshold comes from --compare (20.0 -> 23.00)" "$out" "settles at <= 23.00"
+compare=""
+
 printf '[{"scenario": "S5", "stages": {"frame": {"samples": 10, "p50": 3.0}}}]' >"$TMP/ref-no-s2.json"
 baseline="$TMP/ref-no-s2.json"
 : >"$FAKE_LOG"

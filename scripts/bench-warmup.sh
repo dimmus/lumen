@@ -3,7 +3,11 @@
 # on its own.
 #
 #   warm_s2_frame_p50 JSON   the file's S2 frame p50, empty when it has none
-#   warm_host BACKEND        warm the host into its measured state or exit 2
+#   warm_host BACKEND [REF]  warm the host into its measured state or exit 2; REF is
+#                            the JSON holding the S2 frame p50 to settle against —
+#                            given, it beats both $baseline and $compare (ui-bench's
+#                            --client path passes the tier's headless baseline: the
+#                            client rows have no S2 to settle against)
 #
 # Expects the caller's context: $BENCH (lumen-ui-bench), $runner (its invocation
 # wrapper, e.g. setarch), $baseline (the compared reference; $compare overrides it),
@@ -43,9 +47,10 @@ for r in rows:
         break
 PY
 }
-warm_host() { # BACKEND
-  local backend=$1 ref="$baseline" probe_dir probe_json base p50 settle n fp
-  [[ -n "$compare" ]] && ref="$compare"
+warm_host() { # BACKEND [REF_JSON] — REF overrides the baseline/--compare settle reference
+  local backend=$1 ref="${2:-}" probe_dir probe_json base p50 settle n fp
+  [[ -z "$ref" ]] && ref="$baseline"
+  [[ -z "${2:-}" && -n "$compare" ]] && ref="$compare"
   base="$(warm_s2_frame_p50 "$ref")"
   if [[ -z "$base" ]]; then
     echo "== host warm-up: no S2 frame p50 in ${ref#"$ROOT"/} to settle against — skipped"
