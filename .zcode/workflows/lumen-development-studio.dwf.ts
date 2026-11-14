@@ -29,7 +29,7 @@ args:
   known_red:
     type: json
     description: 'Test names tolerated in a red baseline (json array, e.g.
-      ["ui_gallery","test_task_model"]): tasks proceed and every suite gate then
+      ["some_red_test"]): tasks proceed and every suite gate then
       requires no NEW failures beyond this set. Failures outside the set park
       the run on an owner decision (proceed-and-tolerate vs skip).'
     default: "[]"

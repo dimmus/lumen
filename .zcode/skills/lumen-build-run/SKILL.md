@@ -65,10 +65,10 @@ ctest --test-dir build/test --output-on-failure -LE bench   # 134 non-bench test
 The plain `release` preset sets `LUMEN_BUILD_TESTS=OFF` → `ctest` on `build/release` sees
 **one** test (`scanner_golden`). A "suite green" claim from `build/release` is invalid
 evidence. "Suite green" on the tests-enabled build means **no new failures beyond the
-owner-tolerated known-red set** of that tree — as of 2026-11 the dev tree carries
-`ui_gallery` + `test_task_model` (logout-popup test expectations, ui-gallery golden drift
-after the theme restyle; the studio workflow tracks the set via its `known_red` arg). One
-rerun discounts flakes; a repeated failure of the same test is reportable.
+owner-tolerated known-red set** of that tree — as of 2026-11 the dev tree carries none:
+the logout-popup expectations in `test_task_model` and the ui-gallery golden drift were
+both fixed on 2026-11-14 (the studio workflow tracks any future set via its `known_red`
+arg). One rerun discounts flakes; a repeated failure of the same test is reportable.
 `-S <tree>` works from any cwd, so the same line configures a worktree:
 
 ```bash
