@@ -1,15 +1,15 @@
 [
   {
     "host": {
-      "kernel": "7.2.14-arch1-1",
+      "kernel": "7.2.15-arch1-1",
       "cpus": 4,
       "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
       "arch": "x86_64",
       "hostname": "iritur"
     },
     "driver": "gl",
-    "git": "b03dac3-dirty",
-    "preset": "release",
+    "git": "7c3e3a1-dirty",
+    "preset": "test",
     "scenario": "S1",
     "title": "idle window",
     "backend": "gl",
@@ -23,17 +23,17 @@
     },
     "stages": {
       "update": {
-        "p50": 0.155,
-        "p95": 0.363,
-        "p99": 0.374,
-        "max": 0.429,
+        "p50": 0.023,
+        "p95": 0.024,
+        "p99": 0.064,
+        "max": 0.074,
         "samples": 600
       },
       "tick_idle": {
-        "p50": 2.934,
-        "p95": 3.964,
-        "p99": 4.173,
-        "max": 4.381,
+        "p50": 0.188,
+        "p95": 0.259,
+        "p99": 0.324,
+        "max": 1.607,
         "samples": 600
       },
       "tick": {
@@ -135,10 +135,10 @@
         "samples": 0
       },
       "update_idle": {
-        "p50": 3.107,
-        "p95": 4.152,
-        "p99": 4.424,
-        "max": 4.591,
+        "p50": 0.211,
+        "p95": 0.295,
+        "p99": 0.375,
+        "max": 1.665,
         "samples": 600
       }
     },
@@ -174,7 +174,7 @@
       "allocated_bytes": 0,
       "allocations_per_steady_frame": 0.0,
       "mallinfo2_uordblks_delta": 0,
-      "rss_anon_kb": 15476,
+      "rss_anon_kb": 15796,
       "minor_faults": 0,
       "major_faults": 0,
       "involuntary_switches": 0
@@ -188,8 +188,8 @@
       "ring": "persistent",
       "program_binary_formats": 1,
       "program_cache": true,
-      "program_setup_cold_us": 29169.4,
-      "program_setup_again_us": 28711.6,
+      "program_setup_cold_us": 24439.1,
+      "program_setup_again_us": 23811.2,
       "programs_from_cache": 5
     },
     "gates": {
@@ -199,15 +199,15 @@
   },
   {
     "host": {
-      "kernel": "7.2.14-arch1-1",
+      "kernel": "7.2.15-arch1-1",
       "cpus": 4,
       "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
       "arch": "x86_64",
       "hostname": "iritur"
     },
     "driver": "gl",
-    "git": "b03dac3-dirty",
-    "preset": "release",
+    "git": "7c3e3a1-dirty",
+    "preset": "test",
     "scenario": "S2",
     "title": "shell panel on components",
     "backend": "gl",
@@ -221,24 +221,24 @@
     },
     "stages": {
       "update": {
-        "p50": 1.004,
-        "p95": 1.898,
-        "p99": 2.285,
-        "max": 4.145,
+        "p50": 0.062,
+        "p95": 0.182,
+        "p99": 0.534,
+        "max": 21.827,
         "samples": 36000
       },
       "tick_idle": {
-        "p50": 2.92,
-        "p95": 4.128,
-        "p99": 4.776,
-        "max": 256.1,
+        "p50": 0.175,
+        "p95": 0.319,
+        "p99": 0.986,
+        "max": 13.78,
         "samples": 35400
       },
       "tick": {
-        "p50": 71.753,
-        "p95": 86.749,
-        "p99": 143.995,
-        "max": 175.968,
+        "p50": 38.568,
+        "p95": 70.71,
+        "p99": 78.271,
+        "max": 93.457,
         "samples": 600
       },
       "describe": {
@@ -249,52 +249,52 @@
         "samples": 0
       },
       "reconcile": {
-        "p50": 9.049,
-        "p95": 10.384,
-        "p99": 18.623,
-        "max": 19.28,
+        "p50": 5.81,
+        "p95": 12.935,
+        "p99": 13.908,
+        "max": 14.496,
         "samples": 600
       },
       "layout": {
-        "p50": 48.899,
-        "p95": 62.464,
-        "p99": 98.121,
-        "max": 129.507,
+        "p50": 25.989,
+        "p95": 46.199,
+        "p99": 52.406,
+        "max": 60.529,
         "samples": 600
       },
       "emit": {
-        "p50": 9.277,
-        "p95": 10.915,
-        "p99": 24.067,
-        "max": 28.592,
+        "p50": 5.474,
+        "p95": 10.803,
+        "p99": 20.306,
+        "max": 27.013,
         "samples": 600
       },
       "order": {
-        "p50": 0.862,
-        "p95": 1.726,
-        "p99": 2.058,
-        "max": 2.476,
+        "p50": 0.596,
+        "p95": 0.999,
+        "p99": 1.619,
+        "max": 2.384,
         "samples": 600
       },
       "encode": {
-        "p50": 0.51,
-        "p95": 0.959,
-        "p99": 1.293,
-        "max": 1.503,
+        "p50": 0.435,
+        "p95": 0.783,
+        "p99": 1.138,
+        "max": 1.632,
         "samples": 600
       },
       "emit_order_encode": {
-        "p50": 10.796,
-        "p95": 12.561,
-        "p99": 25.51,
-        "max": 30.149,
+        "p50": 6.513,
+        "p95": 12.468,
+        "p99": 21.675,
+        "max": 28.851,
         "samples": 600
       },
       "frame": {
-        "p50": 73.606,
-        "p95": 88.379,
-        "p99": 148.05,
-        "max": 180.233,
+        "p50": 39.878,
+        "p95": 72.875,
+        "p99": 80.381,
+        "max": 95.667,
         "samples": 600
       },
       "raster": {
@@ -305,38 +305,38 @@
         "samples": 0
       },
       "submit": {
-        "p50": 197.209,
-        "p95": 219.922,
-        "p99": 447.367,
-        "max": 462.676,
+        "p50": 95.492,
+        "p95": 186.246,
+        "p99": 202.023,
+        "max": 301.189,
         "samples": 600
       },
       "gpu": {
-        "p50": 46.72,
-        "p95": 48.16,
-        "p99": 56.24,
-        "max": 57.92,
+        "p50": 42.48,
+        "p95": 47.28,
+        "p99": 50.4,
+        "max": 52.56,
         "samples": 600
       },
       "layout_emit_order_encode": {
-        "p50": 59.981,
-        "p95": 75.486,
-        "p99": 121.669,
-        "max": 154.014,
+        "p50": 32.618,
+        "p95": 57.418,
+        "p99": 64.651,
+        "max": 79.051,
         "samples": 600
       },
       "update_frame": {
-        "p50": 75.775,
-        "p95": 91.29,
-        "p99": 151.924,
-        "max": 184.027,
+        "p50": 40.341,
+        "p95": 73.943,
+        "p99": 81.338,
+        "max": 96.923,
         "samples": 600
       },
       "update_idle": {
-        "p50": 3.945,
-        "p95": 5.193,
-        "p99": 6.605,
-        "max": 257.194,
+        "p50": 0.239,
+        "p95": 0.429,
+        "p99": 1.324,
+        "max": 25.213,
         "samples": 35400
       }
     },
@@ -371,9 +371,9 @@
       "allocations": 0,
       "allocated_bytes": 0,
       "allocations_per_steady_frame": 0.0,
-      "mallinfo2_uordblks_delta": 2832,
-      "rss_anon_kb": 23912,
-      "minor_faults": 193,
+      "mallinfo2_uordblks_delta": 2896,
+      "rss_anon_kb": 23956,
+      "minor_faults": 210,
       "major_faults": 0,
       "involuntary_switches": 0
     },
@@ -386,8 +386,8 @@
       "ring": "persistent",
       "program_binary_formats": 1,
       "program_cache": true,
-      "program_setup_cold_us": 23181.2,
-      "program_setup_again_us": 23184.3,
+      "program_setup_cold_us": 24315.5,
+      "program_setup_again_us": 23456.7,
       "programs_from_cache": 5
     },
     "text": {
@@ -395,8 +395,8 @@
       "doc_lines": 0,
       "doc_glyphs": 0,
       "layout_storage_bytes": 0,
-      "first_frame_us": 23835.1,
-      "first_layout_us": 18251.8,
+      "first_frame_us": 24700.1,
+      "first_layout_us": 18701.3,
       "first_shaping_calls": 26,
       "first_rasterized": 86,
       "first_upload_bytes": 28152,
@@ -423,9 +423,9 @@
       "node_bytes": 64,
       "allocations": 0,
       "cold": {
-        "p50": 104.31,
-        "p95": 106.85,
-        "p99": 113.38,
+        "p50": 108.7,
+        "p95": 125.63,
+        "p99": 234.92,
         "samples": 3000,
         "measures": 1170,
         "hits": 0,
@@ -433,7 +433,7 @@
         "skipped": 0
       },
       "warm": {
-        "p50": 1.66,
+        "p50": 1.67,
         "p95": 1.68,
         "p99": 1.7,
         "samples": 3000,
@@ -443,9 +443,9 @@
         "skipped": 10
       },
       "leaf": {
-        "p50": 10.89,
-        "p95": 10.93,
-        "p99": 13.12,
+        "p50": 11.06,
+        "p95": 11.1,
+        "p99": 13.35,
         "samples": 3000,
         "measures": 5,
         "hits": 121,
@@ -460,15 +460,15 @@
   },
   {
     "host": {
-      "kernel": "7.2.14-arch1-1",
+      "kernel": "7.2.15-arch1-1",
       "cpus": 4,
       "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
       "arch": "x86_64",
       "hostname": "iritur"
     },
     "driver": "gl",
-    "git": "b03dac3-dirty",
-    "preset": "release",
+    "git": "7c3e3a1-dirty",
+    "preset": "test",
     "scenario": "S3",
     "title": "drifting rounded quads",
     "backend": "gl",
@@ -482,10 +482,10 @@
     },
     "stages": {
       "update": {
-        "p50": 336.283,
-        "p95": 374.059,
-        "p99": 378.981,
-        "max": 418.115,
+        "p50": 110.515,
+        "p95": 118.232,
+        "p99": 121.616,
+        "max": 141.038,
         "samples": 1800
       },
       "tick_idle": {
@@ -496,10 +496,10 @@
         "samples": 0
       },
       "tick": {
-        "p50": 1534.225,
-        "p95": 1681.999,
-        "p99": 1726.025,
-        "max": 1840.785,
+        "p50": 452.743,
+        "p95": 468.326,
+        "p99": 486.712,
+        "max": 771.224,
         "samples": 1800
       },
       "describe": {
@@ -517,45 +517,45 @@
         "samples": 0
       },
       "layout": {
-        "p50": 329.853,
-        "p95": 350.771,
-        "p99": 365.479,
-        "max": 427.488,
+        "p50": 100.367,
+        "p95": 108.454,
+        "p99": 119.67,
+        "max": 179.127,
         "samples": 1800
       },
       "emit": {
-        "p50": 1197.521,
-        "p95": 1341.998,
-        "p99": 1371.952,
-        "max": 1483.269,
+        "p50": 347.996,
+        "p95": 361.001,
+        "p99": 371.961,
+        "max": 597.237,
         "samples": 1800
       },
       "order": {
-        "p50": 87.09,
-        "p95": 220.181,
-        "p99": 227.859,
-        "max": 250.295,
+        "p50": 31.395,
+        "p95": 35.217,
+        "p99": 43.904,
+        "max": 57.424,
         "samples": 1800
       },
       "encode": {
-        "p50": 211.887,
-        "p95": 353.868,
-        "p99": 367.294,
-        "max": 390.432,
+        "p50": 75.601,
+        "p95": 84.698,
+        "p99": 94.666,
+        "max": 160.026,
         "samples": 1800
       },
       "emit_order_encode": {
-        "p50": 1527.685,
-        "p95": 1657.433,
-        "p99": 1682.685,
-        "max": 1806.517,
+        "p50": 458.33,
+        "p95": 471.496,
+        "p99": 486.588,
+        "max": 767.97,
         "samples": 1800
       },
       "frame": {
-        "p50": 1867.15,
-        "p95": 1999.073,
-        "p99": 2031.156,
-        "max": 2164.77,
+        "p50": 562.647,
+        "p95": 578.262,
+        "p99": 599.892,
+        "max": 942.672,
         "samples": 1800
       },
       "raster": {
@@ -566,31 +566,31 @@
         "samples": 0
       },
       "submit": {
-        "p50": 528.148,
-        "p95": 672.048,
-        "p99": 711.494,
-        "max": 823.897,
+        "p50": 182.239,
+        "p95": 209.081,
+        "p99": 238.067,
+        "max": 339.902,
         "samples": 1800
       },
       "gpu": {
-        "p50": 8165.28,
-        "p95": 8820.32,
-        "p99": 8877.52,
-        "max": 8989.84,
+        "p50": 4589.12,
+        "p95": 5414.48,
+        "p99": 5590.48,
+        "max": 6042.64,
         "samples": 1800
       },
       "layout_emit_order_encode": {
-        "p50": 1860.629,
-        "p95": 1992.208,
-        "p99": 2023.956,
-        "max": 2157.037,
+        "p50": 559.734,
+        "p95": 574.842,
+        "p99": 596.116,
+        "max": 937.207,
         "samples": 1800
       },
       "update_frame": {
-        "p50": 2226.198,
-        "p95": 2359.563,
-        "p99": 2384.262,
-        "max": 2505.112,
+        "p50": 674.011,
+        "p95": 690.108,
+        "p99": 710.939,
+        "max": 1054.686,
         "samples": 1800
       },
       "update_idle": {
@@ -632,11 +632,11 @@
       "allocations": 0,
       "allocated_bytes": 0,
       "allocations_per_steady_frame": 0.0,
-      "mallinfo2_uordblks_delta": 4112,
-      "rss_anon_kb": 17236,
-      "minor_faults": 13,
+      "mallinfo2_uordblks_delta": 4528,
+      "rss_anon_kb": 16632,
+      "minor_faults": 11,
       "major_faults": 0,
-      "involuntary_switches": 2987
+      "involuntary_switches": 48
     },
     "gpu": {
       "renderer": "Mesa Intel(R) HD Graphics 5500 (BDW GT2)",
@@ -647,26 +647,26 @@
       "ring": "persistent",
       "program_binary_formats": 1,
       "program_cache": true,
-      "program_setup_cold_us": 23205.6,
-      "program_setup_again_us": 22831.9,
+      "program_setup_cold_us": 24348.2,
+      "program_setup_again_us": 23393.8,
       "programs_from_cache": 5
     },
     "gates": {
-      "G3": "fail",
+      "G3": "pass",
       "G5": "fail"
     }
   },
   {
     "host": {
-      "kernel": "7.2.14-arch1-1",
+      "kernel": "7.2.15-arch1-1",
       "cpus": 4,
       "cpu": "Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz",
       "arch": "x86_64",
       "hostname": "iritur"
     },
     "driver": "gl",
-    "git": "b03dac3-dirty",
-    "preset": "release",
+    "git": "7c3e3a1-dirty",
+    "preset": "test",
     "scenario": "S4",
     "title": "scrolling text wall",
     "backend": "gl",
@@ -680,10 +680,10 @@
     },
     "stages": {
       "update": {
-        "p50": 1.243,
-        "p95": 1.544,
-        "p99": 1.827,
-        "max": 26.346,
+        "p50": 0.658,
+        "p95": 1.044,
+        "p99": 1.978,
+        "max": 14.503,
         "samples": 1800
       },
       "tick_idle": {
@@ -694,10 +694,10 @@
         "samples": 0
       },
       "tick": {
-        "p50": 385.566,
-        "p95": 428.059,
-        "p99": 482.629,
-        "max": 630.855,
+        "p50": 122.74,
+        "p95": 137.229,
+        "p99": 156.346,
+        "max": 208.107,
         "samples": 1800
       },
       "describe": {
@@ -715,45 +715,45 @@
         "samples": 0
       },
       "layout": {
-        "p50": 2.044,
-        "p95": 2.286,
-        "p99": 2.641,
-        "max": 32.82,
+        "p50": 0.686,
+        "p95": 0.907,
+        "p99": 1.636,
+        "max": 8.944,
         "samples": 1800
       },
       "emit": {
-        "p50": 379.868,
-        "p95": 421.9,
-        "p99": 474.38,
-        "max": 624.339,
+        "p50": 120.833,
+        "p95": 134.595,
+        "p99": 154.312,
+        "max": 203.659,
         "samples": 1800
       },
       "order": {
-        "p50": 63.811,
-        "p95": 65.967,
-        "p99": 89.1,
-        "max": 139.731,
+        "p50": 20.257,
+        "p95": 20.81,
+        "p99": 27.895,
+        "max": 34.298,
         "samples": 1800
       },
       "encode": {
-        "p50": 36.143,
-        "p95": 38.92,
-        "p99": 60.795,
-        "max": 76.024,
+        "p50": 11.442,
+        "p95": 12.779,
+        "p99": 18.202,
+        "max": 24.666,
         "samples": 1800
       },
       "emit_order_encode": {
-        "p50": 480.701,
-        "p95": 525.838,
-        "p99": 584.929,
-        "max": 786.517,
+        "p50": 152.659,
+        "p95": 168.36,
+        "p99": 189.324,
+        "max": 258.91,
         "samples": 1800
       },
       "frame": {
-        "p50": 487.125,
-        "p95": 532.544,
-        "p99": 591.304,
-        "max": 795.147,
+        "p50": 154.666,
+        "p95": 171.105,
+        "p99": 191.594,
+        "max": 263.738,
         "samples": 1800
       },
       "raster": {
@@ -764,31 +764,31 @@
         "samples": 0
       },
       "submit": {
-        "p50": 326.445,
-        "p95": 366.733,
-        "p99": 446.215,
-        "max": 651.452,
+        "p50": 80.153,
+        "p95": 113.156,
+        "p99": 172.03,
+        "max": 242.612,
         "samples": 1800
       },
       "gpu": {
-        "p50": 2980.96,
-        "p95": 3036.4,
-        "p99": 3052.8,
-        "max": 3141.92,
+        "p50": 3012.48,
+        "p95": 3048.4,
+        "p99": 3065.04,
+        "max": 3076.88,
         "samples": 1800
       },
       "layout_emit_order_encode": {
-        "p50": 482.87,
-        "p95": 527.968,
-        "p99": 587.019,
-        "max": 789.133,
+        "p50": 153.346,
+        "p95": 169.034,
+        "p99": 190.022,
+        "max": 260.591,
         "samples": 1800
       },
       "update_frame": {
-        "p50": 488.502,
-        "p95": 533.752,
-        "p99": 592.602,
-        "max": 797.096,
+        "p50": 155.341,
+        "p95": 171.974,
+        "p99": 192.339,
+        "max": 265.489,
         "samples": 1800
       },
       "update_idle": {
@@ -830,11 +830,11 @@
       "allocations": 0,
       "allocated_bytes": 0,
       "allocations_per_steady_frame": 0.0,
-      "mallinfo2_uordblks_delta": 3552,
-      "rss_anon_kb": 27520,
-      "minor_faults": 24,
+      "mallinfo2_uordblks_delta": 3968,
+      "rss_anon_kb": 27964,
+      "minor_faults": 19,
       "major_faults": 0,
-      "involuntary_switches": 4
+      "involuntary_switches": 1
     },
     "gpu": {
       "renderer": "Mesa Intel(R) HD Graphics 5500 (BDW GT2)",
@@ -845,8 +845,8 @@
       "ring": "persistent",
       "program_binary_formats": 1,
       "program_cache": true,
-      "program_setup_cold_us": 23425.7,
-      "program_setup_again_us": 23131.6,
+      "program_setup_cold_us": 24398.4,
+      "program_setup_again_us": 23533.4,
       "programs_from_cache": 5
     },
     "text": {
@@ -854,8 +854,8 @@
       "doc_lines": 2000,
       "doc_glyphs": 99771,
       "layout_storage_bytes": 8094023,
-      "first_frame_us": 58607.7,
-      "first_layout_us": 55631.3,
+      "first_frame_us": 61296.5,
+      "first_layout_us": 58175.6,
       "first_shaping_calls": 3673,
       "first_rasterized": 402,
       "first_upload_bytes": 39904,
@@ -885,21 +885,21 @@
         "glyphs": 10,
         "shaping_calls": 2,
         "first": {
-          "p50": 10.5,
-          "p95": 14.4
+          "p50": 10.8,
+          "p95": 13.5
         },
         "cold": {
           "p50": 9.6,
-          "p95": 11.8,
+          "p95": 12.0,
           "samples": 300
         },
         "warm": {
-          "p50": 2.0,
-          "p95": 2.0,
+          "p50": 2.1,
+          "p95": 2.1,
           "samples": 300
         },
         "rewrap": {
-          "p50": 0.1,
+          "p50": 0.2,
           "p95": 0.2,
           "samples": 600
         }
@@ -911,17 +911,17 @@
         "glyphs": 50,
         "shaping_calls": 9,
         "first": {
-          "p50": 292.9,
-          "p95": 323.1
+          "p50": 313.7,
+          "p95": 326.7
         },
         "cold": {
-          "p50": 28.2,
-          "p95": 31.3,
+          "p50": 28.5,
+          "p95": 31.4,
           "samples": 300
         },
         "warm": {
-          "p50": 9.4,
-          "p95": 9.5,
+          "p50": 9.8,
+          "p95": 10.0,
           "samples": 300
         },
         "rewrap": {
@@ -937,22 +937,22 @@
         "glyphs": 507,
         "shaping_calls": 46,
         "first": {
-          "p50": 493.4,
-          "p95": 518.6
+          "p50": 512.7,
+          "p95": 525.5
         },
         "cold": {
-          "p50": 206.6,
-          "p95": 231.0,
+          "p50": 211.5,
+          "p95": 224.7,
           "samples": 100
         },
         "warm": {
-          "p50": 83.3,
-          "p95": 107.0,
+          "p50": 86.2,
+          "p95": 91.4,
           "samples": 100
         },
         "rewrap": {
           "p50": 2.8,
-          "p95": 3.1,
+          "p95": 2.9,
           "samples": 200
         }
       },
@@ -963,22 +963,22 @@
         "glyphs": 4990,
         "shaping_calls": 320,
         "first": {
-          "p50": 2256.9,
-          "p95": 2372.9
+          "p50": 2313.3,
+          "p95": 2333.3
         },
         "cold": {
-          "p50": 1953.6,
-          "p95": 1982.0,
+          "p50": 2000.5,
+          "p95": 2017.1,
           "samples": 30
         },
         "warm": {
-          "p50": 941.1,
-          "p95": 1014.8,
+          "p50": 975.3,
+          "p95": 985.4,
           "samples": 30
         },
         "rewrap": {
-          "p50": 38.7,
-          "p95": 40.1,
+          "p50": 40.4,
+          "p95": 41.7,
           "samples": 60
         }
       },
@@ -989,22 +989,22 @@
         "glyphs": 99771,
         "shaping_calls": 3673,
         "first": {
-          "p50": 34719.4,
-          "p95": 36809.3
+          "p50": 35879.8,
+          "p95": 38070.8
         },
         "cold": {
-          "p50": 34319.3,
-          "p95": 34730.6,
+          "p50": 35214.9,
+          "p95": 35471.5,
           "samples": 7
         },
         "warm": {
-          "p50": 20542.1,
-          "p95": 20580.2,
+          "p50": 21303.0,
+          "p95": 21313.7,
           "samples": 7
         },
         "rewrap": {
-          "p50": 886.8,
-          "p95": 1127.5,
+          "p50": 903.6,
+          "p95": 930.4,
           "samples": 14
         }
       }

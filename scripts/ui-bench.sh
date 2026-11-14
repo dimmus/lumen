@@ -73,7 +73,9 @@
 # The bench runs with address-space randomisation off (`setarch -R`, when util-linux is
 # there): S3's layout pass walks 10 000 heap nodes and its p50 moves 10 % with where the heap
 # landed, so a baseline is only comparable at a fixed layout. The comparison runs in
-# `python3 -I`; jq is not required.
+# `python3 -I`; jq is not required. On real hardware the pinned CPU is also kept out of deep
+# idle states and frequency scaling for the run (`quiet_cpu_start`, needs sudo: without it
+# the run says so and its p50s are the host's as much as the code's).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -319,8 +321,11 @@ PY
 if [[ "$e2e" -eq 1 ]]; then
   COMP="${BUILD}/lumen-compositor"
   INJ="${ROOT}/scripts/inject-input.py"
-  POINTER_DEV="${LUMEN_INJECT_POINTER:-/dev/input/event2}"
-  KEYBOARD_DEV="${LUMEN_INJECT_KEYBOARD:-/dev/input/event1}"
+  # The injection nodes: LUMEN_INJECT_* override, else found by device name (the virtual
+  # 'Lumen Inject Mouse' wherever the kernel enumerated it this time).
+  # shellcheck source=inject-devices.sh
+  source "$ROOT/scripts/inject-devices.sh"
+  inject_pick_devices
   e2e_tier="${backend}"
   [[ "$backend_given" -eq 0 || "$backend" == "none" ]] && e2e_tier=auto
   HOVER_S=3
@@ -475,6 +480,73 @@ if [[ "$build_type" != "Release" ]]; then
 fi
 preset="$(basename "$BUILD")"
 
+# ── A quiet CPU for the measurement ───────────────────────────────────────────
+# The bench's frame clock is 1 ms: between two frames the pinned core idles, and real
+# hardware parks an idle core in states that flush its caches (C3 and deeper: 40 us to
+# 2.6 ms of exit latency on the notebook) whenever the idle governor guesses the sleep is
+# long enough — which at 1 ms it does on some runs and not on others. One binary's S2 frame
+# p50 then reads 29 us or 75 us (tick_idle 0.17 or 4 us) with nothing changed, and under
+# schedutil the core's frequency wanders with the 5 % duty cycle on top (27–43 us). Neither
+# is the engine, and a baseline recorded in one mode fails a run that lands in the other.
+# So the pinned CPU is kept out of both for the measurement: a PM-QoS latency request of
+# 10 us held on /dev/cpu_dma_latency (C1 and C1E stay available, so nothing busy-polls;
+# nothing deeper is entered), and the performance governor on the pinned CPU. Runs of one
+# binary then agree within 2 %. Both need root, both are undone when the script exits; a
+# host with neither deep idle states nor a frequency governor (a VM guest) is left alone.
+# Without passwordless sudo the run goes ahead unheld and says so.
+QUIET_QOS_PID=""
+QUIET_GOV_FILE=""
+QUIET_GOV_WAS=""
+quiet_cpu_stop() {
+  if [[ -n "$QUIET_QOS_PID" ]]; then
+    # sudo relays the signal to the holder; the request ends with its descriptor.
+    kill -TERM "$QUIET_QOS_PID" 2>/dev/null || true
+    wait "$QUIET_QOS_PID" 2>/dev/null || true
+    QUIET_QOS_PID=""
+  fi
+  if [[ -n "$QUIET_GOV_FILE" ]]; then
+    echo "$QUIET_GOV_WAS" | sudo -n tee "$QUIET_GOV_FILE" >/dev/null 2>&1 || true
+    QUIET_GOV_FILE=""
+  fi
+}
+quiet_cpu_start() { # CPU
+  local cpu=$1 f deep=0 gov what=""
+  for f in /sys/devices/system/cpu/cpu"$cpu"/cpuidle/state*/latency; do
+    if [[ -r "$f" ]] && (( $(<"$f") > 10 )); then deep=1; fi
+  done
+  gov="/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor"
+  if [[ ! -r "$gov" || "$(<"$gov")" == performance ]]; then gov=""; fi
+  if (( ! deep )) && [[ -z "$gov" ]]; then return 0; fi
+  if ! sudo -n true 2>/dev/null; then
+    echo "NOTE: no passwordless sudo: cpu${cpu}'s deep idle states and frequency are not held."
+    echo "      On this host stage p50s move with them (up to 2x between runs of one binary)."
+    return 0
+  fi
+  trap quiet_cpu_stop EXIT
+  trap 'quiet_cpu_stop; exit 130' INT TERM
+  if (( deep )); then
+    sudo -n python3 -I -c 'import os, signal, struct
+fd = os.open("/dev/cpu_dma_latency", os.O_WRONLY)
+os.write(fd, struct.pack("i", 10))
+signal.pause()' &
+    QUIET_QOS_PID=$!
+    sleep 0.3   # in place before the first frame
+    if kill -0 "$QUIET_QOS_PID" 2>/dev/null; then
+      what="PM-QoS latency 10 us held"
+    else
+      QUIET_QOS_PID=""
+    fi
+  fi
+  if [[ -n "$gov" ]]; then
+    QUIET_GOV_WAS="$(<"$gov")"
+    if echo performance | sudo -n tee "$gov" >/dev/null 2>&1; then
+      QUIET_GOV_FILE="$gov"
+      what+="${what:+, }cpu${cpu} governor ${QUIET_GOV_WAS} -> performance"
+    fi
+  fi
+  echo "== quiet CPU: ${what:-could not hold the idle states or the governor}"
+}
+
 # The machine a baseline belongs to. A hostname is not one: the dev VM (2-core Pentium G6405)
 # and a notebook (4-core i7-5500U) are both "iritur", and the notebook was judged against the
 # VM's numbers. The key adds a digest of the CPU model and count, the fields every result
@@ -534,6 +606,7 @@ if [[ "$client" -eq 1 ]]; then
   [[ -n "$frames" ]] && args+=(--frames "$frames")
   [[ "$warmup_given" -eq 1 ]] && args+=(--warmup "$warmup")
   [[ -n "$pin" ]] && args+=(--pin-client "$pin")
+  quiet_cpu_start "$pin"
   echo "== lumen-ui-bench --client: tier=${tier} load=$(cut -d' ' -f1 /proc/loadavg) -> ${out#"$ROOT"/}"
   rc=0
   "$BENCH" "${args[@]}" || rc=$?
@@ -658,6 +731,7 @@ frames_for() {
   esac
 }
 
+quiet_cpu_start "$pin"
 echo "== lumen-ui-bench: backend=${backend} warmup=${warmup} pin=${pin} -> ${out#"$ROOT"/}"
 parts=()
 for scenario in S1 S2 S3 S4; do
