@@ -888,7 +888,7 @@ private:
     /// A copy of what the mapped window `rec` draws (its frame, its surfaces), at the place
     /// of its tree container in the window layer, its content held (`hold_content`); null
     /// when it cannot be made. For its close animation.
-    [[nodiscard]] scene::container_node* make_ghost(const toplevel_record& rec);
+    [[nodiscard]] scene::container_node* make_ghost(const toplevel_record& rec, window_rest& rest);
     /// The animator is done with a ghost: out of the layer, holds released, freed.
     void free_ghost(scene::container_node* box);
     /// The animator's largest output scale (its settle threshold is half a pixel there).
@@ -2801,6 +2801,20 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     if (!rec)
         return;
 
+    // The unmapping commit goes before anything is measured against this commit: its tree
+    // is empty, so the window geometry it would produce is an empty rect — but the window
+    // was shown at its last geometry until this very commit, and the closing ghost (and
+    // the unmap's damage) has to be sized against that, not against a window that just
+    // collapsed to nothing. A fade of a 0x0 ghost leaves the last presented frame of the
+    // full-size window on screen indefinitely: nothing ever damages the area again.
+    if (rec->mapped && !info.has_buffer) {
+        on_unmap(id, "null-buffer");
+        // xdg-shell: the next commit is a new initial commit.
+        if (auto* again = toplevels_->find_mut(id))
+            toplevel_manager::reset_for_remap(*again);
+        return;
+    }
+
     const lx::rect2i previous = rec->geometry;
     // The frame before this commit: what a placement animates from.
     const lx::rect2i previous_frame = frame_rect(rec->geometry, extents_of(*rec));
@@ -2897,14 +2911,6 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
                     sync_fullscreen(*r, false);
             }
         }
-        return;
-    }
-
-    if (!info.has_buffer) {
-        on_unmap(id, "null-buffer");
-        // xdg-shell: the next commit is a new initial commit.
-        if (auto* again = toplevels_->find_mut(id))
-            toplevel_manager::reset_for_remap(*again);
         return;
     }
 
@@ -3116,11 +3122,13 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     // Window animations: what it drew fades out as a ghost, taking over any motion it had;
     // without one its motion ends with it.
     if (anim_.enabled() && rec->state != lx::toplevel_state::fullscreen) {
-        const window_rest rest = rest_of(*rec);
+        window_rest rest = rest_of(*rec);
         // An older ghost (it remapped unanimated, hidden or fullscreen) lets go of its holds
         // first: they are per surface, and the new ghost takes its own.
         anim_.end_ghost(id);
-        scene::container_node* ghost = make_ghost(*rec);
+        // The ghost's bounds are what it copies (a CSD shadow reaches past the window
+        // geometry, and the tree's own bbox is already empty on the unmapping commit).
+        scene::container_node* ghost = make_ghost(*rec, rest);
         if (ghost && !anim_.close(id, ghost, rest)) {
             free_ghost(ghost);
             ghost = nullptr;
@@ -6317,7 +6325,7 @@ lx::compositor::window_manager::rest_of(const toplevel_record& rec) const {
 }
 
 lx::scene::container_node*
-lx::compositor::window_manager::make_ghost(const toplevel_record& rec) {
+lx::compositor::window_manager::make_ghost(const toplevel_record& rec, window_rest& rest) {
     if (!tree_ || !surfaces_ || !windows_layer_ || !ops_.hold_content)
         return nullptr;
     scene::container_node* box = tree_->container(rec.surface);
@@ -6417,6 +6425,16 @@ lx::compositor::window_manager::make_ghost(const toplevel_record& rec) {
         if (!g->box.add(raw)) {
             release();
             return nullptr;
+        }
+        // What the ghost draws reaches where this node is (a CSD shadow subsurface is
+        // outside the window geometry): the fade damages it frame by frame.
+        const lx::rect2i nr = surfaces_->node_rect(src->surface());
+        if (nr.width > 0 && nr.height > 0) {
+            const int x0 = std::min(rest.bounds.x, nr.x);
+            const int y0 = std::min(rest.bounds.y, nr.y);
+            const int x1 = std::max(rest.bounds.x + rest.bounds.width, nr.x + nr.width);
+            const int y1 = std::max(rest.bounds.y + rest.bounds.height, nr.y + nr.height);
+            rest.bounds = {x0, y0, x1 - x0, y1 - y0};
         }
     }
     // Where the window was: above what was under it, below what was over it (the window's

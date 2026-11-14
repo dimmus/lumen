@@ -726,6 +726,32 @@ std::uint32_t pending_damage() {
     return g_comp->scene().pending_damage_mask();
 }
 
+/// The area the last published snapshot of output 0 carries as damaged — what the render
+/// thread would composite. This is the frame's repaint: a fade that damages less than it
+/// draws leaves what it drew on screen (the close ghost). A full region counts as the
+/// whole output (`damage_region::area` sums rects only).
+unsigned long long published_damage_area() {
+    std::lock_guard<std::mutex> hold(*g_lock);
+    lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+    const auto& snap = g_comp->scene().acquire_render_snapshot(0);
+    const unsigned long long area =
+        snap.damage_rects().full ? 1280ull * 720ull : snap.damage_rects().area();
+    g_comp->scene().release_render_frame(0, snap);
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    return area;
+}
+
+/// A wl_buffer whose release the client sees (the ghost's hold on it has ended and its
+/// frames completed — the retire `defer_retire` held back).
+struct buffer_watch {
+    wl_buffer* buffer = nullptr;
+    bool released = false;
+};
+void on_buffer_release(void* data, wl_buffer*) {
+    static_cast<buffer_watch*>(data)->released = true;
+}
+constexpr wl_buffer_listener k_buffer_listener = {on_buffer_release};
+
 bool same_rect(lx::rect2i a, lx::rect2i b) {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
 }
@@ -907,6 +933,92 @@ void run_cases() {
         const bool quiet = goes_quiet(why);
         check("close: then nothing of it is drawn and the desktop is quiet",
               quiet && !window_draw().found, why);
+    }
+
+    // The unmapping commit itself — a null buffer, the wire path a closing client really
+    // takes (the seat's close ghost). The tree it leaves is empty, so the ghost must be
+    // measured against where the window was last shown: its fade is the only animation
+    // running (nothing else drives the frame clock), every frame damages what it draws —
+    // the repaint that takes the window off the screen — and the buffer it held is
+    // released once the ghost retires.
+    window e{};
+    map_window(c, e, "e");
+    for (int i = 0; i < 60 && animating(); ++i)
+        tick();
+    const rec_copy e0 = record("e");
+    buffer_watch bw{};
+    bw.buffer = make_buffer(c, e.width > 0 ? e.width : 200, e.height > 0 ? e.height : 150);
+    wl_buffer_add_listener(bw.buffer, &k_buffer_listener, &bw);
+    if (e.serial != e.acked)
+        xdg_surface_ack_configure(e.xdg, e.serial);
+    e.acked = e.serial;
+    wl_surface_attach(e.surface, bw.buffer, 0, 0);
+    wl_surface_commit(e.surface);
+    (void)wl_display_roundtrip(c.display);
+    (void)wl_display_roundtrip(c.display);
+    tick();
+    check("null close: the window is at rest, nothing animates",
+          e0.mapped && !animating(), rect_text(e0.geometry));
+    // The unmapping commit: attach(null) + commit, then the client goes away.
+    wl_surface_attach(e.surface, nullptr, 0, 0);
+    wl_surface_commit(e.surface);
+    (void)wl_display_roundtrip(c.display);
+    (void)wl_display_roundtrip(c.display);
+    check("null close: a ghost animates", animating());
+    {
+        const auto want = fade_frames(e0.geometry, true);
+        const unsigned long long window_area = static_cast<unsigned long long>(e0.geometry.width) *
+                                               e0.geometry.height;
+        frame_errors err{};
+        unsigned long long first_damage = 0;
+        unsigned long long least_damage = ~0ull;
+        for (const pose& p : want) {
+            tick();
+            const seen s = window_draw();
+            ++err.frames;
+            if (!s.found) {
+                err.missing = true;
+                continue;
+            }
+            const int d = std::max({std::abs(s.dst.x - p.dst.x), std::abs(s.dst.y - p.dst.y),
+                                    std::abs(s.dst.x + s.dst.width - p.dst.x - p.dst.width),
+                                    std::abs(s.dst.y + s.dst.height - p.dst.y - p.dst.height)});
+            err.worst_px = std::max(err.worst_px, d);
+            err.worst_opacity = std::max(err.worst_opacity, std::abs(s.opacity - p.opacity));
+            // What this frame repainted (a ghost measured against the emptied tree fades a
+            // collapsed sliver here while still drawing the window at full size — the area
+            // is never repainted again, and the last presented frame stays on screen).
+            const unsigned long long area = published_damage_area();
+            if (first_damage == 0)
+                first_damage = area;
+            least_damage = std::min(least_damage, area);
+        }
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "%s; damage first %llu, least %llu of %llu px",
+                      errors_text(err).c_str(), first_damage, least_damage, window_area);
+        check("null close: the ghost fades frame by frame at the rect it was last shown at",
+              !err.missing && err.worst_px <= 1 && err.worst_opacity < 1e-6, detail);
+        // The fade's first frame repaints the whole window; its last still repaints most
+        // of it (the ghost has shrunk to 0.9 of the size by then, 0.81 of the area).
+        check("null close: every frame of the fade repaints what the ghost draws",
+              first_damage >= window_area && least_damage >= window_area * 3 / 4, detail);
+        std::string why;
+        const bool quiet = goes_quiet(why);
+        check("null close: then nothing of it is drawn and the desktop is quiet",
+              quiet && !window_draw().found, why);
+        // The ghost let go of the buffer: the frames it sampled complete (tick_ui dates
+        // them; without a render thread the low-water mark is driven here as tick_render
+        // would) and the client's wl_buffer.release arrives.
+        {
+            std::lock_guard<std::mutex> hold(*g_lock);
+            (void)g_comp->buffer_lifecycle().retire_completed_frames(g_frame);
+            g_comp->wayland().flush();
+        }
+        (void)wl_display_roundtrip(c.display);
+        (void)wl_display_roundtrip(c.display);
+        check("null close: the closed window's last buffer is released once the ghost retires",
+              bw.released);
+        wl_buffer_destroy(bw.buffer);
     }
 
     // A workspace switch: the window slides out to the left (the next workspace comes from
