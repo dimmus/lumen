@@ -269,8 +269,8 @@ LUMEN_TEST(logout_button_takes_the_right_end_and_leaves_entries_the_rest) {
     lx::shell::layout_panel(many, 400, 32, -1, -1, {}, l, lx::shell::panel_logout{true});
     LUMEN_CHECK(l.logout_w == lx::shell::k_logout_width);
     LUMEN_CHECK(l.logout_x == 400 - 4 - lx::shell::k_logout_width);
-    // Entries share 400 - 8 - (84 + 4) = 304: (304 - 44) / 52 = 5 shown, +5, all left of it.
-    LUMEN_CHECK(l.count == 5 && l.hidden == 5);
+    // Entries share 400 - 8 - (28 + 4) = 360: (360 - 44) / 52 = 6 shown, +4, all left of it.
+    LUMEN_CHECK(l.count == 6 && l.hidden == 4);
     LUMEN_CHECK(l.cells[4].x + l.cells[4].w < l.logout_x);
     LUMEN_CHECK(l.more_x + lx::shell::k_panel_more_width <= l.logout_x);
 
@@ -299,12 +299,12 @@ LUMEN_TEST(logout_icon_hit_and_hover_flags) {
     LUMEN_CHECK(l.logout_flags == lx::shell::logout_hover);
 }
 
-LUMEN_TEST(arming_the_logout_button_damages_only_the_button) {
+LUMEN_TEST(pressing_the_logout_button_damages_only_the_button) {
     static lx::shell::panel_layout a, b;
     task_model& m = snapshot_of(3);
     lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, a, lx::shell::panel_logout{true});
     lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, b,
-                            lx::shell::panel_logout{true, false});
+                            lx::shell::panel_logout{true, true});
     lx::rect2i r[8];
     LUMEN_CHECK(lx::shell::panel_diff(a, b, r, 8) == 1);
     LUMEN_CHECK(r[0].x == b.logout_x && r[0].width == b.logout_w);
