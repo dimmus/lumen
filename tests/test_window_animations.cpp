@@ -14,7 +14,9 @@
 //   a buffer the surface shows again is not released by the hold ending, and a newer ghost's
 //   hold outlives the older one's;
 // - in-process against a real compositor (one virtual 1280x720 output, no shell): off by
-//   default nothing animates; on, a window opens, closes (a ghost), slides with a workspace
+//   default nothing animates; on, a window opens, closes (a ghost — through the client's
+//   null-buffer unmapping commit too, a CSD shadow past the geometry fading and repainted
+//   with it), slides with a workspace
 //   switch, minimizes and comes back, maximizes and restores in the maximize's tail
 //   visually — every intermediate frame's
 //   draw equal to the closed form — the client configured for its final size at once, and
@@ -551,6 +553,7 @@ struct client {
     wl_display* display = nullptr;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
     wl_shm* shm = nullptr;
 };
@@ -559,6 +562,9 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
     auto* c = static_cast<client*>(data);
     if (std::strcmp(iface, wl_compositor_interface.name) == 0)
         c->compositor = static_cast<wl_compositor*>(wl_registry_bind(r, name, &wl_compositor_interface, 4));
+    else if (std::strcmp(iface, wl_subcompositor_interface.name) == 0)
+        c->subcompositor = static_cast<wl_subcompositor*>(
+            wl_registry_bind(r, name, &wl_subcompositor_interface, 1));
     else if (std::strcmp(iface, xdg_wm_base_interface.name) == 0)
         c->wm_base = static_cast<xdg_wm_base*>(
             wl_registry_bind(r, name, &xdg_wm_base_interface, version < 6 ? version : 6));
@@ -683,18 +689,22 @@ struct seen {
     float opacity = 0.f;
     bool scaled = false;
 };
-seen window_draw() {
+/// The same, the last one at least `min_w` px wide — a CSD shadow is the wide draw.
+seen draw_wider_than(int min_w) {
     std::lock_guard<std::mutex> hold(*g_lock);
     static lx::scene::draw_list list;
     g_comp->scene().build_draw_list_into(list, 0);
     seen s{};
     for (unsigned i = 0; i < list.size(); ++i) {
         const lx::scene::draw_command& d = list.data()[i];
-        if (d.solid || !d.texture || d.dst.width < 50)
+        if (d.solid || !d.texture || d.dst.width < min_w)
             continue;
         s = {true, d.dst, d.opacity, d.scaled};
     }
     return s;
+}
+seen window_draw() {
+    return draw_wider_than(50);
 }
 
 /// The same, as a capture view of output 0 (a screenshot, a screencast) would draw it now.
@@ -769,14 +779,16 @@ int stop_frame(double x0, double threshold) {
     return -1;
 }
 
-/// Frames of an open/close/minimize motion of a `w`x`h` frame at `rest`: per frame the
-/// expected draw (scale about the centre, opacity), until it settles; `closing` runs
-/// opacity 1 → 0 and scale 1 → 0.9, else 0 → 1 and 0.9 → 1.
+/// Frames of an open/close/minimize motion of a window at `rest`: per frame the expected
+/// draw (scale about the centre, opacity), until it settles; `closing` runs opacity 1 → 0
+/// and scale 1 → 0.9, else 0 → 1 and 0.9 → 1.
 struct pose {
     lx::rect2i dst{};
     double opacity = 1.0;
 };
-std::vector<pose> fade_frames(lx::rect2i rest, bool closing) {
+/// The motion measured on `rect`, what a window's content out at `rect` draws (a CSD
+/// shadow): it scales and fades with the window, about the *rest's* centre, not its own.
+std::vector<pose> fade_frames(lx::rect2i rest, lx::rect2i rect, bool closing) {
     const double half = std::max(rest.width, rest.height) * 0.5;
     const int alpha_stop = stop_frame(1.0, 1.0 / 255.0);
     const int scale_stop = stop_frame(0.1, 0.5 / half);
@@ -792,16 +804,20 @@ std::vector<pose> fade_frames(lx::rect2i rest, bool closing) {
         const double cx = rest.x + rest.width * 0.5;
         const double cy = rest.y + rest.height * 0.5;
         pose p{};
-        const long x0 = std::lround(cx - rest.width * s * 0.5);
-        const long x1 = std::lround(cx + rest.width * s * 0.5);
-        const long y0 = std::lround(cy - rest.height * s * 0.5);
-        const long y1 = std::lround(cy + rest.height * s * 0.5);
+        const long x0 = std::lround(cx + (rect.x - cx) * s);
+        const long x1 = std::lround(cx + (rect.x + rect.width - cx) * s);
+        const long y0 = std::lround(cy + (rect.y - cy) * s);
+        const long y1 = std::lround(cy + (rect.y + rect.height - cy) * s);
         p.dst = {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
                  static_cast<int>(y1 - y0)};
         p.opacity = opacity;
         out.push_back(p);
     }
     return out;
+}
+/// The window's own rect: the motion measured on the window itself.
+std::vector<pose> fade_frames(lx::rect2i rest, bool closing) {
+    return fade_frames(rest, rest, closing);
 }
 
 /// Ticks through `want`, comparing each frame's draw; edges within `slack` px, opacity
@@ -873,8 +889,8 @@ void run_cases() {
     c.registry = wl_display_get_registry(c.display);
     wl_registry_add_listener(c.registry, &registry_listener, &c);
     (void)wl_display_roundtrip(c.display);
-    if (!c.compositor || !c.wm_base || !c.shm) {
-        check("connect: wl_compositor, xdg_wm_base, wl_shm", false);
+    if (!c.compositor || !c.subcompositor || !c.wm_base || !c.shm) {
+        check("connect: wl_compositor, wl_subcompositor, xdg_wm_base, wl_shm", false);
         return;
     }
 
@@ -1020,6 +1036,91 @@ void run_cases() {
               bw.released);
         wl_buffer_destroy(bw.buffer);
     }
+
+    // The same unmapping close with a CSD shadow: a subsurface reaching 24 px past the
+    // window on every side, while xdg_surface.set_window_geometry keeps the window
+    // geometry at the window itself (what a shadowed CSD window does) — content the ghost
+    // draws outside the rect it is measured against. The unmapping commit has already
+    // emptied the tree's own bbox, so the ghost's bounds are what it copies: a fade sized
+    // to the geometry alone would never damage the shadow, and its last presented frame
+    // would stay on screen.
+    window s{};
+    map_window(c, s, "s");
+    for (int i = 0; i < 60 && animating(); ++i)
+        tick();
+    const rec_copy s0 = record("s");
+    const int swidth = s.width > 0 ? s.width : 200;
+    const int sheight = s.height > 0 ? s.height : 150;
+    constexpr int k_halo = 24;
+    wl_surface* shadow = wl_compositor_create_surface(c.compositor);
+    wl_subsurface* sub = wl_subcompositor_get_subsurface(c.subcompositor, shadow, s.surface);
+    wl_subsurface_set_position(sub, -k_halo, -k_halo);
+    wl_surface_attach(shadow, make_buffer(c, swidth + 2 * k_halo, sheight + 2 * k_halo), 0, 0);
+    wl_surface_commit(shadow);
+    // The subsurface's place and the geometry apply at the parent's commit.
+    xdg_surface_set_window_geometry(s.xdg, 0, 0, swidth, sheight);
+    wl_surface_commit(s.surface);
+    (void)wl_display_roundtrip(c.display);
+    (void)wl_display_roundtrip(c.display);
+    tick();
+    const rec_copy s1 = record("s");
+    const lx::rect2i halo{s1.geometry.x - k_halo, s1.geometry.y - k_halo,
+                          s1.geometry.width + 2 * k_halo, s1.geometry.height + 2 * k_halo};
+    {
+        const seen wide = draw_wider_than(s1.geometry.width);
+        check("shadow close: the geometry stays at the window, the shadow is drawn past it",
+              s1.mapped && same_rect(s1.geometry, s0.geometry) && wide.found &&
+                  same_rect(wide.dst, halo) && wide.opacity == 1.f,
+              rect_text(s1.geometry) + " shadow " + rect_text(wide.dst));
+    }
+    wl_surface_attach(s.surface, nullptr, 0, 0);
+    wl_surface_commit(s.surface);
+    (void)wl_display_roundtrip(c.display);
+    (void)wl_display_roundtrip(c.display);
+    check("shadow close: a ghost animates", animating());
+    {
+        const auto want = fade_frames(s1.geometry, halo, true);
+        const unsigned long long halo_area =
+            static_cast<unsigned long long>(halo.width) * halo.height;
+        frame_errors err{};
+        unsigned long long first_damage = 0;
+        unsigned long long least_damage = ~0ull;
+        for (const pose& p : want) {
+            tick();
+            const seen sh = draw_wider_than(s1.geometry.width);
+            ++err.frames;
+            if (!sh.found) {
+                err.missing = true;
+                continue;
+            }
+            const int d = std::max({std::abs(sh.dst.x - p.dst.x), std::abs(sh.dst.y - p.dst.y),
+                                    std::abs(sh.dst.x + sh.dst.width - p.dst.x - p.dst.width),
+                                    std::abs(sh.dst.y + sh.dst.height - p.dst.y - p.dst.height)});
+            err.worst_px = std::max(err.worst_px, d);
+            err.worst_opacity = std::max(err.worst_opacity, std::abs(sh.opacity - p.opacity));
+            // What this frame repainted: the fade has to cover the shadow out at the halo
+            // too, every frame, or what it drew there is never taken off the screen.
+            const unsigned long long area = published_damage_area();
+            if (first_damage == 0)
+                first_damage = area;
+            least_damage = std::min(least_damage, area);
+        }
+        char detail[160];
+        std::snprintf(detail, sizeof(detail), "%s; damage first %llu, least %llu of %llu px",
+                      errors_text(err).c_str(), first_damage, least_damage, halo_area);
+        check("shadow close: the shadow fades with the window, frame by frame",
+              !err.missing && err.worst_px <= 1 && err.worst_opacity < 1e-6, detail);
+        check("shadow close: every frame of the fade repaints the shadow too",
+              first_damage >= halo_area && least_damage >= halo_area * 3 / 4, detail);
+        std::string why;
+        const bool quiet = goes_quiet(why);
+        check("shadow close: then nothing of it is drawn and the desktop is quiet",
+              quiet && !window_draw().found && !draw_wider_than(s1.geometry.width).found, why);
+    }
+    wl_subsurface_destroy(sub);
+    wl_surface_destroy(shadow);
+    destroy_window(c, s);
+    tick();
 
     // A workspace switch: the window slides out to the left (the next workspace comes from
     // the right), then is hidden; switching back slides it in from the left.
