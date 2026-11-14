@@ -173,10 +173,22 @@ second failure is reportable.
   cycle moved the frequency besides (27–43 µs). `ui-bench.sh` now holds a 10 µs PM-QoS
   latency request (`/dev/cpu_dma_latency`, root, C1/C1E stay available — no busy-polling)
   and pins the pinned CPU's governor to performance for the run; runs of one binary then
-  agree within ~2 %. A baseline recorded unheld and a run held (or vice versa) do not
-  compare — the script verifies the hold is in effect (the holder marks its
-  `/dev/cpu_dma_latency` write, the governor is read back) and exits 2 rather than
-  measuring unheld; check for the "== quiet CPU" line all the same.
+  agree within ~2 % — on `--backend none`. A baseline recorded unheld and a run held
+  (or vice versa) do not compare — the script verifies the hold is in effect (the
+  holder marks its `/dev/cpu_dma_latency` write, the governor is read back) and exits 2
+  rather than measuring unheld; check for the "== quiet CPU" line all the same.
+- **The GPU backends have a second, wandering ~2× host mode the quiet hold cannot
+  touch** (found 2026-11-14 evening, notebook, hasvk): minutes-long eras in which
+  every memory-bound stage reads ~2× (S2 frame p50 71 µs against a 36.74 µs baseline)
+  while `update`, `tick_idle` and `layout_solve.warm` sit at baseline and `none` is
+  immune — the core's clock, package heat, the iGPU's rps frequency and the other
+  CPUs' governors are all identical in both modes; holding all CPUs at performance
+  does not help (the prime hasvk-worker hypothesis is refuted by interleaved A/B;
+  evidence/2026-11-14-ui-bench-vulkan-ab/). `ui-bench.sh` therefore warms the host
+  before measuring: an unmeasured S2 probe, full-length warm-up rounds while it reads
+  above 1.15× the baseline's S2 frame p50, and exit 2 when the pole is not reached —
+  a slow-mode run is the host's, not the code's, and is neither a regression nor
+  green. Check for the "== host warm-up" lines in a gate output.
 - Never measure while another session builds or runs a smoke. Serialize all seat work.
 - Memory: `heaptrack -o FILE ./build/release/lumen-compositor` (ptrace_scope 1 — launch
   under it, don't attach). Idle compositor allocates ~nothing; ~100k startup allocations
