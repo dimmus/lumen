@@ -495,8 +495,9 @@ preset="$(basename "$BUILD")"
 # temperature, the iGPU's rps frequency and the other CPUs' governors are all
 # identical in both modes (interleaved A/Bs, evidence/2026-11-14-ui-bench-vulkan-ab/).
 # Its onset is not reproducible (idle gaps do not trigger it), but sustained bench
-# load usually relaxes it within a few rounds — and nothing on this host can hold the
-# state (the ring-ratio MSR refuses writes). So the gate warms the host into the state
+# load usually relaxes it within a few rounds — and no hold for it is known to work
+# (MSR 0x620, UNCORE_RATIO_LIMIT, is writable on this host; whether the hardware
+# honors a raised min ratio is untested). So the gate warms the host into the state
 # the baseline was recorded in and verifies it got there — a short unmeasured S2 probe
 # of this backend first, full-length unmeasured warm-up rounds while the probe reads
 # above the settle threshold, and exit 2 when the pole is not reached: a slow-mode run
