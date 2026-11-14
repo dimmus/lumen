@@ -299,7 +299,8 @@
 #        keyboard, the security-context manager itself); the socket stops when its close fd
 #        hangs up
 #   W  pointer protocols (design-app-compat-capture Part C; relative motion injected on the
-#      VMware mouse's REL_X/REL_Y node, LUMEN_INJECT_RELATIVE, default /dev/input/event3)
+#      virtual mouse's REL_X/REL_Y — the same node as the pointer on the notebook, the
+#      VMware mouse's second node on the VM; LUMEN_INJECT_RELATIVE overrides)
 #     W1 lumen-probe constraints (persistent lock): locked once the pointer is on the focused
 #        window; 20 relative motions arrive with their unaccelerated deltas (10,-5 device
 #        units) and an absolute-device move arrives as a relative delta of the same size —
@@ -441,9 +442,10 @@ PROBE="${BUILD}/lumen-probe"
 PORTAL_PROBE="${BUILD}/lumen-portal-probe"
 SHELL_BIN="${BUILD}/lumen-shell"
 INJ="${ROOT}/scripts/inject-input.py"
-POINTER_DEV="${LUMEN_INJECT_POINTER:-/dev/input/event2}"
-KEYBOARD_DEV="${LUMEN_INJECT_KEYBOARD:-/dev/input/event1}"
-RELATIVE_DEV="${LUMEN_INJECT_RELATIVE:-/dev/input/event3}"
+# The injection nodes are picked after the log redirect (scripts/inject-devices.sh):
+# LUMEN_INJECT_POINTER / LUMEN_INJECT_KEYBOARD / LUMEN_INJECT_RELATIVE override, else they
+# are found by device name — the virtual 'Lumen Inject Mouse' wherever the kernel
+# enumerated it this time, the internal keyboard wherever it sits.
 
 SOCKET="lumen-app-smoke"
 LOG_DIR="${ROOT}/app-smoke-logs"
@@ -526,25 +528,26 @@ if (( ! SKIP_GTK )) && ! command -v gtk4-widget-factory >/dev/null; then
   echo "NOTE: gtk4-widget-factory not installed; GTK scenarios skipped"; SKIP_GTK=1
 fi
 
-newest_of() {
-  { git -C "$ROOT" ls-files -z -- "$@"
-    git -C "$ROOT" ls-files -z --others --exclude-standard -- "$@"; } |
-    (cd "$ROOT" && xargs -0 ls -t 2>/dev/null) | head -1
-}
-if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  for pair in "$COMP:modules executables/lumen-compositor" "$SQUARE:executables/lumen-square" \
-              "$PROBE:tests/clients" "$SHELL_BIN:modules/lx.shell executables/lumen-shell" \
-              "$BUILD/xdg-desktop-portal-lumen:modules/lx.portal executables/xdg-desktop-portal-lumen"; do
-    [[ -e "${pair%%:*}" ]] || continue
-    bin=${pair%%:*}
-    # shellcheck disable=SC2086 # the path list is meant to split
-    src=$(newest_of ${pair#*:})
-    if [[ -n "$src" && "$ROOT/$src" -nt "$bin" ]]; then
-      echo "FAIL: $bin is older than $src. Rebuild:  cmake --build --preset release"
-      exit 2
-    fi
-  done
+# A binary older than its sources would test yesterday's code and look like a pass. The
+# build system says so itself — it knows what each binary links (a touched module the
+# binary does not link is not staleness) — so ask it whether it would rebuild them.
+# shellcheck source=build-fresh.sh
+source "$ROOT/scripts/build-fresh.sh"
+FRESH_TARGETS=(lumen-compositor lumen-square lumen-probe lumen-shell)
+[[ -x "$BUILD/xdg-desktop-portal-lumen" ]] && FRESH_TARGETS+=(xdg-desktop-portal-lumen)
+build_fresh "$BUILD" "${FRESH_TARGETS[@]}"; fresh=$?
+if (( fresh == 1 )); then
+  echo "FAIL: $BUILD is not up to date (${build_fresh_why})."
+  echo "      Rebuild:  cmake --build $BUILD"
+  exit 2
+elif (( fresh == 2 )); then
+  echo "NOTE: binary freshness not checked (${build_fresh_why})."
 fi
+
+# The nodes to inject into: by name unless LUMEN_INJECT_* says otherwise.
+# shellcheck source=inject-devices.sh
+source "$ROOT/scripts/inject-devices.sh"
+inject_pick_devices
 
 if ! sudo -n true 2>/dev/null; then
   echo "FAIL: the injector writes to evdev nodes as root and needs passwordless sudo"
@@ -557,6 +560,12 @@ if want W && [[ ! -c "$RELATIVE_DEV" ]]; then
   echo "FAIL: $RELATIVE_DEV is not an input device node (group W injects relative motion there;"
   echo "      set LUMEN_INJECT_RELATIVE to a node with REL_X/REL_Y)"
   exit 2
+fi
+if { want W || want R; } && ! inject_node_has_rel_motion "$RELATIVE_DEV"; then
+  echo "NOTE: $RELATIVE_DEV has no REL_X/REL_Y (a virtual mouse created by an older"
+  echo "      scripts/uinput-mouse.py?): the kernel drops relative motion written to it, so"
+  echo "      R1, R4 and W1/W2/W4 cannot pass here — only the wheel rides on it. Restart"
+  echo "      its holder from this tree's script."
 fi
 
 SEAT_SCOPE=""
@@ -957,9 +966,25 @@ if want B; then
       settle "$GTK_ID"
       sleep 1
       read -r X Y W H < <(geom "$GTK_ID")
+      # The points were found on the 1914x924 dev output, where the centred window
+      # (1666x881) ends 124 px short of the output's right edge and 22 short of its
+      # bottom one — that is what makes a menu opened low in it run against the bottom
+      # edge (flip) and one opened 40 px inside the right edge against the right one
+      # (slide). A larger output centres the window nowhere near an edge, so Super+drag
+      # it to the same margins first (the compositor's move, exact): the same widgets
+      # inside the window then meet the same edges on every output.
+      TX=$((OUT_W - W - 124)); TY=$((OUT_H - H - 22))
+      if (( TX != X || TY != Y )); then
+        PX=$((X + W / 2)); PY=$((Y + H / 2))
+        inject move "$PX" "$PY"; sleep 0.2
+        inject drag "$PX" "$PY" $((PX + TX - X)) $((PY + TY - Y)) --button left --super --steps 30
+        settle "$GTK_ID"
+        sleep 0.3
+        read -r X Y W H < <(geom "$GTK_ID")
+      fi
       # (rel x, rel y, then): esc = open and Escape; out = open and click outside;
       # the last two open near the output's bottom and right edges.
-      for spec in "1376 529 esc" "1376 529 out" "1376 579 esc" "$((OUT_W - X - 164)) 529 esc"; do
+      for spec in "1376 529 esc" "1376 529 out" "1376 579 esc" "$((W - 40)) 529 esc"; do
         read -r RX RY THEN <<<"$spec"
         B6_LINES+=("$(lines "$COMP_LOG")")
         inject move $((X + RX)) $((Y + RY)); sleep 0.3
@@ -1131,11 +1156,15 @@ if want D; then
     read -r X Y W H < <(geom "$SQ_ID")
     PX=$((X + W / 2)); PY=$((Y + H / 2))
     inject move "$PX" "$PY"; sleep 0.2
-    inject drag "$PX" "$PY" "$PX" $((PY - 600)) --button left --super --steps 40
+    # Drag up by the window's distance to the panel plus 304 px of overshoot (600 px was
+    # the 924-high output's 296 px plus that): the window must stop at y=32, wherever it
+    # was centred on this output.
+    D1_UP=$(( Y - 32 + 304 ))
+    inject drag "$PX" "$PY" "$PX" $((PY - D1_UP)) --button left --super --steps 40
     settle "$SQ_ID"
   fi
   stop_client "$SQ_PID"; forget_client "$SQ_PID"
-  finish id="$SQ_ID"
+  finish id="$SQ_ID" up="${D1_UP:-600}"
   SCEN=park; inject move 20 $((OUT_H - 20))
 
   # D2 — a background surface stretched to every edge, zone -1.
@@ -4246,9 +4275,9 @@ if s is not None:
     tid = s["id"]
     if len(cr) < 2:
         # Only a layout difference can make the clicks miss: page 2's menubar is found by
-        # position on this output's window size, as B6's text widget.
+        # its position inside the window, as B6's text widget.
         record("B7 GTK nested menu chain", len(cr) == 0, f"{len(cr)} popup(s) opened "
-               "(widget-factory's page 2 menubar not where it is at 1914x924)", warn=True)
+               "(widget-factory's page 2 menubar is not where these points expect it)", warn=True)
     else:
         p1, p2 = cr[0], cr[1]
         s1, s2 = p1.group(1), p2.group(1)
@@ -4495,7 +4524,7 @@ if s is not None:
            f"panel surface={sid} configure={cfg[0].group(3, 4) if cfg else '-'} map="
            f"{mp.group(4, 5, 6, 7) if mp else '-'} exclusive={excl[-1].group(2, 3) if excl else '-'} "
            f"usable areas={usable} (want {want_u}); lumen-square mapped at y={map_y} (>=32), "
-           f"after a Super+drag 600 px up y={end_y} (want 32)")
+           f"after a Super+drag {s.get('up', 600)} px up y={end_y} (want 32)")
 
 s = scen.get("D2")
 if s is not None:
@@ -4584,18 +4613,45 @@ def maximize_check(name, s, source, ext_top):
            f"{[(m.group(3), m.group(4)) for m in cfgs][:2]} want ({want_w},{want_h}); maximized "
            f"geometry {gmax} want x=0 y={32 + ext_top}; restored {gend} want {g0}")
 
+DECOFRAME = re.compile(r"compositor\.deco: decoration apply id=(\d+) mode=server frame=(-?\d+),(-?\d+),(\d+)x(\d+)")
+
+def title_bar_height(tid, r):
+    """The title bar height of toplevel `tid`'s server-side frame, from the compositor's own
+    frame rect (`decoration apply … frame=`) against the window geometry it was applied to:
+    what the frame adds above the window minus what it adds below it (the border). A
+    maximized frame keeps the title bar and drops its borders, so this is the height
+    maximize takes off the usable area — the compositor's number (28 px until its title
+    bar grew to 36), read from the run rather than assumed."""
+    for i in r:
+        m = DECOFRAME.search(comp[i])
+        if m and int(m.group(1)) == tid:
+            g = geometry_at(tid, i)
+            if g:
+                fy, fh = int(m.group(3)), int(m.group(5))
+                return (g[1] - fy) - ((fy + fh) - (g[1] + g[3]))
+    return None
+
 s = scen.get("D6-ssd")
 if s is not None:
-    maximize_check("D6 maximize fills the usable area (foot, server-side frame)", s, "decoration", 28)
     tid = s["id"]
-    gdock = geometry_at(tid, s["dock"]) if s.get("dock") else None
-    gundock = geometry_at(tid, s["undock"]) if s.get("undock") else None
-    # foot sizes to whole cells, so a height may come out a little short of the configured one.
-    dock_ok = gdock is not None and gdock[:2] == (0, 60) and out_h - 60 - 40 - 24 <= gdock[3] <= out_h - 60 - 40
-    undock_ok = gundock is not None and gundock[:2] == (0, 60) and out_h - 60 - 24 <= gundock[3] <= out_h - 60
-    record("D6 a maximized window follows the usable area", dock_ok and undock_ok,
-           f"with a 40 px bottom panel {gdock} (want 0,60 h<={out_h - 100}); after it left {gundock} "
-           f"(want 0,60 h<={out_h - 60})")
+    title = title_bar_height(tid, rng(s)) if tid else None
+    if title is None:
+        for name in ("D6 maximize fills the usable area (foot, server-side frame)",
+                     "D6 a maximized window follows the usable area"):
+            record(name, False, "no server-side frame rect in the log to take the title height from")
+    else:
+        maximize_check("D6 maximize fills the usable area (foot, server-side frame)", s, "decoration", title)
+        top = 32 + title  # the usable area's top is the D1 panel's 32 px zone
+        gdock = geometry_at(tid, s["dock"]) if s.get("dock") else None
+        gundock = geometry_at(tid, s["undock"]) if s.get("undock") else None
+        # foot sizes to whole cells, so a height may come out a little short of the configured one.
+        dock_ok = gdock is not None and gdock[:2] == (0, top) and \
+            out_h - top - 40 - 24 <= gdock[3] <= out_h - top - 40
+        undock_ok = gundock is not None and gundock[:2] == (0, top) and \
+            out_h - top - 24 <= gundock[3] <= out_h - top
+        record("D6 a maximized window follows the usable area", dock_ok and undock_ok,
+               f"with a 40 px bottom panel {gdock} (want 0,{top} h<={out_h - top - 40}); after it "
+               f"left {gundock} (want 0,{top} h<={out_h - top})")
 s = scen.get("D6-gtk")
 if s is not None:
     maximize_check("D6 maximize fills the usable area (gtk4-demo, header bar)", s, "client", 0)
@@ -5168,6 +5224,19 @@ if s is not None:
 # ── H: outputs ─────────────────────────────────────────────────────────────
 OUTNAME = re.compile(r"compositor\.output: output 0 name=(\S+) mode=(\d+)x(\d+) refresh_mhz=(\d+)")
 out_name = next((m.group(1) for l in comp if (m := OUTNAME.search(l))), None)
+# The output's description as the compositor composes it (output_manager.cppm
+# `monitor_identity`, ADR 008 M1): "make model [serial] (name)" from the monitor's EDID, the
+# connector's name without one. The log carries the identifier — "make model serial" with
+# "Unknown" for a part the EDID lacks, or "connector:<name>" — so a real panel's
+# description is derived from it rather than assumed to be the name (true only of a
+# virtual connector, which is all the dev VM has).
+OUTIDENT = re.compile(r'compositor\.output: output 0 name=\S+ .* identifier="([^"]*)"')
+out_identifier = next((m.group(1) for l in comp if (m := OUTIDENT.search(l))), None)
+if out_identifier is None or out_identifier.startswith("connector:"):
+    out_description = out_name
+else:
+    out_description = (out_identifier[:-len(" Unknown")] if out_identifier.endswith(" Unknown")
+                       else out_identifier) + f" ({out_name})"
 OUTBIND = re.compile(r"compositor\.output: output bind client=(\d+) output=(\d+) version=(\d+) name=(\S+) replayed=(\d+)")
 OUTENTER = re.compile(r"compositor\.output: output (enter|leave) surface=(\d+) output=(\d+) client=(\d+) resources=(\d+)")
 
@@ -5177,12 +5246,12 @@ if s is not None:
     wl = [l for l in p if l.startswith("wl_output name=")]
     xo = [l for l in p if l.startswith("xdg_output ")]
     want_wl = f"wl_output name={out_name} mode={out_w}x{out_h} "
-    want_xo = f"xdg_output position=0,0 size={out_w}x{out_h} name={out_name} description={out_name}"
+    want_xo = f"xdg_output position=0,0 size={out_w}x{out_h} name={out_name} description={out_description}"
     enter = f"surface enter surface=toplevel output={out_name}" in p
     ok = bool(out_name) and bool(wl) and wl[-1].startswith(want_wl) and xo and xo[-1] == want_xo and enter
     record("H1 wl_output and xdg-output report the output; the toplevel gets enter", ok,
-           f"compositor output name={out_name}; probe: {wl[-1] if wl else '-'} | "
-           f"{xo[-1] if xo else '-'} | enter={enter}")
+           f"compositor output name={out_name} (description {out_description}); probe: "
+           f"{wl[-1] if wl else '-'} | {xo[-1] if xo else '-'} | enter={enter}")
 
 # H2 — foot's own traces: every surface it maps gets wl_surface.enter.
 ENTER_RAW = re.compile(r"\] (?:\{[^}]*\} )?(?:discarded )?wl_surface[#@](\d+)\.enter\(wl_output")
