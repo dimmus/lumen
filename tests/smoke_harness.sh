@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The smoke harness's own plumbing, tested without a seat: binary freshness against a
 # synthetic Ninja tree (scripts/build-fresh.sh), injection-node lookup against a sysfs
-# fixture (scripts/inject-devices.sh), and inject-input.py's key table and pixel mapping.
+# fixture (scripts/inject-devices.sh), inject-input.py's key table and pixel mapping,
+# and the bench warm-up gate against a fake bench (scripts/bench-warmup.sh).
 # Everything here is hermetic: no /dev/input, no real build, no compositor.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -125,6 +126,91 @@ bash "$ROOT/scripts/seat-session.sh" precheck >/dev/null 2>&1
 check "a command without its run dir is refused" 2 $?
 bash "$ROOT/scripts/seat-session.sh" bogus "$TMP/runA" >/dev/null 2>&1
 check "an unknown command is refused" 2 $?
+
+echo "bench-warmup.sh — ui-bench's host warm-up gate against a fake bench:"
+# shellcheck source=../scripts/bench-warmup.sh
+source "$ROOT/scripts/bench-warmup.sh"
+contains() { # NAME TEXT NEEDLE — passes when TEXT contains NEEDLE
+  [[ "$2" == *"$3"* ]] && pass "$1" || fail "$1 (missing '$3' in '$2')"
+}
+# The bench stand-in: each invocation pops the next p50 from $FAKE_SEQ (one line per
+# run — probes and warm-up rounds alike, in order) and writes it as the run's S2 frame
+# p50 to the --json path; "none" writes a run with no frame samples. $FAKE_LOG records
+# "<json basename> <p50>" per run, so the cases can assert the probe/warm interleaving.
+FAKE_BIN="$TMP/fake-ui-bench"
+cat >"$FAKE_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -u
+json=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) json="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+p50="$(head -1 "$FAKE_SEQ")"
+sed -i 1d "$FAKE_SEQ"
+if [[ "$p50" == "none" ]]; then
+  printf '[{"scenario": "S2", "stages": {"frame": {"samples": 0, "p50": 0}}}]' >"$json"
+else
+  printf '[{"scenario": "S1", "stages": {"frame": {"samples": 600, "p50": 9.5}}},\n{"scenario": "S2", "stages": {"frame": {"samples": 6000, "p50": %s}}}]' \
+    "$p50" >"$json"
+fi
+echo "$(basename "$json") $p50" >>"$FAKE_LOG"
+EOF
+chmod +x "$FAKE_BIN"
+FAKE_SEQ="$TMP/seq" FAKE_LOG="$TMP/fake-runs"
+export FAKE_SEQ FAKE_LOG
+# The gate's context: the globals scripts/ui-bench.sh has set where warm_host runs
+# ($runner empty stands for a host without setarch).
+BENCH="$FAKE_BIN" runner=() preset=test pin=3 warmup=120 frames="" compare=""
+ref="$TMP/ref.json"
+printf '[{"scenario": "S2", "stages": {"frame": {"samples": 36000, "p50": 36.74}}}]' >"$ref"
+baseline="$ref"
+
+printf '[{"scenario": "S1", "stages": {"frame": {"samples": 600, "p50": 9.5}}},\n{"scenario": "S2", "stages": {"frame": {"samples": 6000, "p50": 41.276}}}]' \
+  >"$TMP/extract.json"
+check "warm_s2_frame_p50: the S2 frame p50 behind an earlier row" "41.276" \
+      "$(warm_s2_frame_p50 "$TMP/extract.json")"
+printf '[{"scenario": "S2", "stages": {"frame": {"samples": 0, "p50": 0}}}]' >"$TMP/extract.json"
+check "warm_s2_frame_p50: a zero-sample stage reads empty" "" "$(warm_s2_frame_p50 "$TMP/extract.json")"
+check "warm_s2_frame_p50: a file that does not exist reads empty" "" \
+      "$(warm_s2_frame_p50 "$TMP/no-such-file.json")"
+
+: >"$FAKE_LOG"; printf '36.06\n' >"$FAKE_SEQ"
+out="$(warm_host vulkan 2>&1)"; rc=$?
+check "a probe at the baseline settles on probe 1" 0 $rc
+contains "the settle threshold is 1.15x the baseline (36.74 -> 42.25)" "$out" "settles at <= 42.25"
+check "settled on probe 1: one probe, no warm-up round" "probe-1.json 36.06" "$(cat "$FAKE_LOG")"
+
+: >"$FAKE_LOG"; printf '71.0\n40.0\n36.0\n' >"$FAKE_SEQ"
+out="$(warm_host vulkan 2>&1)"; rc=$?
+check "a slow probe warms one round, then settles" 0 $rc
+check "probe and warm-up rounds interleave, bounded (probe, warm, probe)" \
+"probe-1.json 71.0
+warm-1.json 40.0
+probe-2.json 36.0" "$(cat "$FAKE_LOG")"
+
+: >"$FAKE_LOG"; printf 'none\n' >"$FAKE_SEQ"
+out="$(warm_host vulkan 2>&1)"; rc=$?
+check "a probe with no S2 frame samples fails open (exit 0)" 0 $rc
+contains "and says so" "$out" "probe 1 produced no S2 frame samples — measuring anyway"
+
+: >"$FAKE_LOG"; printf '71.0\n70.0\n72.0\n70.0\n73.0\n' >"$FAKE_SEQ"
+out="$(warm_host vulkan 2>&1)"; rc=$?
+check "three unsettled probes refuse to measure (exit 2)" 2 $rc
+contains "the refusal names the pole and the threshold" "$out" \
+      "73.0 us against the baseline's 36.74 us (settle threshold 42.25)"
+check "refused after 3 probes and 2 warm-up rounds, no more" 5 "$(wc -l <"$FAKE_LOG")"
+
+printf '[{"scenario": "S5", "stages": {"frame": {"samples": 10, "p50": 3.0}}}]' >"$TMP/ref-no-s2.json"
+baseline="$TMP/ref-no-s2.json"
+: >"$FAKE_LOG"
+out="$(warm_host gl 2>&1)"; rc=$?
+check "a reference with no S2 frame p50 skips the warm-up" 0 $rc
+contains "and says so" "$out" "no S2 frame p50"
+check "skipped: nothing ran" "" "$(cat "$FAKE_LOG")"
+baseline="$ref"
 
 echo "inject-input.py — the key table and the pixel mapping:"
 python3 -I - "$ROOT/scripts/inject-input.py" <<'PY'
