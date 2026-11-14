@@ -851,8 +851,13 @@ for r in new:
         fails.append(f"{sid}: mallinfo2 delta {delta} B over the steady frames "
                      f"(baseline {base_delta}; G5)")
     elif delta > 0:
+        # The cause is named only when the baseline supports it: none/cpu baselines record
+        # 0 (no driver on those paths), and "driver-side growth: 0 B" would assert what the
+        # baseline contradicts.
+        base_note = (f"the baseline's own driver-side growth: {base_delta} B" if base_delta > 0
+                     else "the baseline recorded no growth")
         warns.append(f"{sid}: mallinfo2 delta {delta} B over the steady frames "
-                     f"(the baseline's own driver-side growth: {base_delta} B; open, G5)")
+                     f"({base_note}; open, G5)")
     cap = BATCH_CAPS.get(sid)
     if cap is not None and cnt.get("batches", 0) > cap:
         fails.append(f"{sid}: {cnt['batches']} batches, cap {cap}")
