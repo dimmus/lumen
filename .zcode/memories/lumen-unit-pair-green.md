@@ -1,6 +1,6 @@
 ---
 name: lumen-unit-pair-green
-description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere"
+description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere — task CLOSED 2026-11-15 at tip b5edbea: merge-tree main→7d15912 proven to carry 0 evidence files (clean exit), review round 4/4 confirmed-all-dispositioned (incl. a reviewer's ctest -N dry-run overwriting the cited LastTest.log), owed VM golden check still memory-only (no .zcode/TODO.md row)"
 metadata:
   node_type: memory
   type: project
@@ -9,7 +9,8 @@ metadata:
 Verified 2026-11-14 on the **notebook** (nouveau card0 + i915 card1 re-read from
 `/sys/class/drm/card*/device/driver` this session). Worktree
 `/home/dimmus/lumen-wt/unit-pair-green`, branch `zcode/task/unit-pair-green` off main
-fa11b38; tip **6b7c81e** (2026-11-15 00:33). The studio rewrote the branch locally before
+fa11b38; tip **6b7c81e** (2026-11-15 00:33; later moved to **b5edbea** — see the close
+section below). The studio rewrote the branch locally before
 merge (never pushed): 42c2aa3→**e29ba04**, 75bf41d→**3917292**, f10183a→**4bcf390**,
 de92ce6→**5efebfc** — trees identical, only e29ba04's message changed (see the
 2026-11-15 section); 1ca2bf9 unchanged. Gate **READY**. Branch diff contains **zero
@@ -156,6 +157,53 @@ time on one host proves determinism, not cross-host stability.
   The pre-refresh version of this record cited the orphaned
   hashes and the retracted claim (fixed by this section).
 
+## 2026-11-15 close — final gate at b5edbea, review 4/4 dispositioned, merge safety proven (branch tip and every command below re-run by the memory writer this session)
+
+- **Task closed; the branch tip is now b5edbea** ("evidence: untrack the gate captures
+  and ignore /evidence/ so a merge cannot carry them"), 7 commits over merge-base
+  fa11b38. Re-verified: `git ls-files -- evidence/` → **0**; `git check-ignore -v
+  evidence/smokes/gate/drag-smoke-logs/run.log` → `.gitignore:14:/evidence/` (comment at
+  :13 "local evidence only, never merged to main"); `git diff-tree -r b5edbea` = only
+  `.gitignore` M + evidence/ D; and `git diff --stat 6b7c81e b5edbea -- .zcode/ tests/
+  modules/ docs/` is **empty**, so the fix-round delta touches no compiled or test input —
+  every suite/golden number above carries to the tip bit-for-bit.
+- **Merge carries no evidence, proven not assumed:** `git merge-tree --write-tree main
+  zcode/task/unit-pair-green` → tree **7d15912**, exit 0 (no conflicts); `git ls-tree -r
+  7d15912 --name-only -- evidence/` → **0** files while the two goldens,
+  tests/test_task_model.cpp and .gitignore are present; main never tracked evidence/
+  (`ls-tree`/`log -- evidence/` both empty). Nuance the b5edbea title oversells: "cannot
+  carry them" is true of the **merged tree** — the 5efebfc/6b7c81e blobs stay reachable
+  through merged history, which is by design what keeps the valid Nov-14 PASS retrievable.
+- **Independent review (final round): 4 findings confirmed, 0 refuted, all
+  dispositioned.** (1, medium) the degraded zero-input 6b7c81e re-capture at tip + the
+  unenforced merge drop → fixed by b5edbea (verified above); (2, medium) the
+  golden-substitution acceptance → resolved by the recorded owner decision fdd75f2
+  (acceptance at lumen-unit-pair-green.md:118 of that commit, owed VM check at :124);
+  (3, low) 4bcf390's message cites the orphaned 42c2aa3 — deliberately left as an owner
+  call (rewording = another history rewrite); trees verified equal
+  (`42c2aa3^{tree}` = `e29ba04^{tree}` = 7dbac1d7…, `git branch --contains` empty);
+  (4, low) the reviewer's own `ctest -N` dry-run **overwrote the gate-run LastTest.log**
+  the handoff cited (a dry run still rewrites `build/test/Testing/Temporary/`); their
+  full-suite rerun then rewrote it with a passing record — the durable evidence (memory
+  commit 8abd92f on main) was never at risk.
+- **Final gate numbers (gatekeeper-run at b5edbea, from the close packet — not re-run by
+  the memory writer):** `ctest --test-dir build/test --output-on-failure -LE bench` →
+  "100% tests passed out of 133", 75.95 s, exit 0 (ninja no-op, LUMEN_BUILD_TESTS=ON);
+  pair `ctest -R 'test_task_model|ui_gallery'` → 2/2; test_task_model → 24 tests 0
+  failed; `lumen-ui-gallery --check` → cpu 0/255 both themes, gl 1/255. Known-red
+  retirement re-checked **per tree** (re-run by me): the branch tree has zero
+  `ui_gallery` mentions in `.zcode/` outside `memories/` — SKILL.md:59-61 says "the dev
+  tree carries none … both fixed on 2026-11-14" and only the generic `known_red` default-`[]`
+  mechanism text remains — but **main (fdd75f2) still carries the stale example**
+  (SKILL.md:60 "carries `ui_gallery` + `test_task_model`", .dwf.ts:32
+  `["ui_gallery","test_task_model"]`) until the owner merges; 4bcf390 travels with the
+  branch. The owed VM golden check is recorded **only here** — `.zcode/TODO.md` has no
+  unit-pair row.
+- **Acceptance caveat the owner owns:** the card's "host-independent evidence" is met by
+  construction (pinned bundled font/icons/hinting, tests/ui_golden.hpp:65-73) plus
+  this-host determinism — not by a cross-host render proof; the system FreeType/HarfBuzz
+  version remains the one unpinned input.
+
 **Why:** a tolerated-red set outlives its cause — a65d06b landed Nov 11 and the stale
 checks sat red-tolerated for three days while verifying nothing, and "golden drift" got
 blamed on hosts when the goldens were simply older than a reviewed fix. Tolerance without
@@ -165,7 +213,9 @@ before the merge is provisional: the studio's local rewrite orphaned four of the
 hashes this page first cited, and its strongest host-independence claim was one
 unrecorded provenance away from false — refresh the record at close.
 
-**How to apply:** `known_red` is empty now — any suite red is reportable immediately; do
+**How to apply:** `known_red` is empty once b5edbea merges — any suite red is reportable
+immediately (until then main's SKILL.md still shows the stale pair example; the branch is
+the truth); do
 not re-tolerate without an owner decision plus a retirement task. When a golden test goes
 red: localize the pixel diff to blobs first, then `git log --follow
 docs/images/<golden>.png` and compare the last-regeneration commit against commits
@@ -180,7 +230,9 @@ determinism, not cross-host stability. Records written mid-run cite hashes that 
 studio's pre-merge local rewrite can orphan: at close, re-check the branch tip and
 refresh the record (or record the tree-equivalence, `git diff <old> <new>` empty, that
 keeps the evidence reachable). Never overwrite a committed evidence run with a worse
-re-run — append or replace the README/verdict pointers too.
+re-run — append or replace the README/verdict pointers too. Never cite a worktree's
+`Testing/Temporary/LastTest.log` as durable evidence: even a `ctest -N` dry run rewrites
+it — commit the numbers (or rely on the memory record) instead.
 
 Related: [[lumen-toplevel-drag-protocol-registration]] (origin of the tolerance),
 [[lumen-toplevel-drag-compositor]], [[lumen-toplevel-drag-drag-smoke]],
