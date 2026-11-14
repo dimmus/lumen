@@ -1,6 +1,6 @@
 ---
 name: lumen-unit-pair-green
-description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc)"
+description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere"
 metadata:
   node_type: memory
   type: project
@@ -115,6 +115,15 @@ time on one host proves determinism, not cross-host stability.
   tree. The gate's independent PNG decode: old vs new goldens differ on exactly 72/76 px
   (max 111/130), three 8×6 px blobs at x[591..598] on rows 1062/1138/1176, all other
   1,320,728/1,320,724 of 1,320,800 px bit-identical (gatekeeper-run, matches Nov-14).
+- **Owner decision (2026-11-15 fix round): the golden-regen substitution is ACCEPTED**
+  as meeting the ui_gallery acceptance — proven stale-golden root cause, every pinnable
+  input pinned in-repo (bundled font/icons, in-code hinting, bit-exact CPU compare), and
+  bit-exact this-host determinism (0/255 both themes, re-run by the fixer); the old
+  goldens never controlled the FreeType/HarfBuzz build either, so a cross-host proof is
+  not held against the fix (this notebook session cannot produce a VM render anyway).
+  **Cross-host check owed:** run `./build/test/lumen-ui-gallery --check` on the dev VM at
+  the next VM session and record the result — a failure there is a new finding about
+  FreeType-version sensitivity, to be handled then.
 - **Branch delta outside evidence/ is 5 files, zero compiled code** (`git diff
   fa11b38..HEAD --stat -- . ':!evidence'`: SKILL.md 8 lines, lumen-development-studio
   .dwf.ts 1 line, the two PNGs, tests/test_task_model.cpp 10 lines) — no seat/bench
@@ -140,7 +149,11 @@ time on one host proves determinism, not cross-host stability.
   available).
 - **Merge cautions (non-blocking):** evidence/ is **74 MB** (`du -sh`) and main has never
   carried an evidence/ commit (`git log main -- evidence/` is empty) — the merge must
-  not carry 5efebfc/6b7c81e; the pre-refresh version of this record cited the orphaned
+  not carry 5efebfc/6b7c81e. **Enforced 2026-11-15 (b5edbea):** the fix round untracked
+  evidence/ on the branch (`git rm -r --cached`) and added `/evidence/` to .gitignore —
+  `git ls-files evidence/` empty, `git ls-tree -r main --name-only -- evidence/` empty,
+  so a plain merge carries nothing; the valid Nov-14 captures stay in history at 5efebfc.
+  The pre-refresh version of this record cited the orphaned
   hashes and the retracted claim (fixed by this section).
 
 **Why:** a tolerated-red set outlives its cause — a65d06b landed Nov 11 and the stale
