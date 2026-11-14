@@ -751,8 +751,9 @@ unsigned long long published_damage_area() {
     return area;
 }
 
-/// A wl_buffer whose release the client sees (the ghost's hold on it has ended and its
-/// frames completed — the retire `defer_retire` held back).
+/// A wl_buffer whose release the client sees. For this rig's copied shm buffers that is
+/// the commit itself; a ghost's hold never delays it (what it holds is the texture, and a
+/// dma-buf's lifecycle record — the tracker cases at the top of this file).
 struct buffer_watch {
     wl_buffer* buffer = nullptr;
     bool released = false;
@@ -955,8 +956,8 @@ void run_cases() {
     // takes (the seat's close ghost). The tree it leaves is empty, so the ghost must be
     // measured against where the window was last shown: its fade is the only animation
     // running (nothing else drives the frame clock), every frame damages what it draws —
-    // the repaint that takes the window off the screen — and the buffer it held is
-    // released once the ghost retires.
+    // the repaint that takes the window off the screen — and the closing client is not
+    // left waiting on its buffer.
     window e{};
     map_window(c, e, "e");
     for (int i = 0; i < 60 && animating(); ++i)
@@ -972,6 +973,15 @@ void run_cases() {
     wl_surface_commit(e.surface);
     (void)wl_display_roundtrip(c.display);
     (void)wl_display_roundtrip(c.display);
+    // The copied-shm contract, and with it the closing client's buffer release: the commit
+    // copies the pixels and the client has its wl_buffer back at once — it cannot stall
+    // behind the close or the ghost. What the ghost holds is its side of the content: the
+    // texture, sampled by every fade frame above, and for a dma-buf the lifecycle record
+    // whose release waits for the ghost (the hold/retire cases at the top of this file);
+    // this rig's shm wl_buffer is never in that path, so its release says nothing about
+    // the ghost and is not claimed to.
+    check("null close: the commit copies the buffer, the client has it back at once",
+          bw.released);
     tick();
     check("null close: the window is at rest, nothing animates",
           e0.mapped && !animating(), rect_text(e0.geometry));
@@ -1022,18 +1032,6 @@ void run_cases() {
         const bool quiet = goes_quiet(why);
         check("null close: then nothing of it is drawn and the desktop is quiet",
               quiet && !window_draw().found, why);
-        // The ghost let go of the buffer: the frames it sampled complete (tick_ui dates
-        // them; without a render thread the low-water mark is driven here as tick_render
-        // would) and the client's wl_buffer.release arrives.
-        {
-            std::lock_guard<std::mutex> hold(*g_lock);
-            (void)g_comp->buffer_lifecycle().retire_completed_frames(g_frame);
-            g_comp->wayland().flush();
-        }
-        (void)wl_display_roundtrip(c.display);
-        (void)wl_display_roundtrip(c.display);
-        check("null close: the closed window's last buffer is released once the ghost retires",
-              bw.released);
         wl_buffer_destroy(bw.buffer);
     }
 
