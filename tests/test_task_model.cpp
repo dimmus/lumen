@@ -271,7 +271,7 @@ LUMEN_TEST(logout_button_takes_the_right_end_and_leaves_entries_the_rest) {
     LUMEN_CHECK(l.logout_x == 400 - 4 - lx::shell::k_logout_width);
     // Entries share 400 - 8 - (28 + 4) = 360: (360 - 44) / 52 = 6 shown, +4, all left of it.
     LUMEN_CHECK(l.count == 6 && l.hidden == 4);
-    LUMEN_CHECK(l.cells[4].x + l.cells[4].w < l.logout_x);
+    LUMEN_CHECK(l.cells[l.count - 1].x + l.cells[l.count - 1].w < l.logout_x);
     LUMEN_CHECK(l.more_x + lx::shell::k_panel_more_width <= l.logout_x);
 
     // No windows at all: the button is still there.
