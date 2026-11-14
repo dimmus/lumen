@@ -35,8 +35,10 @@ The VM facts and the notebook facts below do NOT transfer between hosts.
   pass — restart the holder from the current script. app-smoke reports 158 PASS with 15
   WARN and 4 FAIL rows: the WARNs are capabilities the Vulkan composite path lacks (the
   SIGUSR1 debug read-back is GL-only; window capture and capture dma-buf are not on
-  Vulkan — `wire_capture.cpp`), named in each row; the FAILs are the Z portal rows (same
-  gaps) and the PSI clean-log row. The user may keep a Lumen
+  Vulkan — `wire_capture.cpp`), named in each row — only the sub-checks that need the
+  capability are WARNed away; the row's log-derived half (`record_limited`'s `rest`)
+  still judges, so a defect there FAILs on every backend; the FAILs are the Z portal
+  rows (same gaps) and the PSI clean-log row. The user may keep a Lumen
   desktop logged in on tty1 (session 1) — it holds DRM master; seat work needs it stopped
   (ask the owner first); the tty1 login itself stays.
 - **Never containers**: no Docker, on any host. UI/desktop development runs natively on
@@ -172,7 +174,9 @@ second failure is reportable.
   latency request (`/dev/cpu_dma_latency`, root, C1/C1E stay available — no busy-polling)
   and pins the pinned CPU's governor to performance for the run; runs of one binary then
   agree within ~2 %. A baseline recorded unheld and a run held (or vice versa) do not
-  compare — check for the "== quiet CPU" line.
+  compare — the script verifies the hold is in effect (the holder marks its
+  `/dev/cpu_dma_latency` write, the governor is read back) and exits 2 rather than
+  measuring unheld; check for the "== quiet CPU" line all the same.
 - Never measure while another session builds or runs a smoke. Serialize all seat work.
 - Memory: `heaptrack -o FILE ./build/release/lumen-compositor` (ptrace_scope 1 — launch
   under it, don't attach). Idle compositor allocates ~nothing; ~100k startup allocations
