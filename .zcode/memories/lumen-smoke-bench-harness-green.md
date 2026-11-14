@@ -1,6 +1,6 @@
 ---
 name: lumen-smoke-bench-harness-green
-description: "2026-11-14/15 notebook harness task (worktree smoke-bench-harness-green, f1d619f..8861dc0, gate NOT_READY twice on the same evidence-overwrite pattern): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = aaedada's acceptance-level seat evidence (158/15/4 + zero-warning drag) overwritten by 28e2ef3 with dirty re-runs; round 4 closeout (2026-11-15) re-did it green at b3ac4fb (drag zero-warning PASS row-g p95 25.6 ms, app-smoke 158/15/4, Z2–Z5 flake root-caused to relative LUMEN_BUILD_DIR dangling portal-session.sh:113 symlink) and 8861dc0 then overwrote it again with below-level runs (drag g-latency p95 47.5 ms, app-smoke 154/15/8) — the b3ac4fb tree and /tmp/gate-r4 hold the good evidence"
+description: "2026-11-14/15 notebook harness task (worktree smoke-bench-harness-green, f1d619f..8861dc0, gate NOT_READY twice on the same evidence-overwrite pattern): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = aaedada's acceptance-level seat evidence (158/15/4 + zero-warning drag) overwritten by 28e2ef3 with dirty re-runs; round 4 closeout (2026-11-15) re-did it green at b3ac4fb (drag zero-warning PASS row-g p95 25.6 ms, app-smoke 158/15/4, Z2–Z5 flake root-caused to relative LUMEN_BUILD_DIR dangling portal-session.sh:113 symlink) and 8861dc0 then overwrote it again with below-level runs (drag g-latency p95 47.5 ms, app-smoke 154/15/8) — the b3ac4fb tree and /tmp/gate-r4 hold the good evidence; round 5 (2026-11-15, tip 062f3e6) closed gate READY as a pure RESTORE: 49fa712 re-checked out b3ac4fb's evidence/smokes/gate/ byte-identical (drag bare PASS 25.6 ms, app-smoke 158/15/4, review 0 findings), the gate-time step was re-namespaced to evidence/smokes/gate-workflow/ so it can never clobber the acceptance evidence again"
 metadata:
   node_type: memory
   type: project
@@ -220,6 +220,55 @@ reproducible; holding it via a raised UNCORE_RATIO_LIMIT min_ratio is untried.
   be merged or pushed. Suite/ctest not re-run this session (deferred to the workflow's
   post-gate stage).
 
+## Round 5 close — the overwrite loop ended by namespace split + restore, gate READY, 2026-11-15 (branch tip **062f3e6**; every check below re-run by the memory writer this session, notebook iritur)
+
+- **The acceptance was a RESTORE, done as specified (49fa712, 03:38:02 +0500):**
+  `git checkout b3ac4fb -- evidence/smokes/gate/` plus removal of
+  precheck-drag-smoke.txt — `git ls-tree b3ac4fb -- evidence/smokes/gate/` confirms
+  b3ac4fb never carried it (only 8861dc0 did). `git diff b3ac4fb 49fa712 --stat` is
+  **empty** (byte-identical) and the commit message states the restore and the clobber
+  history (28e2ef3, 8861dc0). HEAD 062f3e6 touches only the NEW
+  evidence/smokes/gate-workflow/ namespace; `git diff 28e2ef3 HEAD -- ':!evidence'` is
+  empty, so the restored evidence describes exactly HEAD's code. No smokes re-run,
+  nothing outside evidence/ touched.
+- **Restored logs verified line-by-line, not inherited from round 4:** drag run.log ends
+  exactly `VERDICT: PASS` with zero `(warnings` occurrences (grep -c = 0), rows a–j all
+  PASS, row g window-move p95 **25.6 ms** / cursor p95 **19.6 ms** vs the 37.3 ms bar,
+  the log's path line names /tmp/gate-r4 (genuine round-4 provenance), line 1 =
+  autodetect event17 'Lumen Inject Mouse' REL; app-smoke counts **158 PASS / 15 WARN /
+  4 FAIL** with FAILs exactly Z1 Z6 Z7 + the PSI run-clean row (`compositor.memory:
+  critical pressure — evicting caches`); app-smoke-logs/Z2.ppm + three
+  Z-pictures/Screenshots PNGs restored. README is b3ac4fb's own and describes exactly
+  these logs — every claim cross-checked, no edit needed.
+- **The structural fix: the workflow's gate-time step now writes its own namespace**
+  (evidence/smokes/gate-workflow/, 062f3e6). Its round-5 corroborating runs read below
+  level (drag `VERDICT: PASS (warnings: g latency)`; app-smoke 154 PASS / 15 WARN /
+  8 FAIL) and are pre-designated session noise — the gate judges gate/, and the
+  two-round clobber loop (28e2ef3, 8861dc0) cannot recur against the acceptance
+  evidence.
+- **Suite (gatekeeper-run 03:38 per the close packet — not re-run by me):** LastTest.log
+  then showed 134 tests, 132 Passed / 2 Failed with LastTestsFailed.log naming exactly
+  {ui_gallery, test_task_model} — the tolerated pair of this base-7c3e3a1 worktree. My
+  re-check: `ctest --test-dir build/test -N -LE bench` → Total Tests: **134**, and
+  LastTestsFailed.log (03:39) still names the pair. The trap struck twice more while
+  verifying: LastTest.log is now an empty 121-byte stub, rewritten at 04:08 by a later
+  step and again at 04:12 by my own `ctest -N` — Testing/Temporary is non-durable
+  evidence, exactly as [[lumen-unit-pair-green]] recorded.
+- **Bench verified from stored results** (no A/B due for an evidence-only round with an
+  empty code diff): tests/bench/results/iritur-08fd3c-none/20261115-062f3e6-dirty.json
+  has S1–S4, each with its G1–G4 + G5 = `pass` (parsed the JSON this session). The
+  packet's gate_runs.bench field said "run (see findings)" with no findings attached —
+  the gate verified green directly from this JSON instead.
+- **Residual leak, cleanup owed before merge:** the precheck helper still appends into
+  the acceptance namespace — uncommitted `M evidence/smokes/gate/precheck-app-smoke.txt`
+  and an untracked precheck-drag-smoke.txt sat dirty in the worktree this session (the
+  committed gate/ files and README untouched). Clean or namespace the precheck path
+  before merging. Host: seat clean (pgrep: no lumen processes), notebook confirmed
+  (card0 04:00.0 nouveau, card1 00:02.0 i915 via /sys/class/drm).
+- **Verdicts: independent review Ready (0 confirmed, 0 refuted), gate READY** —
+  acceptance met as a restore: byte-identity proven by empty diff, commit message
+  states the restore and why, exactly as the card required.
+
 
 
 **Why:** a harness gate is only as strong as its provisioning — every acceptance blocker
@@ -234,6 +283,11 @@ commit, not git history, and 28e2ef3 turned a READY tree into a self-contradicti
 Round 4 proved that rule was not decorative: the same overwrite pattern happened again
 (8861dc0, post-review), and a flaky "portal timing" symptom was actually a dangling
 symlink from a relative build path — reproduce before attributing flake to timing.
+Round 5 proved the cure as well as the rule: the recurring mechanical step got its own
+directory namespace (gate-workflow/) so it physically cannot clobber the acceptance
+evidence again, and a restore — checkout of the good tree plus dropping files the good
+tree never carried, proven byte-identical by empty diff — recovered the at-level state
+without re-rolling a noisy seat.
 
 **How to apply:** on the notebook never set `LUMEN_INJECT_*` — let inject-devices.sh
 autodetect, and ensure the uinput holder was started from a tree ≥ f1d619f (else restart
@@ -245,7 +299,15 @@ README numbers too. A run that comes in below level (g-latency warning, Z2–Z5 
 **damage, not evidence**: leave evidence/ as it was (`git checkout <good-sha> --
 evidence/smokes/gate/`), fix the run conditions, re-run — never commit over the good
 logs, and before committing, re-verify every number in README.md against the committed
-logs (that check has caught the same contradiction twice). On the notebook pass
+logs (that check has caught the same contradiction twice). Checkout alone leaves strays:
+also delete every file in the path the good tree does not carry, and prove the restore
+with `git diff <good-sha> HEAD -- <path>` empty before committing (round 5 did exactly
+this — precheck-drag-smoke.txt had to go). Give every recurring workflow step that
+writes evidence its **own namespace** (`evidence/smokes/gate-workflow/`) — a step that
+can overwrite acceptance evidence will, and twice in a row is the observed pattern;
+runs landing there read as session noise, not acceptance evidence. The precheck helper
+still leaks into gate/ uncommitted (precheck-app-smoke.txt appends, precheck-drag-smoke.txt
+recreated) — clean or namespace it before merging the branch. On the notebook pass
 `LUMEN_BUILD_DIR` **absolute** to app-smoke, or portal Z2–Z5 fail from the dangling
 portal-session.sh:113 symlink (fixing that script is a portal follow-up, not harness
 work). Use scripts/build-fresh.sh for freshness; never newest-source mtime.
