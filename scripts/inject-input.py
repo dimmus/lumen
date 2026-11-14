@@ -13,7 +13,9 @@ normalised position into the output (libinput: (value - min) / (max - min + 1)),
 injector needs the output size — from --output WxH, or read from the compositor's
 `output 0 mode=WxH` log line with --compositor-log — and the device's own axis range,
 which it reads with EVIOCGABS. Each position is aimed at the centre of the pixel, so
-rounding on either side cannot land it on a neighbour.
+rounding on either side cannot land it on a neighbour; a device no finer than the
+output (a virtual mouse with 1:1 axes) has no such value, and the write is the value
+that maps into the pixel aimed at.
 
 With several outputs the compositor maps an absolute device onto the bounding box of the
 layout (ADR 008 M9). `--layout LOG` reads every `output N name=… logical=WxH+X+Y` line of
@@ -79,7 +81,17 @@ KEYS = {"KEY_ESC": 1, "KEY_LEFTMETA": 125, "KEY_LEFTSHIFT": 42, "KEY_RIGHTSHIFT"
         "KEY_MINUS": 12, "KEY_INSERT": 110, "KEY_BACKSPACE": 14, "KEY_TAB": 15,
         "KEY_RIGHTMETA": 126, "KEY_RIGHTCTRL": 97, "KEY_RIGHTALT": 100,
         "KEY_HOME": 102, "KEY_END": 107, "KEY_PAGEUP": 104, "KEY_PAGEDOWN": 109,
-        "KEY_KPENTER": 96}
+        "KEY_KPENTER": 96,
+        # The punctuation of a US layout and the lock/edit cluster — the default bindings'
+        # `equal` and `grave` reached this table as numbers before they were named.
+        "KEY_EQUAL": 13, "KEY_LEFTBRACE": 26, "KEY_RIGHTBRACE": 27, "KEY_SEMICOLON": 39,
+        "KEY_APOSTROPHE": 40, "KEY_GRAVE": 41, "KEY_BACKSLASH": 43, "KEY_COMMA": 51,
+        "KEY_DOT": 52, "KEY_SLASH": 53, "KEY_CAPSLOCK": 58, "KEY_NUMLOCK": 69,
+        "KEY_SCROLLLOCK": 70, "KEY_KPASTERISK": 55, "KEY_KPMINUS": 74, "KEY_KPPLUS": 78,
+        "KEY_KP0": 82, "KEY_KP1": 79, "KEY_KP2": 80, "KEY_KP3": 81, "KEY_KP4": 75,
+        "KEY_KP5": 76, "KEY_KP6": 77, "KEY_KP7": 71, "KEY_KP8": 72, "KEY_KP9": 73,
+        "KEY_KPDOT": 83, "KEY_KPSLASH": 98, "KEY_SYSRQ": 99, "KEY_DELETE": 111,
+        "KEY_PAUSE": 119}
 # F1–F10 are consecutive; F11 and F12 are not (VT switching is Ctrl+Alt+F<n>).
 for _i in range(10):
     KEYS[f"KEY_F{_i + 1}"] = 59 + _i
@@ -183,6 +195,17 @@ class Injector:
         lo, hi = self.axis_ranges()[axis]
         span = hi - lo + 1
         px = min(max(px, 0.0), extent - 1)
+        if span <= extent:
+            # A device no finer than the output — the virtual mouse's 1:1 axes — has no
+            # value at a pixel's centre: libinput puts value v at exactly v * extent / span,
+            # a pixel's edge, so rounding the centre to the nearest value lands every other
+            # pixel on its right-hand neighbour (pixel 1749 came out as 1750, and the
+            # last-column hit-test hit outside the window). Take the value that maps into
+            # the pixel aimed at, when the device has one.
+            pixel = int(px + 0.5)
+            v = -(-pixel * span // extent)  # ceil: the first value at or past the pixel's edge
+            if v * extent // span == pixel:
+                return min(hi, lo + v)
         # Aim at the pixel centre: libinput's (v - lo) / span * extent then floors to px.
         return min(hi, lo + int(round((px + 0.5) * span / extent)))
 

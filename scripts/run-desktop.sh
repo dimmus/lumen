@@ -413,15 +413,16 @@ if ! command -v "${CLIENT[0]}" >/dev/null; then
   exit 2
 fi
 
-# A binary older than its sources runs yesterday's code; say so, but let it run.
-if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  newest=$( { git -C "$ROOT" ls-files -z -- modules executables
-              git -C "$ROOT" ls-files -z --others --exclude-standard -- modules executables; } |
-            (cd "$ROOT" && xargs -0 ls -t 2>/dev/null) | head -1)
-  if [[ -n "$newest" && "$ROOT/$newest" -nt "$COMP" ]]; then
-    echo "NOTE: $COMP is older than $newest — rebuild to run the current code:"
-    echo "      cmake --build --preset release"
-  fi
+# A binary older than its sources runs yesterday's code; say so, but let it run. The build
+# system is asked (scripts/build-fresh.sh): it knows what the binaries link.
+# shellcheck source=build-fresh.sh
+source "$ROOT/scripts/build-fresh.sh"
+FRESH_TARGETS=(lumen-compositor)
+(( WITH_SHELL )) && FRESH_TARGETS+=(lumen-shell)
+build_fresh "$BUILD" "${FRESH_TARGETS[@]}"
+if (( $? == 1 )); then
+  echo "NOTE: $BUILD is not up to date (${build_fresh_why}) — rebuild to run the current code:"
+  echo "      cmake --build $BUILD"
 fi
 
 if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then

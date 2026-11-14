@@ -1220,6 +1220,12 @@ if(LUMEN_BUILD_TESTS)
     set_tests_properties(ui_bench_e2e_dry_run PROPERTIES TIMEOUT 30
         ENVIRONMENT "LUMEN_BUILD_DIR=${CMAKE_BINARY_DIR}")
 
+    # The smoke harness's own plumbing, hermetically: build freshness against a synthetic
+    # Ninja tree (scripts/build-fresh.sh), injection-node lookup against a sysfs fixture
+    # (scripts/inject-devices.sh), and inject-input.py's key table and pixel mapping.
+    add_test(NAME smoke_harness COMMAND bash "${CMAKE_SOURCE_DIR}/tests/smoke_harness.sh")
+    set_tests_properties(smoke_harness PROPERTIES TIMEOUT 60)
+
     add_executable(test_headless_golden tests/test_headless_golden.cpp)
     target_link_libraries(test_headless_golden PRIVATE lx.gfx)
     lumen_apply_module_properties(test_headless_golden)

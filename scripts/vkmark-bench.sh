@@ -130,24 +130,20 @@ for bin in "$COMP" $( (( need_shell )) && echo "$SHELL_BIN"); do
   fi
 done
 
-# A binary older than its sources would measure yesterday's code.
-newest_of() {
-  { git -C "$ROOT" ls-files -z -- "$@"
-    git -C "$ROOT" ls-files -z --others --exclude-standard -- "$@"; } |
-    (cd "$ROOT" && xargs -0 ls -t 2>/dev/null) | head -1
-}
-if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  for pair in "$COMP:modules executables/lumen-compositor" \
-              "$SHELL_BIN:modules/lx.shell executables/lumen-shell"; do
-    bin=${pair%%:*}
-    [[ -e "$bin" ]] || continue
-    # shellcheck disable=SC2086 # the path list is meant to split
-    src=$(newest_of ${pair#*:})
-    if [[ -n "$src" && "$ROOT/$src" -nt "$bin" ]]; then
-      echo "FAIL: $bin is older than $src. Rebuild:  cmake --build --preset release"
-      exit 2
-    fi
-  done
+# A binary older than its sources would measure yesterday's code. The build system says so
+# itself — it knows what the binaries link (a touched module they do not link is not
+# staleness) — so ask it whether it would rebuild them.
+# shellcheck source=build-fresh.sh
+source "$ROOT/scripts/build-fresh.sh"
+FRESH_TARGETS=(lumen-compositor)
+[[ -e "$SHELL_BIN" ]] && FRESH_TARGETS+=(lumen-shell)
+build_fresh "$BUILD" "${FRESH_TARGETS[@]}"; fresh=$?
+if (( fresh == 1 )); then
+  echo "FAIL: $BUILD is not up to date (${build_fresh_why})."
+  echo "      Rebuild:  cmake --build $BUILD"
+  exit 2
+elif (( fresh == 2 )); then
+  echo "NOTE: binary freshness not checked (${build_fresh_why})."
 fi
 
 if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then

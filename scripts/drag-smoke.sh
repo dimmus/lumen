@@ -19,9 +19,10 @@
 #   --logs DIR            log directory (default <repo>/drag-smoke-logs)
 #
 # Needs: a build (LUMEN_BUILD_DIR, default build/release) with lumen-compositor and
-# lumen-square, passwordless sudo for the injector, an absolute pointer at
-# /dev/input/event2 and a keyboard at /dev/input/event1 (override with
-# LUMEN_INJECT_POINTER / LUMEN_INJECT_KEYBOARD). The VMware/QEMU console mouse is absolute.
+# lumen-square, passwordless sudo for the injector, and evdev nodes to inject into —
+# found by device name at start (the virtual 'Lumen Inject Mouse', the internal keyboard),
+# overridable with LUMEN_INJECT_POINTER / LUMEN_INJECT_KEYBOARD. The VMware/QEMU console
+# mouse is absolute; the defaults are its nodes.
 #
 # The scenarios move the pointer and press buttons on the real devices, so do not touch
 # the mouse or keyboard while it runs (about 30 s), and keep the host pointer outside the
@@ -62,8 +63,9 @@ BUILD="${LUMEN_BUILD_DIR:-${ROOT}/build/release}"
 COMP="${BUILD}/lumen-compositor"
 SQUARE="${BUILD}/lumen-square"
 INJ="${ROOT}/scripts/inject-input.py"
-POINTER_DEV="${LUMEN_INJECT_POINTER:-/dev/input/event2}"
-KEYBOARD_DEV="${LUMEN_INJECT_KEYBOARD:-/dev/input/event1}"
+# The injection nodes are picked after the log redirect (scripts/inject-devices.sh):
+# LUMEN_INJECT_POINTER / LUMEN_INJECT_KEYBOARD override, else they are found by device
+# name — the virtual 'Lumen Inject Mouse' wherever the kernel enumerated it this time.
 
 SOCKET="lumen-drag-smoke"
 LOG_DIR="${ROOT}/drag-smoke-logs"
@@ -113,24 +115,24 @@ for bin in "$COMP" "$SQUARE"; do
   fi
 done
 
-# A binary older than its sources would test yesterday's code and look like a pass.
-# lumen-square is standalone, so it is only compared with its own directory.
-newest_of() {
-  { git -C "$ROOT" ls-files -z -- "$@"
-    git -C "$ROOT" ls-files -z --others --exclude-standard -- "$@"; } |
-    (cd "$ROOT" && xargs -0 ls -t 2>/dev/null) | head -1
-}
-if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  for pair in "$COMP:modules executables/lumen-compositor" "$SQUARE:executables/lumen-square"; do
-    bin=${pair%%:*}
-    # shellcheck disable=SC2086 # the path list is meant to split
-    src=$(newest_of ${pair#*:})
-    if [[ -n "$src" && "$ROOT/$src" -nt "$bin" ]]; then
-      echo "FAIL: $bin is older than $src. Rebuild:  cmake --build --preset release"
-      exit 2
-    fi
-  done
+# A binary older than its sources would test yesterday's code and look like a pass. The
+# build system says so itself — it knows what the binaries link (a touched module they do
+# not link is not staleness) — so ask it whether it would rebuild them.
+# shellcheck source=build-fresh.sh
+source "$ROOT/scripts/build-fresh.sh"
+build_fresh "$BUILD" lumen-compositor lumen-square; fresh=$?
+if (( fresh == 1 )); then
+  echo "FAIL: $BUILD is not up to date (${build_fresh_why})."
+  echo "      Rebuild:  cmake --build $BUILD"
+  exit 2
+elif (( fresh == 2 )); then
+  echo "NOTE: binary freshness not checked (${build_fresh_why})."
 fi
+
+# The nodes to inject into: by name unless LUMEN_INJECT_* says otherwise.
+# shellcheck source=inject-devices.sh
+source "$ROOT/scripts/inject-devices.sh"
+inject_pick_devices
 
 if ! sudo -n true 2>/dev/null; then
   echo "FAIL: the injector writes to evdev nodes as root and needs passwordless sudo"

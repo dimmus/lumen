@@ -5,15 +5,18 @@ Notebook hosts have no absolute pointer to inject into (the touchpad is a multit
 device: no hover, and libinput ignores bare ABS_X/Y on it), and some kernels ship
 without the uinput module — where it exists, a virtual mouse is the clean target: a
 separate node the smoke's watcher can tell apart from real hardware, an axis range in
-output pixels (a 1:1 map), and buttons plus a wheel on the same device.
+output pixels (a 1:1 map), and buttons, relative motion (REL_X/REL_Y — a pointer
+acceleration profile comes with it, so the mouse-configuration scenarios have a mouse
+to configure) and the wheel on the same device.
 
     sudo python3 scripts/uinput-mouse.py --output 3200x1800 [--name 'Lumen Inject']
 
 Prints one JSON line {"node": "/dev/input/eventN", "pid": N} once the device exists and
 holds it open (closing the uinput fd destroys the device) until SIGTERM/SIGINT. Root:
 the device is created with the caller's ownership, and logind ACLs it to the active
-seat like any evdev node. Pass the node to inject-input.py as both --pointer and
---relative (REL_WHEEL rides on it).
+seat like any evdev node. The smoke scripts find the node by the device's name
+(scripts/inject-devices.sh), so it needs no passing on; by hand it is inject-input.py's
+--pointer and --relative (relative motion and REL_WHEEL ride on it).
 """
 import argparse
 import fcntl
@@ -25,6 +28,7 @@ import sys
 import time
 
 EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
+REL_X, REL_Y = 0x00, 0x01
 REL_WHEEL = 0x08
 ABS_X, ABS_Y = 0x00, 0x01
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
@@ -76,7 +80,11 @@ def main() -> int:
         fcntl.ioctl(fd, UI_SET_EVBIT, evtype)
     for btn in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
         fcntl.ioctl(fd, UI_SET_KEYBIT, btn)
-    fcntl.ioctl(fd, UI_SET_RELBIT, REL_WHEEL)
+    # REL_X/REL_Y beside the absolute axes: `inject-input.py rel` needs a node that takes
+    # relative motion (pointer lock and confinement, the acceleration profile), and
+    # libinput gives a device an acceleration config only when it has them.
+    for rel in (REL_X, REL_Y, REL_WHEEL):
+        fcntl.ioctl(fd, UI_SET_RELBIT, rel)
     for axis in (ABS_X, ABS_Y):
         fcntl.ioctl(fd, UI_SET_ABSBIT, axis)
 

@@ -69,20 +69,19 @@ if [[ ! -x "$PROBE" ]]; then
 fi
 
 # A stale binary is the worst failure mode here, because everything appears to run and the
-# result is simply wrong. Compare against the newest tracked source: if any of them is
-# newer than the compositor, the test would be measuring yesterday's code.
-newest_src=""
-if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-  newest_src=$(git -C "$ROOT" ls-files -z -- modules executables \
-               | xargs -0 ls -t 2>/dev/null | head -1)
-fi
-if [[ -n "$newest_src" && "$ROOT/$newest_src" -nt "$COMP" ]]; then
-  echo "FAIL: $COMP is older than the sources."
-  echo "  newest source: $newest_src"
-  echo "  Running it would test a build that predates your changes — which is exactly how"
-  echo "  an afternoon disappears. Rebuild:"
-  echo "      cmake --build --preset release"
+# result is simply wrong. The build system says so itself — it knows what the compositor
+# links (a touched module it does not link is not staleness) — so ask it whether it would
+# rebuild the binary; running it would test a build that predates the changes, which is
+# exactly how an afternoon disappears.
+# shellcheck source=build-fresh.sh
+source "$ROOT/scripts/build-fresh.sh"
+build_fresh "$BUILD" lumen-compositor; fresh=$?
+if (( fresh == 1 )); then
+  echo "FAIL: $BUILD is not up to date (${build_fresh_why})."
+  echo "      Rebuild:  cmake --build $BUILD"
   exit 1
+elif (( fresh == 2 )); then
+  echo "NOTE: binary freshness not checked (${build_fresh_why})."
 fi
 
 if ! command -v wev >/dev/null; then
