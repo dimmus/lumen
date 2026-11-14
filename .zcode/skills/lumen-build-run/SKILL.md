@@ -27,11 +27,17 @@ The VM facts and the notebook facts below do NOT transfer between hosts.
   (NVK; never force the GL tier on it — nouveau cannot compile Lumen's GLES UI shaders).
   **Hardware Vulkan is the decisive backend here.** Injection: `sudo python3
   scripts/uinput-mouse.py --output 3200x1800` (hold it open — closing the fd destroys
-  the device), then `LUMEN_INJECT_POINTER`/`LUMEN_INJECT_RELATIVE` = its printed node,
-  `LUMEN_INJECT_KEYBOARD=/dev/input/event3`, `LUMEN_SMOKE_SCALE=1`. app-smoke exits 1
-  with ~140 PASS rows (~36 rows embed the VM's geometry — host noise, not regressions).
-  The user may keep a Lumen desktop logged in on tty1 (session 1) — it holds DRM master;
-  seat work needs it stopped (ask the owner first); the tty1 login itself stays.
+  the device); the smoke scripts find the device by its name ("Lumen Inject Mouse")
+  wherever the kernel enumerated it, so no env vars are needed (explicit
+  `LUMEN_INJECT_POINTER`/`LUMEN_INJECT_RELATIVE`/`LUMEN_INJECT_KEYBOARD` still override),
+  with `LUMEN_SMOKE_SCALE=1`. A holder started from an older `uinput-mouse.py` creates a
+  mouse without REL_X/REL_Y: app-smoke says so up front and R1/R4 and W1/W2/W4 cannot
+  pass — restart the holder from the current script. app-smoke exits 1 with ~150 PASS
+  rows; the remaining FAIL rows on this host are the Vulkan backend's own gaps — the
+  SIGUSR1 debug read-back is GL-only and window (toplevel) capture needs the GL or CPU
+  backend (`wire_capture.cpp`) — not geometry, not regressions. The user may keep a Lumen
+  desktop logged in on tty1 (session 1) — it holds DRM master; seat work needs it stopped
+  (ask the owner first); the tty1 login itself stays.
 - **Never containers**: no Docker, on any host. UI/desktop development runs natively on
   one of the two hosts above; a container has no seat, no KMS master, no input.
 - `ui-bench.sh` keys baselines by hostname+CPU digest (`iritur-168b7c` VM,
@@ -50,7 +56,7 @@ cmake --build --preset release      # ~526 ninja steps, ~15 min cold on 2 cores
 ```bash
 cmake --preset release -S . -B build/test -DLUMEN_BUILD_TESTS=ON
 cmake --build build/test -j2
-ctest --test-dir build/test --output-on-failure -LE bench   # 133 non-bench tests as of 2026-11 (138 registered incl. bench)
+ctest --test-dir build/test --output-on-failure -LE bench   # 134 non-bench tests as of 2026-11 (139 registered incl. bench)
 ```
 
 The plain `release` preset sets `LUMEN_BUILD_TESTS=OFF` → `ctest` on `build/release` sees
@@ -94,10 +100,14 @@ instances — a headless run is not evidence for that surface (unit ctest and th
   after seat work. `loginctl list-sessions` shows whether a user desktop session on tty1
   holds the seat.
 - Input injection without uinput: `scripts/inject-input.py` — writes `input_event` structs
-  to the existing nodes as root. event2 = **absolute** VMware mouse (ABS 0..65535),
-  event3 = relative, event1 = AT keyboard. On the notebook: `scripts/uinput-mouse.py`
-  (virtual ABS mouse + wheel) as `LUMEN_INJECT_POINTER`/`LUMEN_INJECT_RELATIVE`,
-  keyboard `/dev/input/event3`, and `LUMEN_SMOKE_SCALE=1`.
+  to the existing nodes as root. The smoke scripts pick the nodes themselves
+  (`scripts/inject-devices.sh`): the virtual "Lumen Inject Mouse" by name wherever the
+  kernel put it this boot, the internal keyboard by name; explicit `LUMEN_INJECT_*` env
+  still overrides; without either the dev VM's nodes (event2 absolute, event3 relative,
+  event1 AT keyboard) are the defaults. On the notebook: `sudo python3
+  scripts/uinput-mouse.py --output 3200x1800` held open creates the mouse (absolute +
+  relative + wheel on one node) — start it from this tree, or the relative-motion rows
+  cannot pass. `LUMEN_SMOKE_SCALE=1` runs the smokes' compositors at scale 1.
 - Lost console (tty1 text mode, no output): force fbdev re-modeset with
   `head -1 /sys/class/graphics/fb0/modes | sudo tee /sys/class/graphics/fb0/mode` while no
   process is DRM master.
@@ -129,6 +139,15 @@ instances — a headless run is not evidence for that surface (unit ctest and th
   (vmwgfx-specific), `scripts/input-smoke.sh`.
 - Smoke scripts grep compositor log lines — log format strings are interfaces; keep them
   stable when touching logging.
+- The smokes gate binary freshness by asking the build system (`scripts/build-fresh.sh`):
+  a touched module the binaries do not link is not staleness; a genuinely stale binary or
+  a changed `CMakeLists.txt` fails the preflight. Never gate freshness on
+  newest-source-mtime.
+- An interactive seat session (evidence probes) uses `scripts/seat-session.sh` for its
+  generic half — precheck/postcheck, config backup/restore by hash, the logout key, the
+  pointer park — each command taking the run dir as an argument. Never write a run dir
+  into a script: the close-ghost gate's second session reused one that hard-coded the
+  first session's dir and trampled its teardown.
 
 **Before blaming a change**: rerun/build a baseline first. Environmental failures seen on
 clean main: PSI "critical pressure" WARN (tmpfs), T1/T3 timing flakes (SVGA3D present),
@@ -143,6 +162,16 @@ second failure is reportable.
 - Judge UI perf by **interleaved A/B** (same pin, `setarch -R`, ≥3 rounds), never a single
   run against the stored baseline. One binary's p95 moves 40 %+ run to run; p50 up to
   14–18 %. `ui-bench.sh` gate: FAIL on p50 +25 %, WARN on p50 +10 % or p95 +25 %.
+- **Real-hardware bench noise is idle states and frequency, not the host being "moody"**
+  (found 2026-11-14, notebook): the bench's 1 ms frame clock lets the pinned core drop
+  into C3-and-deeper states that flush its caches whenever the idle governor guesses the
+  sleep is long enough — per run, not per sample. One binary read S2 frame p50 29 µs or
+  75 µs (idle ticks 0.17 or 4 µs) with nothing changed, and under schedutil the 5 % duty
+  cycle moved the frequency besides (27–43 µs). `ui-bench.sh` now holds a 10 µs PM-QoS
+  latency request (`/dev/cpu_dma_latency`, root, C1/C1E stay available — no busy-polling)
+  and pins the pinned CPU's governor to performance for the run; runs of one binary then
+  agree within ~2 %. A baseline recorded unheld and a run held (or vice versa) do not
+  compare — check for the "== quiet CPU" line.
 - Never measure while another session builds or runs a smoke. Serialize all seat work.
 - Memory: `heaptrack -o FILE ./build/release/lumen-compositor` (ptrace_scope 1 — launch
   under it, don't attach). Idle compositor allocates ~nothing; ~100k startup allocations

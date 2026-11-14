@@ -107,6 +107,25 @@ inject_pick_devices "$S" "$TMP/dev" >/dev/null
 check "nothing found: the dev VM's nodes" "/dev/input/event2 /dev/input/event1 /dev/input/event3" \
       "$POINTER_DEV $KEYBOARD_DEV $RELATIVE_DEV"
 
+echo "seat-session.sh — the run dir is an argument; the config comes back byte-identical:"
+X=$TMP/xdg
+mkdir -p "$X/lumen"
+printf 'a = 1\n' >"$X/lumen/config.toml"
+XDG_CONFIG_HOME=$X bash "$ROOT/scripts/seat-session.sh" config-backup "$TMP/runA" >/dev/null
+printf 'a = 2\n' >"$X/lumen/config.toml"          # the first session's edit
+# A second session with its own run dir, mid-way: the trampling case.
+XDG_CONFIG_HOME=$X bash "$ROOT/scripts/seat-session.sh" config-backup "$TMP/runB" >/dev/null
+XDG_CONFIG_HOME=$X bash "$ROOT/scripts/seat-session.sh" config-restore "$TMP/runA" >/dev/null
+check "the config is restored byte-identical from its own run dir" "a = 1" "$(cat "$X/lumen/config.toml")"
+check "a second session's run dir keeps its own backup" "a = 2" "$(cat "$TMP/runB/config-BEFORE.toml")"
+check "the first run dir holds its own artifacts only" \
+      "config-BEFORE.toml config-sha256-AFTER-TEST.txt config-sha256-BEFORE.txt config-sha256-RESTORED.txt" \
+      "$(ls "$TMP/runA" | tr '\n' ' ' | sed 's/ $//')"
+bash "$ROOT/scripts/seat-session.sh" precheck >/dev/null 2>&1
+check "a command without its run dir is refused" 2 $?
+bash "$ROOT/scripts/seat-session.sh" bogus "$TMP/runA" >/dev/null 2>&1
+check "an unknown command is refused" 2 $?
+
 echo "inject-input.py — the key table and the pixel mapping:"
 python3 -I - "$ROOT/scripts/inject-input.py" <<'PY'
 import importlib.util, re, sys
