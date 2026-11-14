@@ -1,6 +1,6 @@
 ---
 name: lumen-smoke-bench-harness-green
-description: "2026-11-14 notebook harness task (worktree smoke-bench-harness-green, f1d619f..28e2ef3, final gate NOT_READY on evidence overwrite): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = the acceptance-level seat evidence committed in aaedada (158/15/4 + zero-warning drag) was OVERWRITTEN by 28e2ef3 with dirty non-conforming re-runs (app-smoke 154/15/8 FAIL incl. Z2-Z5, drag g-latency WARN, prechecks 'smoke already running')"
+description: "2026-11-14/15 notebook harness task (worktree smoke-bench-harness-green, f1d619f..8861dc0, gate NOT_READY twice on the same evidence-overwrite pattern): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = aaedada's acceptance-level seat evidence (158/15/4 + zero-warning drag) overwritten by 28e2ef3 with dirty re-runs; round 4 closeout (2026-11-15) re-did it green at b3ac4fb (drag zero-warning PASS row-g p95 25.6 ms, app-smoke 158/15/4, Z2–Z5 flake root-caused to relative LUMEN_BUILD_DIR dangling portal-session.sh:113 symlink) and 8861dc0 then overwrote it again with below-level runs (drag g-latency p95 47.5 ms, app-smoke 154/15/8) — the b3ac4fb tree and /tmp/gate-r4 hold the good evidence"
 metadata:
   node_type: memory
   type: project
@@ -182,6 +182,46 @@ reproducible; holding it via a raised UNCORE_RATIO_LIMIT min_ratio is untried.
   found and killed during final host-state verification; governors, i915 rps and
   MSR 0x620 verified back at boot values.
 
+## Round 4 seat closeout — done green, then overwritten again, 2026-11-15 (worktree HEAD now **8861dc0**)
+
+- **The closeout itself passed at the acceptance level (b3ac4fb, 01:44):** at final HEAD
+  28e2ef3 on a coordinator-verified clean serialized seat (no compositor/smoke, loadavg
+  ≤ 0.61, REL holder pid 1766725 live on event17, `LUMEN_INJECT_*` unset — autodetect
+  bound event17): drag-smoke **exit 0, bare `VERDICT: PASS`, zero warnings**, row g
+  window-move p95 **25.6 ms** vs the 37.3 ms bar (b3ac4fb
+  evidence/smokes/gate/drag-smoke-logs/run.log:19,28; first attempt,
+  /tmp/gate-r4/drag-run1.exit = `exit=0`); app-smoke **158 PASS / 15 WARN / 4 FAIL** with
+  FAILs exactly Z1 Z6 Z7 + the PSI run-clean row and **Z2–Z5 PASS** (run.log:192;
+  Z2.ppm + three Z-pictures PNGs committed). No code changed in round 4 (b3ac4fb touches
+  only evidence/); `bash tests/smoke_harness.sh` → `smoke_harness: PASS` re-run at HEAD
+  this session.
+- **The Z2–Z5 portal flake is root-caused — not a timing race (follow-up finding, not
+  fixed here):** two attempts failed exactly Z2–Z5 with `response None`
+  (/tmp/gate-r4/app-run{1,2}.stdout); cause = a **relative `LUMEN_BUILD_DIR`**
+  (scripts/app-smoke.sh:445) is passed verbatim to portal-session.sh, whose
+  `ln -s "$build/share/xdg-desktop-portal/portals/lumen.portal"`
+  (scripts/portal-session.sh:113) then dangles inside the runtime dir, so
+  xdg-desktop-portal never loads the Lumen backend config (journalctl: `Error loading
+  …/lumen.portal: No such file or directory` — verified by the reviewer at every cited
+  restart time; zero occurrences in the kept run's window). The third attempt, same env
+  var in absolute form, passed all four — no new env var, no pin.
+- **The overwrite happened AGAIN (8861dc0, 02:13:34 — the round-4 fuckup, gate verdict
+  NOT_READY):** an evidence-only commit (199 files, all under evidence/, same pattern as
+  28e2ef3) replaced b3ac4fb's gate evidence with below-level re-runs: drag
+  `VERDICT: PASS (warnings: g latency)`, row g window-move p95 **47.5 ms** (run.log:21,30);
+  app-smoke **154 PASS / 15 WARN / 8 FAIL, `VERDICT: FAIL`** with Z1–Z7 all red
+  (run.log:179–185) + PSI; deleted Z2.ppm and the Z-pictures; opens with
+  `WARN: another session is running` (run.log:2). README.md was not touched, so it still
+  claims the b3ac4fb state (zero warnings, 25.6 ms, 158/15/4, "Z2–Z5 passed") — a
+  self-contradicting tree for the second gate in a row, this time *after* an approving
+  review. Remedy: restore b3ac4fb's evidence tree (`git checkout b3ac4fb --
+  evidence/smokes/gate/`) or re-run at level; the b3ac4fb tree and /tmp/gate-r4 originals
+  (byte-identical per the reviewer's `diff -r`) are the good evidence; 8861dc0 must not
+  be merged or pushed. Suite/ctest not re-run this session (deferred to the workflow's
+  post-gate stage).
+
+
+
 **Why:** a harness gate is only as strong as its provisioning — every acceptance blocker
 at gate time came from the environment (a stale env pin overriding the new autodetect, an
 uncommitted passing run, a CPU mode the hold does not cover on vulkan), not from the code
@@ -191,6 +231,9 @@ design around a claimed hardware failure only after reproducing it (the 0x620 EI
 never demonstrated, and the gate's design justified itself with it); and committed
 evidence must never be overwritten by a worse run — the gate reads the tree's latest
 commit, not git history, and 28e2ef3 turned a READY tree into a self-contradicting one.
+Round 4 proved that rule was not decorative: the same overwrite pattern happened again
+(8861dc0, post-review), and a flaky "portal timing" symptom was actually a dangling
+symlink from a relative build path — reproduce before attributing flake to timing.
 
 **How to apply:** on the notebook never set `LUMEN_INJECT_*` — let inject-devices.sh
 autodetect, and ensure the uinput holder was started from a tree ≥ f1d619f (else restart
@@ -198,7 +241,14 @@ scripts/uinput-mouse.py) or R1/R4/W1/W2/W4 fail with no REL deltas. Gate-time se
 must be committed under evidence/ with per-session prechecks showing a **clean host**
 ("ok: no smoke running") **and the same provisioning as the acceptance runs**; commit
 only runs that meet the acceptance level, and when re-running for evidence, replace the
-README numbers too. Use scripts/build-fresh.sh for freshness; never newest-source mtime.
+README numbers too. A run that comes in below level (g-latency warning, Z2–Z5 red) is
+**damage, not evidence**: leave evidence/ as it was (`git checkout <good-sha> --
+evidence/smokes/gate/`), fix the run conditions, re-run — never commit over the good
+logs, and before committing, re-verify every number in README.md against the committed
+logs (that check has caught the same contradiction twice). On the notebook pass
+`LUMEN_BUILD_DIR` **absolute** to app-smoke, or portal Z2–Z5 fail from the dangling
+portal-session.sh:113 symlink (fixing that script is a portal follow-up, not harness
+work). Use scripts/build-fresh.sh for freshness; never newest-source mtime.
 Never bench vulkan without the warm-up gate (ui-bench.sh does it automatically — look for
 the `== host warm-up` lines; exit 2 = host would not settle, not a code regression).
 Before diagnosing the ~2x mode further, start from the untried avenue: a raised
