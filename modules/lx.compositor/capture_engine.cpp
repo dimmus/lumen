@@ -2,7 +2,9 @@ module;
 
 // Bodies of `:capture_engine`. See capture_engine.cppm for the model.
 
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 module lx.compositor;
@@ -211,14 +213,22 @@ void capture_renderer::reset(session_state& st, unsigned generation) {
     st.read_src_w = st.read_src_h = 0;
     st.read_dx = st.read_dy = 0;
     st.read_cursor = false;
+    st.vk_view = {};
+    close_fd(st.read_dmabuf_fd);
+    st.read_dmabuf_offset = st.read_dmabuf_stride = 0;
 }
 
 capture_renderer::session_state& capture_renderer::state(const capture_job& job) {
     session_state& s = sessions_[(job.session - 1) % k_capture_sessions];
     s.owner = this;
     // Never while a worker read of the slot is in flight (callers wait for it first).
-    if (s.generation != job.generation && !s.busy.load(std::memory_order_acquire))
+    if (s.generation != job.generation && !s.busy.load(std::memory_order_acquire)) {
+        if (vk_ && s.vk_view.valid())
+            // Its last composite's copy (the two are always submitted in that order): the
+            // target is GPU-idle once it has landed.
+            vk_->read_back_free(static_cast<unsigned>(&s - sessions_));
         reset(s, job.generation);
+    }
     return s;
 }
 
@@ -312,6 +322,43 @@ void capture_renderer::worker_read_vk(void* arg) {
         self->notify_(self->notify_user_);
 }
 
+void capture_renderer::worker_read_vk_dmabuf(void* arg) {
+    auto* st = static_cast<session_state*>(arg);
+    capture_renderer* self = st->owner;
+    // The copy's completion: waited for here, never on render.
+    const bool landed =
+        self->vk_ && self->vk_->read_back_wait(st->vk_slot, 2'000'000'000ull) != nullptr;
+    capture_completion c = st->read_done;
+    bool ok = landed;
+    if (ok && st->read_dmabuf_fd >= 0 && st->read_cursor) {
+        // The pointer the GPU copy cannot draw, blended into the client's own LINEAR
+        // buffer — the one place capture writes a dma-buf from the CPU, and a small one.
+        const off_t size = ::lseek(st->read_dmabuf_fd, 0, SEEK_END);
+        void* map = size > 0 ? ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                      st->read_dmabuf_fd, 0)
+                             : MAP_FAILED;
+        if (map != MAP_FAILED) {
+            auto* pixels = static_cast<unsigned char*>(map) + st->read_dmabuf_offset;
+            capture_blend_argb(pixels, st->read_bo_w, st->read_bo_h, st->read_dmabuf_stride,
+                               st->cursor_copy.data(), st->read_cursor_w, st->read_cursor_h,
+                               st->read_cursor_w, st->read_cursor_rect.x, st->read_cursor_rect.y);
+            ::munmap(map, size);
+        } else {
+            ok = false;
+        }
+    }
+    close_fd(st->read_dmabuf_fd);
+    if (!ok) {
+        c.result = capture_result::failed;
+        c.reason = capture_failure::unknown;
+    }
+    for (int i = 0; i < 2000 && !st->read_out->complete(c); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    st->busy.store(false, std::memory_order_release);
+    if (self->notify_)
+        self->notify_(self->notify_user_);
+}
+
 void capture_renderer::read_on_worker(session_state& st, const capture_job& job,
                                       capture_completion c, unsigned w, unsigned h,
                                       const lx::gfx::damage_region& rects,
@@ -366,10 +413,17 @@ void capture_renderer::flush(capture_channel& out) {
 }
 
 int capture_renderer::take_sample_fence(bool wanted) {
-    if (!sampled_textures_)
-        return -1;
-    sampled_textures_ = false;
-    return wanted && gl_ ? gl_capture_.fence() : -1;
+    if (gl_) {
+        if (!sampled_textures_)
+            return -1;
+        sampled_textures_ = false;
+        return wanted ? gl_capture_.fence() : -1;
+    }
+    const int fd = sample_fence_vk_;
+    sample_fence_vk_ = -1;
+    if (!wanted && fd >= 0)
+        ::close(fd);
+    return fd;
 }
 
 void capture_renderer::close_job(capture_job& job) {
@@ -417,6 +471,16 @@ void capture_renderer::take(capture_channel& in) {
         switch (job.kind) {
         case capture_job_kind::forget_buffer:
             gl_capture_.forget_dmabuf(job.target.buffer_key);
+            if (vk_) {
+                // A Vulkan import's memory is the client's dma-buf kept alive by it: a job
+                // still pending would copy into it after it is freed, so those go first
+                // (their frames are gone on the UI side anyway).
+                for (unsigned k = pending_count_; k-- > 0;)
+                    if (pending_[k].target.dmabuf &&
+                        pending_[k].target.buffer_key == job.target.buffer_key)
+                        drop_pending(k, in);
+                vk_->capture_dmabuf_forget(job.target.buffer_key);
+            }
             break;
         case capture_job_kind::forget_session: {
             session_state& s = sessions_[(job.session - 1) % k_capture_sessions];
@@ -495,6 +559,42 @@ bool capture_renderer::paint_cursor_gl(unsigned framebuffer, lx::size2i size,
                                      static_cast<unsigned>(size.height),
                                      lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, where, false, false);
     return static_cast<bool>(drawn);
+}
+
+bool capture_renderer::cursor_blit_vk(const capture_cursor& cursor, lx::size2i size,
+                                      lx::gfx::blit_command& out) {
+    if (!vk_ || !cursor.visible || !cursor.pixels || cursor.width == 0)
+        return false;
+    if (cursor.generation != cursor_uploaded_gen_ || cursor_uploaded_gen_ == 0) {
+        // The upload takes RGBA rows; the pointer image is premultiplied ARGB (BGRA bytes).
+        std::vector<unsigned char> rgba(static_cast<std::size_t>(cursor.width) * cursor.height *
+                                        4u);
+        for (unsigned y = 0; y < cursor.height; ++y)
+            for (unsigned x = 0; x < cursor.width; ++x) {
+                const std::uint32_t p =
+                    cursor.pixels[static_cast<std::size_t>(y) * cursor.stride_px + x];
+                unsigned char* d = &rgba[(static_cast<std::size_t>(y) * cursor.width + x) * 4u];
+                d[0] = static_cast<unsigned char>(p >> 16);
+                d[1] = static_cast<unsigned char>(p >> 8);
+                d[2] = static_cast<unsigned char>(p);
+                d[3] = static_cast<unsigned char>(p >> 24);
+            }
+        auto up = vk_->upload_rgba(k_capture_cursor_texture, cursor.width, cursor.height,
+                                   rgba.data());
+        if (!up) {
+            log_capture.error(up.get_error());
+            return false;
+        }
+        cursor_uploaded_gen_ = cursor.generation;
+    }
+    out = {};
+    out.texture_id = k_capture_cursor_texture;
+    out.dst = cursor.rect;
+    out.blend = lx::blend_mode::premultiplied;
+    lx::gfx::damage_region where{};
+    where.add(cursor.rect);
+    where.clip({0, 0, size.width, size.height});
+    return !where.empty();
 }
 
 bool capture_renderer::recomposite_cpu(const capture_frame_source& src,
@@ -772,10 +872,75 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
             return true;
         }
     } else if (vk_ && src.vk_target) {
+        const unsigned slot = static_cast<unsigned>(&st - sessions_);
+        if (job.target.dmabuf) {
+            // The client's dma-buf as the copy's destination, imported once and kept while
+            // the buffer lives: the GPU places each rect's rows at its stride, the CPU
+            // never touches one. Render neither allocates nor stalls.
+            auto imported = vk_->capture_dmabuf_import(
+                job.target.buffer_key, job.target.fd, job.target.offset, job.target.stride,
+                job.target.width, job.target.height, job.target.format, job.target.modifier);
+            if (!imported) {
+                log_capture.error(imported.get_error());
+                fail(out, job, capture_failure::buffer_constraints);
+                return true;
+            }
+            c.cursor = {true, hw_cursor, hw_cursor ? src.cursor.rect : lx::rect2i{},
+                        src.cursor.generation};
+            if (hw_cursor) {
+                // The GPU copy cannot draw the pointer: it is blended into the client's
+                // mapped buffer once the copy lands (a worker; render here without one).
+                auto copy = vk_->capture_dmabuf_copy(slot, job.target.buffer_key, *src.vk_target,
+                                                     region.rects, region.count, crop.x, crop.y);
+                if (!copy) {
+                    log_capture.error(copy.get_error());
+                    fail(out, job, capture_failure::unknown);
+                    return true;
+                }
+                if (copy.value() >= 0)
+                    ::close(copy.value()); // the worker's wait is the slot's fence
+                st.read_region = region;
+                st.read_bo_w = w; // the buffer's size, for the blend's clipping
+                st.read_bo_h = h;
+                st.read_dmabuf_fd = ::fcntl(job.target.fd, F_DUPFD_CLOEXEC, 0);
+                st.read_dmabuf_offset = job.target.offset;
+                st.read_dmabuf_stride = job.target.stride;
+                st.read_cursor = true;
+                const std::size_t px =
+                    static_cast<std::size_t>(src.cursor.width) * src.cursor.height;
+                if (st.cursor_copy.size() < px)
+                    st.cursor_copy.resize(px);
+                for (unsigned y = 0; y < src.cursor.height; ++y)
+                    std::memcpy(&st.cursor_copy[static_cast<std::size_t>(y) * src.cursor.width],
+                                src.cursor.pixels +
+                                    static_cast<std::size_t>(y) * src.cursor.stride_px,
+                                src.cursor.width * 4u);
+                st.read_cursor_rect = cursor_at;
+                st.read_cursor_w = src.cursor.width;
+                st.read_cursor_h = src.cursor.height;
+                st.vk_slot = slot;
+                st.read_done = c;
+                st.read_out = &out;
+                st.busy.store(true, std::memory_order_release);
+                if (!post_ || !post_(&capture_renderer::worker_read_vk_dmabuf, &st))
+                    worker_read_vk_dmabuf(&st); // no worker: here (the wait blocks render)
+                return true;
+            }
+            auto copy = vk_->capture_dmabuf_copy(slot, job.target.buffer_key, *src.vk_target,
+                                                 region.rects, region.count, crop.x, crop.y);
+            if (!copy) {
+                log_capture.error(copy.get_error());
+                fail(out, job, capture_failure::unknown);
+                return true;
+            }
+            c.fence_fd = copy.value();
+            c.result = c.fence_fd >= 0 ? capture_result::fence : capture_result::ready;
+            complete(out, c);
+            return true;
+        }
         // One copy of the changed rects into the session's persistent mapped buffer, submitted
         // without waiting; the worker waits for it and writes the client's rows (BGRA is
         // already wl_shm's byte order) — render neither allocates nor stalls per frame.
-        const unsigned slot = static_cast<unsigned>(&st - sessions_);
         if (auto read = vk_->read_back_async(slot, *src.vk_target, region.rects, region.count);
             !read) {
             log_capture.error(read.get_error());
@@ -970,7 +1135,7 @@ void capture_renderer::run_curtains(capture_channel& out) {
         c.damage.set_full();
         bool ok = false;
         if (job.target.dmabuf) {
-            if (ensure_gl()) {
+            if (gl_ && ensure_gl()) {
                 auto dst = gl_capture_.dmabuf_framebuffer(
                     job.target.buffer_key, job.target.fd, job.target.offset, job.target.stride,
                     job.target.width, job.target.height, job.target.format, job.target.modifier);
@@ -979,6 +1144,23 @@ void capture_renderer::run_curtains(capture_channel& out) {
                     ok = true;
                     c.fence_fd = gl_capture_.fence();
                     c.result = c.fence_fd >= 0 ? capture_result::fence : capture_result::ready;
+                }
+            } else if (vk_) {
+                auto imported = vk_->capture_dmabuf_import(
+                    job.target.buffer_key, job.target.fd, job.target.offset, job.target.stride,
+                    job.target.width, job.target.height, job.target.format, job.target.modifier);
+                if (!imported) {
+                    log_capture.error(imported.get_error());
+                } else {
+                    auto filled = vk_->capture_dmabuf_fill(
+                        (job.session - 1) % k_capture_sessions, job.target.buffer_key);
+                    if (!filled) {
+                        log_capture.error(filled.get_error());
+                    } else {
+                        ok = true;
+                        c.fence_fd = filled.value();
+                        c.result = c.fence_fd >= 0 ? capture_result::fence : capture_result::ready;
+                    }
                 }
             }
         } else {
@@ -1151,6 +1333,88 @@ void capture_renderer::toplevel_composited(unsigned view, const lx::gfx::damage_
                                            src.cursor.stride_px, src.cursor.rect.x,
                                            src.cursor.rect.y);
                 });
+        } else if (vk_) {
+            // The window's view composited into this session's persistent capture target
+            // (made at the buffer's size, kept while it fits): only `region` redrawn, the
+            // rest intact from its last frame — the pointer, when it paints it, a blit like
+            // any other, so what follows (read-back or copy) carries it with no second
+            // pass.
+            auto target = vk_->capture_view_target(st.vk_view, w, h);
+            if (!target) {
+                log_capture.error(target.get_error());
+                ok = false;
+            } else if (!region.empty()) {
+                static thread_local std::vector<lx::gfx::blit_command> scratch;
+                const lx::gfx::blit_command* draws = src.blits;
+                unsigned draw_count = src.blit_count;
+                lx::gfx::blit_command pointer{};
+                if (hw_cursor && cursor_blit_vk(src.cursor, size, pointer)) {
+                    scratch.assign(src.blits, src.blits + src.blit_count);
+                    scratch.push_back(pointer);
+                    draws = scratch.data();
+                    draw_count = static_cast<unsigned>(scratch.size());
+                }
+                auto drew = vk_->composite_region(st.vk_view, clear, draws, draw_count, region,
+                                                  region, &st.vk_view);
+                if (!drew) {
+                    log_capture.error(drew.get_error());
+                    ok = false;
+                } else if (drew.value().out_fence_fd >= 0) {
+                    // The composite sampled client textures: its fence is what
+                    // explicit-sync release points must follow (`take_sample_fence`).
+                    if (sample_fence_vk_ >= 0)
+                        ::close(sample_fence_vk_);
+                    sample_fence_vk_ = drew.value().out_fence_fd;
+                }
+            }
+            const unsigned slot = static_cast<unsigned>(&st - sessions_);
+            if (ok && job.target.dmabuf) {
+                auto imported = vk_->capture_dmabuf_import(
+                    job.target.buffer_key, job.target.fd, job.target.offset, job.target.stride,
+                    w, h, job.target.format, job.target.modifier);
+                if (!imported) {
+                    log_capture.error(imported.get_error());
+                    fail(out, job, capture_failure::buffer_constraints);
+                    remove_pending(i);
+                    continue;
+                }
+                auto copy = vk_->capture_dmabuf_copy(slot, job.target.buffer_key, st.vk_view,
+                                                     region.rects, region.count, 0, 0);
+                if (!copy) {
+                    log_capture.error(copy.get_error());
+                    fail(out, job, capture_failure::unknown);
+                    remove_pending(i);
+                    continue;
+                }
+                c.fence_fd = copy.value();
+                c.result = c.fence_fd >= 0 ? capture_result::fence : capture_result::ready;
+            } else if (ok && !region.empty()) {
+                if (auto read = vk_->read_back_async(slot, st.vk_view, region.rects,
+                                                     region.count);
+                    !read) {
+                    log_capture.error(read.get_error());
+                    fail(out, job, capture_failure::unknown);
+                    remove_pending(i);
+                    continue;
+                }
+                st.read_region = region;
+                st.read_src_w = w;
+                st.read_src_h = h;
+                st.read_dx = st.read_dy = 0;
+                st.read_cursor = false; // the pointer is in the composite
+                st.vk_slot = slot;
+                c.result = capture_result::ready;
+                st.read_done = c;
+                st.read_out = &out;
+                st.busy.store(true, std::memory_order_release);
+                if (!post_ || !post_(&capture_renderer::worker_read_vk, &st)) {
+                    worker_read_vk(&st); // no worker: here (the wait blocks render)
+                    remove_pending(i);
+                    continue;
+                }
+                remove_pending(i);
+                continue;
+            }
         } else {
             ok = false;
         }

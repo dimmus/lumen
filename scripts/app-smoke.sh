@@ -3939,31 +3939,42 @@ def record(name, ok, detail, warn=False):
 
 # ── What this run's composite path can do ───────────────────────────────────
 # Read from the compositor's own log, not assumed: the "composite path active" line names
-# the backend, and the capabilities are exactly where the code refuses them. A row that
-# needs a capability this backend lacks is that backend's gap, not this run's failure:
-# it is reported as a WARN naming the gap (the 2026-11-14 owner decision — a
-# backend-limited WARN is green for the gate), and it judges normally again the moment a
-# backend has the capability, because the WARN only replaces a failure. Only the
-# sub-checks that need the capability are WARNed away: the row's log-derived half keeps
-# judging on every backend (record_limited's `rest`), so a defect there still fails. The
-# refusals:
-# the SIGUSR1 debug read-back reads the GL scanout target only (compositor_impl.cpp
-# `write_screenshot`; lx.compositor.cppm documents it on `request_screenshot`), window
-# (toplevel) capture is refused on the Vulkan backend and capture dma-buf buffers are
-# offered on the GL path only (wire_capture.cpp `create_session` and its constraints).
+# the backend, and — from a compositor that states it — the "capabilities" line says what
+# its capture can do (read-back, window capture, dma-buf buffers). A row that needs a
+# capability this run lacks is that backend's gap, not this run's failure: it is reported
+# as a WARN naming the gap (the 2026-11-14 owner decision — a backend-limited WARN is
+# green for the gate), and it judges normally again the moment a backend has the
+# capability, because the WARN only replaces a failure. Only the sub-checks that need the
+# capability are WARNed away: the row's log-derived half keeps judging on every backend
+# (record_limited's `rest`), so a defect there still fails. Compositors without the
+# capabilities line (older binaries): the gaps are where the code refused them — the
+# SIGUSR1 debug read-back reads the GL scanout target only, and capture dma-buf buffers
+# were offered on the GL path only (window capture was refused nowhere once CPU had it).
 GFXPATH = re.compile(r"compositor\.gfx: (Vulkan|GL|CPU) composite path active")
 composite_path = next((m.group(1).lower() for l in comp if (m := GFXPATH.search(l))), None)
+CAPS = re.compile(r"compositor\.capture: capabilities read-back=(\d) window-capture=(\d) "
+                  r"dmabuf=(\d)")
+caps = next((tuple(g == "1" for g in m.groups()) for l in comp if (m := CAPS.search(l))), None)
 
 def backend_gap(needs):
     """The capability this backend lacks, as a string naming it — None when it has it."""
     if composite_path is None:
         return None
+    if caps is not None:
+        read_back, window, dmabuf = caps
+        if needs == "read-back" and not read_back:
+            return ("the SIGUSR1 debug read-back is not on this composite path "
+                    "(compositor_impl.cpp write_screenshot)")
+        if needs == "window-capture" and not window:
+            return ("window (toplevel) capture is not on this composite path "
+                    "(wire_capture.cpp create_session)")
+        if needs == "capture-dmabuf" and not dmabuf:
+            return ("capture dma-buf buffers are not offered on this composite path "
+                    "(wire_capture.cpp)")
+        return None
     if needs == "read-back" and composite_path != "gl":
         return ("the SIGUSR1 debug read-back is the GL path only "
                 "(compositor_impl.cpp write_screenshot)")
-    if needs == "window-capture" and composite_path == "vulkan":
-        return ("window (toplevel) capture needs the GL or CPU backend "
-                "(wire_capture.cpp create_session)")
     if needs == "capture-dmabuf" and composite_path != "gl":
         return "capture dma-buf buffers are offered on the GL path only (wire_capture.cpp)"
     return None

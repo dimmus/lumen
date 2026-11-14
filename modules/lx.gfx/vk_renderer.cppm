@@ -4,6 +4,7 @@ module;
 #include <vulkan/vulkan.h>
 #endif
 #include <stdint.h>
+#include <unistd.h> // lseek: a capture dma-buf's size
 
 import lx.foundation;
 
@@ -362,6 +363,49 @@ public:
     /// Render thread: frees `slot` (its capture session ended). Waits for its read first.
     void read_back_free(unsigned slot);
 
+    // ── Screen capture into client dma-bufs ───────────────────────────────────────
+
+    /// A capture client's LINEAR XR24/AR24 dma-buf (what a screencast cycles through),
+    /// imported once and kept while the buffer lives (`key`: its wl_buffer's never-reused
+    /// id) — its memory bound to a persistent TRANSFER_DST buffer, the LRU table bounded
+    /// like `gl_capture`'s.
+    static constexpr unsigned k_capture_dmabufs = 32;
+    /// Whether the device imports dma-buf memory as buffer memory
+    /// (VK_EXT_external_memory_dma_buf): capture offers dma-buf buffers only then.
+    [[nodiscard]] bool capture_dmabuf_supported() const { return capture_dmabuf_importable_; }
+    /// Imports (or finds) `key`'s buffer; `fd` is borrowed (the caller closes it). The
+    /// fourcc must be XR24/AR24 — the formats the capture constraints offer, and this
+    /// compositor's scanout byte order, so the copy needs no swizzle.
+    [[nodiscard]] lx::result<void> capture_dmabuf_import(unsigned key, int fd, unsigned offset,
+                                                         unsigned stride, unsigned width,
+                                                         unsigned height, lx::fourcc format,
+                                                         unsigned long long modifier);
+    /// The wl_buffer behind `key` is gone: its import goes.
+    void capture_dmabuf_forget(unsigned key);
+    /// Copies `rects` of `src` — at their place less (`dx`, `dy`) — into `key`'s buffer,
+    /// each row at the client's stride and the plane's offset, on `slot`'s persistent
+    /// command buffer and fence (the slot an shm read of the same session would use; a
+    /// session never mixes kinds). The GPU places the rows: no CPU copy, no render-thread
+    /// wait. A sync_file signalled once the copy completes — hand it to the client's
+    /// readiness — or -1 when the copy already completed (the device exports none: the
+    /// submit waited).
+    [[nodiscard]] lx::result<int> capture_dmabuf_copy(unsigned slot, unsigned key,
+                                                      const render_target& src,
+                                                      const lx::rect2i* rects, unsigned count,
+                                                      int dx, int dy);
+    /// `key`'s buffer filled with opaque black (the lock curtain). As `capture_dmabuf_copy`.
+    [[nodiscard]] lx::result<int> capture_dmabuf_fill(unsigned slot, unsigned key);
+    /// A window capture's render target (`slot`, the session's, recreated only on a size
+    /// change): the window's capture view is composited into it, then read back or copied
+    /// like an output's frame. ARGB8888 — a window has alpha where it covers nothing.
+    [[nodiscard]] lx::result<void> capture_view_target(render_target& slot, unsigned width,
+                                                       unsigned height);
+    /// Read-back and capture buffers created so far: same-size read-backs and an unchanged
+    /// window target allocate nothing — tests assert capture stays off the allocation path.
+    [[nodiscard]] unsigned readback_allocations() const { return readback_allocations_; }
+    /// dma-buf imports created so far (a re-import happens only for an evicted buffer).
+    [[nodiscard]] unsigned capture_dmabuf_imports() const { return capture_dmabuf_imports_; }
+
     // ── Backdrop blur (ext-background-effect-v1) ──────────────────────────────────
 
     /// Outputs with their own blur cache (the compositor's output slots).
@@ -696,11 +740,46 @@ private:
         unsigned char* mapped = nullptr;
         void* command_buffer = nullptr;
         void* fence = nullptr;
+        /// Exportable (SYNC_FD), signalled by a `capture_dmabuf_copy` submit: the exported
+        /// sync file is the copy's fence for the client. Null where the device cannot.
+        void* semaphore = nullptr;
         unsigned capacity = 0;
         /// A copy was submitted with `fence` and not waited for by render yet.
         bool submitted = false;
     };
     readback_slot readbacks_[k_readback_slots]{};
+    /// The synchronous `read_back`'s own slot (debug screenshots, one-off reads): pooled
+    /// like the sessions', and apart from them, so a one-off read leaves the frame slots
+    /// alone and creates nothing after its first.
+    readback_slot sync_read_{};
+    /// Whether a TRANSFER_DST buffer's memory may be imported from a dma-buf on this
+    /// device (VK_EXT_external_memory_dma_buf): the capability behind capture's dma-buf
+    /// buffers.
+    bool capture_dmabuf_importable_ = false;
+    struct capture_dmabuf {
+        unsigned key = 0;
+        void* buffer = nullptr;
+        void* memory = nullptr;
+        unsigned offset = 0;
+        unsigned stride = 0;
+        unsigned width = 0;
+        unsigned height = 0;
+        unsigned long long used = 0;
+    };
+    capture_dmabuf capture_dmabufs_[k_capture_dmabufs]{};
+    unsigned long long capture_dmabuf_clock_ = 0;
+    unsigned readback_allocations_ = 0;
+    unsigned capture_dmabuf_imports_ = 0;
+
+    /// Makes `rb`'s persistent mapped buffer (`needed` bytes, cached memory where the device
+    /// has it), command buffer, fence and — where sync files can be exported — semaphore.
+    /// Nothing is created after the first use while the size fits.
+    [[nodiscard]] lx::result<void> ensure_readback_buffer(readback_slot& rb, unsigned needed);
+    [[nodiscard]] lx::result<void> ensure_readback_sync(readback_slot& rb);
+    /// Frees `rb`'s objects (waits for its read first).
+    void free_readback_slot(readback_slot& rb);
+    /// `key`'s import, or null (the LRU clock not touched).
+    [[nodiscard]] capture_dmabuf* find_capture_dmabuf(unsigned key);
 };
 
 } // namespace lx::gfx
@@ -1866,6 +1945,22 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx,
     // never exists.
     host_copy_.init(ctx_, static_cast<unsigned>(VK_FORMAT_R8G8B8A8_UNORM));
 
+    // Screen capture's dma-buf copies: whether a TRANSFER_DST buffer's memory may be
+    // imported from a dma-buf on this device. Without it the capability stays off and
+    // capture offers shm buffers only.
+    {
+        VkPhysicalDeviceExternalBufferInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        VkExternalBufferProperties props{};
+        props.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
+        vkGetPhysicalDeviceExternalBufferProperties(
+            static_cast<VkPhysicalDevice>(ctx_.physical_device), &info, &props);
+        capture_dmabuf_importable_ = (props.externalMemoryProperties.externalMemoryFeatures &
+                                      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0;
+    }
+
     return {};
 #else
     (void)ctx;
@@ -1924,6 +2019,16 @@ void lx::gfx::vulkan_compositor::shutdown() {
         gpu_done_count_ = 0;
         for (unsigned i = 0; i < k_readback_slots; ++i)
             read_back_free(i);
+        free_readback_slot(sync_read_);
+        for (capture_dmabuf& d : capture_dmabufs_) {
+            if (d.memory)
+                vkFreeMemory(dev, static_cast<VkDeviceMemory>(d.memory), nullptr);
+            if (d.buffer)
+                vkDestroyBuffer(dev, static_cast<VkBuffer>(d.buffer), nullptr);
+            d = {};
+        }
+        capture_dmabuf_importable_ = false;
+        capture_dmabuf_clock_ = 0;
 
         for (unsigned o = 0; o < k_blur_outputs; ++o)
             release_blur(o);
@@ -4413,55 +4518,23 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
     if (!rgba || capacity < needed) {
         return lx::invalid_argument("read_back destination too small");
     }
-
     auto dev = static_cast<VkDevice>(ctx_.device);
-    auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
-
-    VkBufferCreateInfo bci{};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = needed;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    VkBuffer staging = VK_NULL_HANDLE;
-    if (vkCreateBuffer(dev, &bci, nullptr, &staging) != VK_SUCCESS)
-        return vk_error("read_back vkCreateBuffer failed");
-
-    VkMemoryRequirements reqs{};
-    vkGetBufferMemoryRequirements(dev, staging, &reqs);
-    const int type_index =
-        find_memory_type(phys, reqs.memoryTypeBits,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (type_index < 0) {
-        vkDestroyBuffer(dev, staging, nullptr);
-        return vk_error("no host-visible memory type for read_back");
+    auto queue = static_cast<VkQueue>(ctx_.queue);
+    // Its own persistent slot: the first read makes the buffer, the fence and the command
+    // buffer; later ones create nothing, and the frame slots' fences are left alone.
+    if (auto ok = ensure_readback_buffer(sync_read_, needed); !ok)
+        return ok;
+    if (auto ok = ensure_readback_sync(sync_read_); !ok)
+        return ok;
+    if (sync_read_.submitted) {
+        auto fence = static_cast<VkFence>(sync_read_.fence);
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return vk_error("read_back: the previous read never completed");
     }
-
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = reqs.size;
-    mai.memoryTypeIndex = static_cast<uint32_t>(type_index);
-
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
-        vkDestroyBuffer(dev, staging, nullptr);
-        return vk_error("read_back vkAllocateMemory failed");
-    }
-    if (vkBindBufferMemory(dev, staging, memory, 0) != VK_SUCCESS) {
-        vkFreeMemory(dev, memory, nullptr);
-        vkDestroyBuffer(dev, staging, nullptr);
-        return vk_error("read_back vkBindBufferMemory failed");
-    }
-
-    const unsigned frame_slot = submit_slot_;
-    auto fence = static_cast<VkFence>(fences_[frame_slot]);
-    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
-        return vk_error("vkWaitForFences timed out reclaiming read_back slot");
+    auto fence = static_cast<VkFence>(sync_read_.fence);
     vkResetFences(dev, 1, &fence);
-
-    auto cb = static_cast<VkCommandBuffer>(command_buffers_[frame_slot]);
+    auto cb = static_cast<VkCommandBuffer>(sync_read_.command_buffer);
     vkResetCommandBuffer(cb, 0);
-    slot_timed_[frame_slot] = false; // a read is not a frame
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -4479,37 +4552,49 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
     copy.imageSubresource.layerCount = 1;
     copy.imageExtent = {target.width(), target.height(), 1};
     vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(target.vk_image()),
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &copy);
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           static_cast<VkBuffer>(sync_read_.buffer), 1, &copy);
 
     image_barrier(cb, static_cast<VkImage>(target.vk_image()),
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_NONE,
                   VK_ACCESS_2_NONE);
 
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = static_cast<VkBuffer>(sync_read_.buffer);
+    to_host.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &to_host;
+    vkCmdPipelineBarrier2(cb, &dep);
     vkEndCommandBuffer(cb);
 
-    if (auto submitted = submit_current_slot(true); !submitted)
-        return submitted.get_error();
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cb;
+    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
+        return vk_error("read_back vkQueueSubmit failed");
+    sync_read_.submitted = true;
+    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+        return vk_error("read_back vkWaitForFences timed out");
 
-    void* mapped = nullptr;
-    if (vkMapMemory(dev, memory, 0, needed, 0, &mapped) == VK_SUCCESS) {
-        // The target is B8G8R8A8; callers expect tightly packed RGBA.
-        const auto* src = static_cast<const unsigned char*>(mapped);
-        for (unsigned i = 0; i < needed; i += 4u) {
-            rgba[i + 0] = src[i + 2];
-            rgba[i + 1] = src[i + 1];
-            rgba[i + 2] = src[i + 0];
-            rgba[i + 3] = src[i + 3];
-        }
-        vkUnmapMemory(dev, memory);
-    } else {
-        vkFreeMemory(dev, memory, nullptr);
-        vkDestroyBuffer(dev, staging, nullptr);
-        return vk_error("read_back vkMapMemory failed");
+    // The target is B8G8R8A8; callers expect tightly packed RGBA.
+    const auto* src = sync_read_.mapped;
+    for (unsigned i = 0; i < needed; i += 4u) {
+        rgba[i + 0] = src[i + 2];
+        rgba[i + 1] = src[i + 1];
+        rgba[i + 2] = src[i + 0];
+        rgba[i + 3] = src[i + 3];
     }
-
-    vkFreeMemory(dev, memory, nullptr);
-    vkDestroyBuffer(dev, staging, nullptr);
     return {};
 #else
     (void)target;
@@ -4527,7 +4612,6 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
     if (!ready() || !target.valid() || slot >= k_readback_slots)
         return lx::not_implemented("lx::gfx::vulkan_compositor::read_back_async");
     auto dev = static_cast<VkDevice>(ctx_.device);
-    auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
     auto queue = static_cast<VkQueue>(ctx_.queue);
     readback_slot& rb = readbacks_[slot];
     const unsigned w = target.width();
@@ -4541,81 +4625,10 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
             return vk_error("read_back_async: the slot's previous read never completed");
         rb.submitted = false;
     }
-    if (rb.capacity < needed) {
-        // The output grew (or the first frame): the buffer is made once per size.
-        if (rb.memory) {
-            vkUnmapMemory(dev, static_cast<VkDeviceMemory>(rb.memory));
-            vkFreeMemory(dev, static_cast<VkDeviceMemory>(rb.memory), nullptr);
-        }
-        if (rb.buffer)
-            vkDestroyBuffer(dev, static_cast<VkBuffer>(rb.buffer), nullptr);
-        rb.buffer = rb.memory = nullptr;
-        rb.mapped = nullptr;
-        rb.capacity = 0;
-
-        VkBufferCreateInfo bci{};
-        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size = needed;
-        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        VkBuffer buffer = VK_NULL_HANDLE;
-        if (vkCreateBuffer(dev, &bci, nullptr, &buffer) != VK_SUCCESS)
-            return vk_error("read_back_async vkCreateBuffer failed");
-        VkMemoryRequirements reqs{};
-        vkGetBufferMemoryRequirements(dev, buffer, &reqs);
-        // Cached memory where there is some: the CPU reads every byte of it back.
-        int type = find_memory_type(phys, reqs.memoryTypeBits,
-                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-        if (type < 0)
-            type = find_memory_type(phys, reqs.memoryTypeBits,
-                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (type < 0) {
-            vkDestroyBuffer(dev, buffer, nullptr);
-            return vk_error("no host-visible memory type for read_back_async");
-        }
-        VkMemoryAllocateInfo mai{};
-        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        mai.allocationSize = reqs.size;
-        mai.memoryTypeIndex = static_cast<uint32_t>(type);
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
-            vkDestroyBuffer(dev, buffer, nullptr);
-            return vk_error("read_back_async vkAllocateMemory failed");
-        }
-        void* mapped = nullptr;
-        if (vkBindBufferMemory(dev, buffer, memory, 0) != VK_SUCCESS ||
-            vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
-            vkFreeMemory(dev, memory, nullptr);
-            vkDestroyBuffer(dev, buffer, nullptr);
-            return vk_error("read_back_async: buffer bind or map failed");
-        }
-        rb.buffer = buffer;
-        rb.memory = memory;
-        rb.mapped = static_cast<unsigned char*>(mapped);
-        rb.capacity = needed;
-    }
-    if (!rb.command_buffer) {
-        VkCommandBufferAllocateInfo cbai{};
-        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cbai.commandPool = static_cast<VkCommandPool>(ctx_.command_pool);
-        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbai.commandBufferCount = 1;
-        VkCommandBuffer cb = VK_NULL_HANDLE;
-        if (vkAllocateCommandBuffers(dev, &cbai, &cb) != VK_SUCCESS)
-            return vk_error("read_back_async vkAllocateCommandBuffers failed");
-        rb.command_buffer = cb;
-    }
-    if (!rb.fence) {
-        VkFenceCreateInfo fci{};
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        VkFence fence = VK_NULL_HANDLE;
-        if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS)
-            return vk_error("read_back_async vkCreateFence failed");
-        rb.fence = fence;
-    }
+    if (auto ok = ensure_readback_buffer(rb, needed); !ok)
+        return ok;
+    if (auto ok = ensure_readback_sync(rb); !ok)
+        return ok;
     auto fence = static_cast<VkFence>(rb.fence);
     vkResetFences(dev, 1, &fence);
 
@@ -4741,7 +4754,128 @@ void lx::gfx::vulkan_compositor::read_back_free(unsigned slot) {
 #ifdef LUMEN_HAS_VULKAN
     if (slot >= k_readback_slots)
         return;
-    readback_slot& rb = readbacks_[slot];
+    free_readback_slot(readbacks_[slot]);
+#else
+    (void)slot;
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::ensure_readback_buffer(readback_slot& rb,
+                                                                     unsigned needed) {
+#ifdef LUMEN_HAS_VULKAN
+    if (rb.capacity >= needed)
+        return {};
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
+    if (rb.memory) {
+        vkUnmapMemory(dev, static_cast<VkDeviceMemory>(rb.memory));
+        vkFreeMemory(dev, static_cast<VkDeviceMemory>(rb.memory), nullptr);
+    }
+    if (rb.buffer)
+        vkDestroyBuffer(dev, static_cast<VkBuffer>(rb.buffer), nullptr);
+    rb.buffer = rb.memory = nullptr;
+    rb.mapped = nullptr;
+    rb.capacity = 0;
+
+    // The buffer is made once per size (an output grew, or the first frame).
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = needed;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(dev, &bci, nullptr, &buffer) != VK_SUCCESS)
+        return vk_error("read-back vkCreateBuffer failed");
+    VkMemoryRequirements reqs{};
+    vkGetBufferMemoryRequirements(dev, buffer, &reqs);
+    // Cached memory where there is some: the CPU reads every byte of it back.
+    int type = find_memory_type(phys, reqs.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (type < 0)
+        type = find_memory_type(phys, reqs.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type < 0) {
+        vkDestroyBuffer(dev, buffer, nullptr);
+        return vk_error("no host-visible memory type for read-back");
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = reqs.size;
+    mai.memoryTypeIndex = static_cast<uint32_t>(type);
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
+        vkDestroyBuffer(dev, buffer, nullptr);
+        return vk_error("read-back vkAllocateMemory failed");
+    }
+    void* mapped = nullptr;
+    if (vkBindBufferMemory(dev, buffer, memory, 0) != VK_SUCCESS ||
+        vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(dev, memory, nullptr);
+        vkDestroyBuffer(dev, buffer, nullptr);
+        return vk_error("read-back: buffer bind or map failed");
+    }
+    rb.buffer = buffer;
+    rb.memory = memory;
+    rb.mapped = static_cast<unsigned char*>(mapped);
+    rb.capacity = needed;
+    ++readback_allocations_;
+    return {};
+#else
+    (void)rb;
+    (void)needed;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_readback_buffer");
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::ensure_readback_sync(readback_slot& rb) {
+#ifdef LUMEN_HAS_VULKAN
+    if (rb.command_buffer && rb.fence && (!can_export_fence_ || rb.semaphore))
+        return {};
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    if (!rb.command_buffer) {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = static_cast<VkCommandPool>(ctx_.command_pool);
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dev, &cbai, &cb) != VK_SUCCESS)
+            return vk_error("read-back vkAllocateCommandBuffers failed");
+        rb.command_buffer = cb;
+    }
+    if (!rb.fence) {
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence fence = VK_NULL_HANDLE;
+        if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS)
+            return vk_error("read-back vkCreateFence failed");
+        rb.fence = fence;
+    }
+    // A slot that copies into a client's dma-buf hands its completion to the client as a
+    // sync file, exactly as the frame slots do for KMS.
+    if (can_export_fence_ && !rb.semaphore) {
+        VkExportSemaphoreCreateInfo export_info{};
+        export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+        export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        VkSemaphoreCreateInfo sem_ci{};
+        sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sem_ci.pNext = &export_info;
+        VkSemaphore sem = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(dev, &sem_ci, nullptr, &sem) == VK_SUCCESS)
+            rb.semaphore = sem; // else: copies wait inline, which is correct but serialises
+    }
+    return {};
+#else
+    (void)rb;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_readback_sync");
+#endif
+}
+
+void lx::gfx::vulkan_compositor::free_readback_slot(readback_slot& rb) {
+#ifdef LUMEN_HAS_VULKAN
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev) {
         rb = {};
@@ -4763,8 +4897,388 @@ void lx::gfx::vulkan_compositor::read_back_free(unsigned slot) {
     }
     if (rb.fence)
         vkDestroyFence(dev, static_cast<VkFence>(rb.fence), nullptr);
+    if (rb.semaphore)
+        vkDestroySemaphore(dev, static_cast<VkSemaphore>(rb.semaphore), nullptr);
     rb = {};
+#endif
+}
+
+lx::gfx::vulkan_compositor::capture_dmabuf* lx::gfx::vulkan_compositor::find_capture_dmabuf(
+    unsigned key) {
+    for (capture_dmabuf& d : capture_dmabufs_)
+        if (d.key == key && key != 0)
+            return &d;
+    return nullptr;
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::capture_dmabuf_import(
+    unsigned key, int fd, unsigned offset, unsigned stride, unsigned width, unsigned height,
+    lx::fourcc format, unsigned long long modifier) {
+#ifdef LUMEN_HAS_VULKAN
+    (void)modifier; // LINEAR and the implicit (invalid) are the same layout; anything else
+                    // never reaches here (the constraints offer LINEAR only).
+    if (!ready())
+        return lx::not_implemented("lx::gfx::vulkan_compositor::capture_dmabuf_import");
+    if (key == 0 || fd < 0)
+        return lx::invalid_argument("capture dma-buf without a key or fd");
+    // XR24/AR24 (DRM XRGB8888/ARGB8888): the constraints' formats, in this compositor's
+    // scanout byte order — the copy needs no swizzle.
+    constexpr std::uint32_t k_xr24 = 0x34325258u;
+    constexpr std::uint32_t k_ar24 = 0x34325241u;
+    if (format != k_xr24 && format != k_ar24)
+        return lx::invalid_argument("capture dma-buf format is not XR24/AR24");
+    if (stride % 4u != 0 || stride < width * 4u)
+        return lx::invalid_argument("capture dma-buf stride does not fit its rows");
+    if (!capture_dmabuf_importable_)
+        return vk_error("capture dma-buf: the device imports no dma-buf memory");
+    if (capture_dmabuf* have = find_capture_dmabuf(key)) {
+        have->used = ++capture_dmabuf_clock_;
+        return {};
+    }
+    // The allocation the client handed over: the last row ends inside it.
+    const off_t size = ::lseek(fd, 0, SEEK_END);
+    const unsigned long long needed =
+        static_cast<unsigned long long>(offset) + stride * (height - 1ull) + width * 4ull;
+    if (size <= 0 || static_cast<unsigned long long>(size) < needed)
+        return lx::invalid_argument("capture dma-buf smaller than its frame");
+    (void)::lseek(fd, 0, SEEK_SET);
+
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = needed;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(dev, &bci, nullptr, &buffer) != VK_SUCCESS)
+        return vk_error("capture dma-buf vkCreateBuffer failed");
+    VkMemoryRequirements reqs{};
+    vkGetBufferMemoryRequirements(dev, buffer, &reqs);
+    std::uint32_t bits = reqs.memoryTypeBits;
+    if (bits == 0) {
+        vkDestroyBuffer(dev, buffer, nullptr);
+        return vk_error("capture dma-buf: no memory type takes the import");
+    }
+    unsigned type = 0;
+    while ((bits & 1u) == 0) {
+        bits >>= 1;
+        ++type;
+    }
+    VkImportMemoryFdInfoKHR import{};
+    import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    import.fd = fd; // borrowed: the caller closes it, the driver dups what it keeps
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = &import;
+    mai.allocationSize = static_cast<VkDeviceSize>(size);
+    mai.memoryTypeIndex = type;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
+        vkDestroyBuffer(dev, buffer, nullptr);
+        return vk_error("capture dma-buf vkAllocateMemory failed");
+    }
+    if (vkBindBufferMemory(dev, buffer, memory, 0) != VK_SUCCESS) {
+        vkFreeMemory(dev, memory, nullptr);
+        vkDestroyBuffer(dev, buffer, nullptr);
+        return vk_error("capture dma-buf vkBindBufferMemory failed");
+    }
+
+    // A free slot, else the least recently used (its buffer re-imports when it returns).
+    capture_dmabuf* slot = &capture_dmabufs_[0];
+    for (capture_dmabuf& d : capture_dmabufs_) {
+        if (d.key == 0) {
+            slot = &d;
+            break;
+        }
+        if (d.used < slot->used)
+            slot = &d;
+    }
+    if (slot->memory)
+        vkFreeMemory(dev, static_cast<VkDeviceMemory>(slot->memory), nullptr);
+    if (slot->buffer)
+        vkDestroyBuffer(dev, static_cast<VkBuffer>(slot->buffer), nullptr);
+    *slot = {key, buffer, memory, offset, stride, width, height, ++capture_dmabuf_clock_};
+    ++capture_dmabuf_imports_;
+    return {};
+#else
+    (void)key;
+    (void)fd;
+    (void)offset;
+    (void)stride;
+    (void)width;
+    (void)height;
+    (void)format;
+    (void)modifier;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::capture_dmabuf_import");
+#endif
+}
+
+void lx::gfx::vulkan_compositor::capture_dmabuf_forget(unsigned key) {
+#ifdef LUMEN_HAS_VULKAN
+    if (capture_dmabuf* d = find_capture_dmabuf(key)) {
+        auto dev = static_cast<VkDevice>(ctx_.device);
+        if (dev) {
+            // The import is what keeps the client's dma-buf alive: a copy still executing
+            // would write into freed memory once it goes. Copies are short and few (one per
+            // capture session), and a buffer is destroyed long after its frame reached the
+            // client — these waits are instants, not stalls.
+            for (readback_slot& rb : readbacks_)
+                if (rb.submitted && rb.fence) {
+                    auto fence = static_cast<VkFence>(rb.fence);
+                    (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull);
+                    rb.submitted = false;
+                }
+            vkFreeMemory(dev, static_cast<VkDeviceMemory>(d->memory), nullptr);
+            vkDestroyBuffer(dev, static_cast<VkBuffer>(d->buffer), nullptr);
+        }
+        *d = {};
+    }
+#else
+    (void)key;
+#endif
+}
+
+lx::result<int> lx::gfx::vulkan_compositor::capture_dmabuf_copy(unsigned slot, unsigned key,
+                                                                const render_target& src,
+                                                                const lx::rect2i* rects,
+                                                                unsigned count, int dx, int dy) {
+#ifdef LUMEN_HAS_VULKAN
+    if (!ready() || !src.valid() || slot >= k_readback_slots)
+        return lx::not_implemented("lx::gfx::vulkan_compositor::capture_dmabuf_copy");
+    capture_dmabuf* d = find_capture_dmabuf(key);
+    if (!d)
+        return lx::invalid_argument("capture_dmabuf_copy of an unimported buffer");
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto queue = static_cast<VkQueue>(ctx_.queue);
+    readback_slot& rb = readbacks_[slot];
+    if (auto ok = ensure_readback_sync(rb); !ok)
+        return lx::result<int>{ok.get_error()};
+    if (rb.submitted) {
+        auto fence = static_cast<VkFence>(rb.fence);
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return lx::result<int>{vk_error(
+                "capture_dmabuf_copy: the slot's previous copy never completed")};
+        rb.submitted = false;
+    }
+    auto fence = static_cast<VkFence>(rb.fence);
+    vkResetFences(dev, 1, &fence);
+    auto cb = static_cast<VkCommandBuffer>(rb.command_buffer);
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &begin);
+
+    // After the composites that wrote the source (earlier submissions on this queue).
+    image_barrier(cb, static_cast<VkImage>(src.vk_image()), VK_IMAGE_LAYOUT_GENERAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                  VK_ACCESS_2_TRANSFER_READ_BIT);
+
+    // The asked rects, each row at the client's stride: the buffer places them, the CPU
+    // never touches a row.
+    constexpr unsigned k_max_regions = 32;
+    VkBufferImageCopy regions[k_max_regions]{};
+    unsigned nregions = 0;
+    const int w = static_cast<int>(src.width());
+    const int h = static_cast<int>(src.height());
+    const auto add = [&](int x, int y, int rw, int rh) {
+        const int sx = x + dx; // the rect is in buffer pixels; the source's are (dx, dy) in
+        const int sy = y + dy; // (a wlr-screencopy region, a window at its own origin)
+        const int x0 = sx < 0 ? 0 : sx;
+        const int y0 = sy < 0 ? 0 : sy;
+        const int x1 = sx + rw > w ? w : sx + rw;
+        const int y1 = sy + rh > h ? h : sy + rh;
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        VkBufferImageCopy& r = regions[nregions++];
+        r.bufferOffset = static_cast<VkDeviceSize>(d->offset) +
+                         static_cast<VkDeviceSize>(y + y0 - sy) * d->stride +
+                         static_cast<VkDeviceSize>(x + x0 - sx) * 4u;
+        r.bufferRowLength = d->stride / 4u;
+        r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        r.imageSubresource.layerCount = 1;
+        r.imageOffset = {x0, y0, 0};
+        r.imageExtent = {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0), 1};
+    };
+    if (count == 0 || count > k_max_regions) {
+        add(0, 0, static_cast<int>(d->width), static_cast<int>(d->height));
+    } else {
+        for (unsigned i = 0; i < count; ++i)
+            add(rects[i].x, rects[i].y, rects[i].width, rects[i].height);
+    }
+    if (nregions > 0)
+        vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(src.vk_image()),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               static_cast<VkBuffer>(d->buffer), nregions, regions);
+
+    // The source back for the next composite, and the writes visible to whoever reads the
+    // client's buffer once the fence says the copy is done.
+    VkImageMemoryBarrier2 back{};
+    back.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    back.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    back.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    back.dstAccessMask =
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    back.image = static_cast<VkImage>(src.vk_image());
+    back.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    back.subresourceRange.levelCount = 1;
+    back.subresourceRange.layerCount = 1;
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = static_cast<VkBuffer>(d->buffer);
+    to_host.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &to_host;
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &back;
+    vkCmdPipelineBarrier2(cb, &dep);
+    vkEndCommandBuffer(cb);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cb;
+    VkSemaphore sem = static_cast<VkSemaphore>(rb.semaphore);
+    if (sem) {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &sem;
+    }
+    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
+        return lx::result<int>{vk_error("capture_dmabuf_copy vkQueueSubmit failed")};
+    rb.submitted = true;
+    if (!sem) {
+        // No sync files: the copy has to complete here (the frame path's fallback too). The
+        // slot stays marked — the fence is signalled, a waiter reclaims it instantly.
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return lx::result<int>{vk_error("capture_dmabuf_copy vkWaitForFences timed out")};
+        return -1;
+    }
+    VkSemaphoreGetFdInfoKHR get{};
+    get.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    get.semaphore = sem;
+    get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+        vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
+    int fd_out = -1;
+    if (!get_fd || get_fd(dev, &get, &fd_out) != VK_SUCCESS || fd_out < 0)
+        return lx::result<int>{vk_error("capture_dmabuf_copy: no sync file for the copy")};
+    return fd_out;
 #else
     (void)slot;
+    (void)key;
+    (void)src;
+    (void)rects;
+    (void)count;
+    (void)dx;
+    (void)dy;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::capture_dmabuf_copy");
 #endif
+}
+
+lx::result<int> lx::gfx::vulkan_compositor::capture_dmabuf_fill(unsigned slot, unsigned key) {
+#ifdef LUMEN_HAS_VULKAN
+    if (!ready() || slot >= k_readback_slots)
+        return lx::not_implemented("lx::gfx::vulkan_compositor::capture_dmabuf_fill");
+    capture_dmabuf* d = find_capture_dmabuf(key);
+    if (!d)
+        return lx::invalid_argument("capture_dmabuf_fill of an unimported buffer");
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto queue = static_cast<VkQueue>(ctx_.queue);
+    readback_slot& rb = readbacks_[slot];
+    if (auto ok = ensure_readback_sync(rb); !ok)
+        return lx::result<int>{ok.get_error()};
+    if (rb.submitted) {
+        auto fence = static_cast<VkFence>(rb.fence);
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return lx::result<int>{vk_error(
+                "capture_dmabuf_fill: the slot's previous copy never completed")};
+        rb.submitted = false;
+    }
+    auto fence = static_cast<VkFence>(rb.fence);
+    vkResetFences(dev, 1, &fence);
+    auto cb = static_cast<VkCommandBuffer>(rb.command_buffer);
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &begin);
+    // 0xFF000000 little-endian: B, G, R zero, the padding byte opaque — the same black the
+    // shm curtain writes.
+    vkCmdFillBuffer(cb, static_cast<VkBuffer>(d->buffer), 0, VK_WHOLE_SIZE, 0xFF000000u);
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = static_cast<VkBuffer>(d->buffer);
+    to_host.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &to_host;
+    vkCmdPipelineBarrier2(cb, &dep);
+    vkEndCommandBuffer(cb);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cb;
+    VkSemaphore sem = static_cast<VkSemaphore>(rb.semaphore);
+    if (sem) {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &sem;
+    }
+    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
+        return lx::result<int>{vk_error("capture_dmabuf_fill vkQueueSubmit failed")};
+    rb.submitted = true;
+    if (!sem) {
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return lx::result<int>{vk_error("capture_dmabuf_fill vkWaitForFences timed out")};
+        return -1;
+    }
+    VkSemaphoreGetFdInfoKHR get{};
+    get.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    get.semaphore = sem;
+    get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+        vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
+    int fd_out = -1;
+    if (!get_fd || get_fd(dev, &get, &fd_out) != VK_SUCCESS || fd_out < 0)
+        return lx::result<int>{vk_error("capture_dmabuf_fill: no sync file for the fill")};
+    return fd_out;
+#else
+    (void)slot;
+    (void)key;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::capture_dmabuf_fill");
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::capture_view_target(render_target& slot,
+                                                                 unsigned width,
+                                                                 unsigned height) {
+    if (slot.valid() && slot.width() == width && slot.height() == height)
+        return {};
+    auto made = render_target::create(ctx_, width, height, lx::pixel_format::argb8888);
+    if (!made)
+        return made.get_error();
+    slot = std::move(made).value();
+    return {};
 }

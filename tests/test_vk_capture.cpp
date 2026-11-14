@@ -2,11 +2,24 @@
 // back from the composited target into a client's shm buffer (wl_shm byte order, alpha
 // opaque), a crop, and the pointer blended for paint_cursors; the asynchronous path — the
 // copy submitted on render without a wait, the rows written by a worker, the slot's buffer
-// reused frame after frame. Runs on whatever Vulkan device exists (lavapipe on a host
-// without hardware Vulkan); skips without one.
+// reused frame after frame. A client's dma-buf as the copy's destination (imported once,
+// rows placed at its stride on the GPU, damage-limited, the sync file of the copy), a window
+// capture composited into the session's persistent target (shm read-back and dma-buf copy),
+// and the pooling of it all (same-size read-backs and re-used buffers allocate nothing).
+// Runs on whatever Vulkan device exists (lavapipe on a host without hardware Vulkan); skips
+// without one — and the dma-buf tests without a device that imports dma-buf memory.
 #include "lumen_test.hpp"
+#include "render_node.hpp"
 
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+
+#ifdef LUMEN_HAS_EGL
+#include <gbm.h>
+#endif
 
 import std;
 import lx.foundation;
@@ -17,11 +30,17 @@ namespace {
 
 constexpr unsigned k_w = 64;
 constexpr unsigned k_h = 48;
+constexpr lx::fourcc k_xr24 = 0x34325258u;
 
 struct fixture {
     lx::gfx::device device{};
     lx::gfx::vulkan_compositor vk{};
     lx::gfx::render_target target{};
+    /// The render node behind the connected card: where a client (GBM) allocates the
+    /// dma-bufs the copy tests import — the same device the compositor's Vulkan runs on.
+    int node_fd = -1;
+    void* gbm = nullptr;
+    bool dmabufs = false;
     bool usable = false;
 };
 
@@ -31,7 +50,19 @@ fixture* gpu() {
     if (tried)
         return f.usable ? &f : nullptr;
     tried = true;
-    auto selected = lx::gfx::device_selector::select_best();
+    // The device behind the display's card, as the compositor selects it — so a client's
+    // dma-buf of that node is native memory to the device the copy runs on.
+    lx::gfx::drm_node card{};
+    f.node_fd = lumen_test::open_render_node();
+    if (f.node_fd >= 0) {
+        struct stat st{};
+        if (::fstat(f.node_fd, &st) == 0) {
+            card.present = true;
+            card.major = major(st.st_rdev);
+            card.minor = minor(st.st_rdev);
+        }
+    }
+    auto selected = lx::gfx::device_selector::select_best(card);
     if (!selected) {
         std::printf("  (skip: no Vulkan device)\n");
         return nullptr;
@@ -47,6 +78,15 @@ fixture* gpu() {
         return nullptr;
     }
     f.target = std::move(t).value();
+#ifdef LUMEN_HAS_EGL
+    if (f.vk.capture_dmabuf_supported() && f.node_fd >= 0 &&
+        f.device.info().render_node.present &&
+        f.device.info().render_node.major == card.major &&
+        f.device.info().render_node.minor == card.minor) {
+        f.gbm = gbm_create_device(f.node_fd);
+        f.dmabufs = f.gbm != nullptr;
+    }
+#endif
     // Left half red, right half blue.
     std::vector<unsigned char> rgba(k_w * k_h * 4u);
     for (unsigned y = 0; y < k_h; ++y)
@@ -67,6 +107,98 @@ fixture* gpu() {
     f.usable = static_cast<bool>(c);
     return f.usable ? &f : nullptr;
 }
+
+#ifdef LUMEN_HAS_EGL
+
+/// A capture client's LINEAR XRGB dma-buf at GBM's own stride (what a screencast cycles
+/// through). A width GBM does not align to 4 pixels makes the stride padded, which is the
+/// placement the copy must honour.
+struct client_dmabuf {
+    gbm_bo* bo = nullptr;
+    int fd = -1;
+    unsigned stride = 0;
+    unsigned w = 0;
+    unsigned h = 0;
+    explicit client_dmabuf(void* gbm_dev, unsigned width, unsigned height)
+        : w(width), h(height) {
+        auto* dev = static_cast<gbm_device*>(gbm_dev);
+        const std::uint64_t linear = 0;
+        bo = gbm_bo_create_with_modifiers2(dev, width, height, GBM_FORMAT_XRGB8888, &linear, 1,
+                                           GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+        if (!bo)
+            bo = gbm_bo_create(dev, width, height, GBM_FORMAT_XRGB8888,
+                               GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+        if (bo) {
+            fd = gbm_bo_get_fd(bo);
+            stride = gbm_bo_get_stride(bo);
+        }
+    }
+    ~client_dmabuf() {
+        if (fd >= 0)
+            ::close(fd);
+        if (bo)
+            gbm_bo_destroy(bo);
+    }
+    client_dmabuf(const client_dmabuf&) = delete;
+    client_dmabuf& operator=(const client_dmabuf&) = delete;
+    /// (x, y) as B, G, R — reading the mapped buffer at GBM's stride.
+    std::uint32_t at(unsigned x, unsigned y) const {
+        std::uint32_t s = 0;
+        void* data = nullptr;
+        void* p = gbm_bo_map(bo, 0, 0, w, h, GBM_BO_TRANSFER_READ, &s, &data);
+        if (!p)
+            return 0xDEADBEEFu;
+        const std::uint32_t v = *reinterpret_cast<const std::uint32_t*>(
+            static_cast<const unsigned char*>(p) + y * s + x * 4u);
+        gbm_bo_unmap(bo, data);
+        return v & 0x00FFFFFFu;
+    }
+    /// Every mapped byte to a pattern (so a copy that misses a row shows).
+    void fill(unsigned char pattern) {
+        std::uint32_t s = 0;
+        void* data = nullptr;
+        void* p = gbm_bo_map(bo, 0, 0, w, h, GBM_BO_TRANSFER_WRITE, &s, &data);
+        if (!p)
+            return;
+        std::memset(p, pattern, static_cast<std::size_t>(s) * h);
+        gbm_bo_unmap(bo, data);
+    }
+};
+
+/// A composited target of `w` x `h`, left half red, right half blue (as `gpu`'s).
+lx::gfx::render_target red_blue_target(fixture& f, unsigned w, unsigned h) {
+    auto t = lx::gfx::render_target::create(f.device.context(), w, h);
+    if (!t)
+        return {};
+    std::vector<unsigned char> rgba(static_cast<std::size_t>(w) * h * 4u);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            unsigned char* p = &rgba[(static_cast<std::size_t>(y) * w + x) * 4u];
+            const bool left = x < w / 2;
+            p[0] = left ? 255 : 0;
+            p[2] = left ? 0 : 255;
+            p[3] = 255;
+        }
+    (void)f.vk.upload_rgba(0x4000'0202u, w, h, rgba.data());
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = 0x4000'0202u;
+    cmd.dst = {0, 0, static_cast<int>(w), static_cast<int>(h)};
+    auto c = f.vk.composite(t.value(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    if (c && c.value().out_fence_fd >= 0)
+        ::close(c.value().out_fence_fd);
+    return static_cast<bool>(c) ? std::move(t).value() : lx::gfx::render_target{};
+}
+
+/// Waits a capture copy's sync file out (a -1 fence already completed).
+void wait_fence(int fd) {
+    if (fd < 0)
+        return;
+    pollfd p{fd, POLLIN, 0};
+    (void)::poll(&p, 1, 2000);
+    ::close(fd);
+}
+
+#endif // LUMEN_HAS_EGL
 
 struct rig {
     lx::compositor::capture_shm_guards guards{};
@@ -233,5 +365,339 @@ LUMEN_TEST(vk_read_back_async_copies_only_the_rects_asked_for) {
     f->vk.read_back_free(5);
     LUMEN_CHECK(f->vk.read_back_wait(5, 0) == nullptr);
 }
+
+// ── the synchronous debug read-back is pooled ───────────────────────────────
+
+LUMEN_TEST(vk_read_back_latency_at_panel_resolution) {
+    // One number for the evidence file (AGENTS.md §1.2): the read-back a screencast frame
+    // pays at this host's panel size, GPU copy → fence → rows visible. Not a gate — printed,
+    // not asserted (host frequency states move it; see the build-run skill).
+    fixture* f = gpu();
+    if (!f)
+        return;
+    constexpr unsigned k_pw = 3200;
+    constexpr unsigned k_ph = 1800;
+    auto t = lx::gfx::render_target::create(f->device.context(), k_pw, k_ph);
+    if (!t)
+        return;
+    lx::gfx::render_target panel = std::move(t).value();
+    std::vector<unsigned char> rgba(k_pw * k_ph * 4u, 255);
+    (void)f->vk.upload_rgba(0x4000'0303u, k_pw, k_ph, rgba.data());
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = 0x4000'0303u;
+    cmd.dst = {0, 0, static_cast<int>(k_pw), static_cast<int>(k_ph)};
+    auto c = f->vk.composite(panel, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    if (c && c.value().out_fence_fd >= 0)
+        ::close(c.value().out_fence_fd);
+    if (!c)
+        return;
+    double samples[16];
+    unsigned n = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!f->vk.read_back_async(63, panel, nullptr, 0))
+            return;
+        (void)f->vk.read_back_wait(63, 2'000'000'000ull);
+        samples[n++] = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+    }
+    std::sort(samples, samples + n);
+    const double median = (samples[n / 2 - 1] + samples[n / 2]) / 2.0;
+    std::printf("  read-back %ux%u: %.2f ms median (min %.2f, max %.2f, %u reads)\n", k_pw,
+                k_ph, median, samples[0], samples[n - 1], n);
+    LUMEN_CHECK(median > 0.0 && median < 250.0); // sane, not a gate
+}
+
+LUMEN_TEST(vk_sync_read_back_reuses_its_buffer) {
+    fixture* f = gpu();
+    if (!f)
+        return;
+    std::vector<unsigned char> a(k_w * k_h * 4u, 0);
+    LUMEN_CHECK(static_cast<bool>(f->vk.read_back(f->target, a.data(),
+                                                  static_cast<unsigned>(a.size()))));
+    const unsigned made = f->vk.readback_allocations();
+    LUMEN_CHECK(made >= 1);
+    for (unsigned i = 0; i < 3; ++i) {
+        std::vector<unsigned char> again(k_w * k_h * 4u, 0);
+        LUMEN_CHECK(static_cast<bool>(f->vk.read_back(f->target, again.data(),
+                                                      static_cast<unsigned>(again.size()))));
+        // R, G, B, A rows: red on the left, blue on the right, every time.
+        const unsigned char* left = &again[(20 * k_w + 10) * 4u];
+        const unsigned char* right = &again[(20 * k_w + 50) * 4u];
+        LUMEN_CHECK(left[0] > 200 && left[2] < 60);
+        LUMEN_CHECK(right[2] > 200 && right[0] < 60);
+    }
+    // A same-size read-back allocates nothing (the SIGUSR1 path: on demand, pooled).
+    LUMEN_CHECK(f->vk.readback_allocations() == made);
+}
+
+#ifdef LUMEN_HAS_EGL
+
+// ── capture dma-buf: the GPU places the rows at the client's stride ─────────
+
+LUMEN_TEST(vk_output_frame_is_copied_into_a_client_dmabuf) {
+    fixture* f = gpu();
+    if (!f || !f->dmabufs)
+        return;
+    // 62 wide: GBM's LINEAR stride is padded past 62*4 — the placement under test.
+    client_dmabuf client{f->gbm, 62, 47};
+    LUMEN_CHECK(client.bo != nullptr && client.fd >= 0);
+    if (!client.bo)
+        return;
+    client.fill(0x5A);
+    lx::gfx::render_target target = red_blue_target(*f, 62, 47);
+    LUMEN_CHECK(target.valid());
+    if (!target.valid())
+        return;
+    auto imported = f->vk.capture_dmabuf_import(7, client.fd, 0, client.stride, 62, 47, k_xr24,
+                                                0);
+    LUMEN_CHECK(static_cast<bool>(imported));
+    if (!imported)
+        return;
+    const unsigned made = f->vk.capture_dmabuf_imports();
+    for (unsigned frame = 0; frame < 3; ++frame) {
+        auto copy = f->vk.capture_dmabuf_copy(9, 7, target, nullptr, 0, 0, 0);
+        LUMEN_CHECK(static_cast<bool>(copy));
+        if (!copy)
+            return;
+        wait_fence(copy.value());
+        // B, G, R at the client's stride: red left, blue right.
+        const std::uint32_t red = client.at(5, 23);
+        const std::uint32_t blue = client.at(50, 23);
+        LUMEN_CHECK((red & 0xFF) < 60 && ((red >> 16) & 0xFF) > 200);
+        LUMEN_CHECK((blue & 0xFF) > 200 && ((blue >> 16) & 0xFF) < 60);
+    }
+    // The buffer of one screencast imports once; its frames copy without allocating.
+    LUMEN_CHECK(f->vk.capture_dmabuf_imports() == made);
+    f->vk.capture_dmabuf_forget(7);
+}
+
+LUMEN_TEST(vk_dmabuf_copy_copies_only_the_rects_asked_for) {
+    fixture* f = gpu();
+    if (!f || !f->dmabufs)
+        return;
+    client_dmabuf client{f->gbm, 62, 47};
+    LUMEN_CHECK(client.bo != nullptr && client.fd >= 0);
+    if (!client.bo)
+        return;
+    client.fill(0x5A);
+    lx::gfx::render_target target = red_blue_target(*f, 62, 47);
+    LUMEN_CHECK(target.valid());
+    if (!target.valid())
+        return;
+    LUMEN_CHECK(static_cast<bool>(f->vk.capture_dmabuf_import(8, client.fd, 0, client.stride,
+                                                              62, 47, k_xr24, 0)));
+    // The left half only (source pixels — no crop).
+    const lx::rect2i rects[1] = {{0, 0, 31, 47}};
+    auto copy = f->vk.capture_dmabuf_copy(10, 8, target, rects, 1, 0, 0);
+    LUMEN_CHECK(static_cast<bool>(copy));
+    if (!copy)
+        return;
+    wait_fence(copy.value());
+    // Red inside the rect, the fill pattern outside it (columns 31..61 keep 0x5A5A5A).
+    const std::uint32_t red = client.at(5, 23);
+    const std::uint32_t untouched = client.at(45, 23);
+    LUMEN_CHECK(((red >> 16) & 0xFF) > 200 && (red & 0xFF) < 60);
+    LUMEN_CHECK((untouched & 0xFFFFFF) == 0x5A5A5Au);
+    f->vk.capture_dmabuf_forget(8);
+}
+
+LUMEN_TEST(vk_dmabuf_curtain_fills_opaque_black) {
+    fixture* f = gpu();
+    if (!f || !f->dmabufs)
+        return;
+    client_dmabuf client{f->gbm, 62, 47};
+    LUMEN_CHECK(client.bo != nullptr && client.fd >= 0);
+    if (!client.bo)
+        return;
+    client.fill(0x77);
+    LUMEN_CHECK(static_cast<bool>(f->vk.capture_dmabuf_import(9, client.fd, 0, client.stride,
+                                                              62, 47, k_xr24, 0)));
+    auto filled = f->vk.capture_dmabuf_fill(11, 9);
+    LUMEN_CHECK(static_cast<bool>(filled));
+    if (!filled)
+        return;
+    wait_fence(filled.value());
+    const std::uint32_t px = client.at(30, 20);
+    LUMEN_CHECK((px & 0xFFFFFF) == 0);
+    // The padding byte is opaque (a reader that takes it as alpha must see the curtain).
+    std::uint32_t s = 0;
+    void* data = nullptr;
+    void* p = gbm_bo_map(client.bo, 0, 0, 1, 1, GBM_BO_TRANSFER_READ, &s, &data);
+    LUMEN_CHECK(p && (*static_cast<const std::uint32_t*>(p) & 0xFF000000u) == 0xFF000000u);
+    if (p)
+        gbm_bo_unmap(client.bo, data);
+    f->vk.capture_dmabuf_forget(9);
+}
+
+// ── window capture through the engine ───────────────────────────────────────
+
+LUMEN_TEST(vk_window_view_is_composited_and_read_back_into_shm) {
+    fixture* f = gpu();
+    if (!f)
+        return;
+    rig r{*f};
+    std::vector<unsigned char> mem(k_w * k_h * 4u, 0x11);
+    lx::compositor::capture_job j{};
+    j.kind = lx::compositor::capture_job_kind::toplevel;
+    j.session = 4;
+    j.generation = 1;
+    j.serial = 1;
+    j.full = true;
+    j.view = 0x100; // any capture-view id: the engine matches it against the job's own
+    j.view_frame = 0;
+    j.target.width = k_w;
+    j.target.height = k_h;
+    j.target.shm = r.guards.add(mem.data(), mem.data(), mem.data(), k_w * 4u, k_w, k_h, true);
+    (void)r.channel.post(j);
+    r.renderer.take(r.channel);
+    // The view's single draw, as `capture_draws` would hand it.
+    lx::gfx::blit_command draw{};
+    draw.texture_id = 0x4000'0101u;
+    draw.dst = {0, 0, static_cast<int>(k_w), static_cast<int>(k_h)};
+    lx::compositor::capture_frame_source src{};
+    src.frame = 1;
+    src.size = {static_cast<int>(k_w), static_cast<int>(k_h)};
+    src.blits = &draw;
+    src.blit_count = 1;
+    src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    lx::gfx::damage_region all{};
+    all.set_full();
+    r.renderer.toplevel_composited(j.view, all, src, r.channel);
+    lx::compositor::capture_completion c[4];
+    LUMEN_CHECK(r.channel.drain(c, 4) == 1 && c[0].result == lx::compositor::capture_result::ready);
+    const unsigned char* left = &mem[(20 * k_w + 10) * 4u];
+    const unsigned char* right = &mem[(20 * k_w + 50) * 4u];
+    LUMEN_CHECK(left[2] > 200 && left[0] < 60);
+    LUMEN_CHECK(right[0] > 200 && right[2] < 60);
+}
+
+LUMEN_TEST(vk_window_view_is_copied_into_a_client_dmabuf) {
+    fixture* f = gpu();
+    if (!f || !f->dmabufs)
+        return;
+    client_dmabuf client{f->gbm, 62, 47};
+    LUMEN_CHECK(client.bo != nullptr && client.fd >= 0);
+    if (!client.bo)
+        return;
+    client.fill(0x5A);
+    // The window's draw is the 62x47 texture: made for this size by `red_blue_target`'s
+    // upload — a second one here keeps the fixture's own untouched.
+    lx::gfx::render_target reference = red_blue_target(*f, 62, 47);
+    LUMEN_CHECK(reference.valid());
+    rig r{*f};
+    lx::compositor::capture_job j{};
+    j.kind = lx::compositor::capture_job_kind::toplevel;
+    j.session = 5;
+    j.generation = 1;
+    j.serial = 1;
+    j.full = true;
+    j.view = 0x101;
+    j.view_frame = 0;
+    j.target.dmabuf = true;
+    j.target.width = 62;
+    j.target.height = 47;
+    j.target.buffer_key = 42;
+    j.target.fd = ::fcntl(client.fd, F_DUPFD_CLOEXEC, 0);
+    j.target.stride = client.stride;
+    j.target.format = k_xr24;
+    LUMEN_CHECK(j.target.fd >= 0);
+    lx::gfx::blit_command draw{};
+    draw.texture_id = 0x4000'0202u;
+    draw.dst = {0, 0, 62, 47};
+    (void)r.channel.post(j);
+    r.renderer.take(r.channel);
+    lx::compositor::capture_frame_source src{};
+    src.frame = 1;
+    src.size = {62, 47};
+    src.blits = &draw;
+    src.blit_count = 1;
+    src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    lx::gfx::damage_region all{};
+    all.set_full();
+    r.renderer.toplevel_composited(j.view, all, src, r.channel);
+    lx::compositor::capture_completion c[4];
+    const unsigned n = r.channel.drain(c, 4);
+    LUMEN_CHECK(n == 1 && (c[0].result == lx::compositor::capture_result::ready ||
+                           c[0].result == lx::compositor::capture_result::fence));
+    if (n == 1) {
+        if (c[0].fence_fd >= 0) {
+            pollfd p{c[0].fence_fd, POLLIN, 0};
+            (void)::poll(&p, 1, 2000);
+            ::close(c[0].fence_fd);
+        }
+        const std::uint32_t red = client.at(5, 23);
+        const std::uint32_t blue = client.at(50, 23);
+        LUMEN_CHECK(((red >> 16) & 0xFF) > 200 && (red & 0xFF) < 60);
+        LUMEN_CHECK((blue & 0xFF) > 200 && ((blue >> 16) & 0xFF) < 60);
+    }
+    // The session's end frees its slot and target.
+    lx::compositor::capture_job forget{};
+    forget.kind = lx::compositor::capture_job_kind::forget_session;
+    forget.session = 5;
+    (void)r.channel.post(forget);
+    r.renderer.take(r.channel);
+}
+
+LUMEN_TEST(vk_engine_output_job_copies_into_a_client_dmabuf) {
+    fixture* f = gpu();
+    if (!f || !f->dmabufs)
+        return;
+    client_dmabuf client{f->gbm, k_w, k_h};
+    LUMEN_CHECK(client.bo != nullptr && client.fd >= 0);
+    if (!client.bo)
+        return;
+    client.fill(0x5A);
+    rig r{*f};
+    lx::compositor::capture_job j{};
+    j.kind = lx::compositor::capture_job_kind::output;
+    j.session = 6;
+    j.generation = 1;
+    j.serial = 1;
+    j.full = true;
+    j.target.dmabuf = true;
+    j.target.width = k_w;
+    j.target.height = k_h;
+    j.target.buffer_key = 43;
+    j.target.fd = ::fcntl(client.fd, F_DUPFD_CLOEXEC, 0);
+    j.target.stride = client.stride;
+    j.target.format = k_xr24;
+    LUMEN_CHECK(j.target.fd >= 0);
+    (void)r.channel.post(j);
+    r.renderer.take(r.channel);
+    lx::compositor::capture_frame_source src{};
+    src.frame = 1;
+    src.size = {static_cast<int>(k_w), static_cast<int>(k_h)};
+    src.vk_target = &f->target;
+    r.renderer.output_front(0, src, r.channel);
+    lx::compositor::capture_completion c[4];
+    const unsigned n = r.channel.drain(c, 4);
+    LUMEN_CHECK(n == 1 && (c[0].result == lx::compositor::capture_result::ready ||
+                           c[0].result == lx::compositor::capture_result::fence));
+    if (n == 1) {
+        if (c[0].fence_fd >= 0) {
+            pollfd p{c[0].fence_fd, POLLIN, 0};
+            (void)::poll(&p, 1, 2000);
+            ::close(c[0].fence_fd);
+        }
+        const std::uint32_t red = client.at(10, 20);
+        const std::uint32_t blue = client.at(50, 20);
+        LUMEN_CHECK(((red >> 16) & 0xFF) > 200 && (red & 0xFF) < 60);
+        LUMEN_CHECK((blue & 0xFF) > 200 && ((blue >> 16) & 0xFF) < 60);
+    }
+    lx::compositor::capture_job forget{};
+    forget.kind = lx::compositor::capture_job_kind::forget_session;
+    forget.session = 6;
+    (void)r.channel.post(forget);
+    r.renderer.take(r.channel);
+    lx::compositor::capture_job drop{};
+    drop.kind = lx::compositor::capture_job_kind::forget_buffer;
+    drop.target.buffer_key = 43;
+    (void)r.channel.post(drop);
+    r.renderer.take(r.channel);
+}
+
+#endif // LUMEN_HAS_EGL
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

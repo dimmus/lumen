@@ -12,12 +12,17 @@ module;
 //     a LINEAR GBM buffer that a worker thread maps and copies once the blit's fence has
 //     signalled (the map is where SVGA3D spends ~12 ms; render never waits; without a
 //     worker or GBM, a pixel-pack buffer read copied out by a second render job); on the CPU path the frame's draws are composited straight
-//     into the client's shm; Vulkan reads its target back. A session that needs a frame with
+//     into the client's shm; Vulkan copies its target into the client's dma-buf on the GPU
+//     (rows placed at the client's stride; a pointer it must paint is blended into the
+//     mapped buffer by a worker) or reads it back into shm through the session's
+//     persistent mapped buffer. A session that needs a frame with
 //     nothing new composited (its first, a pointer move with paint_cursors) copies the
 //     newest composited frame, which stays intact in its scanout slot until the next
 //     composite of the output;
 //   - a toplevel session composites its capture view (the window's tree, projected into
-//     the buffer) into the client buffer, or an offscreen buffer read back for shm.
+//     the buffer) into the client buffer, or an offscreen buffer read back for shm — on
+//     Vulkan into the session's persistent capture target, then read back or copied as an
+//     output's frame is.
 // Damage (CC3): per output, a ring of the damage of its last composites; a session copies
 // everything since the composite it last copied, plus the client's damage. A job waits until
 // its output composites something new — a capture request starts no clock (CC10).
@@ -409,7 +414,8 @@ public:
     void flush(capture_channel& out);
     [[nodiscard]] bool has_pending() const { return pending_count_ > 0 || overflow_count_ > 0; }
     /// GL: a fence (sync_file) after this tick's capture composites that sampled client
-    /// textures, or -1 when none did, `wanted` is false, or the driver exports none. The
+    /// textures, or -1 when none did, `wanted` is false, or the driver exports none;
+    /// Vulkan: the newest capture composite's out fence (nothing was sampled when -1). The
     /// caller owns it; it is what explicit-sync release points must follow besides the
     /// output composites (the GPU completes work in order, so it covers both). Clears the
     /// mark either way.
@@ -449,6 +455,16 @@ private:
         bool read_cursor = false;
         /// Vulkan: the read-back slot of `vulkan_compositor` the worker waits on.
         unsigned vk_slot = 0;
+        /// Vulkan: this session's window-capture target (`capture_view_target`, kept while
+        /// the buffer's size fits) — the window's view is composited into it, then read
+        /// back (shm) or copied (dma-buf) as an output's frame is.
+        lx::gfx::render_target vk_view{};
+        /// A dma-buf copy whose pointer is blended once it lands: the client's fd (dup'd)
+        /// to map, its plane offset and stride, with `read_region` as the copy's rects and
+        /// `read_bo_w`/`read_bo_h` the buffer's size.
+        int read_dmabuf_fd = -1;
+        unsigned read_dmabuf_offset = 0;
+        unsigned read_dmabuf_stride = 0;
     };
     void complete(capture_channel& out, const capture_completion& c);
     /// GL shm: hands a read of `owner`'s offscreen buffer object to the worker (or runs it
@@ -460,6 +476,13 @@ private:
     /// Vulkan shm: waits for the slot's copy and writes the client's rows (a worker, or
     /// render when there is none).
     static void worker_read_vk(void* arg);
+    /// Vulkan dma-buf with a pointer to paint: waits for the slot's copy, then blends the
+    /// pointer into the mapped buffer (the GPU copy cannot draw it).
+    static void worker_read_vk_dmabuf(void* arg);
+    /// The pointer as a blit to append to a Vulkan window composite (uploaded once per
+    /// image, as `paint_cursor_gl`). False when there is nothing to draw.
+    [[nodiscard]] bool cursor_blit_vk(const capture_cursor& cursor, lx::size2i size,
+                                      lx::gfx::blit_command& out);
     /// Frees what forgotten sessions left while a worker read was in flight.
     void reap();
     /// Resets a session's state (not while busy).
@@ -497,6 +520,9 @@ private:
     lx::gfx::gl_capture gl_capture_{};
     bool gl_tried_ = false;
     unsigned cursor_uploaded_gen_ = 0;
+    /// Vulkan: the out fence of the newest capture composite that sampled client
+    /// textures, to hand over as the release fence (`take_sample_fence`); -1: none.
+    int sample_fence_vk_ = -1;
 
     capture_damage_ring rings_[16]{};
     capture_job pending_[capture_channel::k_jobs]{};

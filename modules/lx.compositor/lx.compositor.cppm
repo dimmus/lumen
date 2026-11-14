@@ -179,8 +179,9 @@ public:
     /// Async-signal-safe.
     void request_reload();
     /// Debug aid: the next frame is repainted in full, read back and written as a PPM to
-    /// $LUMEN_SCREENSHOT_DIR (else $XDG_RUNTIME_DIR) — GL path only. Async-signal-safe
-    /// (lumen-compositor maps SIGUSR1 to it).
+    /// $LUMEN_SCREENSHOT_DIR (else $XDG_RUNTIME_DIR) — the GL and Vulkan paths (the CPU
+    /// composite has no GPU frame to read). Async-signal-safe (lumen-compositor maps
+    /// SIGUSR1 to it).
     void request_screenshot();
 
     [[nodiscard]] config configuration() const;

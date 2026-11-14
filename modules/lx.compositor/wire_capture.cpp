@@ -11,7 +11,8 @@ module;
 // not stop its sessions.
 //
 // Sessions (`:capture` holds the policy): constraints at creation and whenever they change
-// (`buffer_size`, `shm_format` × 2, `dmabuf_device` + `dmabuf_format` × 2 on GL, `done`), one
+// (`buffer_size`, `shm_format` × 2, and `dmabuf_device` + `dmabuf_format` × 2 where the
+// backend offers dma-buf targets — GL's EGL import, Vulkan's buffer import — `done`), one
 // frame object at a time (`duplicate_frame`), frames `attach_buffer` / `damage_buffer` /
 // `capture` with every protocol error (`no_buffer`, `invalid_buffer_damage`,
 // `already_captured`; the manager's `invalid_option`). A captured frame is decided per tick
@@ -275,7 +276,7 @@ void send_failed(frame_obj* f, capture_failure reason) {
     capture_host* h = host();
     if (!h)
         return {};
-    const bool dmabuf = h->dmabuf && h->backend == capture_backend::gl;
+    const bool dmabuf = h->dmabuf;
     if (cs.kind == capture_source_kind::output) {
         const capture_output_info& o = h->outputs[cs.output_slot % 16];
         if (!o.live || o.id != cs.output)
@@ -974,8 +975,6 @@ void create_session(struct wl_client* client, struct wl_resource* manager, uint3
         why = "no capture backend";
     else if (!src || src->kind == capture_source_kind::none)
         why = "source gone";
-    else if (src->kind == capture_source_kind::toplevel && h->backend == capture_backend::vulkan)
-        why = "window capture needs the GL or CPU backend";
     unsigned handle = 0;
     if (!why) {
         handle = g_sessions.open(wire_client_id(client), src->kind);
@@ -1068,8 +1067,7 @@ void screencopy_copy(wl_client* client, wl_resource* resource, wl_resource* buff
     const capture_buffer_desc d = describe(buffer);
     capture_host* h = host();
     const capture_constraints c = make_capture_constraints(
-        {f->crop.width, f->crop.height}, h && h->dmabuf && h->backend == capture_backend::gl,
-        h ? h->dmabuf_device : 0);
+        {f->crop.width, f->crop.height}, h && h->dmabuf, h ? h->dmabuf_device : 0);
     if (!capture_buffer_fits(c, d)) {
         wl_resource_post_error(resource, ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER,
                                "invalid buffer");
@@ -1162,8 +1160,7 @@ void screencopy_capture(wl_client* client, wl_resource* manager, uint32_t id, in
     cs->output_slot = static_cast<unsigned>(slot);
     cs->output = o->id;
     cs->paint_cursors = overlay != 0;
-    cs->constraints = make_capture_constraints({f->crop.width, f->crop.height},
-                                               hst->dmabuf && hst->backend == capture_backend::gl,
+    cs->constraints = make_capture_constraints({f->crop.width, f->crop.height}, hst->dmabuf,
                                                hst->dmabuf_device);
     if (hst->channel)
         hst->channel->sessions.store(g_sessions.count(), std::memory_order_release);

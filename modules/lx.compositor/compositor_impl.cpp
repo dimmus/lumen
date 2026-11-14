@@ -2749,14 +2749,35 @@ void compositor_impl::housekeeping_callback() {
 
 void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) {
     // Render thread, on request only: a full-frame read back and a synchronous write. Not a
-    // hot-path operation and never part of a normal frame.
-    const auto& target = p.gl[slot];
-    const unsigned w = target.width();
-    const unsigned h = target.height();
-    std::vector<unsigned char> rgba(static_cast<std::size_t>(w) * h * 4u);
-    if (auto read = gl_compositor_.read_back(target, rgba.data(), static_cast<unsigned>(rgba.size()));
-        !read) {
-        log_render.error(read.get_error());
+    // hot-path operation and never part of a normal frame. Either accelerated backend: GL
+    // reads its scanout framebuffer, Vulkan its scanout target (the CPU composite has no
+    // GPU frame to read, which is why it writes no file).
+    unsigned w = 0;
+    unsigned h = 0;
+    std::vector<unsigned char> rgba;
+    if (gl_present_) {
+        const auto& target = p.gl[slot];
+        w = target.width();
+        h = target.height();
+        rgba.resize(static_cast<std::size_t>(w) * h * 4u);
+        if (auto read = gl_compositor_.read_back(target, rgba.data(),
+                                                 static_cast<unsigned>(rgba.size()));
+            !read) {
+            log_render.error(read.get_error());
+            return;
+        }
+    } else if (vulkan_present_) {
+        const auto& target = p.vk[slot];
+        w = target.width();
+        h = target.height();
+        rgba.resize(static_cast<std::size_t>(w) * h * 4u);
+        if (auto read = vk_compositor_.read_back(target, rgba.data(),
+                                                 static_cast<unsigned>(rgba.size()));
+            !read) {
+            log_render.error(read.get_error());
+            return;
+        }
+    } else {
         return;
     }
     const char* dir = std::getenv("LUMEN_SCREENSHOT_DIR");
@@ -2773,7 +2794,7 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
         return;
     }
     std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-    // GL_RGBA read-back yields R, G, B, A per pixel whatever the renderbuffer's storage.
+    // GL_RGBA / RGBA read-back yields R, G, B, A per pixel whatever the storage's order.
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
         std::fwrite(&rgba[i * 4u], 1, 3, f);
     std::fclose(f);
@@ -3349,13 +3370,15 @@ void compositor_impl::register_protocol_globals() {
     wire_.foreign = &foreign_;
     // Screen capture (design-app-compat-capture Part D): on the composite path that runs —
     // GL copies the composited frame (one blit, or a read-back for shm) and renders windows'
-    // capture views, CPU composites into the client's memory, Vulkan reads its target back
-    // (outputs only). Without a composite path (headless) nothing is offered.
+    // capture views, CPU composites into the client's memory, Vulkan copies its target into
+    // the client's dma-buf on the GPU or reads it back for shm, windows through the
+    // session's capture target. Without a composite path (headless) nothing is offered.
     capture_host_.backend = gl_present_       ? capture_backend::gl
                             : cpu_present_    ? capture_backend::cpu
                             : vulkan_present_ ? capture_backend::vulkan
                                               : capture_backend::none;
-    capture_host_.dmabuf = gl_present_ && egl_.supports_dmabuf_import();
+    capture_host_.dmabuf = (gl_present_ && egl_.supports_dmabuf_import()) ||
+                           (vulkan_present_ && vk_compositor_.capture_dmabuf_supported());
     capture_host_.dmabuf_device = wire_.dmabuf_main_device;
     capture_host_.channel = &capture_channel_;
     capture_host_.guards = &capture_guards_;
@@ -3373,6 +3396,13 @@ void compositor_impl::register_protocol_globals() {
         return static_cast<unsigned long long>(self->clocks_.clock(slot).next_deadline(
             static_cast<lx::runtime::clock_time>(composited)));
     };
+    // What this run's capture can do, said once, next to the composite-path line: the smokes
+    // read it to tell a backend's gap from a defect (rows that need a capability this run
+    // lacks WARN naming it, and judge normally again the moment a backend has it).
+    if (capture_host_.backend != capture_backend::none)
+        log_capture.info("capabilities read-back={} window-capture={} dmabuf={}",
+                         gl_present_ || vulkan_present_ ? 1 : 0, 1,
+                         capture_host_.dmabuf ? 1 : 0);
     capture_guards_.bind({}); // libwayland's access calls are bound by install_protocols
     if (gl_present_)
         capture_renderer_.bind_gl(&gl_compositor_, &egl_);
@@ -11094,6 +11124,13 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                     const auto blits = painter_.last_surfaces();
                     report_unregistered_draw(blits.data(), static_cast<unsigned>(blits.size()));
                 }
+                // A requested debug screenshot of a fully repainted frame of this output.
+                const std::uint32_t bit = 1u << slot;
+                if ((screenshot_pending_.load(std::memory_order_relaxed) & bit) &&
+                    region.count == 1 && region.rects[0].width == p.scanout_rect.width &&
+                    region.rects[0].height == p.scanout_rect.height &&
+                    (screenshot_pending_.fetch_and(~bit, std::memory_order_acq_rel) & bit))
+                    write_screenshot(p, back);
             }
         }
         if (drawn) {
