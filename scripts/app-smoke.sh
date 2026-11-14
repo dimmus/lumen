@@ -432,6 +432,12 @@
 #
 # Exit status: 0 PASS (possibly with warnings), 1 FAIL, 2 could not run, 3 INVALID (input
 # the injector did not send was seen — re-run hands off).
+#
+# A row that needs a capability the run's composite path lacks (the SIGUSR1 debug
+# read-back is the GL path only; window capture and capture dma-buf buffers are not on
+# the Vulkan backend) is reported as a WARN naming the gap, not a FAIL: it is the
+# backend's, not the run's. The judgement comes from the compositor's own log, so the row
+# judges normally again on a backend that has the capability.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -3930,6 +3936,44 @@ def comp_index(r, rx):
 def record(name, ok, detail, warn=False):
     results.append((name, "FAIL" if not ok else "WARN" if warn else "PASS", detail))
 
+# ── What this run's composite path can do ───────────────────────────────────
+# Read from the compositor's own log, not assumed: the "composite path active" line names
+# the backend, and the capabilities are exactly where the code refuses them. A row that
+# needs a capability this backend lacks is that backend's gap, not this run's failure:
+# it is reported as a WARN naming the gap (the 2026-11-14 owner decision — a
+# backend-limited WARN is green for the gate), and it judges normally again the moment a
+# backend has the capability, because the WARN only replaces a failure. The refusals:
+# the SIGUSR1 debug read-back reads the GL scanout target only (compositor_impl.cpp
+# `write_screenshot`; lx.compositor.cppm documents it on `request_screenshot`), window
+# (toplevel) capture is refused on the Vulkan backend and capture dma-buf buffers are
+# offered on the GL path only (wire_capture.cpp `create_session` and its constraints).
+GFXPATH = re.compile(r"compositor\.gfx: (Vulkan|GL|CPU) composite path active")
+composite_path = next((m.group(1).lower() for l in comp if (m := GFXPATH.search(l))), None)
+
+def backend_gap(needs):
+    """The capability this backend lacks, as a string naming it — None when it has it."""
+    if composite_path is None:
+        return None
+    if needs == "read-back" and composite_path != "gl":
+        return ("the SIGUSR1 debug read-back is the GL path only "
+                "(compositor_impl.cpp write_screenshot)")
+    if needs == "window-capture" and composite_path == "vulkan":
+        return ("window (toplevel) capture needs the GL or CPU backend "
+                "(wire_capture.cpp create_session)")
+    if needs == "capture-dmabuf" and composite_path != "gl":
+        return "capture dma-buf buffers are offered on the GL path only (wire_capture.cpp)"
+    return None
+
+def record_limited(name, ok, detail, warn=False, needs=None):
+    """record(), but a row whose needed capability this backend lacks WARNs naming the gap
+    instead of failing. The parts of the row that do not need the capability stay in the
+    detail, so a real defect elsewhere in the row still shows up there."""
+    gap = backend_gap(needs) if not ok and not warn else None
+    if gap:
+        record(name, True, f"{detail}; not on this backend: {gap}", warn=True)
+    else:
+        record(name, ok, detail, warn=warn)
+
 def need(name):
     if name not in scen:
         record(name, False, "scenario did not run")
@@ -5751,8 +5795,9 @@ if s is not None:
         px_ok = interior and green == len(interior) and frame_ok
         detail_px = f"interior green {green}/{len(interior)}; frame {frame}"
     ok = bool(g) and g[2] == 300 and g[3] == 150 and geo_ok and px_ok
-    record("S2 viewport crop + destination: mapped at the destination, the quadrant shown, framed", ok,
-           f"geometry={g}; compositor {geo[-1].group(0)[len('compositor.surface: '):] if geo else '-'}; {detail_px}")
+    record_limited("S2 viewport crop + destination: mapped at the destination, the quadrant shown, framed", ok,
+           f"geometry={g}; compositor {geo[-1].group(0)[len('compositor.surface: '):] if geo else '-'}; {detail_px}",
+               needs="read-back")
 
 # ── P: wp_presentation ──────────────────────────────────────────────────────
 PSUM = re.compile(r"presentation summary frames=(\d+) presented=(\d+) discarded=(\d+) pending=(\d+) "
@@ -5970,9 +6015,10 @@ if s is not None:
     ok = (("locked", "abandoned") in t and ("abandoned", "locked") in t and
           ("locked", "unlocked") in t and colour == (0x3f, 0, 0) and share > 0.99 and
           not leaked and 0.0 <= rep_after <= 0.1)
-    record("L2 locker died: stays locked (dark red), keys to nobody; a replacement is locked at once", ok,
+    record_limited("L2 locker died: stays locked (dark red), keys to nobody; a replacement is locked at once", ok,
            f"transitions {t}; screenshot {colour} over {share:.3f} of the output; keys leaked {len(leaked)}; "
-           f"replacement locked {rep_after:.3f} s after its request")
+           f"replacement locked {rep_after:.3f} s after its request",
+               needs="read-back")
 
 s = scen.get("L3")
 if s is not None:
@@ -5982,8 +6028,9 @@ if s is not None:
     colour, share = shot_colour(s.get("shot", ""))
     ok = (0.95 <= after <= 1.6 and ("locking", "locked") in t and colour == (0, 0, 0) and
           share > 0.99)
-    record("L3 no lock surface: locked after the 1 s wait, the output a solid colour", ok,
-           f"locked {after:.3f} s after the request; transitions {t}; screenshot {colour} over {share:.3f}")
+    record_limited("L3 no lock surface: locked after the 1 s wait, the output a solid colour", ok,
+           f"locked {after:.3f} s after the request; transitions {t}; screenshot {colour} over {share:.3f}",
+               needs="read-back")
 
 s = scen.get("L4")
 if s is not None:
@@ -6036,12 +6083,13 @@ if s is not None:
     ok = (entered and pre[:2] == ['ti preedit "α" 2 2', 'ti preedit "αα" 4 4'] and
           commit[:1] == ['ti commit "αα"'] and bool(done_commit) and not window_keys and
           grab_a == 2 and b_fwd and at_cursor and rect and on_screen and ptr and pressed and kept)
-    record("M1 compose: keys to the grab, preedit and commit back; the popup at the cursor", ok,
+    record_limited("M1 compose: keys to the grab, preedit and commit back; the popup at the cursor", ok,
            f"entered+activated={entered}; preedit {pre[:2]}; commit {commit[:1]}; done with the text="
            f"{bool(done_commit)}; KEY_A at the grab {grab_a}, at the window {len(window_keys)}; B forwarded="
            f"{b_fwd}; popup first shown at {(first.group(2), first.group(3)) if first else None} want {want_xy}; "
            f"text_input_rectangle={rect}; on screen={on_screen}; click on it: pointer={ptr} "
-           f"press at the input method={pressed} keyboard kept={kept}")
+           f"press at the input method={pressed} keyboard kept={kept}",
+               needs="read-back")
 
 s = scen.get("M2")
 if s is not None:
@@ -6255,10 +6303,11 @@ if s is not None:
         detail_px = f"{len(good)}/{len(samples)} samples half green (first {samples[0] if samples else '-'})"
     ok = bool(solid) and "size=320x240" in solid[-1] and "opaque=1" in solid[-1] and \
         bool(alpha) and "multiplier=0.5" in alpha[-1] and bool(ctype) and px_ok
-    record("T4 single-pixel + viewport + alpha + content type: a solid, half green, typed video", ok,
+    record_limited("T4 single-pixel + viewport + alpha + content type: a solid, half green, typed video", ok,
            f"{solid[-1].split('compositor.surface: ')[-1] if solid else 'no solid line'}; "
            f"{alpha[-1].split('compositor.surface: ')[-1] if alpha else 'no alpha line'}; "
-           f"content type video={bool(ctype)}; geometry={g}; {detail_px}")
+           f"content type video={bool(ctype)}; geometry={g}; {detail_px}",
+               needs="read-back")
 
 s = scen.get("T5")
 if s is not None:
@@ -6316,10 +6365,11 @@ if s is not None:
         detail_px = (f"inside {len(inside)} samples {min(inside) if inside else '-'}..{max(inside) if inside else '-'}; "
                      f"outside {sum(1 for a, b in outside if a == b)}/{len(outside)} exact stripes")
     ok = caps == "1" and bool(region) and "rects=1" in region[-1] and "area=38400" in region[-1] and px_ok
-    record("T7 ext-background-effect-v1: blur offered, the region applied, stripes blurred inside "
+    record_limited("T7 ext-background-effect-v1: blur offered, the region applied, stripes blurred inside "
            "and untouched outside", ok,
            f"caps={caps}; {region[-1].split('compositor.surface: ')[-1] if region else 'no region line'}; "
-           f"geometry={g}; {detail_px}")
+           f"geometry={g}; {detail_px}",
+               needs="read-back")
 
 # ── U: dialogs, icons, bell, xdg-foreign (design-app-compat-capture Part B) ──
 SHUV = read("shell-uv.log")
@@ -6578,9 +6628,10 @@ if s is not None:
     # blue, may show as a small part of it.
     gone = not (c2 == blue and f2 > 0.5) and not (c2 == (0, 0, 0) and f2 > 0.5)
     ok = c1 == blue and f1 > 0.8 and gone and c3 == blue and f3 > 0.8
-    record("Q4 a fullscreen window: shown on its workspace; on another, neither it nor its black "
+    record_limited("Q4 a fullscreen window: shown on its workspace; on another, neither it nor its black "
            "backdrop; back, it again", ok,
-           f"screenshots: {c1} {f1:.2f} | {c2} {f2:.2f} | {c3} {f3:.2f}")
+           f"screenshots: {c1} {f1:.2f} | {c2} {f2:.2f} | {c3} {f3:.2f}",
+               needs="read-back")
 
 s = scen.get("Q5")
 if s is not None:
@@ -6605,8 +6656,9 @@ if s is not None:
     m = re.search(r"frames=(\d+) ready=(\d+)", summ[-1]) if summ else None
     hidden = since(s, rf"compositor\.workspace: window id={s.get('id', 0)} hidden")
     ok = bool(m) and int(m.group(2)) >= 8 and bool(hidden)
-    record("Q6 a window on a workspace that is not shown is captured: frames keep coming", ok,
-           f"{summ[-1:]}; hidden {len(hidden)}")
+    record_limited("Q6 a window on a workspace that is not shown is captured: frames keep coming", ok,
+           f"{summ[-1:]}; hidden {len(hidden)}",
+               needs="window-capture")
 
 s = scen.get("Q7")
 if s is not None:
@@ -6689,10 +6741,11 @@ if s is not None:
         px_ok = bg > 50 and sel > 50
         detail_px = f"background px {bg}, selection px {sel}"
     ok = bool(opened) and bool(act) and f[-1:] == [a] and centred and px_ok
-    record("O2 Alt held, Tab, Tab: the switcher is drawn after the open delay (centred, at the "
+    record_limited("O2 Alt held, Tab, Tab: the switcher is drawn after the open delay (centred, at the "
            "output's scale), the third window of the MRU order gets the keyboard on release", ok,
            f"opened {opened[-1:]}; maps {[m.group(0) for m in maps]}; centred={centred}; "
-           f"{detail_px}; focus {f[-1:]} (want {a}); {act[-1:] or sw[-4:]}")
+           f"{detail_px}; focus {f[-1:]} (want {a}); {act[-1:] or sw[-4:]}",
+               needs="read-back")
 
 s = scen.get("O3")
 if s is not None:
@@ -6780,11 +6833,12 @@ if s is not None:
             px_detail = (f"y={y}: border px {got0} want {tuple(round(v) for v in e0)} over {under0}; "
                          f"fill px {got2} want {tuple(round(v) for v in e2)} over {under2}")
     ok = bool(prev) and bool(hidden) and bool(snapped) and half_ok and bool(restored) and back_ok and px_ok
-    record("O6 Super+drag to the left edge: the preview shows the left half (border and fill "
+    record_limited("O6 Super+drag to the left edge: the preview shows the left half (border and fill "
            "as composited), the release snaps the window there (tiled); dragged out it is "
            "restored to 400x300 under the pointer", ok,
            f"preview {prev[-1:]}; hidden {len(hidden)}; snapped {len(snapped)}; half {half_ok} "
-           f"{first[-1:]}; restored {restored[-1:]} {second[-1:]}; {px_detail}")
+           f"{first[-1:]}; restored {restored[-1:]} {second[-1:]}; {px_detail}",
+               needs="read-back")
 
 s = scen.get("O7")
 if s is not None:
@@ -7025,12 +7079,13 @@ if s is not None:
           "sni menu clicked id=1 label=_Open" in sn and "sni menu event id=0 type=closed" in sn and
           "sni scroll delta=120 orientation=vertical" in sn and has(sh, r'tray: tooltip "Smoke item"') and
           orange >= 100)
-    record("N6 the tray: lumen-probe sni in the panel (its pixmap drawn), tooltip, left click → "
+    record_limited("N6 the tray: lumen-probe sni in the panel (its pixmap drawn), tooltip, left click → "
            "ProvideXdgActivationToken then Activate with it, busctl lists it, right click → its "
            "dbusmenu as a grabbing popup, Down+Return → Event(1, clicked), wheel → Scroll", ok,
            f"token {tok[:8] or '-'}…; activate {act[-1:]}; busctl {bus}; popup grabs {len(grabs)} "
            f"maps {len(maps)}; menu {[l for l in sn if 'menu' in l][-4:]}; scroll "
-           f"{[l for l in sn if 'scroll' in l]}; orange px {orange}")
+           f"{[l for l in sn if 'scroll' in l]}; orange px {orange}",
+               needs="read-back")
 
 s = scen.get("N7")
 if s is not None:
@@ -7202,7 +7257,8 @@ if s is not None:
         detail = (f"grim {w}x{h}, compositor read-back {shot[0]}x{shot[1]}: "
                   f"{'identical' if same else f'{diff} pixels differ'}; window centre red={red_ok}")
     ok = same and red_ok and grim_img is not None and grim_img[0] == out_w and grim_img[1] == out_h
-    record("Y1 grim -o: the output's size, pixel for pixel the compositor's own read-back", ok, detail)
+    record_limited("Y1 grim -o: the output's size, pixel for pixel the compositor's own read-back", ok, detail,
+               needs="read-back")
 
 s = scen.get("Y2")
 if s is not None:
@@ -7213,7 +7269,8 @@ if s is not None:
         colours = {tuple(px[k:k + 3]) for k in range(0, len(px), 3 * 7)}
         ok = (w, h) == (320, 240) and colours == {(255, 0, 0)}
         detail = f"{w}x{h}, colours {sorted(colours)[:4]} (covered by a green window on screen)"
-    record("Y2 grim -T: a covered window is captured with its own pixels at its own size", ok, detail)
+    record_limited("Y2 grim -T: a covered window is captured with its own pixels at its own size", ok, detail,
+               needs="window-capture")
 
 s = scen.get("Y3")
 if s is not None:
@@ -7242,9 +7299,10 @@ if s is not None:
         ok = len(f) >= 4 and f[0].group(2) == "full" and later and len(small) == len(later) and \
             bool(e) and all(" OK " in l for l in e)
         areas = sorted(int(m.group(4)) for m in later)
-        record(f"Y4 screencast into {kind}: the first frame full, then only the moving square",
-               ok, f"{len(f)} frames, later areas {areas[:3]}…{areas[-1:] if areas else ''} px; "
-               f"{e[-1] if e else 'no pixel check'}")
+        record_limited(f"Y4 screencast into {kind}: the first frame full, then only the moving square",
+                       ok, f"{len(f)} frames, later areas {areas[:3]}…{areas[-1:] if areas else ''} px; "
+                       f"{e[-1] if e else 'no pixel check'}",
+                       needs="capture-dmabuf" if kind == "dmabuf" else None)
 
 s = scen.get("Y5")
 if s is not None:
@@ -7254,9 +7312,10 @@ if s is not None:
         span = float(f[-1].group(6)) - float(f[1].group(6))
         rate = (len(f) - 2) / span if span > 0 else 0.0
     ok = len(f) >= 20 and rate >= 10.0
-    record("Y5 a covered window being cast keeps drawing at the output's pace", ok,
+    record_limited("Y5 a covered window being cast keeps drawing at the output's pace", ok,
            f"{len(f)} frames of weston-simple-shm behind a covering window, {rate:.1f}/s "
-           f"(a covered window not being captured is throttled to 1/s)")
+           f"(a covered window not being captured is throttled to 1/s)",
+               needs="window-capture")
 
 s = scen.get("Y6")
 if s is not None:

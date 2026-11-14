@@ -19,8 +19,11 @@
 #                  100–450 us one time in twenty, so one binary's p95 moves 40 % and more
 #                  between runs; its p50 moves 3 % typically and up to 14–18 %, so a smaller
 #                  regression is found by an interleaved A/B against the base binary; any heap
-#                  allocation or non-zero mallinfo2 delta in a steady frame of any
-#                  scenario (G5); more batches than the scenario's cap (S2, S3,
+#                  allocation on the UI thread in a steady frame of any scenario, or net
+#                  malloc growth beyond the baseline's by more than the driver's own
+#                  jitter (a driver under the GPU backends grows a little itself — growth
+#                  within it warns as an open gate) (G5);
+#                  more batches than the scenario's cap (S2, S3,
 #                  S4: 8); a gate the bench judged `fail` that the baseline passed (or has no
 #                  verdict for); a stage whose sample count went from zero to non-zero or
 #                  back (S1 producing frames, say); a scenario, stage or gate of the
@@ -799,11 +802,27 @@ for sid in by_id:
 for r in new:
     sid = r["scenario"]
     mem, cnt = r["memory"], r["counters"]
-    # G5 holds for every scenario: neither operator new nor net malloc growth.
+    # G5 holds for every scenario: no operator new on the UI thread, ever — that one is
+    # absolute, it is the engine's own count. The net malloc growth is judged against the
+    # baseline: on the GPU backends the driver itself grows a little during steady frames
+    # (1..4.5 kB that the 2026-11-03 baseline binary also shows on the 7.2.15 kernel —
+    # interleaved A/B, evidence/2026-11-14-ui-bench-ab/), which is the environment, not
+    # code. New or larger growth still fails; growth the baseline already carried warns,
+    # as any other open gate does.
     if mem.get("allocations_per_steady_frame", 0) > 0 or mem.get("allocations", 0) > 0:
         fails.append(f"{sid}: {mem['allocations']} heap allocations in {r['frames']} steady frames (G5)")
-    if mem.get("mallinfo2_uordblks_delta", 0) != 0:
-        fails.append(f"{sid}: mallinfo2 delta {mem['mallinfo2_uordblks_delta']} B over the steady frames (G5)")
+    delta = mem.get("mallinfo2_uordblks_delta", 0)
+    base = by_id.get(sid)
+    base_delta = base["memory"].get("mallinfo2_uordblks_delta", 0) if base else 0
+    # The driver's own growth jitters a few hundred bytes run to run on the GPU backends
+    # (gl S2: 2416–3024 B over fifteen runs of four binaries) — 1 kB above the baseline's
+    # recorded growth is beyond that jitter and still fails.
+    if delta > base_delta + 1024:
+        fails.append(f"{sid}: mallinfo2 delta {delta} B over the steady frames "
+                     f"(baseline {base_delta}; G5)")
+    elif delta > 0:
+        warns.append(f"{sid}: mallinfo2 delta {delta} B over the steady frames "
+                     f"(the baseline's own driver-side growth: {base_delta} B; open, G5)")
     cap = BATCH_CAPS.get(sid)
     if cap is not None and cnt.get("batches", 0) > cap:
         fails.append(f"{sid}: {cnt['batches']} batches, cap {cap}")
