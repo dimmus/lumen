@@ -34,7 +34,8 @@
 #                  the baseline (an open gate: never silent); a scenario the baseline lacks
 #
 # Exit status: 0 PASS (possibly with warnings), 1 FAIL, 2 could not run (a bad option, no
-# python3, no configured build, no bench binary).
+# python3, no configured build, no bench binary, a quiet-CPU hold that could not be
+# verified in effect — a baseline recorded held would judge an unheld run on noise).
 #
 #   ./scripts/ui-bench.sh                     # build, run, store, compare
 #   ./scripts/ui-bench.sh --update-baseline   # ... and rewrite the baseline (a reviewed change)
@@ -496,7 +497,10 @@ preset="$(basename "$BUILD")"
 # nothing deeper is entered), and the performance governor on the pinned CPU. Runs of one
 # binary then agree within 2 %. Both need root, both are undone when the script exits; a
 # host with neither deep idle states nor a frequency governor (a VM guest) is left alone.
-# Without passwordless sudo the run goes ahead unheld and says so.
+# A hold that cannot be verified in effect — no passwordless sudo, a holder that died, a
+# governor that did not take — fails the run (exit 2) instead of measuring: a baseline
+# recorded held then judges an unheld run a regression out of pure noise (a 2026-11-14
+# gate run failed 9 rows that way and passed held minutes later).
 QUIET_QOS_PID=""
 QUIET_GOV_FILE=""
 QUIET_GOV_WAS=""
@@ -513,7 +517,7 @@ quiet_cpu_stop() {
   fi
 }
 quiet_cpu_start() { # CPU
-  local cpu=$1 f deep=0 gov what=""
+  local cpu=$1 f deep=0 gov what="" mark
   for f in /sys/devices/system/cpu/cpu"$cpu"/cpuidle/state*/latency; do
     if [[ -r "$f" ]] && (( $(<"$f") > 10 )); then deep=1; fi
   done
@@ -521,30 +525,56 @@ quiet_cpu_start() { # CPU
   if [[ ! -r "$gov" || "$(<"$gov")" == performance ]]; then gov=""; fi
   if (( ! deep )) && [[ -z "$gov" ]]; then return 0; fi
   if ! sudo -n true 2>/dev/null; then
-    echo "NOTE: no passwordless sudo: cpu${cpu}'s deep idle states and frequency are not held."
-    echo "      On this host stage p50s move with them (up to 2x between runs of one binary)."
-    return 0
+    echo "FAIL: no passwordless sudo: cpu${cpu}'s deep idle states and frequency cannot be held."
+    echo "      On this host stage p50s move with them (up to 2x between runs of one binary), so"
+    echo "      an unheld run cannot be judged against the held baselines — not measuring."
+    exit 2
   fi
   trap quiet_cpu_stop EXIT
   trap 'quiet_cpu_stop; exit 130' INT TERM
   if (( deep )); then
-    sudo -n python3 -I -c 'import os, signal, struct
+    # The holder marks the request as written only after a full 4-byte write; the mark plus
+    # the holder being alive is what "in effect" is verified by — not the process merely
+    # having been started (a 2026-11-14 run measured anyway and failed 9 rows on noise).
+    mark="$(mktemp)"
+    sudo -n python3 -I -c 'import os, signal, struct, sys
 fd = os.open("/dev/cpu_dma_latency", os.O_WRONLY)
-os.write(fd, struct.pack("i", 10))
-signal.pause()' &
+if os.write(fd, struct.pack("i", 10)) != 4:
+    sys.exit(1)
+# no O_CREAT: fs.protected_regular denies root creating in sticky dirs it does not own
+mfd = os.open(sys.argv[1], os.O_WRONLY)
+os.write(mfd, b"1")
+os.close(mfd)
+signal.pause()' "$mark" &
     QUIET_QOS_PID=$!
-    sleep 0.3   # in place before the first frame
-    if kill -0 "$QUIET_QOS_PID" 2>/dev/null; then
+    for _ in $(seq 1 20); do   # in place before the first frame (python startup included)
+      [[ -s "$mark" ]] && break
+      kill -0 "$QUIET_QOS_PID" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ "$(<"$mark")" == 1 ]] && kill -0 "$QUIET_QOS_PID" 2>/dev/null; then
       what="PM-QoS latency 10 us held"
     else
-      QUIET_QOS_PID=""
+      quiet_cpu_stop
+      rm -f "$mark"
+      echo "FAIL: the PM-QoS latency request on cpu${cpu} did not take effect — not measuring:"
+      echo "      unheld, one binary's stage p50s read up to 2x apart between runs, and the held"
+      echo "      baselines then fail the run on noise."
+      exit 2
     fi
+    rm -f "$mark"
   fi
   if [[ -n "$gov" ]]; then
     QUIET_GOV_WAS="$(<"$gov")"
-    if echo performance | sudo -n tee "$gov" >/dev/null 2>&1; then
+    if echo performance | sudo -n tee "$gov" >/dev/null 2>&1 && [[ "$(<"$gov")" == performance ]]; then
       QUIET_GOV_FILE="$gov"
       what+="${what:+, }cpu${cpu} governor ${QUIET_GOV_WAS} -> performance"
+    else
+      quiet_cpu_stop
+      echo "FAIL: cpu${cpu}'s governor is still '$(<"$gov")' after setting performance — not measuring:"
+      echo "      under ${QUIET_GOV_WAS} the pinned core's frequency wanders with the duty cycle"
+      echo "      (27-43 us on one binary), and the held baselines then fail the run on noise."
+      exit 2
     fi
   fi
   echo "== quiet CPU: ${what:-could not hold the idle states or the governor}"
