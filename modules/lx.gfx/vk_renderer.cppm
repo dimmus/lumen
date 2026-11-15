@@ -796,6 +796,12 @@ private:
     void free_readback_slot(readback_slot& rb);
     /// `key`'s import, or null (the LRU clock not touched).
     [[nodiscard]] capture_dmabuf* find_capture_dmabuf(unsigned key);
+    /// Waits out every still-executing capture copy before an import's memory goes: the
+    /// import is what keeps the client's dma-buf alive, and a copy still executing would
+    /// write into freed memory once it goes. Copies are short and few (one per capture
+    /// session), and a buffer is destroyed long after its frame reached the client — these
+    /// waits are instants, not stalls.
+    void wait_capture_copies();
 };
 
 } // namespace lx::gfx
@@ -4942,6 +4948,20 @@ lx::gfx::vulkan_compositor::capture_dmabuf* lx::gfx::vulkan_compositor::find_cap
     return nullptr;
 }
 
+void lx::gfx::vulkan_compositor::wait_capture_copies() {
+#ifdef LUMEN_HAS_VULKAN
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    if (!dev)
+        return;
+    for (readback_slot& rb : readbacks_)
+        if (rb.submitted && rb.fence) {
+            auto fence = static_cast<VkFence>(rb.fence);
+            (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull);
+            rb.submitted = false;
+        }
+#endif
+}
+
 lx::result<void> lx::gfx::vulkan_compositor::capture_dmabuf_import(
     unsigned key, int fd, unsigned offset, unsigned stride, unsigned width, unsigned height,
     lx::fourcc format, unsigned long long modifier) {
@@ -5033,6 +5053,11 @@ lx::result<void> lx::gfx::vulkan_compositor::capture_dmabuf_import(
         if (d.used < slot->used)
             slot = &d;
     }
+    // An evicted import stays alive until its last copy lands, exactly like a forgotten
+    // one: freeing the memory under a still-executing copy writes into the client's freed
+    // dma-buf.
+    if (slot->memory || slot->buffer)
+        wait_capture_copies();
     if (slot->memory)
         vkFreeMemory(dev, static_cast<VkDeviceMemory>(slot->memory), nullptr);
     if (slot->buffer)
@@ -5058,16 +5083,7 @@ void lx::gfx::vulkan_compositor::capture_dmabuf_forget(unsigned key) {
     if (capture_dmabuf* d = find_capture_dmabuf(key)) {
         auto dev = static_cast<VkDevice>(ctx_.device);
         if (dev) {
-            // The import is what keeps the client's dma-buf alive: a copy still executing
-            // would write into freed memory once it goes. Copies are short and few (one per
-            // capture session), and a buffer is destroyed long after its frame reached the
-            // client — these waits are instants, not stalls.
-            for (readback_slot& rb : readbacks_)
-                if (rb.submitted && rb.fence) {
-                    auto fence = static_cast<VkFence>(rb.fence);
-                    (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull);
-                    rb.submitted = false;
-                }
+            wait_capture_copies();
             vkFreeMemory(dev, static_cast<VkDeviceMemory>(d->memory), nullptr);
             vkDestroyBuffer(dev, static_cast<VkBuffer>(d->buffer), nullptr);
         }
