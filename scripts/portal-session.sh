@@ -66,6 +66,14 @@ portal__stop_pid() {
 
 portal_session_start() { # SOCKET BUILD LOG_DIR [XDPW_CONFIG]
   local socket=$1 build=$2 logs=$3 xdpw_config=${4:-}
+  # Absolutize once, here: a relative build path dangles inside $PORTAL_DIR — the
+  # lumen.portal / lumen-portals.conf symlinks below resolve against that directory, not
+  # this shell's cwd, so the frontend logs "Error loading .../lumen.portal" and serves
+  # none of the Lumen interfaces (every frontend-routed portal row "response None": the
+  # relative-LUMEN_BUILD_DIR runs of 2026-11-14/15; the backend itself still serves, which
+  # is why the backend-direct rows passed). $PWD is the caller's cwd, where BUILD was
+  # resolved.
+  [[ "$build" == /* ]] || build="$PWD/$build"
   local frontend=/usr/lib/xdg-desktop-portal xdpw=/usr/lib/xdg-desktop-portal-wlr
   local backend="$build/xdg-desktop-portal-lumen"
   if ! command -v systemctl >/dev/null || ! command -v busctl >/dev/null ||
