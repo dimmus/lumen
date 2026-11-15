@@ -306,9 +306,10 @@ void release_fence_mailbox::publish(int sync_file, unsigned frame) {
     // Newest wins (a binary syncobj holds one fence; the import replaces it). The fd is
     // closed before returning whatever happened: it never leaves this call, so no number
     // of it can be closed again later by anyone.
-    if (ops_.import_binary(ops_.user, syncobj_, sync_file) != 0)
-        log_timeline.debug("release-fence import refused: release points wait the previous "
-                           "composite");
+    const int imported = ops_.import_binary(ops_.user, syncobj_, sync_file);
+    if (imported != 0)
+        log_timeline.debug("release-fence import refused ({}): release points wait the "
+                           "previous composite", imported);
     ::close(sync_file);
 }
 
