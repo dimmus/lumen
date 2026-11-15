@@ -421,8 +421,15 @@ int capture_renderer::take_sample_fence(bool wanted) {
     }
     const int fd = sample_fence_vk_;
     sample_fence_vk_ = -1;
-    if (!wanted && fd >= 0)
-        ::close(fd);
+    if (!wanted) {
+        // Nobody follows release points: the fence is consumed here. Returning the closed
+        // number anyway handed a dead fd to the caller, which published it — the release
+        // mailbox then held a number whose later close landed on whatever had reused it
+        // (a fresh client's accepted socket: the Z7 portal flake's first domino).
+        if (fd >= 0)
+            ::close(fd);
+        return -1;
+    }
     return fd;
 }
 

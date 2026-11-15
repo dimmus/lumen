@@ -640,6 +640,63 @@ LUMEN_TEST(vk_window_view_is_copied_into_a_client_dmabuf) {
     r.renderer.take(r.channel);
 }
 
+LUMEN_TEST(vk_take_sample_fence_never_hands_on_a_closed_fd) {
+    // The Z7 flake's first domino: with release points unwanted, the sample fence was
+    // closed AND its number returned — the caller published the dead number into the
+    // release mailbox, whose later replace-close of it killed whatever had reused the
+    // number (a fresh client's accepted socket). Unwanted now: consumed inside, -1 out.
+    // Wanted: a live fd the caller owns.
+    fixture* f = gpu();
+    if (!f)
+        return;
+    lx::gfx::render_target reference = red_blue_target(*f, 62, 47);
+    LUMEN_CHECK(reference.valid());
+    rig r{*f};
+    lx::gfx::blit_command draw{};
+    draw.texture_id = 0x4000'0202u;
+    draw.dst = {0, 0, 62, 47};
+    lx::compositor::capture_frame_source src{};
+    src.frame = 1;
+    src.size = {62, 47};
+    src.blits = &draw;
+    src.blit_count = 1;
+    src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    lx::gfx::damage_region all{};
+    all.set_full();
+    const auto composite_once = [&]() {
+        lx::compositor::capture_job j{};
+        j.kind = lx::compositor::capture_job_kind::toplevel;
+        j.session = 7;
+        j.generation = 1;
+        j.serial = 1;
+        j.full = true;
+        j.view = 0x101;
+        j.view_frame = 0;
+        j.target.width = 62; // the view composite runs at the buffer's size; no copy-out
+        j.target.height = 47;
+        (void)r.channel.post(j);
+        r.renderer.take(r.channel);
+        r.renderer.toplevel_composited(j.view, all, src, r.channel);
+        lx::compositor::capture_completion c[4];
+        const unsigned n = r.channel.drain(c, 4);
+        if (n == 1 && c[0].fence_fd >= 0)
+            ::close(c[0].fence_fd);
+    };
+    composite_once();
+    composite_once();
+    // Unwanted: consumed inside — never a closed number handed on, and nothing is left
+    // stored for a later take to publish either. (The wanted half — a live, owned fd —
+    // is exercised at 60 fps by every seat smoke: the release-fence imports of the
+    // composite path would refuse a dead one.)
+    LUMEN_CHECK(r.renderer.take_sample_fence(false) == -1);
+    LUMEN_CHECK(r.renderer.take_sample_fence(true) == -1);
+    lx::compositor::capture_job forget{};
+    forget.kind = lx::compositor::capture_job_kind::forget_session;
+    forget.session = 7;
+    (void)r.channel.post(forget);
+    r.renderer.take(r.channel);
+}
+
 LUMEN_TEST(vk_engine_output_job_copies_into_a_client_dmabuf) {
     fixture* f = gpu();
     if (!f || !f->dmabufs)
