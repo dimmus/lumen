@@ -11417,8 +11417,11 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
         req.request_page_flip = true;
         // The flip event names the frame it shows (presentation feedback).
         req.user_tag = p.composited_frame;
-        // Borrowed by the commit; closed below once it has returned. When the GL backend
-        // produced no fence it already blocked, so an absent fence is still correct.
+        // Owned by the commit on success: the KMS layer closes it and reports consumption
+        // by clearing the request's field (forget_consumed_fence below). A failed commit
+        // hands it back untouched — the retry further down owns it, never a close here.
+        // When the GL backend produced no fence it already blocked, so an absent fence is
+        // still correct.
         req.in_fence_fd = p.composited_fence;
         req.framebuffer_id = p.framebuffer(present_slot, cpu_present_);
 
