@@ -103,6 +103,14 @@ int real_import_sync_file(void* user, unsigned handle, unsigned long long point,
     return err;
 }
 
+int real_import_binary(void* user, unsigned handle, int sync_file) {
+    return drmSyncobjImportSyncFile(fd_of(user), handle, sync_file) != 0 ? -errno : 0;
+}
+
+int real_transfer(void* user, unsigned dst, unsigned long long point, unsigned src) {
+    return drmSyncobjTransfer(fd_of(user), dst, point, src, 0, 0) != 0 ? -errno : 0;
+}
+
 void real_destroy(void* user, unsigned handle) { (void)drmSyncobjDestroy(fd_of(user), handle); }
 
 int real_create(void* user, unsigned* handle) {
@@ -128,6 +136,8 @@ drm_timeline_ops drm_timeline_ops_for(int drm_fd) {
     ops.query = &real_query;
     ops.eventfd = &real_eventfd;
     ops.signal = &real_signal;
+    ops.import_binary = &real_import_binary;
+    ops.transfer = &real_transfer;
     ops.import_sync_file = &real_import_sync_file;
     ops.destroy = &real_destroy;
     ops.create = &real_create;
@@ -261,37 +271,54 @@ lx::result<void> drm_timeline_table::signal_after(unsigned id, unsigned long lon
     return {};
 }
 
+lx::result<void> drm_timeline_table::signal_after_syncobj(unsigned id, unsigned long long point,
+                                                          unsigned src_handle) const {
+    const entry* e = find(id);
+    if (!e || !ops_.transfer)
+        return timeline_error("drm timeline: unknown timeline");
+    if (ops_.transfer(ops_.user, e->handle, point, src_handle) != 0)
+        return timeline_error("drm timeline: syncobj transfer failed");
+    return {};
+}
+
 // ── release_fence_mailbox ──────────────────────────────────────────────────
 
 release_fence_mailbox::~release_fence_mailbox() {
-    if (fd_ >= 0)
-        ::close(fd_);
+    if (syncobj_ && ops_.destroy)
+        ops_.destroy(ops_.user, syncobj_);
 }
 
 void release_fence_mailbox::publish(int sync_file, unsigned frame) {
-    int old = -1;
-    {
-        std::lock_guard lock{mutex_};
-        old = fd_;
-        fd_ = sync_file;
-        frame_ = frame;
+    if (sync_file < 0)
+        return;
+    std::lock_guard lock{mutex_};
+    frame_ = frame;
+    if (!ops_.create || !ops_.import_binary) {
+        // No kernel ops bound: the fence cannot be kept — consumers signal at once.
+        ::close(sync_file);
+        return;
     }
-    if (old >= 0)
-        ::close(old);
+    if (syncobj_ == 0 && ops_.create(ops_.user, &syncobj_) != 0) {
+        syncobj_ = 0;
+        ::close(sync_file);
+        return;
+    }
+    // Newest wins (a binary syncobj holds one fence; the import replaces it). The fd is
+    // closed before returning whatever happened: it never leaves this call, so no number
+    // of it can be closed again later by anyone.
+    if (ops_.import_binary(ops_.user, syncobj_, sync_file) != 0)
+        log_timeline.debug("release-fence import refused: release points wait the previous "
+                           "composite");
+    ::close(sync_file);
 }
 
-int release_fence_mailbox::dup(unsigned* frame) const {
+lx::result<void> release_fence_mailbox::signal_after(const drm_timeline_table& timelines,
+                                                     unsigned id, unsigned long long point) const {
     std::lock_guard lock{mutex_};
-    if (frame)
-        *frame = frame_;
-    if (fd_ < 0)
-        return -1;
-    const int dup = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
-    if (dup < 0)
-        // The published fd was closed under us (its number reused: the Z7 portal flake's
-        // shape). Debug names the site without gating anything on it.
-        log_timeline.debug("release-fence mailbox fd {} closed before its dup", fd_);
-    return dup;
+    if (syncobj_ == 0)
+        // Nothing published (the composite blocked until done): nothing to wait for.
+        return timelines.signal(id, point);
+    return timelines.signal_after_syncobj(id, point, syncobj_);
 }
 
 } // namespace lx::gfx

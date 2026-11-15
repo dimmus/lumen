@@ -137,6 +137,52 @@ int main() {
         std::fprintf(stderr, "WARN: atomic commit failed (may need DRM master): continuing poll\n");
     }
 
+    // The in-fence's ownership contract: a successful commit consumes the fd (the layer
+    // closes it and reports that by clearing the field — the flip holds the kernel's own
+    // fence reference); a failed commit leaves it untouched and still open, so the caller
+    // retries on the same fd and never probes the number (the Z7 flake's F_GETFD probe
+    // could not tell a consumed fence from a reused number).
+    const auto fence_round = [&](const char* where) {
+        uint32_t so = 0;
+        int sync_fd = -1;
+        if (drmSyncobjCreate(fd, 0, &so) == 0 && drmSyncobjSignal(fd, &so, 1) == 0)
+            (void)drmSyncobjExportSyncFile(fd, so, &sync_fd);
+        if (sync_fd < 0) {
+            // vkms on kernels without DRIVER_SYNCOBJ: a plain fd the kernel refuses as an
+            // in-fence (EINVAL) — still exercises the failure half of the contract.
+            int pipefd[2] = {-1, -1};
+            if (::pipe(pipefd) == 0) {
+                ::close(pipefd[1]);
+                sync_fd = pipefd[0];
+            }
+        }
+        if (sync_fd < 0) {
+            std::fprintf(stderr, "WARN: no fd for the in-fence round (%s)\n", where);
+            return;
+        }
+        lx::drm::atomic_commit_request freq{};
+        freq.framebuffer_id = fb_id;
+        freq.request_page_flip = true;
+        freq.in_fence_fd = sync_fd;
+        auto fence_committed = atomic.commit(freq);
+        if (fence_committed) {
+            if (freq.in_fence_fd != -1 || ::fcntl(sync_fd, F_GETFD) != -1) {
+                std::fprintf(stderr,
+                             "FAIL: successful commit did not consume the in-fence (%s)\n",
+                             where);
+                std::exit(1);
+            }
+        } else if (freq.in_fence_fd != sync_fd || ::fcntl(sync_fd, F_GETFD) == -1) {
+            std::fprintf(stderr, "FAIL: failed commit disturbed the in-fence (%s)\n", where);
+            std::exit(1);
+        } else {
+            ::close(sync_fd); // the caller owns it after a refusal
+        }
+        drmSyncobjDestroy(fd, so);
+        std::printf("in-fence ownership round ok (%s, committed=%d)\n", where,
+                    fence_committed ? 1 : 0);
+    };
+    fence_round("flip pending"); // EBUSY while the first flip is in flight: not consumed
     for (int i = 0; i < 50 && !flipped; ++i) {
         dev.dispatch_events();
         usleep(10000);
@@ -156,6 +202,7 @@ int main() {
         std::fprintf(stderr, "FAIL: expected page-flip on vkms\n");
         return 1;
     }
+    fence_round("idle"); // the flip landed: a commit that succeeds must consume the fence
     std::printf("vkms atomic path ok (flipped=%d)\n", flipped ? 1 : 0);
     return 0;
 #endif

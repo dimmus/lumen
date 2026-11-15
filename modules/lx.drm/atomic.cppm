@@ -81,8 +81,15 @@ struct atomic_commit_request {
     kms_damage_region damage{};
     bool request_page_flip = true;
     bool async = false;
-    /// Optional explicit-sync input fence (sync_file FD). Borrowed: the caller keeps
-    /// ownership and must close it after the commit returns. The modeset carries it too.
+    /// Optional explicit-sync input fence (sync_file FD). Owned for the duration of the
+    /// call, and the commit layer is the single closer: on a successful non-test commit it
+    /// closes the fd and reports that by clearing the field to -1 (the kernel keeps its own
+    /// fence reference in the flip) — the caller must not close or reuse it afterwards. On
+    /// every failure — and for `test_only` — the fd is untouched and still open (the kernel
+    /// never closes an IN_FENCE_FD: `sync_file_get_fence` only takes a fence reference, so
+    /// userspace owns the fd on every path), and the field keeps its value so the caller can
+    /// retry the same fence or close it once itself. No fd-number probing above this layer.
+    /// The modeset carries it too.
     int in_fence_fd = -1;
     /// When set, receives an owned sync_file FD for the commit completion fence, or -1.
     /// The caller must close it.
@@ -94,7 +101,8 @@ struct atomic_commit_request {
     /// False for a cursor-only commit: the primary plane is left exactly as it is (no FB,
     /// damage or fences), and the commit fails rather than performing the first modeset.
     bool update_primary = true;
-    /// DRM_MODE_ATOMIC_TEST_ONLY: validate, apply nothing, raise no event.
+    /// DRM_MODE_ATOMIC_TEST_ONLY: validate, apply nothing, raise no event. The in-fence is
+    /// validated but never consumed: `in_fence_fd` keeps its value.
     bool test_only = false;
     /// The caller's name for what this commit shows (the compositor: the frame index of the
     /// composite it scans out; 0 = none). Echoed in the `page_flip_event` of this commit —
@@ -140,7 +148,7 @@ struct kms_pipeline_desc {
 
 class kms_pipeline;
 struct modeset_entry;
-[[nodiscard]] lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+[[nodiscard]] lx::result<void> commit_modeset(kms_device& device, modeset_entry* entries,
                                               unsigned count, bool test_only);
 
 /// `drmModeAtomicCommit` user data. One shape for a single pipeline's commit and for a
@@ -226,8 +234,10 @@ public:
     /// `prepare_resume` or `set_mode` — is a full modeset of this pipeline alone (see
     /// `commit_modeset`); several pipelines that all need one are better committed together
     /// through `commit_modeset`. Nonblocking, with a flip event; the flip handler never runs
-    /// on the committing thread: a failure is reported by the return value only.
-    [[nodiscard]] lx::result<void> commit(const atomic_commit_request& request);
+    /// on the committing thread: a failure is reported by the return value only. The
+    /// in-fence follows `atomic_commit_request::in_fence_fd`'s ownership: consumed (closed,
+    /// field cleared) on success, untouched on failure.
+    [[nodiscard]] lx::result<void> commit(atomic_commit_request& request);
     void set_page_flip_handler(page_flip_handler handler, void* user_data = nullptr);
     /// The last successful commit completed synchronously (a blocking modeset), so no
     /// event will arrive on the card fd: the committing thread must have the event-draining
@@ -286,7 +296,7 @@ public:
 
 private:
     friend class kms_device;
-    friend lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+    friend lx::result<void> commit_modeset(kms_device& device, modeset_entry* entries,
                                            unsigned count, bool test_only);
 
     [[nodiscard]] lx::result<void> ensure_props();
@@ -392,7 +402,9 @@ struct modeset_entry {
     bool enable = true;
     /// The first frame of the new configuration (sized to the pipeline's mode).
     unsigned framebuffer_id = 0;
-    /// Borrowed sync_file the primary plane waits on, -1 for none.
+    /// Sync_file the primary plane waits on, -1 for none. Same ownership as
+    /// `atomic_commit_request::in_fence_fd`: consumed (closed, field cleared) by a
+    /// successful non-test commit of this entry, untouched and still open on failure.
     int in_fence_fd = -1;
     /// Borrowed; stated in full when given (shown where wanted, or off).
     kms_cursor_plane* cursor = nullptr;
@@ -423,13 +435,17 @@ struct modeset_entry {
 /// keeps scanning a stale picture out on a monitor this session does not use (wlroots MR
 /// 3967).
 ///
-/// `test_only`: DRM_MODE_ATOMIC_TEST_ONLY of exactly that state (no event, nothing applied).
-/// Otherwise nonblocking with one flip event per CRTC; a driver that refuses a nonblocking
-/// modeset (EINVAL) gets it once more blocking — then each pipeline's completion is reported
-/// by the next `kms_device::dispatch_events` (`completion_needs_dispatch`) — and, refused
-/// again, once more without the neutral settings. Every pipeline must have no flip pending.
-/// On failure no pipeline changed state; `last_failure_*` of every entry's pipeline says why.
-[[nodiscard]] lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+/// `test_only`: DRM_MODE_ATOMIC_TEST_ONLY of exactly that state (no event, nothing applied;
+/// every entry's `in_fence_fd` stays open and unchanged). Otherwise nonblocking with one
+/// flip event per CRTC; a driver that refuses a nonblocking modeset (EINVAL) gets it once
+/// more blocking — then each pipeline's completion is reported by the next
+/// `kms_device::dispatch_events` (`completion_needs_dispatch`) — and, refused again, once
+/// more without the neutral settings. Every pipeline must have no flip pending.
+/// On failure no pipeline changed state and no entry's fence was consumed — every
+/// `in_fence_fd` is untouched and still open; `last_failure_*` of every entry's pipeline
+/// says why. On success every enabled entry's `in_fence_fd` is closed and cleared (the
+/// flip holds the kernel's own fence reference).
+[[nodiscard]] lx::result<void> commit_modeset(kms_device& device, modeset_entry* entries,
                                               unsigned count, bool test_only);
 
 } // namespace lx::drm

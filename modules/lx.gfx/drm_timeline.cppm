@@ -32,10 +32,17 @@ struct drm_timeline_ops {
     /// Attaches `sync_file`'s fence at `point` (a temporary syncobj, then a transfer).
     int (*import_sync_file)(void* user, unsigned handle, unsigned long long point,
                             int sync_file) = nullptr;
+    /// Replaces the fence of the binary syncobj `handle` with `sync_file`'s fence
+    /// (DRM_IOCTL_SYNCOBJ_IMPORT_SYNC_FILE on `handle` directly — no temporary syncobj).
+    int (*import_binary)(void* user, unsigned handle, int sync_file) = nullptr;
+    /// Transfers the binary syncobj `src`'s fence onto `point` of the timeline syncobj
+    /// `dst` (DRM_IOCTL_SYNCOBJ_TRANSFER) — Mutter's release-point shape.
+    int (*transfer)(void* user, unsigned dst, unsigned long long point, unsigned src) = nullptr;
     void (*destroy)(void* user, unsigned handle) = nullptr;
     void* user = nullptr;
-    /// Client side (a window's swapchain, lx.gfx:swapchain): a new syncobj, and an fd for it
-    /// to send to the compositor (wp_linux_drm_syncobj_manager_v1.import_timeline).
+    /// A new syncobj: client side (a window's swapchain's timeline fd to send to the
+    /// compositor, wp_linux_drm_syncobj_manager_v1.import_timeline) and the release-fence
+    /// mailbox's persistent fence holder.
     int (*create)(void* user, unsigned* handle) = nullptr;
     int (*handle_to_fd)(void* user, unsigned handle, int* fd) = nullptr;
 };
@@ -80,6 +87,10 @@ public:
     /// point is signalled now.
     [[nodiscard]] lx::result<void> signal_after(unsigned id, unsigned long long point,
                                                 int sync_file) const;
+    /// Signals `point` of timeline `id` when the binary syncobj `src_handle` (the caller's —
+    /// the release-fence mailbox's) does: one transfer, no fd exists on this path at all.
+    [[nodiscard]] lx::result<void> signal_after_syncobj(unsigned id, unsigned long long point,
+                                                        unsigned src_handle) const;
 
 private:
     struct entry {
@@ -94,25 +105,49 @@ private:
     mutable bool deadline_off_ = false;
 };
 
-/// The newest composite fence (a sync_file) of a frame that sampled an explicit-sync
-/// buffer, published by render and read by UI to signal release points: the GPU executes
-/// composites in order, so the newest covers every earlier read. Render: `publish` (takes
-/// ownership); UI: `dup` (a new fd the caller owns, or -1: none, the composite blocked until
-/// done). A mutex, not a lock-free slot: the fd must not be closed while UI dups it.
+/// The newest composite fence of a frame that sampled an explicit-sync buffer, published by
+/// render and read by UI to signal release points: the GPU executes composites in order, so
+/// the newest covers every earlier read. The fence is kept as a kernel object, not an fd:
+/// render's `publish` takes ownership of the sync_file fd, imports it into one persistent
+/// binary syncobj (newest replaces previous, Mutter's meta-drm-timeline shape) and closes
+/// the fd before returning — no fence fd number is ever held across frames. It must not be:
+/// under capture fd churn a held number went stale, was reused by a fresh client's accepted
+/// socket, and the mailbox's next `close(old)` killed the connection (the Z7 portal flake;
+/// line-level evidence in evidence/2026-11-15-vulkan-capture/). A kernel syncobj handle
+/// cannot be closed by a stray `close()`. UI: `signal_after` transfers the syncobj onto a
+/// client timeline point.
 class release_fence_mailbox {
 public:
+    release_fence_mailbox() = default;
     ~release_fence_mailbox();
+    release_fence_mailbox(const release_fence_mailbox&) = delete;
+    release_fence_mailbox& operator=(const release_fence_mailbox&) = delete;
+
+    /// The kernel ops (the DRM fd) to hold the fence with, once — alongside the timeline
+    /// table's bind. Without them `publish` closes the fence and consumers signal at once.
+    void bind(const drm_timeline_ops& ops) {
+        std::lock_guard lock{mutex_};
+        ops_ = ops;
+    }
+    /// Render: takes ownership of `sync_file` (imported, then closed — the fd never leaves
+    /// this call). `frame` names the composite it came from.
     void publish(int sync_file, unsigned frame);
-    [[nodiscard]] int dup(unsigned* frame = nullptr) const;
+    /// UI: signals `point` of client timeline `id` (in `timelines`) when the newest
+    /// composite fence has. With nothing published — or no kernel ops — the point is
+    /// signalled now (the composite blocked until done: nothing to wait for).
+    [[nodiscard]] lx::result<void> signal_after(const drm_timeline_table& timelines, unsigned id,
+                                                unsigned long long point) const;
     /// Whether render should publish (some explicit-sync surface exists). UI sets, render
-    /// reads; a stale read costs one dup or one missed fence before a release that then
-    /// signals at once — after render's low-water mark, which already passed the frame.
+    /// reads; a stale read costs one fence import before a release that then waits the
+    /// previous composite — after render's low-water mark, which already passed the frame.
     void set_wanted(bool wanted) { wanted_.store(wanted, std::memory_order_relaxed); }
     [[nodiscard]] bool wanted() const { return wanted_.load(std::memory_order_relaxed); }
 
 private:
     mutable std::mutex mutex_{};
-    int fd_ = -1;
+    drm_timeline_ops ops_{};
+    /// The persistent binary syncobj holding the newest composite fence (0: none yet).
+    unsigned syncobj_ = 0;
     unsigned frame_ = 0;
     std::atomic<bool> wanted_{false};
 };

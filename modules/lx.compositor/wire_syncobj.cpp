@@ -105,12 +105,16 @@ namespace {
 void sync_point_signal_after_composite(sync_point& p) {
     if (!p.timeline)
         return;
-    const int fence =
-        g_ctx && g_ctx->release_fences ? g_ctx->release_fences->dup() : -1;
-    if (auto r = g_timelines.signal_after(p.timeline, p.point, fence); !r)
+    // The mailbox holds the newest composite fence as a kernel syncobj: the transfer onto
+    // the client's release point crosses no fd. The old shape (dup the mailbox's fd, import
+    // it, close the dup) left fence fd numbers live across frames, and one of them — closed
+    // after its number's reuse — killed the portal's fresh overlay connection (Z7).
+    if (g_ctx && g_ctx->release_fences) {
+        if (auto r = g_ctx->release_fences->signal_after(g_timelines, p.timeline, p.point); !r)
+            log_timeline_error(r.get_error());
+    } else if (auto r = g_timelines.signal(p.timeline, p.point); !r) {
         log_timeline_error(r.get_error());
-    if (fence >= 0)
-        ::close(fence);
+    }
     sync_point_drop(p);
 }
 
@@ -250,8 +254,13 @@ const struct wp_linux_drm_syncobj_manager_v1_interface manager_impl = {
 void bind_syncobj_manager(wayland::client_connection& client, unsigned id, int version) {
     if (!g_ctx)
         return;
-    if (!g_timelines.bound())
-        g_timelines.bind(lx::gfx::drm_timeline_ops_for(g_ctx->syncobj_drm_fd));
+    if (!g_timelines.bound()) {
+        const lx::gfx::drm_timeline_ops ops =
+            lx::gfx::drm_timeline_ops_for(g_ctx->syncobj_drm_fd);
+        g_timelines.bind(ops);
+        if (g_ctx->release_fences)
+            g_ctx->release_fences->bind(ops);
+    }
     auto res =
         wayland::resource::create(client, &wp_linux_drm_syncobj_manager_v1_interface, version, id);
     if (res)

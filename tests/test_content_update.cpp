@@ -215,6 +215,16 @@ struct fake_kernel {
     bool refuse_deadline = false;            // a kernel before 6.4: WAIT_DEADLINE is EINVAL
     unsigned queries = 0;
     unsigned long long last_deadline = 0;
+    // The release-fence mailbox: its persistent syncobj and the imports/transfers on it.
+    unsigned created = 0;
+    unsigned last_created = 0;
+    unsigned imports = 0;
+    unsigned last_import_handle = 0;
+    int last_import_fd = -1;
+    unsigned transfers = 0;
+    unsigned last_transfer_dst = 0;
+    unsigned long long last_transfer_point = 0;
+    unsigned last_transfer_src = 0;
 };
 
 lx::gfx::drm_timeline_ops fake_ops(fake_kernel& k) {
@@ -247,6 +257,27 @@ lx::gfx::drm_timeline_ops fake_ops(fake_kernel& k) {
     ops.import_sync_file = [](void* u, unsigned, unsigned long long point, int sync_file) {
         static_cast<fake_kernel*>(u)->last_signal = point;
         static_cast<fake_kernel*>(u)->last_sync_file = sync_file;
+        return 0;
+    };
+    ops.create = [](void* u, unsigned* h) {
+        auto* k = static_cast<fake_kernel*>(u);
+        ++k->created;
+        *h = k->last_created = k->next_handle++;
+        return 0;
+    };
+    ops.import_binary = [](void* u, unsigned handle, int sync_file) {
+        auto* k = static_cast<fake_kernel*>(u);
+        ++k->imports;
+        k->last_import_handle = handle;
+        k->last_import_fd = sync_file;
+        return 0;
+    };
+    ops.transfer = [](void* u, unsigned dst, unsigned long long point, unsigned src) {
+        auto* k = static_cast<fake_kernel*>(u);
+        ++k->transfers;
+        k->last_transfer_dst = dst;
+        k->last_transfer_point = point;
+        k->last_transfer_src = src;
         return 0;
     };
     ops.destroy = [](void* u, unsigned) { ++static_cast<fake_kernel*>(u)->destroyed; };
@@ -322,15 +353,37 @@ LUMEN_TEST(timeline_query_carries_the_deadline_until_the_kernel_refuses_it) {
     LUMEN_CHECK(k.queries == 1 && k.last_deadline == 0);
 }
 
-LUMEN_TEST(release_fence_mailbox_keeps_the_newest_and_dups) {
+LUMEN_TEST(release_fence_mailbox_keeps_the_newest_as_a_syncobj) {
+    fake_kernel k;
+    const lx::gfx::drm_timeline_ops ops = fake_ops(k);
+    lx::gfx::drm_timeline_table t;
+    t.bind(ops);
     lx::gfx::release_fence_mailbox box;
-    LUMEN_CHECK(box.dup() == -1);
-    box.publish(::eventfd(0, EFD_CLOEXEC), 3);
-    box.publish(::eventfd(0, EFD_CLOEXEC), 4); // the older one is closed
-    unsigned frame = 0;
-    const int d = box.dup(&frame);
-    LUMEN_CHECK(d >= 0 && frame == 4);
-    ::close(d);
+    // Unbound: publish cannot keep the fence — it closes the fd, imports nothing.
+    const int unbound = ::eventfd(0, EFD_CLOEXEC);
+    box.publish(unbound, 1);
+    LUMEN_CHECK(::fcntl(unbound, F_GETFD) == -1 && k.imports == 0 && k.created == 0);
+    // Nothing published yet: a release point is signalled at once.
+    const unsigned id = t.import(::eventfd(0, EFD_CLOEXEC)).value();
+    LUMEN_CHECK(static_cast<bool>(box.signal_after(t, id, 5)));
+    LUMEN_CHECK(k.last_signal == 5 && k.transfers == 0);
+    // Bound: publish imports into one persistent syncobj and closes the fd before
+    // returning — no fence fd number survives the call (a held number, closed after its
+    // reuse, killed the portal's fresh connection: the Z7 flake).
+    box.bind(ops);
+    const int fence = ::eventfd(0, EFD_CLOEXEC);
+    box.publish(fence, 3);
+    LUMEN_CHECK(k.created == 1 && k.imports == 1 && k.last_import_fd == fence &&
+                k.last_import_handle == k.last_created);
+    LUMEN_CHECK(::fcntl(fence, F_GETFD) == -1); // closed inside publish, not by the fake
+    const int fence2 = ::eventfd(0, EFD_CLOEXEC);
+    box.publish(fence2, 4); // newest wins: the same syncobj imported again, no new one
+    LUMEN_CHECK(k.created == 1 && k.imports == 2 && ::fcntl(fence2, F_GETFD) == -1);
+    // A release point: one transfer from the mailbox's syncobj — no fd exists on this path.
+    LUMEN_CHECK(static_cast<bool>(box.signal_after(t, id, 9)));
+    LUMEN_CHECK(k.transfers == 1 && k.last_transfer_src == k.last_created &&
+                k.last_transfer_point == 9);
+    LUMEN_CHECK(k.last_transfer_dst != 0); // the imported client timeline's handle
 }
 
 LUMEN_TEST(drm_timeline_unsupported_without_a_card) {

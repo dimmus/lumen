@@ -251,7 +251,7 @@ public:
 
 private:
     friend class kms_pipeline;
-    friend lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+    friend lx::result<void> commit_modeset(kms_device& device, modeset_entry* entries,
                                            unsigned count, bool test_only);
 
     void release();
@@ -1588,7 +1588,7 @@ bool lx::drm::kms_pipeline::ensure_modeset_props(int fd) {
 #endif
 }
 
-lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& request) {
+lx::result<void> lx::drm::kms_pipeline::commit(atomic_commit_request& request) {
 #ifdef LUMEN_HAS_DRM
     if (!device_)
         return lx::make_error(lx::drm_err::page_flip_failed, "null kms device");
@@ -1637,6 +1637,8 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
         auto modeset = commit_modeset(*device_, &entry, 1, false);
         if (modeset || last_rejected_state_)
             modeset_attempted_ = true;
+        // The modeset owns the fence for the call: -1 back means it consumed it.
+        request.in_fence_fd = entry.in_fence_fd;
         return modeset;
     }
 
@@ -1724,6 +1726,14 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
     if (want_out_fence)
         *request.out_fence_fd_ptr = out_fence_fd;
 
+    // The commit consumed the in-fence: the kernel holds its fence reference in the flip,
+    // the layer closes the fd (the single owner — see the request field's contract) and
+    // reports it by clearing the field. Also when the driver has no IN_FENCE_FD property
+    // and the fence never reached the kernel: the caller must not reuse it after success.
+    if (request.in_fence_fd >= 0) {
+        ::close(request.in_fence_fd);
+        request.in_fence_fd = -1;
+    }
     return {};
 #else
     (void)request;
@@ -1850,7 +1860,7 @@ void lx::drm::kms_pipeline::build_damage_blob(const kms_damage_region& region) {
 
 // ── commit_modeset ────────────────────────────────────────────────────────────
 
-lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry* entries,
+lx::result<void> lx::drm::commit_modeset(kms_device& device, modeset_entry* entries,
                                          unsigned count, bool test_only) {
 #ifdef LUMEN_HAS_DRM
     const int fd = device.card_fd();
@@ -2154,7 +2164,7 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
         if (stale & (1u << device.crtcs_[k].index))
             device.note_crtc_inactive(device.crtcs_[k].index);
     for (unsigned i = 0; i < count; ++i) {
-        const modeset_entry& e = entries[i];
+        modeset_entry& e = entries[i];
         kms_pipeline& p = *e.pipe;
         p.last_rejected_state_ = false;
         p.last_lost_master_ = false;
@@ -2169,6 +2179,12 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
         p.modeset_attempted_ = true;
         if (e.cursor && e.cursor->valid())
             e.cursor->on_committed();
+        // The modeset consumed the entry's in-fence (see `modeset_entry::in_fence_fd`): the
+        // layer is the single closer — the flip holds the kernel's own fence reference.
+        if (e.in_fence_fd >= 0) {
+            ::close(e.in_fence_fd);
+            e.in_fence_fd = -1;
+        }
         // Whether flip timestamps are the CRTC's vblank timestamps: a driver without vblank
         // support (vmwgfx, some virtual GPUs) answers EOPNOTSUPP, and its flip events then
         // carry sequence 0 and a time sampled when the event was sent

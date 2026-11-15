@@ -215,18 +215,13 @@ struct output_pipeline {
             composited_fence = -1;
         }
     }
-    /// A commit that carried `composited_fence` as its in-fence can leave the fd closed
-    /// even while rejecting the state (observed as EINVAL streaks: every retry then
-    /// re-passes the dead number to the kernel and dup-EBADFs on it, and the number —
-    /// reused meanwhile by, say, a fresh client's socket — was closed by the next
-    /// composite's discard_fence, killing the connection: the Z7 portal flake). The
-    /// retry keeps the fence only while it still exists; a consumed one re-composites
-    /// (`kms_pending` still carries the damage) instead of committing a corpse number.
-    void drop_consumed_fence() {
-        if (composited_fence >= 0 && ::fcntl(composited_fence, F_GETFD) == -1) {
-            composited_fence = -1;
-            composited_slot = -1;
-        }
+    /// A successful commit: the KMS layer consumed the in-fence — it closed the fd and
+    /// reported that by clearing `atomic_commit_request::in_fence_fd` (the flip holds the
+    /// kernel's own fence reference). Forget the number without closing it: a close here
+    /// would be a second one. `discard_fence` stays for fences that never entered a commit
+    /// (a superseded composite), where the pipeline is still the only owner.
+    void forget_consumed_fence() {
+        composited_fence = -1;
     }
     /// The scanout slot that is neither on screen nor queued for a flip.
     [[nodiscard]] unsigned back_slot() const {
@@ -1641,8 +1636,12 @@ struct compositor_impl {
     /// Per output: the last `allow_async` verdict (what an async-capable commit path reads).
     std::uint32_t async_allowed_mask_ = 0;
     bool async_unsupported_logged_ = false;
-    /// Render: hands a dup of this composite's fence to explicit-sync release points (only
-    /// while some client uses linux-drm-syncobj-v1).
+    /// Render: hands this composite's fence to explicit-sync release points (only while some
+    /// client uses linux-drm-syncobj-v1). The dup is needed for the few microseconds until
+    /// the mailbox imports it — the original stays owned by the pipeline for the commit —
+    /// and the mailbox closes it inside `publish`: no fence fd number this frame created
+    /// survives past this call (the old shape kept the mailbox's dup until the next frame,
+    /// and its close after a number reuse killed a fresh client's socket: the Z7 flake).
     void publish_release_fence(int fence_fd, unsigned frame) {
         if (fence_fd < 0 || !release_fences_.wanted())
             return;
@@ -1650,9 +1649,9 @@ struct compositor_impl {
         if (dup >= 0) {
             release_fences_.publish(dup, frame);
         } else {
-            // The fence was closed under us (observed under the Z7 portal flake: the fd
-            // number's second owner then closes a reused number — a fresh client's socket).
-            // Debug, not warn: this happens on steady green runs too; it names the site.
+            // The fence was closed under us — an ownership slip somewhere else; this site
+            // owns its fd from the composite to here and cannot cause this. Debug, not
+            // warn: it names the site for whoever chases the slip.
             log_render.debug("release fence fd {} closed before its dup", fence_fd);
         }
     }
@@ -11494,16 +11493,19 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
             p.content_committed_once = true;
             p.ever_lit.store(true, std::memory_order_release);
             p.composited_slot = -1;
-            // The kernel has taken its own reference to the fence.
-            p.discard_fence();
+            // The KMS layer closed the in-fence (its word: the request's field came back -1).
+            p.forget_consumed_fence();
             p.kms_pending.clear();
             kind = "content";
             note_committed_input(p, true);
         } else {
             // Keep the slot and its fence: the commit is retried next tick without
-            // compositing the frame again (or, paused, discarded by the resume) — unless
-            // the rejected commit consumed the fence fd.
-            p.drop_consumed_fence();
+            // compositing the frame again (or, paused, discarded by the resume). The
+            // kernel never closes an IN_FENCE_FD (it takes only a fence reference), and
+            // the commit layer reports consumption by clearing the request's field — so a
+            // failed commit leaves the fd open and solely owned here. No liveness probing:
+            // an F_GETFD probe cannot tell a consumed fence from a reused number, and the
+            // number's later close then killed a fresh client's socket (the Z7 flake).
             kind = lost_to_pause ? "paused" : "failed";
         }
         // Lowered after the commit raised flip_pending (see the idle-callback check).
@@ -11635,7 +11637,7 @@ void compositor_impl::commit_pending_modesets(const char** kinds) {
             p.content_committed_once = true;
             p.ever_lit.store(true, std::memory_order_release);
             p.composited_slot = -1;
-            p.discard_fence();
+            p.forget_consumed_fence(); // the grouped commit or the fallback consumed it
             p.kms_pending.clear();
             p.frame_outstanding.store(false, std::memory_order_release);
             p.modeset_wait_since_ns = 0;
@@ -11649,7 +11651,8 @@ void compositor_impl::commit_pending_modesets(const char** kinds) {
         } else {
             kinds[p.slot] = lost ? "paused" : "failed";
             retract_commit_timing(p);
-            p.drop_consumed_fence(); // as the content commit: a rejected one may consume
+            // As the content commit: a rejected modeset leaves every entry's fence open
+            // (commit_modeset touches them only on success) — kept for the retry.
             if (!lost && !p.drm_commit_failing) {
                 p.drm_commit_failing = true;
                 log_drm.error(r.get_error());
