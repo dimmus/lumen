@@ -890,9 +890,19 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
             if (hw_cursor) {
                 // The GPU copy cannot draw the pointer: it is blended into the client's
                 // mapped buffer once the copy lands (a worker; render here without one).
+                // The blend's own dma-buf reference, dup'd before the copy is submitted: a
+                // frame whose pointer cannot be painted fails whole (like the worker's
+                // mmap failure does) instead of shipping ready with the cursor missing.
+                const int blend_fd = ::fcntl(job.target.fd, F_DUPFD_CLOEXEC, 0);
+                if (blend_fd < 0) {
+                    log_capture.error("capture: cannot dup the target dma-buf for the pointer blend");
+                    fail(out, job, capture_failure::unknown);
+                    return true;
+                }
                 auto copy = vk_->capture_dmabuf_copy(slot, job.target.buffer_key, *src.vk_target,
                                                      region.rects, region.count, crop.x, crop.y);
                 if (!copy) {
+                    ::close(blend_fd);
                     log_capture.error(copy.get_error());
                     fail(out, job, capture_failure::unknown);
                     return true;
@@ -902,7 +912,7 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                 st.read_region = region;
                 st.read_bo_w = w; // the buffer's size, for the blend's clipping
                 st.read_bo_h = h;
-                st.read_dmabuf_fd = ::fcntl(job.target.fd, F_DUPFD_CLOEXEC, 0);
+                st.read_dmabuf_fd = blend_fd;
                 st.read_dmabuf_offset = job.target.offset;
                 st.read_dmabuf_stride = job.target.stride;
                 st.read_cursor = true;
