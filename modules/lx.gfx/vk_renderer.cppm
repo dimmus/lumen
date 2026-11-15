@@ -5254,8 +5254,12 @@ lx::result<int> lx::gfx::vulkan_compositor::capture_dmabuf_copy(unsigned slot, u
     auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
         vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
     int fd_out = -1;
-    if (!get_fd || get_fd(dev, &get, &fd_out) != VK_SUCCESS || fd_out < 0)
+    if (!get_fd || get_fd(dev, &get, &fd_out) != VK_SUCCESS)
         return lx::result<int>{vk_error("capture_dmabuf_copy: no sync file for the copy")};
+    // A successful export may hand back -1: the semaphore was already signalled — the copy
+    // completed before the export ran. That is the documented -1 (already completed)
+    // return, the frame path's own reading of this call (:2811 treats fd < 0 as
+    // not-exported, never as failure); the slot's fence stays signalled for the reclaimer.
     return fd_out;
 #else
     (void)slot;
@@ -5340,8 +5344,10 @@ lx::result<int> lx::gfx::vulkan_compositor::capture_dmabuf_fill(unsigned slot, u
     auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
         vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
     int fd_out = -1;
-    if (!get_fd || get_fd(dev, &get, &fd_out) != VK_SUCCESS || fd_out < 0)
+    if (!get_fd || get_fd(dev, &get, &fd_out) != VK_SUCCESS)
         return lx::result<int>{vk_error("capture_dmabuf_fill: no sync file for the fill")};
+    // As the copy's: -1 from a successful export is the fill already completed, not a
+    // failure.
     return fd_out;
 #else
     (void)slot;
@@ -5446,8 +5452,11 @@ lx::result<int> lx::gfx::vulkan_compositor::capture_sample_fence() {
     auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
         vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
     int fd = -1;
-    if (!get_fd || get_fd(dev, &get, &fd) != VK_SUCCESS || fd < 0)
+    if (!get_fd || get_fd(dev, &get, &fd) != VK_SUCCESS)
         return lx::result<int>{vk_error("capture fence: no sync file")};
+    // -1 from a successful export: everything submitted so far — this sample included —
+    // had already completed; the documented "the device exports none" -1, nothing to
+    // follow. The fence stays for the next call's wait.
     return fd;
 #else
     return -1;
