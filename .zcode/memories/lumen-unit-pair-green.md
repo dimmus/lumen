@@ -1,6 +1,6 @@
 ---
 name: lumen-unit-pair-green
-description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere — task CLOSED 2026-11-15: merge-tree proven to carry 0 evidence files, review 4/4 confirmed-all-dispositioned, then post-close review FIXED AND CLEAN (1 confirmed: the owed VM check was memory-only) fixed by 255e757 — the open condition is now an open `- [ ]` row at .zcode/TODO.md:18 (./build/test/lumen-ui-gallery --check on the dev VM, check off after recording); final tip **255e757** (8 commits over fa11b38, unmerged as of 2026-11-15), gate READY re-verified there 133/133 (76.85 s), ui-gallery cpu 0/255 both themes / gl 1/255, merge-tree main→44479c2 clean"
+description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere — task CLOSED 2026-11-15: merge-tree proven to carry 0 evidence files, review 4/4 confirmed-all-dispositioned, then post-close review FIXED AND CLEAN (1 confirmed: the owed VM check was memory-only) fixed by 255e757 — the open condition is now an open `- [ ]` row at .zcode/TODO.md:18 (./build/test/lumen-ui-gallery --check on the dev VM, check off after recording); final tip **255e757** (8 commits over fa11b38, unmerged as of 2026-11-15); final gate READY re-certified there after independent review went fully clean (0 findings) — 133/133 re-run (75.66 s by the memory writer, 76.39 s by the gate), ui-gallery cpu 0/255 both themes / gl 1/255, merge-tree main→592ede7 clean with 0 evidence files after main advanced past 44479c2 via memory commits (branch diff outside evidence/ since 5efebfc = .gitignore +3, TODO.md +7 → engine binary code-identical to main's), and the packet's gate-time seat reds audited to not-this-change: drag exit-1 = injector bound /dev/input/event2 (no ABS axis 0, zero input reached the scenarios, compositor-health row still PASS), app-smoke timed out (no verdict → no evidence), ui-bench = both-direction drift vs the unreproducible 2026-11-04 baselines (S1 −63% / S4 +986%) — no A/B regression owed; the valid Nov-14 smokes survive at 5efebfc"
 metadata:
   node_type: memory
   type: project
@@ -243,6 +243,52 @@ time on one host proves determinism, not cross-host stability.
   re-verify'` → 0; the real entries are the dated refresh/close sections and the
   "Owner decision" bullet) — message-only, fixable only by another history rewrite of
   the unmerged branch, an owner call like the orphaned-hash wart.
+
+## 2026-11-15 final gate — review fully clean (0 findings), READY re-certified at 255e757 after main advanced; the packet's seat/bench reds audited to harness/baseline noise (suite numbers re-run by the memory writer this session)
+
+- **Final gate verdict: READY at 255e757 — certifies this gate only, not permission to
+  merge, publish or push.** Branch still unmerged (`git merge-base --is-ancestor
+  255e757 main` fails; main tip cf05213, advanced past 44479c2 by the intervening
+  memory commits).
+- **Independent review's final round: 0 confirmed / 0 refuted** (verdict "Ready for
+  gate/merge") after the post-close round's single finding was fixed by 255e757; its
+  distinctive claims were spot-verified by the gate and re-run by me: 133/133;
+  ui-gallery cpu 0/255 / gl 1/255; `42c2aa3^{tree}` = `e29ba04^{tree}` = 7dbac1d7
+  (`git rev-parse`); `git status --porcelain` empty; zero `ui_gallery` mentions in
+  branch `.zcode/` outside `memories/` (SKILL.md:59 "the dev tree carries none").
+- **Final suite numbers (re-run by me):** `cmake --build build/test -j8` → ninja no-op
+  (LUMEN_BUILD_TESTS=ON); `ctest -R 'test_task_model|ui_gallery'` → 2/2 (0.34 s);
+  `./build/test/test_task_model` → 24 tests, 0 failed; `./build/test/lumen-ui-gallery
+  --check` → cpu **0/255** both themes, gl **1/255** vs CPU (G10 ≤ 3), exit 0; full
+  `ctest --test-dir build/test --output-on-failure -LE bench` → **"100% tests passed
+  out of 133"**, 75.66 s, exit 0 (the gate's own run: 76.39 s).
+- **Merge safety re-proven against the moved main:** `git merge-tree --write-tree main
+  zcode/task/unit-pair-green` → tree **592ede7**, exit 0, `git ls-tree -r 592ede7 --
+  evidence/` → **0** files (supersedes 44479c2, which the main advance obsoleted).
+  Engine/compositor binary stays code-identical to main's: `git diff --stat
+  5efebfc..HEAD -- . ':!evidence'` = `.gitignore` +3, `.zcode/TODO.md` +7, nothing
+  else — so the gate-time seat/bench outcomes below cannot be regressions of this
+  change.
+- **The packet's three gate-time reds audited to not-this-change** (gatekeeper audit of
+  the committed logs, consistent with the close section): the drag-smoke exit 1 was
+  **injector misconfiguration** — run.log shows `/dev/input/event2` bound ("has no
+  absolute axis 0"), inject.jsonl 2 lines, every delta +0,+0 n=0/0, so zero input
+  reached the scenarios while the compositor-health row still PASSes
+  (errors+warnings=0, exit=0); the notebook recipe requires the virtual ABS mouse from
+  `scripts/uinput-mouse.py`. The gate-time app-smoke **timed out** (partial logs
+  16:01–16:16, no verdict) → contributes no evidence; the complete 5efebfc run
+  (142 PASS / 34 FAIL, drag PASS with 603 real inject lines, latency n=150/150 median
+  10.3/15.0 ms) matches the documented pre-REL families of the unmerged
+  [[lumen-smoke-bench-harness-green]]. The ui-bench exit 1 is **both-direction drift
+  vs the 2026-11-04 baselines** (tests/bench/results/iritur-08fd3c-none/
+  20261115-255e757-2.json vs the 97f59a4 baseline: S1 update −63% "improved" while S4
+  layout +986%) — impossible for a code-identical binary and exactly the
+  unreproducible-baseline signature of [[lumen-ui-bench-noise-and-g7]]. Per §1.2 no
+  A/B regression of this change exists to take to the user.
+- **The owed VM golden check stays open where it belongs:** the row lives on the branch
+  at `.zcode/TODO.md:18-24` (255e757); main's `.zcode/TODO.md` does not carry it until
+  the branch merges (on main tip cf05213 lines 14-26 go straight from the ADR-013 rows
+  to "## Host-limited gates").
 
 **Why:** a tolerated-red set outlives its cause — a65d06b landed Nov 11 and the stale
 checks sat red-tolerated for three days while verifying nothing, and "golden drift" got
