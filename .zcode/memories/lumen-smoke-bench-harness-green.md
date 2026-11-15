@@ -1,6 +1,6 @@
 ---
 name: lumen-smoke-bench-harness-green
-description: "2026-11-14/15 notebook harness task (worktree smoke-bench-harness-green, f1d619f..8861dc0, gate NOT_READY twice on the same evidence-overwrite pattern): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = aaedada's acceptance-level seat evidence (158/15/4 + zero-warning drag) overwritten by 28e2ef3 with dirty re-runs; round 4 closeout (2026-11-15) re-did it green at b3ac4fb (drag zero-warning PASS row-g p95 25.6 ms, app-smoke 158/15/4, Z2–Z5 flake root-caused to relative LUMEN_BUILD_DIR dangling portal-session.sh:113 symlink) and 8861dc0 then overwrote it again with below-level runs (drag g-latency p95 47.5 ms, app-smoke 154/15/8) — the b3ac4fb tree and /tmp/gate-r4 hold the good evidence; round 5 (2026-11-15, tip 062f3e6) closed gate READY as a pure RESTORE: 49fa712 re-checked out b3ac4fb's evidence/smokes/gate/ byte-identical (drag bare PASS 25.6 ms, app-smoke 158/15/4, review 0 findings), the gate-time step was re-namespaced to evidence/smokes/gate-workflow/ so it can never clobber the acceptance evidence again"
+description: "2026-11-14/15 notebook harness task (worktree smoke-bench-harness-green, f1d619f..8861dc0, gate NOT_READY twice on the same evidence-overwrite pattern): round 1 = injection autodetect by device name (REL-capable uinput mouse, LUMEN_INJECT_* overrides), build-system freshness (build-fresh.sh), host-aware app-smoke geometry, 15 backend-limited WARNs (Vulkan-capture contract), quiet-CPU PM-QoS hold fail-closed + 5 iritur-08fd3c baselines; round 2 = vulkan ~2x bench mode root-caused to what it is NOT (hasvk-workers-off-core refuted by all-core interleaved A/B 73.6/70.1/71.0/53.1 vs cpu3-only 71.0/70.5/78.2/72.2 us; wandering vulkan-only ~2x on memory-bound stages, MSR 0x620 the knob, its 'EIO' claim retracted bb59b9a) and the gate now warms + verifies the measured state (bench-warmup.sh, settle = baseline S2 p50 x1.15, exit-2 refusal; 3 green vulkan gate runs S2 36.06/40.16/35.88 vs 36.74 us); smoke_harness 48 checks; round 3 fuckup = aaedada's acceptance-level seat evidence (158/15/4 + zero-warning drag) overwritten by 28e2ef3 with dirty re-runs; round 4 closeout (2026-11-15) re-did it green at b3ac4fb (drag zero-warning PASS row-g p95 25.6 ms, app-smoke 158/15/4, Z2–Z5 flake root-caused to relative LUMEN_BUILD_DIR dangling portal-session.sh:113 symlink) and 8861dc0 then overwrote it again with below-level runs (drag g-latency p95 47.5 ms, app-smoke 154/15/8) — the b3ac4fb tree and /tmp/gate-r4 hold the good evidence; round 5 (2026-11-15, tip 062f3e6) closed gate READY as a pure RESTORE: 49fa712 re-checked out b3ac4fb's evidence/smokes/gate/ byte-identical (drag bare PASS 25.6 ms, app-smoke 158/15/4, review 0 findings), the gate-time step was re-namespaced to evidence/smokes/gate-workflow/ so it can never clobber the acceptance evidence again; post-close re-check same day (tip still 062f3e6): worktree clean — uncommitted precheck leak removed, merge blocker cleared (helper's gate/ write path unchanged in code), 3 stored none-backend bench JSONs (8861dc0 02:14 / 062f3e6-dirty 04:04 / 062f3e6 16:35) every gate pass across S1–S4 (clean-tip S2 36.556 µs vs baseline 36.74), packet seat exit-1s = the acceptance evidence's own 4 owner-owned FAIL rows + designated gate-workflow noise (drag g-latency, 154/15/8), suite 134 from a tests-enabled build with the tolerated pair"
 metadata:
   node_type: memory
   type: project
@@ -269,6 +269,43 @@ reproducible; holding it via a raised UNCORE_RATIO_LIMIT min_ratio is untried.
   acceptance met as a restore: byte-identity proven by empty diff, commit message
   states the restore and why, exactly as the card required.
 
+## Round 5 post-close re-check — 2026-11-15 later the same day (tip still 062f3e6; every check below run by the memory writer this session, notebook iritur)
+
+- **The residual leak is gone — merge blocker cleared:** worktree `git status
+  --short` is **empty** at tip 062f3e6. The uncommitted `M precheck-app-smoke.txt`
+  + untracked `precheck-drag-smoke.txt` recorded at the round-5 close were cleaned
+  away with no commit (062f3e6 remains tip); gate/ carries exactly the b3ac4fb set
+  (precheck-app-smoke.txt, precheck-seat-smokes.txt, postcheck-seat-smokes.txt,
+  README.md, both log dirs; no precheck-drag-smoke.txt). But the precheck helper's
+  write path is unchanged in code (`git diff 28e2ef3 HEAD -- ':!evidence'` empty,
+  re-verified) — an uncoupled precheck run re-creates the dirt.
+- **Scope re-proven at the tip:** `git diff b3ac4fb 49fa712 --stat` and
+  `git diff b3ac4fb HEAD -- evidence/smokes/gate` both empty — the byte-identical
+  restore stands.
+- **Restored logs re-verified, not inherited:** drag tail bare `VERDICT: PASS`,
+  `grep -c '(warnings'` = 0; app-smoke 177 rows = **158 PASS / 15 WARN / 4 FAIL**,
+  FAILs exactly Z1 Z6 Z7 + the PSI clean-log row (`compositor.memory: critical
+  pressure — evicting caches`).
+- **Bench: three stored none-backend JSONs at this code, every gate pass** (parsed
+  with python3 this session): 20261115-8861dc0.json (02:14),
+  20261115-062f3e6-dirty.json (04:04) and a **third run at the clean tip,
+  20261115-062f3e6.json (16:35)** — each of S1–S4 carries its G1–G4 + G5 and all
+  are `pass`; clean-tip S2 frame p50 **36.556 µs** vs baseline 36.74. The close
+  packet's bare `bench: run (see findings)` with no findings attached stays
+  **unexplained-but-unsubstantiated** — no stored artifact shows a below-baseline
+  read, so no §1.2 A/B is owed.
+- **Packet seat exits decoded:** app-smoke exit 1 is inherent to acceptance — the
+  card's own 4 owner-owned FAIL rows guarantee it; the gate_runs ui-bench/app-smoke
+  exit 1s correspond to the pre-designated gate-workflow corroborating runs, which
+  read below level (drag `PASS (warnings: g latency)`, app **154/15/8** — counted
+  this session) and are session noise by design; the gate judges gate/.
+- **Suite:** tests-enabled build confirmed (`grep LUMEN_BUILD_TESTS
+  build/test/CMakeCache.txt` → `ON`); my `ctest --test-dir build/test -N -LE bench`
+  → **Total Tests: 134**; LastTestsFailed.log (03:39, the gatekeeper run) names
+  exactly {17:ui_gallery, 82:test_task_model}. **Testing/Temporary struck a third
+  time:** my own `ctest -N` rewrote LastTest.log at 16:44, nine minutes after the
+  16:35 bench JSON — nothing under Testing/Temporary is durable evidence.
+
 
 
 **Why:** a harness gate is only as strong as its provisioning — every acceptance blocker
@@ -305,9 +342,13 @@ with `git diff <good-sha> HEAD -- <path>` empty before committing (round 5 did e
 this — precheck-drag-smoke.txt had to go). Give every recurring workflow step that
 writes evidence its **own namespace** (`evidence/smokes/gate-workflow/`) — a step that
 can overwrite acceptance evidence will, and twice in a row is the observed pattern;
-runs landing there read as session noise, not acceptance evidence. The precheck helper
-still leaks into gate/ uncommitted (precheck-app-smoke.txt appends, precheck-drag-smoke.txt
-recreated) — clean or namespace it before merging the branch. On the notebook pass
+runs landing there read as session noise, not acceptance evidence. The round-5 precheck
+leak was cleaned (worktree clean at 062f3e6) but the helper still writes into gate/ when
+run uncoupled — after any later precheck run, restore gate/ to the acceptance run's
+committed state before judging or committing. Exit codes: an acceptance-level app-smoke
+**always exits 1** (its 4 owner-owned FAIL rows are required by the card) and a
+below-level gate-workflow corroboration run is designated noise — judge by FAIL row IDs
+against the card, never by exit code alone. On the notebook pass
 `LUMEN_BUILD_DIR` **absolute** to app-smoke, or portal Z2–Z5 fail from the dangling
 portal-session.sh:113 symlink (fixing that script is a portal follow-up, not harness
 work). Use scripts/build-fresh.sh for freshness; never newest-source mtime.
