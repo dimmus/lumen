@@ -149,6 +149,10 @@ struct output_pipeline {
     /// Written by render after each composite of this output, read by UI for its clock.
     std::atomic<unsigned> render_cost_us{0};
     bool drm_commit_failing = false;
+    /// Consecutive commits the kernel rejected as invalid state (EINVAL-class; EBUSY's
+    /// racing flip and EACCES's lost master do not count). At k_rejected_recovery the
+    /// present path forces a full modeset — the recovery a wedged atomic request needs.
+    unsigned drm_rejected_streak = 0;
     lx::runtime::clock_time master_lost_since_ns = 0;
     bool master_lost_reported = false;
     /// Waiting for the combined modeset (every pipeline needing one has a frame) since.
@@ -1618,6 +1622,11 @@ struct compositor_impl {
     /// so the idle housekeeping tick runs it.
     [[nodiscard]] bool catch_up_owed(const output_pipeline& p, unsigned& front) const;
     static constexpr lx::runtime::clock_time k_catch_up_idle_ns = 200'000'000;
+    /// Render. Consecutive state-rejected commits (EINVAL-class) of one output before the
+    /// present path forces a full modeset — ~167 ms at 60 fps, past any driver hiccup, far
+    /// under the 250 ms no-present watchdog. A wedged request retried identically froze an
+    /// output for ~2 s (131 failed commits) during a capture session's battery once.
+    static constexpr unsigned k_rejected_recovery = 10;
     /// Render. A copy failed once: no more catch-ups (the frames repaint by buffer age).
     bool catch_up_failed_ = false;
     /// Render. Every pipeline that needs a modeset and has a frame: one combined commit (M5).
@@ -11503,6 +11512,7 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
             // The KMS layer closed the in-fence (its word: the request's field came back -1).
             p.forget_consumed_fence();
             p.kms_pending.clear();
+            p.drm_rejected_streak = 0;
             kind = "content";
             note_committed_input(p, true);
         } else {
@@ -11514,6 +11524,27 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
             // an F_GETFD probe cannot tell a consumed fence from a reused number, and the
             // number's later close then killed a fresh client's socket (the Z7 flake).
             kind = lost_to_pause ? "paused" : "failed";
+            // A rejection that persists is a wedged request, not a race: retrying the
+            // identical one every tick froze the output for ~2 s once (131 failed commits,
+            // 8 no-present warnings, mid-battery during a capture session). Bound the
+            // streak: at k_rejected_recovery the next content commit becomes a full
+            // modeset again — every plane property re-programmed, the recovery the resume
+            // path uses. prepare_resume disowns in-flight flip events, so never with a
+            // flip pending (a rejected commit lowered its own; a racing cursor-only flip
+            // may hold one).
+            if (!lost_to_pause && p.kms->last_failure_rejected_state()) {
+                if (++p.drm_rejected_streak >= k_rejected_recovery && !p.kms->flip_pending()) {
+                    p.drm_rejected_streak = 0;
+                    p.kms->prepare_resume();
+                    log_drm.error("commit rejected {} times in a row: recovering with a full "
+                                  "modeset (fb {} fence {} cursor {} damage {} {} rects)",
+                                  k_rejected_recovery, req.framebuffer_id, p.composited_fence,
+                                  cursor_rode, req.damage.full_frame ? "full" : "partial",
+                                  req.damage.full_frame ? 0u : req.damage.count);
+                }
+            } else {
+                p.drm_rejected_streak = 0;
+            }
         }
         // Lowered after the commit raised flip_pending (see the idle-callback check).
         p.frame_outstanding.store(!committed, std::memory_order_release);
@@ -11524,6 +11555,15 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
         } else if (!committed && !p.drm_commit_failing) {
             p.drm_commit_failing = true;
             log_drm.error(committed.get_error());
+            // The rejected request's facts, once per streak: the errno alone never named
+            // the check the kernel refused, and a one-in-7500-commits rejection left
+            // nothing to root-cause from.
+            log_drm.error("commit failed: fb {} fence {} cursor {} damage {} {} rects "
+                          "page_flip {} async {} test {}",
+                          req.framebuffer_id, p.composited_fence, cursor_rode,
+                          req.damage.full_frame ? "full" : "partial",
+                          req.damage.full_frame ? 0u : req.damage.count, req.request_page_flip,
+                          req.async, req.test_only);
         } else if (committed && p.drm_commit_failing) {
             p.drm_commit_failing = false;
             log_drm.info("atomic commit recovered");
