@@ -215,6 +215,19 @@ struct output_pipeline {
             composited_fence = -1;
         }
     }
+    /// A commit that carried `composited_fence` as its in-fence can leave the fd closed
+    /// even while rejecting the state (observed as EINVAL streaks: every retry then
+    /// re-passes the dead number to the kernel and dup-EBADFs on it, and the number —
+    /// reused meanwhile by, say, a fresh client's socket — was closed by the next
+    /// composite's discard_fence, killing the connection: the Z7 portal flake). The
+    /// retry keeps the fence only while it still exists; a consumed one re-composites
+    /// (`kms_pending` still carries the damage) instead of committing a corpse number.
+    void drop_consumed_fence() {
+        if (composited_fence >= 0 && ::fcntl(composited_fence, F_GETFD) == -1) {
+            composited_fence = -1;
+            composited_slot = -1;
+        }
+    }
     /// The scanout slot that is neither on screen nor queued for a flip.
     [[nodiscard]] unsigned back_slot() const {
         if (slot_count <= 1)
@@ -1634,8 +1647,14 @@ struct compositor_impl {
         if (fence_fd < 0 || !release_fences_.wanted())
             return;
         const int dup = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
-        if (dup >= 0)
+        if (dup >= 0) {
             release_fences_.publish(dup, frame);
+        } else {
+            // The fence was closed under us (observed under the Z7 portal flake: the fd
+            // number's second owner then closes a reused number — a fresh client's socket).
+            // Debug, not warn: this happens on steady green runs too; it names the site.
+            log_render.debug("release fence fd {} closed before its dup", fence_fd);
+        }
     }
     /// Render: the frame just composited into `p` is needed by the vblank its tick aimed at —
     /// hinted on its fence at submission, ahead of the commit (one ioctl, none once the
@@ -1950,6 +1969,9 @@ void compositor_impl::publish_commit_timing(output_pipeline& p, int fence_fd) {
     // one fcntl per commit; the file is closed at the next commit or the flip.
     p.committed_submit_us.store(monotonic_us(), std::memory_order_release);
     const int dup_fd = fence_fd >= 0 ? ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (fence_fd >= 0 && dup_fd < 0)
+        // As in publish_release_fence: the fence was closed under us — the site this names.
+        log_drm.debug("commit-timing fence fd {} closed before its dup", fence_fd);
     if (const int old = p.committed_fence_fd.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
         ::close(old);
 }
@@ -11479,7 +11501,9 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
             note_committed_input(p, true);
         } else {
             // Keep the slot and its fence: the commit is retried next tick without
-            // compositing the frame again (or, paused, discarded by the resume).
+            // compositing the frame again (or, paused, discarded by the resume) — unless
+            // the rejected commit consumed the fence fd.
+            p.drop_consumed_fence();
             kind = lost_to_pause ? "paused" : "failed";
         }
         // Lowered after the commit raised flip_pending (see the idle-callback check).
@@ -11625,6 +11649,7 @@ void compositor_impl::commit_pending_modesets(const char** kinds) {
         } else {
             kinds[p.slot] = lost ? "paused" : "failed";
             retract_commit_timing(p);
+            p.drop_consumed_fence(); // as the content commit: a rejected one may consume
             if (!lost && !p.drm_commit_failing) {
                 p.drm_commit_failing = true;
                 log_drm.error(r.get_error());

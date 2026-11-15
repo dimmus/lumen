@@ -32,6 +32,7 @@ PORTAL_XDPW_PID=""
 PORTAL_LUMEN_PID=""
 PORTAL_DIR=""
 PORTAL_STARTED_WP=0
+PORTAL_LUMEN_MASKED=0
 PORTAL_PREV_ENV=()
 PORTAL_PREV_UNITS=()
 
@@ -118,7 +119,20 @@ portal_session_start() { # SOCKET BUILD LOG_DIR [XDPW_CONFIG]
   # 1. The session environment.
   systemctl --user set-environment "${set_env[@]}"
 
-  # 3. The backends, as children.
+  # 3. The backends, as children. The Lumen backend unit first: where the portal package
+  #    is installed, D-Bus activation would hand the interface to the SYSTEM binary
+  #    whenever the session's backend is momentarily not the name's owner — even
+  #    mid-session, and with the user manager's stale activation environment (observed:
+  #    a system backend "serving on display" an earlier session's socket while the smoke
+  #    ran, then answering this session's Screenshot requests with the old binary).
+  #    Masked for the session, the backend started below is the only Lumen backend.
+  if systemctl --user cat xdg-desktop-portal-lumen.service >/dev/null 2>&1; then
+    systemctl --user stop xdg-desktop-portal-lumen.service 2>/dev/null
+    if systemctl --user mask xdg-desktop-portal-lumen.service 2>/dev/null; then
+      PORTAL_LUMEN_MASKED=1
+      portal__log "the system xdg-desktop-portal-lumen unit is masked for this session"
+    fi
+  fi
   if [[ -x "$xdpw" ]]; then
     [[ -n "$xdpw_config" ]] || xdpw_config="$build/share/xdg/xdg-desktop-portal-wlr/Lumen"
     [[ -f "$xdpw_config" ]] || xdpw_config=""
@@ -171,6 +185,10 @@ portal__stop_session_units() { # backends not running before the session: stoppe
 portal_session_stop() {
   (( PORTAL_ACTIVE )) || return 0
   PORTAL_ACTIVE=0
+  if (( PORTAL_LUMEN_MASKED )); then
+    systemctl --user unmask xdg-desktop-portal-lumen.service 2>/dev/null
+    PORTAL_LUMEN_MASKED=0
+  fi
   portal__stop_pid "$PORTAL_LUMEN_PID"; PORTAL_LUMEN_PID=""
   portal__stop_pid "$PORTAL_XDPW_PID"; PORTAL_XDPW_PID=""
   portal__stop_session_units

@@ -284,7 +284,14 @@ int release_fence_mailbox::dup(unsigned* frame) const {
     std::lock_guard lock{mutex_};
     if (frame)
         *frame = frame_;
-    return fd_ >= 0 ? ::fcntl(fd_, F_DUPFD_CLOEXEC, 0) : -1;
+    if (fd_ < 0)
+        return -1;
+    const int dup = ::fcntl(fd_, F_DUPFD_CLOEXEC, 0);
+    if (dup < 0)
+        // The published fd was closed under us (its number reused: the Z7 portal flake's
+        // shape). Debug names the site without gating anything on it.
+        log_timeline.debug("release-fence mailbox fd {} closed before its dup", fd_);
+    return dup;
 }
 
 } // namespace lx::gfx

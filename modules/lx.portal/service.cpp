@@ -574,7 +574,13 @@ int service::run() {
             // nothing else waking the poll, both are the difference between an overlay
             // and a deadlock.
             after_events();
-            (void)req_->ov->pump_ui();
+            // after_events may have completed the request (a key the dispatch above
+            // delivered: Enter, Esc) and with it answered — destroying the overlay and
+            // resetting req_. Re-checked: this used to dereference the null req_ (a
+            // SIGSEGV at exactly this point, coredump 2575731), which dropped the bus
+            // name mid-run and let a stale D-Bus-activated backend take the interface.
+            if (req_ && req_->ov)
+                (void)req_->ov->pump_ui();
         }
         uint64_t usec = UINT64_MAX;
         int timeout = -1;
@@ -595,11 +601,11 @@ int service::run() {
                 quit_ = true;
             }
         }
-        if (with_wl && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (with_wl && req_ && req_->wl && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             (void)req_->wl->dispatch_readable();
             after_events();
         }
-        if (with_ui && (fds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
+        if (with_ui && req_ && req_->ov && (fds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
             (void)req_->ov->pump_ui();
             after_events();
         }
