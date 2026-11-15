@@ -5001,8 +5001,10 @@ lx::result<void> lx::gfx::vulkan_compositor::capture_dmabuf_import(
     // A dup of our own: whatever the driver does with the fd it is handed (the spec lets
     // an implementation take it), the caller's must stay open until it closes it.
     import.fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    if (import.fd < 0)
+    if (import.fd < 0) {
+        vkDestroyBuffer(dev, buffer, nullptr);
         return vk_error("capture dma-buf: cannot dup the descriptor");
+    }
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.pNext = &import;
@@ -5336,13 +5338,17 @@ lx::result<int> lx::gfx::vulkan_compositor::capture_sample_fence() {
         VkSemaphore sem = VK_NULL_HANDLE;
         if (vkCreateSemaphore(dev, &sem_ci, nullptr, &sem) != VK_SUCCESS)
             return lx::result<int>{vk_error("capture fence vkCreateSemaphore failed")};
-        sample_semaphore_ = sem;
         VkFenceCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // the first wait (nothing submitted yet)
         VkFence fence = VK_NULL_HANDLE;
-        if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS)
+        if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS) {
+            // Pair them in the members only once both exist: a semaphore without its
+            // fence would make the next call wait on VK_NULL_HANDLE.
+            vkDestroySemaphore(dev, sem, nullptr);
             return lx::result<int>{vk_error("capture fence vkCreateFence failed")};
+        }
+        sample_semaphore_ = sem;
         sample_fence_ = fence;
     }
     auto sem = static_cast<VkSemaphore>(sample_semaphore_);
