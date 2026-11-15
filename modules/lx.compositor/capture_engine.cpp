@@ -325,9 +325,12 @@ void capture_renderer::worker_read_vk(void* arg) {
 void capture_renderer::worker_read_vk_dmabuf(void* arg) {
     auto* st = static_cast<session_state*>(arg);
     capture_renderer* self = st->owner;
-    // The copy's completion: waited for here, never on render.
+    // The copy's completion: waited for here, never on render. The slot's fence, not
+    // `read_back_wait`'s rows — the copy landed in the client's own dma-buf, a session
+    // kind whose slot maps no host buffer (probing the rows reported every frame failed
+    // after the copy had landed).
     const bool landed =
-        self->vk_ && self->vk_->read_back_wait(st->vk_slot, 2'000'000'000ull) != nullptr;
+        self->vk_ && self->vk_->read_back_wait_fence(st->vk_slot, 2'000'000'000ull);
     capture_completion c = st->read_done;
     bool ok = landed;
     if (ok && st->read_dmabuf_fd >= 0 && st->read_cursor) {

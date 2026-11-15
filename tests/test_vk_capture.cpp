@@ -755,6 +755,72 @@ LUMEN_TEST(vk_engine_output_job_copies_into_a_client_dmabuf) {
     r.renderer.take(r.channel);
 }
 
+LUMEN_TEST(vk_engine_dmabuf_job_with_cursor_lands) {
+    // The dmabuf read worker probed the slot's mapped rows (`read_back_wait`) — but a
+    // dma-buf copy's slot maps none, so every paint_cursors frame over a dma-buf was
+    // reported failed after the copy had landed in the client's buffer. The wait is the
+    // slot's fence; the frame must complete and the pointer must land in the buffer.
+    fixture* f = gpu();
+    if (!f || !f->dmabufs)
+        return;
+    client_dmabuf client{f->gbm, k_w, k_h};
+    LUMEN_CHECK(client.bo != nullptr && client.fd >= 0);
+    if (!client.bo)
+        return;
+    client.fill(0x5A);
+    rig r{*f};
+    lx::compositor::capture_job j{};
+    j.kind = lx::compositor::capture_job_kind::output;
+    j.session = 8;
+    j.generation = 1;
+    j.serial = 1;
+    j.full = true;
+    j.paint_cursors = true;
+    j.target.dmabuf = true;
+    j.target.width = k_w;
+    j.target.height = k_h;
+    j.target.buffer_key = 44;
+    j.target.fd = ::fcntl(client.fd, F_DUPFD_CLOEXEC, 0);
+    j.target.stride = client.stride;
+    j.target.format = k_xr24;
+    LUMEN_CHECK(j.target.fd >= 0);
+    (void)r.channel.post(j);
+    r.renderer.take(r.channel);
+    std::vector<std::uint32_t> pointer(4u * 4u, 0xFFFF'FFFFu); // opaque white, 4x4
+    lx::compositor::capture_frame_source src{};
+    src.frame = 1;
+    src.size = {static_cast<int>(k_w), static_cast<int>(k_h)};
+    src.vk_target = &f->target;
+    src.cursor.pixels = pointer.data();
+    src.cursor.width = 4;
+    src.cursor.height = 4;
+    src.cursor.stride_px = 4;
+    src.cursor.rect = {10, 20, 4, 4};
+    src.cursor.visible = true;
+    r.renderer.output_front(0, src, r.channel);
+    lx::compositor::capture_completion c[4];
+    const unsigned n = r.channel.drain(c, 4);
+    LUMEN_CHECK(n == 1 && (c[0].result == lx::compositor::capture_result::ready ||
+                           c[0].result == lx::compositor::capture_result::fence));
+    if (n == 1) {
+        wait_fence(c[0].fence_fd);
+        const std::uint32_t red = client.at(5, 23);
+        const std::uint32_t pointed = client.at(12, 22);
+        LUMEN_CHECK(((red >> 16) & 0xFF) > 200 && (red & 0xFF) < 60);
+        LUMEN_CHECK(pointed == 0x00FF'FFFFu); // the blended pointer, opaque white
+    }
+    lx::compositor::capture_job forget{};
+    forget.kind = lx::compositor::capture_job_kind::forget_session;
+    forget.session = 8;
+    (void)r.channel.post(forget);
+    r.renderer.take(r.channel);
+    lx::compositor::capture_job drop{};
+    drop.kind = lx::compositor::capture_job_kind::forget_buffer;
+    drop.target.buffer_key = 44;
+    (void)r.channel.post(drop);
+    r.renderer.take(r.channel);
+}
+
 #endif // LUMEN_HAS_EGL
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

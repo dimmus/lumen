@@ -361,6 +361,10 @@ public:
     /// `slot`'s read to land; its rows, or null when it failed or timed out.
     [[nodiscard]] const unsigned char* read_back_wait(unsigned slot,
                                                       unsigned long long timeout_ns) const;
+    /// As `read_back_wait`, for a copy that lands in the client's own dma-buf — no rows
+    /// come back (the client owns the buffer), so this waits the slot's fence alone: false
+    /// when it failed or timed out.
+    [[nodiscard]] bool read_back_wait_fence(unsigned slot, unsigned long long timeout_ns) const;
     /// Render thread: frees `slot` (its capture session ended). Waits for its read first.
     void read_back_free(unsigned slot);
 
@@ -4784,6 +4788,26 @@ const unsigned char* lx::gfx::vulkan_compositor::read_back_wait(
     (void)slot;
     (void)timeout_ns;
     return nullptr;
+#endif
+}
+
+bool lx::gfx::vulkan_compositor::read_back_wait_fence(unsigned slot,
+                                                      unsigned long long timeout_ns) const {
+#ifdef LUMEN_HAS_VULKAN
+    if (slot >= k_readback_slots)
+        return false;
+    const readback_slot& rb = readbacks_[slot];
+    // No `rb.mapped` here by design: a dma-buf copy's destination is the client's buffer,
+    // and the fence every read-back or copy submit signals is the completion to wait.
+    if (!rb.submitted || !rb.fence)
+        return false;
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto fence = static_cast<VkFence>(rb.fence);
+    return vkWaitForFences(dev, 1, &fence, VK_TRUE, timeout_ns) == VK_SUCCESS;
+#else
+    (void)slot;
+    (void)timeout_ns;
+    return false;
 #endif
 }
 
