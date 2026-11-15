@@ -6578,9 +6578,13 @@ void compositor_impl::commit_black_frame(output_pipeline& p) {
     // Its flip lands while gated: it rotates the slot and answers nothing.
     p.pending_flip_slot.store(slot, std::memory_order_release);
     p.last_commit_content.store(false, std::memory_order_release);
-    if (auto committed = p.kms->commit(req); committed && p.kms->completion_needs_dispatch())
+    const auto committed = p.kms->commit(req);
+    if (committed && p.kms->completion_needs_dispatch())
         post_flip_dispatch();
-    if (fence >= 0)
+    // The commit layer closed the in-fence on success (its word: the request's field came
+    // back -1); a failed one leaves the fd solely owned here. Closing it after a success
+    // would kill whatever number the kernel reused meanwhile (the Z7 class).
+    if (!committed && fence >= 0)
         ::close(fence);
     // Every slot is stale against what a power-on shows (the resume repaints it all anyway).
     for (unsigned i = 0; i < output_pipeline::k_slots; ++i)
