@@ -15,6 +15,13 @@ current when an item closes.
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
   schema-side rows in `lumen-settings` waiting on their own compositor feature (rule store
   behind the inert `zlm_window_rules_v1`; `[[input.device]]` override plumbing), not on the app.
+- [ ] **Owed VM golden check (unit-pair-green)** — run `./build/test/lumen-ui-gallery --check`
+  on the dev VM (tests-enabled build of the unit-pair-green tree, or main once it merges) at
+  the next VM session and record the result; then check this row off. It is the open condition
+  of the owner's 2026-11-15 acceptance of the golden substitution
+  (`.zcode/memories/lumen-unit-pair-green.md`): cpu expected 0/255 in both themes, gl ≤ 3 vs
+  CPU (G10); a VM failure there is a new finding about FreeType-version sensitivity, to be
+  handled then — not a regression of the substitution.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
