@@ -3,6 +3,7 @@ module;
 #ifdef LUMEN_HAS_VULKAN
 #include <vulkan/vulkan.h>
 #endif
+#include <fcntl.h>
 #include <stdint.h>
 #include <unistd.h> // lseek: a capture dma-buf's size
 
@@ -400,10 +401,19 @@ public:
     /// like an output's frame. ARGB8888 — a window has alpha where it covers nothing.
     [[nodiscard]] lx::result<void> capture_view_target(render_target& slot, unsigned width,
                                                        unsigned height);
+    /// A sync_file signalled once everything the GPU has been submitted so far has
+    /// completed — the capture composite of this tick included (a global memory barrier in
+    /// a submit of its own orders against all prior submissions on the queue). What the
+    /// release fence of the captured window's client buffers follows: the composite's own
+    /// out fence cannot serve (its slot semaphore is re-signalled by the next frame, which
+    /// invalidates the export), so this runs on a dedicated pair — signalled and exported
+    /// here, nowhere else. One at a time (one capture tick's composites); the previous
+    /// export is a snapshot that stays valid. -1 when the device exports none.
+    [[nodiscard]] lx::result<int> capture_sample_fence();
     /// Read-back and capture buffers created so far: same-size read-backs and an unchanged
     /// window target allocate nothing — tests assert capture stays off the allocation path.
     [[nodiscard]] unsigned readback_allocations() const { return readback_allocations_; }
-    /// dma-buf imports created so far (a re-import happens only for an evicted buffer).
+    /// dma-bufs imported so far (a re-import happens only for an evicted buffer).
     [[nodiscard]] unsigned capture_dmabuf_imports() const { return capture_dmabuf_imports_; }
 
     // ── Backdrop blur (ext-background-effect-v1) ──────────────────────────────────
@@ -770,6 +780,12 @@ private:
     unsigned long long capture_dmabuf_clock_ = 0;
     unsigned readback_allocations_ = 0;
     unsigned capture_dmabuf_imports_ = 0;
+    /// `capture_sample_fence`'s dedicated sync: its own semaphore (exported there and
+    /// nowhere else), fence and command buffer (freed once the fence signalled), made on
+    /// first use.
+    void* sample_semaphore_ = nullptr;
+    void* sample_fence_ = nullptr;
+    void* sample_command_buffer_ = nullptr;
 
     /// Makes `rb`'s persistent mapped buffer (`needed` bytes, cached memory where the device
     /// has it), command buffer, fence and — where sync files can be exported — semaphore.
@@ -2020,6 +2036,21 @@ void lx::gfx::vulkan_compositor::shutdown() {
         for (unsigned i = 0; i < k_readback_slots; ++i)
             read_back_free(i);
         free_readback_slot(sync_read_);
+        if (sample_fence_) {
+            auto fence = static_cast<VkFence>(sample_fence_);
+            (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull);
+            vkDestroyFence(dev, fence, nullptr);
+            sample_fence_ = nullptr;
+        }
+        if (sample_command_buffer_) {
+            auto cb = static_cast<VkCommandBuffer>(sample_command_buffer_);
+            vkFreeCommandBuffers(dev, static_cast<VkCommandPool>(ctx_.command_pool), 1, &cb);
+            sample_command_buffer_ = nullptr;
+        }
+        if (sample_semaphore_) {
+            vkDestroySemaphore(dev, static_cast<VkSemaphore>(sample_semaphore_), nullptr);
+            sample_semaphore_ = nullptr;
+        }
         for (capture_dmabuf& d : capture_dmabufs_) {
             if (d.memory)
                 vkFreeMemory(dev, static_cast<VkDeviceMemory>(d.memory), nullptr);
@@ -4967,7 +4998,11 @@ lx::result<void> lx::gfx::vulkan_compositor::capture_dmabuf_import(
     VkImportMemoryFdInfoKHR import{};
     import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
     import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    import.fd = fd; // borrowed: the caller closes it, the driver dups what it keeps
+    // A dup of our own: whatever the driver does with the fd it is handed (the spec lets
+    // an implementation take it), the caller's must stay open until it closes it.
+    import.fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (import.fd < 0)
+        return vk_error("capture dma-buf: cannot dup the descriptor");
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.pNext = &import;
@@ -4975,9 +5010,11 @@ lx::result<void> lx::gfx::vulkan_compositor::capture_dmabuf_import(
     mai.memoryTypeIndex = type;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
+        ::close(import.fd);
         vkDestroyBuffer(dev, buffer, nullptr);
         return vk_error("capture dma-buf vkAllocateMemory failed");
     }
+    ::close(import.fd); // the memory holds its own reference from here
     if (vkBindBufferMemory(dev, buffer, memory, 0) != VK_SUCCESS) {
         vkFreeMemory(dev, memory, nullptr);
         vkDestroyBuffer(dev, buffer, nullptr);
@@ -5281,4 +5318,92 @@ lx::result<void> lx::gfx::vulkan_compositor::capture_view_target(render_target& 
         return made.get_error();
     slot = std::move(made).value();
     return {};
+}
+
+lx::result<int> lx::gfx::vulkan_compositor::capture_sample_fence() {
+#ifdef LUMEN_HAS_VULKAN
+    if (!ready() || !can_export_fence_)
+        return -1;
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto queue = static_cast<VkQueue>(ctx_.queue);
+    if (!sample_semaphore_) {
+        VkExportSemaphoreCreateInfo export_info{};
+        export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+        export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        VkSemaphoreCreateInfo sem_ci{};
+        sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sem_ci.pNext = &export_info;
+        VkSemaphore sem = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(dev, &sem_ci, nullptr, &sem) != VK_SUCCESS)
+            return lx::result<int>{vk_error("capture fence vkCreateSemaphore failed")};
+        sample_semaphore_ = sem;
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT; // the first wait (nothing submitted yet)
+        VkFence fence = VK_NULL_HANDLE;
+        if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS)
+            return lx::result<int>{vk_error("capture fence vkCreateFence failed")};
+        sample_fence_ = fence;
+    }
+    auto sem = static_cast<VkSemaphore>(sample_semaphore_);
+    auto fence = static_cast<VkFence>(sample_fence_);
+    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+        return lx::result<int>{vk_error("capture fence: the previous one never completed")};
+    vkResetFences(dev, 1, &fence);
+    if (sample_command_buffer_) {
+        // Kept until the fence above signalled: freeing a pending buffer is not allowed.
+        auto old = static_cast<VkCommandBuffer>(sample_command_buffer_);
+        vkFreeCommandBuffers(dev, static_cast<VkCommandPool>(ctx_.command_pool), 1, &old);
+        sample_command_buffer_ = nullptr;
+    }
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = static_cast<VkCommandPool>(ctx_.command_pool);
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(dev, &cbai, &cb) != VK_SUCCESS)
+        return lx::result<int>{vk_error("capture fence vkAllocateCommandBuffers failed")};
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &begin);
+    // A global barrier: its first scope is every command submitted to the queue so far —
+    // the capture composite this follows included.
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cb, &dep);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cb;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &sem;
+    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(dev, static_cast<VkCommandPool>(ctx_.command_pool), 1, &cb);
+        return lx::result<int>{vk_error("capture fence vkQueueSubmit failed")};
+    }
+    sample_command_buffer_ = cb;
+    VkSemaphoreGetFdInfoKHR get{};
+    get.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+    get.semaphore = sem;
+    get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+    auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+        vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
+    int fd = -1;
+    if (!get_fd || get_fd(dev, &get, &fd) != VK_SUCCESS || fd < 0)
+        return lx::result<int>{vk_error("capture fence: no sync file")};
+    return fd;
+#else
+    return -1;
+#endif
 }

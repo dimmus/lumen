@@ -347,7 +347,13 @@ bool read_pixel(const spa_data& d, int stride, int x, int y, uint8_t out[4]) {
         return true;
     }
     const int fd = static_cast<int>(d.fd);
-    const std::size_t len = d.mapoffset + d.maxsize;
+    // The whole allocation, from the dma-buf itself: the chunk fields a producer fills for
+    // a dma-buf plane need not describe the buffer (observed: size 9), and a short mapping
+    // would read past its end.
+    const off_t end = ::lseek(fd, 0, SEEK_END);
+    if (end <= 0)
+        return false;
+    const std::size_t len = static_cast<std::size_t>(end);
     void* m = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
     if (m == MAP_FAILED)
         return false;

@@ -223,6 +223,7 @@ const struct wp_linux_drm_syncobj_manager_v1_interface manager_impl = {
             // The fd is closed by `import` in every path.
             auto imported = g_timelines.import(fd);
             if (!imported) {
+                log_timeline_error(imported.get_error());
                 wl_resource_post_error(r, WP_LINUX_DRM_SYNCOBJ_MANAGER_V1_ERROR_INVALID_TIMELINE,
                                        "the fd is not a DRM syncobj");
                 return;

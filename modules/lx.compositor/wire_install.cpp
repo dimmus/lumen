@@ -760,14 +760,13 @@ void install_core(protocol_context& ctx) {
              .interface_desc = &ext_output_image_capture_source_manager_v1_interface},
             &bind_output_capture_source_manager);
 #ifdef LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1
-        if (ctx.capture->backend != capture_backend::vulkan)
-            ctx.server->add_global(
-                {.interface_name = "ext_foreign_toplevel_image_capture_source_manager_v1",
-                 .version = 1,
-                 .privileged = false,
-                 .deny_sandboxed = true,
-                 .interface_desc = &ext_foreign_toplevel_image_capture_source_manager_v1_interface},
-                &bind_toplevel_capture_source_manager);
+        ctx.server->add_global(
+            {.interface_name = "ext_foreign_toplevel_image_capture_source_manager_v1",
+             .version = 1,
+             .privileged = false,
+             .deny_sandboxed = true,
+             .interface_desc = &ext_foreign_toplevel_image_capture_source_manager_v1_interface},
+            &bind_toplevel_capture_source_manager);
 #endif
         ctx.server->add_global({.interface_name = "ext_image_copy_capture_manager_v1",
                                 .version = 1,

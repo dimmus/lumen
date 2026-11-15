@@ -42,6 +42,7 @@ module;
 #include <stdint.h>
 #include <time.h>
 
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -233,9 +234,36 @@ void buffer_unwatch(frame_obj* f) {
     f->buffer = nullptr;
 }
 
+/// The frame's captured dma-buf is no longer in use (its copy completed and `ready` was
+/// sent, or the frame failed without the GPU writing it): the client may reuse the buffer.
+/// wlroots sends the same; a screencast that cycles a pair of buffers (xdpw) waits for it
+/// before its next capture. Shm buffers keep their guard as the reuse signal.
+void release_captured_buffer(const frame_obj* f) {
+    if (!f->buffer)
+        return;
+    const buffer_obj* b = find_buffer(f->buffer);
+    if (b && b->is_dmabuf)
+        wl_buffer_send_release(f->buffer);
+}
+
 void send_failed(frame_obj* f, capture_failure reason) {
     if (!f || f->state == frame_state::done)
         return;
+    if (log_capture.enabled(lx::trace::level::debug)) {
+        log_capture.debug("frame failed session={} serial={} reason={} state={}",
+                          f->session ? f->session->handle : 0, f->serial,
+                          static_cast<unsigned>(reason),
+                          f->state == frame_state::requested   ? "requested"
+                          : f->state == frame_state::posted    ? "posted"
+                          : f->state == frame_state::waiting_fence ? "waiting_fence"
+                          : f->state == frame_state::waiting_read ? "waiting_read"
+                          : "idle");
+    }
+    // A frame nothing of was ever in flight (a limit, constraints) may hand the buffer
+    // straight back; one the GPU may still be writing (a fence that could not be watched)
+    // keeps it — the client hears the failure and asks again.
+    if (f->state == frame_state::idle || f->state == frame_state::requested)
+        release_captured_buffer(f);
 #ifdef LUMEN_HAS_SCREENCOPY
     if (f->screencopy)
         zwlr_screencopy_frame_v1_send_failed(f->resource);
@@ -639,6 +667,7 @@ void send_ready(frame_obj* f, const capture_completion& meta) {
         }
         if (so && !f->curtain)
             so->last_ready_ns = mono_ns();
+        release_captured_buffer(f);
         return;
     }
 #endif
@@ -680,6 +709,7 @@ void send_ready(frame_obj* f, const capture_completion& meta) {
                           f->serial, d.full ? "full/" : "", d.full ? 0u : d.count, meta.frame,
                           f->curtain ? " curtain" : "");
     }
+    release_captured_buffer(f);
 }
 
 // ── frame ────────────────────────────────────────────────────────────────────
@@ -1396,8 +1426,10 @@ void lx::compositor::capture_complete(protocol_context& ctx) {
                     send_ready(f, f->meta);
                 else if (cu_poll_add(c.fence_fd, k_poll_base + so->handle, c.serial))
                     f->state = frame_state::waiting_fence;
-                else
+                else {
+                    log_capture.error("capture fence not polled: {}", std::strerror(errno));
                     send_failed(f, capture_failure::unknown);
+                }
                 break;
             case capture_result::readback:
                 f->meta = c;

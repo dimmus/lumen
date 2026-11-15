@@ -1359,12 +1359,22 @@ void capture_renderer::toplevel_composited(unsigned view, const lx::gfx::damage_
                 if (!drew) {
                     log_capture.error(drew.get_error());
                     ok = false;
-                } else if (drew.value().out_fence_fd >= 0) {
-                    // The composite sampled client textures: its fence is what
-                    // explicit-sync release points must follow (`take_sample_fence`).
-                    if (sample_fence_vk_ >= 0)
-                        ::close(sample_fence_vk_);
-                    sample_fence_vk_ = drew.value().out_fence_fd;
+                } else {
+                    // The composite sampled client textures: what its buffers'
+                    // explicit-sync release points must follow (`take_sample_fence`). The
+                    // composite's own out fence cannot serve — its slot semaphore is
+                    // re-signalled by the next frame — so a dedicated one covers
+                    // everything submitted so far, this composite included.
+                    if (drew.value().out_fence_fd >= 0)
+                        ::close(drew.value().out_fence_fd);
+                    auto fence = vk_->capture_sample_fence();
+                    if (!fence) {
+                        log_capture.error(fence.get_error());
+                    } else if (fence.value() >= 0) {
+                        if (sample_fence_vk_ >= 0)
+                            ::close(sample_fence_vk_);
+                        sample_fence_vk_ = fence.value();
+                    }
                 }
             }
             const unsigned slot = static_cast<unsigned>(&st - sessions_);
