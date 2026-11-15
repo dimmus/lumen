@@ -15,5 +15,7 @@ Measured 2026-10-28 against a clean build of main 6296931 on the vmwgfx VM:
 
 Update 2026-10-29: on main f42b085 Z2–Z6 PASS (177/177 in two runs), so they are no longer known-broken; the new environmental failure is run:(clean log) from '[WARN] compositor.memory: critical pressure' when /tmp tmpfs and other sessions push PSI, reproducible on base binaries. Another session's lumen-vkmark-bench compositor can hold DRM master.
 
+Update 2026-11-15: on the notebook the critical-pressure WARN was **not** PSI — PSI never fired (zero transitions in every failing log); it was the staging pool judging `bytes_mapped()` (size-class rounding + cached spare blocks = two 32 MiB blocks = exactly 100% of the 64 MiB budget). Fixed in memory-pressure-green d24e1f3 by judging `bytes_in_flight()`; final run has zero critical lines — [[lumen-memory-pressure-green]]. The PSI/tmpfs attribution above stays true for the VM's genuine spikes only (PSI path untouched, still fires where real).
+
 **Why:** a session spent a baseline build proving these were not caused by the tiling change.
 **How to apply:** treat Z2–Z6 as known-broken and T as flaky until fixed; compare with a baseline when they fail. Related: [[lumen-host-build-run-env]].
