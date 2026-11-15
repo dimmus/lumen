@@ -169,6 +169,16 @@ public:
     void trim();
     /// UI affinity. Bytes currently mapped, in flight or cached.
     [[nodiscard]] unsigned long long bytes_mapped() const { return mapped_bytes_; }
+    /// Bytes staged and not yet uploaded: the backlog the memory coordinator judges
+    /// pressure against. Not `bytes_mapped()`: a cached spare block is capacity held for
+    /// reuse (unmapped after an idle second), and the size classes round a 23 MB fullscreen
+    /// update up to a 32 MiB block — two of those mapped once read as 100 % of the staging
+    /// budget, and a normal working set as `critical pressure` on a host with GiBs to spare.
+    /// 100 % of this is where `acquire` starts declining updates, which is what the
+    /// critical threshold has to mean.
+    [[nodiscard]] unsigned long long bytes_in_flight() const {
+        return in_flight_bytes_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] unsigned blocks_mapped() const;
 
 private:

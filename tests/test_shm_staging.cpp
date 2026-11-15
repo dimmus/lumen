@@ -112,6 +112,42 @@ LUMEN_TEST(pool_refuses_when_every_block_is_in_flight) {
     pool.trim();
 }
 
+// Pressure is judged against the backlog — bytes staged and not yet uploaded — not against
+// bytes mapped. Two size-class blocks mapped (64 MiB after rounding two fullscreen updates
+// up) once read as 100 % of the staging budget and a normal client workload as
+// `critical pressure` on a host with GiBs available; the spare capacity a cached block
+// holds is not consumption, and 100 % of the backlog is where updates start being dropped.
+LUMEN_TEST(pool_in_flight_counts_the_backlog_not_spare_capacity) {
+    shm_upload_pool pool;
+    unsigned long long t = 0;
+    unsigned char* a = pool.acquire(300 * 1024, t, 1);
+    LUMEN_CHECK(a != nullptr && t != 0);
+    LUMEN_CHECK(pool.bytes_in_flight() == 300u * 1024u);
+    LUMEN_CHECK(pool.bytes_mapped() >= 512u * 1024u); // the class rounds up
+
+    pool.release(t);
+    // Released but cached for reuse: still mapped, no longer a backlog.
+    LUMEN_CHECK(pool.bytes_in_flight() == 0);
+    LUMEN_CHECK(pool.bytes_mapped() >= 512u * 1024u);
+    pool.trim();
+    LUMEN_CHECK(pool.bytes_in_flight() == 0 && pool.bytes_mapped() == 0);
+}
+
+LUMEN_TEST(pool_backlog_reaches_the_cap_where_updates_are_declined) {
+    shm_upload_pool pool;
+    unsigned long long a = 0, b = 0, declined = 0;
+    LUMEN_CHECK(pool.acquire(40u << 20u, a, 1) != nullptr); // 40 MiB staged
+    LUMEN_CHECK(pool.acquire(24u << 20u, b, 1) != nullptr); // 64 MiB together: the cap
+    LUMEN_CHECK(pool.bytes_in_flight() == (40ull << 20) + (24ull << 20));
+    LUMEN_CHECK(pool.bytes_in_flight() == shm_upload_pool::k_max_in_flight_bytes);
+    // At the cap the next update is dropped, not staged: the budget the coordinator sees
+    // is exactly the pool's drop point, so critical (90 %) means "about to drop".
+    LUMEN_CHECK(pool.acquire(64 * 1024, declined, 1) == nullptr && declined == 0);
+    pool.release(a);
+    pool.release(b);
+    LUMEN_CHECK(pool.bytes_in_flight() == 0);
+}
+
 LUMEN_TEST(store_frees_a_retired_texture_once_nothing_samples_it) {
     shm_pixel_store store;
     unsigned long long token = 0;

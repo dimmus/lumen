@@ -134,6 +134,33 @@ LUMEN_TEST(staging_is_not_an_arena) {
     LUMEN_CHECK(ui.used_bytes() == used); // resetting "staging" must not reset the UI arena
 }
 
+// What the compositor reports as `memory_pool::staging` is the upload backlog — bytes
+// staged and not yet uploaded — and the budget (64 MiB) is the pool's own drop point. A
+// fullscreen client's 23 MiB backlog is a normal working set even while two size-class
+// blocks are mapped (that mapping once read as 100 % and as `critical pressure` on a host
+// with GiBs available); a backlog at 95 % is genuinely critical: the next update is about
+// to be dropped.
+LUMEN_TEST(staging_pressure_judges_the_backlog_against_the_drop_point) {
+    lx::runtime::memory_budget_coordinator coord{};
+    coord.set_pressure_handler(&on_pressure);
+    g_calls = 0;
+    constexpr unsigned k_budget = 64u * 1024u * 1024u;
+    // 23 MiB staged of 64: a fullscreen update in flight (its block rounds up to 32 MiB
+    // mapped, and a cached second block would map 64 — none of that is pressure).
+    coord.report_usage(lx::runtime::memory_pool::staging, 23u * 1024u * 1024u, k_budget);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::normal);
+    // 50 MiB of 64 (78 %): most of the headroom is consumed — the pool would decline a
+    // second fullscreen update — but small ones still stage.
+    coord.report_usage(lx::runtime::memory_pool::staging, 50u * 1024u * 1024u, k_budget);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::moderate);
+    // 61 MiB of 64: 95 % — the pool declines the next update at the cap.
+    coord.report_usage(lx::runtime::memory_pool::staging, 61u * 1024u * 1024u, k_budget);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::critical);
+    LUMEN_CHECK(g_last == lx::runtime::memory_pressure::critical);
+    coord.report_usage(lx::runtime::memory_pool::staging, 0, k_budget);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::normal);
+}
+
 namespace {
 
 /// Pages of [p, p + bytes) resident in this process, by mincore.

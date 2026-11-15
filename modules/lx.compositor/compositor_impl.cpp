@@ -2640,7 +2640,17 @@ void compositor_impl::handle_memory_pressure(lx::runtime::memory_pressure level)
     if (level != lx::runtime::memory_pressure::normal)
         shm_pool_.trim();
     if (level == lx::runtime::memory_pressure::critical) {
-        log_memory.warn("critical pressure — evicting caches");
+        // Name the pools that move: "critical" alone says nothing about which signal drove
+        // it (the coordinator takes the fullest pool, and the kernel's PSI logs its own
+        // transitions under runtime.psi) — the pair is what made the next diagnosis of a
+        // wrong verdict a grep instead of an instrumented run.
+        const unsigned long long staged =
+            shm_store_.bytes_held() + shm_pool_.bytes_in_flight();
+        log_memory.warn("critical pressure — evicting caches (staged {} KiB of {} budget, "
+                        "gpu {} KiB of {})",
+                        staged >> 10u, memory_.config().staging_budget_bytes >> 10u,
+                        gpu_used_kib_.load(std::memory_order_relaxed),
+                        gpu_budget_kib_.load(std::memory_order_relaxed));
     }
 }
 
@@ -4073,7 +4083,7 @@ void compositor_impl::answer_health(unsigned token, bool render_answered, unsign
     in.import_cache_used = cache_used;
     in.import_cache_capacity = cache_capacity;
     in.render_figures = render_answered;
-    in.staging_bytes = shm_store_.bytes_held() + shm_pool_.bytes_mapped();
+    in.staging_bytes = shm_store_.bytes_held() + shm_pool_.bytes_in_flight();
     in.staging_budget = memory_.config().staging_budget_bytes;
     in.gpu = gpu_memory_for_health();
     in.last_tick_ui_us = budget_.last_tick_ui_us();
@@ -10402,12 +10412,16 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Output heads changed since the last loop iteration (tests drive ticks without the loop).
     impl->flush_output_heads();
     // Staging: free retired CPU-path storage the render thread has let go of, unmap GL
-    // blocks idle past the threshold, and report what is left against the budget.
+    // blocks idle past the threshold, and report the backlog against the budget. The
+    // backlog — staged and not yet uploaded — is what pressure means here: a cached spare
+    // block is capacity held for reuse, not consumption, and counting mapped bytes (with
+    // their size-class rounding) read a fullscreen client's normal working set as critical
+    // pressure on a host with GiBs available.
     impl->shm_store_.collect();
     impl->shm_pool_.collect(impl->wire_.now_ns, detail::compositor_impl::k_staging_idle_ns);
     {
         const unsigned long long staged = impl->shm_store_.bytes_held() +
-                                          impl->shm_pool_.bytes_mapped();
+                                          impl->shm_pool_.bytes_in_flight();
         lx::trace::timeline_counter("staging_bytes", static_cast<long long>(staged));
         const unsigned clamped =
             staged > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<unsigned>(staged);

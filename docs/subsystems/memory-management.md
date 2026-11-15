@@ -96,7 +96,14 @@ GL otherwise, and Vulkan: `shm_upload_pool` — transient mmap'd blocks (sized b
 buffer-age region on GL, the whole image on Vulkan), returned right after the upload,
 unmapped after 1 s idle; an idle desktop holds none, and no more than 64 MiB is staged and
 not yet uploaded. CPU: `shm_pixel_store` — the staged rows are the texture, freed by `collect` once a
-retired texture's slots are no longer sampled. Both are reported as `memory_pool::staging`.
+retired texture's slots are no longer sampled. Both are reported as `memory_pool::staging`
+— the upload pool's share of the report is the **backlog** (bytes staged and not yet
+uploaded), never its mapped bytes: a cached spare block is capacity held for reuse, and the
+power-of-two size classes round a 23 MB fullscreen update up to a 32 MiB block, so two
+mapped blocks once read as 100 % of the budget — a fullscreen client's normal working set
+as `critical pressure` on a host with GiBs available. The 64 MiB budget is the pool's own
+drop point (`k_max_in_flight_bytes`), so 100 % is exactly where `acquire` starts declining
+updates and `critical` (90 %) means drops are imminent.
 See rendering-performance.md, SHM staging, for why per-texture staging used to grow
 without bound.
 

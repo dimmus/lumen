@@ -107,6 +107,8 @@ struct memory_status {
     unsigned long long rss_kib = 0;
     unsigned import_cache_used = 0;
     unsigned import_cache_capacity = 0;
+    /// Staged and not yet consumed (the upload backlog), not bytes mapped: cached spare
+    /// blocks and size-class rounding are capacity, not consumption.
     unsigned long long staging_bytes = 0;
     /// 0: no budget configured.
     unsigned long long staging_budget = 0;
