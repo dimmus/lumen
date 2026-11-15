@@ -1,6 +1,6 @@
 ---
 name: lumen-vulkan-capture-green
-description: "2026-11-15 notebook capture task (worktree vulkan-capture-green, c28e3a0..abf37cb, gate NOT_READY): Vulkan read-back (SIGUSR1 write_screenshot branches per backend, pooled one-shot read_back 3.33/3.34/3.36 ms median @3200x1800 on hasvk), window capture via ext_foreign_toplevel_image_capture_source_v1, capture dma-buf (LRU import + vkCmdCopyImageToBuffer at client stride/offset, sync-file frame fence, worker pointer blend); app-smoke 176 PASS/1 FAIL run2 (174/3 run1 — O6+Z7), all 15 backend-limited rows + Y4 dmabuf+shm + Z1–Z8 PASS, WARNs flipped capability-driven via the compositor.capture:capabilities log line; ctest 132/134; three real-world defects fixed (fd-consuming import, missing wl_buffer.release — latent-broken on GL too, stale frame-slot sample fence); review 5/5 confirmed and fixed (00d3614, dc3e93e); Z7 flake 3-layered (3be174d): portal SIGSEGV + interface takeover FIXED, the compositor's stale-fd close killing the portal's fresh ui connection remains OPEN — hence NOT_READY; the gate-time run at final HEAD was invalid (no uinput holder, drag VERDICT: FAIL)"
+description: "2026-11-15 notebook capture task (worktree vulkan-capture-green, c28e3a0..959c9cd, gate NOT_READY twice): Vulkan read-back (SIGUSR1, pooled one-shot read_back 3.33/3.34/3.36 ms median @3200x1800 on hasvk), window capture via ext_foreign_toplevel_image_capture_source_v1, capture dma-buf (LRU import + vkCmdCopyImageToBuffer at client stride/offset, sync-file frame fence, worker pointer blend); app-smoke 176 PASS/1 FAIL with all 15 backend-limited rows + Y4 + Z1–Z8 PASS, WARNs flipped capability-driven via the compositor.capture:capabilities line; ctest 132/134; Z7 flake CLOSED in round 6 — kernel never consumes IN_FENCE_FD (mainline sync_file_get_fence takes a ref only), the killer was take_sample_fence(!wanted) returning its own just-closed fd whose number the release-mailbox replace-close then killed on reuse (the portal's fresh ui connection), fixed in 3 layers (lx.drm commit owns the in-fence: close-on-success + field-clear b6b1f55; persistent-syncobj release mailbox; return -1 f7640f9; F_GETFD probe deleted); 3× Z-streaks 10 PASS/0 FAIL with 0 import-refused (pre-fix 117–119/run per packet), full app-smoke 176/1/0 + drag PASS at f7640f9 with the REL holder live (pid 2692863, event16); review rounds 5/5 then 4/4 fixed (1ce36d8 black-frame double-close, dcf001e eviction wait-before-free); NOT_READY at the gate-time tip run: 171 PASS/6 FAIL with Z2–Z6 'response None' vs 176/1/0 the same morning — undiagnosed regression across 3a4441e/1ce36d8/dcf001e, §1.2 A/B owed to the user; the packet's '152 PASS rows' is a truncated-^PASS workflow artifact (no committed run has 152); disproven: kernel consumes IN_FENCE_FD, 'the portal churn is the race'"
 metadata:
   node_type: memory
   type: project
@@ -112,32 +112,137 @@ the [[lumen-smoke-bench-harness-green]] round-5 rule).
   test_vk_capture 12/12 with the latency reproduced (3.36 ms), §1.1 clean, WARN flip
   capability-driven, all five review fixes verbatim, O6 widening recorded.
 
+## Round 6 — the Z7 killer caught from failing runs and the chain closed; a NEW tip-level Z2–Z6 regression blocks the gate, 2026-11-15 (branch tip **959c9cd**; every log below tallied by the memory writer this session)
+
+- **Item 1 — the killer caught (the prescribed plan failed, a cheaper one worked):** the
+  z7-flake README's gdb `catch syscall close` could not confirm anything — its own
+  caveat says tracer-slowed runs pass. An LD_PRELOAD close auditor (~50 ns/close:
+  fd + caller return address + CLOCK_MONOTONIC into a ring, accept4 marked; kept out of
+  the tree in /tmp/close-audit) ran on FAILING runs — Z7 failed 3/3 at the round's
+  starting head, so the exposure window stayed open — and caught the chain with
+  line-level attribution. The kernel-consumption theory is disproven from mainline
+  source: `drm_atomic_plane_set_property` handles IN_FENCE_FD via
+  `sync_file_get_fence`, which only takes a fence reference — **the kernel never
+  closes an IN_FENCE_FD**; a truthful "kernel consumed it" report would be
+  constant-false, voiding the packet's prescribed reporting mechanism.
+- **The proven chain (z7-fixed/README "The catch"):** `take_sample_fence(!wanted)`
+  consumed the sample-fence fd and then returned its dead number
+  (modules/lx.compositor/capture_engine.cpp:415-430 — fixed to return -1, f7640f9);
+  the capture drain published the stale number into the release-fence mailbox; the
+  mailbox's replace-close of that number landed on whatever had reused it — the
+  portal's fresh ui connection (accept4, killed 68–71 ms later through the
+  publish_release_fence tail call) and, on the older build, the pipeline's own
+  composited_fence (the EBADF+EINVAL signature). The F_GETFD probe in
+  drop_consumed_fence could not tell a consumed fence from a reused number — deleted,
+  only an explanatory comment remains (compositor_impl.cpp:11514;
+  forget_consumed_fence :223 answers the layer's word at :11504 and :11647).
+- **The fix, three layers (b6b1f55 + f7640f9) — no fence fd crosses a frame:** (1)
+  lx.drm's commit owns the in-fence: on success it closes the fd and reports
+  consumption by clearing `request.in_fence_fd`; on failure it leaves the fd open for
+  the caller's retry (modules/lx.drm/lx.drm.cppm close+clear, verified; result-typed,
+  no fd-number guessing above lx.drm, per the scope note). (2) the release-fence
+  mailbox holds the newest fence as a persistent DRM syncobj — import-on-publish,
+  `drmSyncobjTransfer` to release points. (3) `take_sample_fence(!wanted)` returns -1.
+- **Item 2 — seat evidence at f7640f9 with the REL holder live (pid 2692863, event16),
+  committed under evidence/2026-11-15-vulkan-capture/z7-fixed/:** three consecutive
+  `--only Z` streaks **10 PASS / 0 FAIL each** (Z1–Z8 + 2 run rows) with **0
+  `release-fence import refused` lines** (the packet reports the pre-fix streaks at
+  117–119/run — not re-verified by me); the full app-smoke **176 PASS / 1 FAIL /
+  0 WARN**, the FAIL the owner-documented PSI tmpfs clean-log row, all 15 flip rows +
+  Y4 dmabuf + Z1–Z8 PASS (16/16 flip-row lines counted); drag-smoke `VERDICT: PASS
+  (warnings: g latency)` — the known host-noise family
+  ([[lumen-toplevel-drag-compositor]]).
+- **New tests (all present, verified by grep):**
+  `release_fence_mailbox_keeps_the_newest_as_a_syncobj`
+  (tests/test_content_update.cpp:356), the in-fence ownership rounds
+  (tests/test_kms_vkms.cpp:182 — this host's vkms lacks DRIVER_SYNCOBJ, so only the
+  failure half runs on the seat; the success half is proven by the 60 fps seat runs),
+  `vk_take_sample_fence_never_hands_on_a_closed_fd` (tests/test_vk_capture.cpp:643).
+- **Review: 4 findings confirmed, 0 refuted, all fixed by f073a24** (content per the
+  review report; the resulting tree state verified by grep): 1ce36d8 — the DPMS
+  black-frame path double-closed the in-fence the KMS layer now consumes; the caller
+  closes only when `!committed && fence >= 0`. dcf001e — an LRU-evicted capture
+  dma-buf freed its VkMemory/VkBuffer without waiting in-flight copies;
+  `wait_capture_copies()` now runs before the free (also in capture_dmabuf_forget).
+  bd9043f — the borrowed-fd comment replaced by the real contract
+  (compositor_impl.cpp:11421). f073a24 — the z7-fixed README states 3a4441e was not
+  evidence-only (it added the errno arg to the `release-fence import refused` debug
+  line in modules/lx.gfx/drm_timeline.cpp), so the certified code is exactly
+  f7640f9; history untouched. Review re-ran at f073a24: ctest 132/134 tolerated pair,
+  capture ctest set 6/6, test_vk_capture 13 tests 0 failed (per the review report,
+  not re-run by me).
+- **Gate verdict NOT_READY on a NEW regression — the §1.2 stop condition, live:** the
+  gate-time full app-smoke at tip 959c9cd (evidence/smokes/gate-workflow/app-smoke-logs/
+  run.log, 15:17–15:27, holder event16 alive) is **171 PASS / 6 FAIL / 0 WARN** with
+  **Z2–Z6 all FAIL `response None`** — the portal's interactive frontend never
+  answered (Z1/Z7/Z8 and all 15 flip rows PASS) — against the same-morning f7640f9
+  run's 176/1/0: same harness, same host, same holder, **5 previously-green rows
+  regressed**, and the committed logs do not determine the root cause (0 EBADF,
+  0 import-refused, no client-kill line; the keyboard reached the chooser). The only
+  code between is 3a4441e (log string), 1ce36d8 (black-frame close fix), dcf001e
+  (capture eviction wait). Per §1.2 the A/B evidence goes to the user, not accepted.
+  The tip-level drag-smoke did PASS (gate-workflow/drag-smoke-logs/run.log).
+- **Packet misstatement, for the record:** gate_runs.seat's "app-smoke → PASS at host
+  tolerance (152 PASS rows ≥ 140)" — no committed run has 152 PASS rows (176 and 171
+  verified by me here); the number is the workflow step counting `^PASS` over the
+  captured process output (lumen-development-studio.dwf.ts:672-684 — the count spans
+  stderr+stdout of the run; the 65536-char cap the gate names sits upstream of that
+  file, not verified by me), and the tolerance's premise ("the known host-calibrated
+  set") is false for Z2–Z6, green the same morning.
+- **Evidence hygiene at close:** the worktree is dirty —
+  `evidence/smokes/gate/precheck-app-smoke.txt` modified and `precheck-drag-smoke.txt`
+  untracked (the gate-time precheck still leaks into the round-5 acceptance
+  namespace — [[lumen-smoke-bench-harness-green]]'s owed cleanup, still owed), and
+  the 15:07/15:17 prechecks record no injection-device line unlike every certified
+  run's. Gate-named remedy: diagnose the Z2–Z6 `response None` at final head (portal
+  frontend vs the three intervening commits), then re-deliver ITEM 2's battery at the
+  true final head — full app-smoke with Z1–Z8 and the 15 flip rows, Z-streaks per the
+  card, drag-smoke — committed with prechecks showing the injection device.
+
 **Disproven / retracted (do not re-chase):** "Z7's residual is the portal's connection
 churn" — disproven by strace (the compositor closes the fd); the portal is the victim.
-"Z7 is undiagnosed timing luck" — it is well-characterized: a stale close of a reused
-fd number in a ~1 ms window after accept4; what is missing is a symbolized backtrace,
-not a hypothesis. "The WARNs were row-hardcoded and would flip by relabel" — they were
-capability-derived and flipped because the capability now exists.
+"Z7 is undiagnosed timing luck" — closed in round 6: the killer is
+`take_sample_fence(!wanted)`'s dead-fd handoff amplified by the release mailbox's
+replace-close, caught with line-level attribution by an LD_PRELOAD auditor on failing
+runs (the planned symbolized backtrace was never needed). "The kernel consumes
+IN_FENCE_FD (so the KMS layer can report consumption)" — disproven from mainline
+drm_atomic_uapi.c: sync_file_get_fence takes a reference only; ownership had to move
+into the commit layer itself. "The WARNs were row-hardcoded and would flip by relabel"
+— they were capability-derived and flipped because the capability now exists.
 
 **Why:** closing a backend-limited surface area is product work measured in *what real
 clients can now do* — but a flaky acceptance row is not a pass, and a diagnosis that
 names the wrong component (portal vs compositor) sends the next session down the same
-wrong path; the strace evidence, not intuition, settled it. And evidence validity is
-provisioning-bound: the same workflow step that produced 176 PASS produced garbage when
-the uinput holder was absent — a run without its holder is not a weaker pass, it is no
-evidence.
+wrong path; the strace evidence, not intuition, settled it, and round 6 finished it
+only by abandoning both parts of the prescribed plan: the mechanism ("the kernel
+consumes the in-fence") was disproven from mainline source before implementing, and
+the tool (gdb `catch syscall close`) could not observe the failure at all — a ~50 ns
+LD_PRELOAD auditor running on failing runs caught in one evening what a week of
+tracer-based inference had not. Evidence validity is provisioning-bound (the
+holder-less run produced garbage), and evidence *summaries* are not evidence either:
+the workflow's `^PASS` count over truncated captured output reported "152 PASS rows"
+that no committed log contains — only the committed logs, tallied, are the record.
 
-**How to apply:** to finish this task, fix or owner-accept (with A/B evidence, §1.2) the
-layer-3 stale-fd close — start from the README's named next step (debug build, gdb
-`catch syscall close` on the live socket fd read from accept4, one unthrottled
-`--only Z` streak), then produce a valid uinput-held drag-smoke + full app-smoke at
-final HEAD and commit them under evidence/; check the z7-flake README's layer list
-before touching the portal (layers 1–2 are already fixed). The capabilities log line is
-grep-stable (`compositor.capture:capabilities read-back=…`) — scripts key on it. Do not
-call the O6 ±18 tolerance a regression; it is a measured gamma-vs-linear blend delta.
-GL/CPU no-regression claims must cite test_gl_capture/test_capture/test_capture_protocols
-until GL seat smokes actually run on the VM. Read-back latency is quoted as
-`./build/test/test_vk_capture` at 3200x1800 (~3.3 ms median on hasvk).
+**How to apply:** the fence contract as of b6b1f55/f7640f9 — lx.drm's commit owns the
+in-fence (close on success and clear `request.in_fence_fd`; a failed commit hands the
+fd back untouched), no fence fd crosses a frame (release-fence mailbox = one
+persistent DRM syncobj, `drmSyncobjTransfer` to release points),
+`take_sample_fence(!wanted)` returns -1. Never re-add a caller-side close of an
+in-fence/composited_fence after a successful commit — that is the Z7 bug class twice
+over (round-5 killer, 1ce36d8's black-frame double-close). To finish the task:
+diagnose the tip-level Z2–Z6 `response None` regression (portal interactive frontend
+vs commits 3a4441e/1ce36d8/dcf001e — reproduce at f7640f9 vs 959c9cd first), then
+re-deliver ITEM 2's battery at the true final head (full app-smoke with Z1–Z8 + 15
+flip rows, ≥3 Z-streaks, drag-smoke) with prechecks showing the injection device,
+committing only at-level runs. Still owed before merge: the precheck leak into
+`evidence/smokes/gate/` (clean or namespace it). The capabilities log line is
+grep-stable (`compositor.capture:capabilities read-back=…`) — scripts key on it. Do
+not call the O6 ±18 tolerance a regression; it is a measured gamma-vs-linear blend
+delta. GL/CPU no-regression claims must cite
+test_gl_capture/test_capture/test_capture_protocols until GL seat smokes actually run
+on the VM. Read-back latency is quoted as `./build/test/test_vk_capture` at
+3200x1800 (~3.3 ms median on hasvk). Tally smoke evidence from the committed logs —
+never from a workflow step's row counts.
 
 Related: [[lumen-smoke-bench-harness-green]] (the 15-WARN contract this closes, the
 gate-workflow namespace, the uinput-holder provisioning rule), [[lumen-notebook-hw]]
