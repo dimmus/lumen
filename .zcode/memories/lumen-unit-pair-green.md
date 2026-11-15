@@ -1,6 +1,6 @@
 ---
 name: lumen-unit-pair-green
-description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere — task CLOSED 2026-11-15 at tip b5edbea: merge-tree main→7d15912 proven to carry 0 evidence files (clean exit), review round 4/4 confirmed-all-dispositioned (incl. a reviewer's ctest -N dry-run overwriting the cited LastTest.log), owed VM golden check still memory-only (no .zcode/TODO.md row)"
+description: "2026-11-14/15 notebook task (worktree unit-pair-green, rewritten in place before merge to 1ca2bf9..6b7c81e, gate READY, 133/133 re-run both days): the owner-tolerated known-red pair retired with zero production code — test_task_model's two CHECKs were stale expectations left by a65d06b (logout popup shrank k_logout_width 84→28 and dropped panel_logout.armed; count 5/5 → 6/4 via (360−44)/52; the arming check compared identical inputs so panel_diff was 0 → now drives `pressed`, exactly 1 damage rect; 3917292 cells[l.count−1] rightmost bound); ui_gallery was NOT font-rasterization host drift — the goldens (2c443b0, Nov 5) predate the select-chevron attach fix 1a44c01 (Nov 8); diff = three 8×6 px chevron blobs (72/76 px, max 111/130 per 255), GL-vs-CPU ≤1/255; goldens regenerated (e29ba04, tree-identical to the orphaned 42c2aa3) — the 'VM-era cross-host bit-agreement 1,320,728/1,320,800 px' claim is RETRACTED: the regold host of 2c443b0 is recorded nowhere, the agreement proves this-host determinism only; 4bcf390 cleared the SKILL.md known-red note — known_red is now empty; the 6b7c81e smoke re-capture overwrote the Nov-14 committed drag-smoke PASS with a zero-input FAIL run (PASS survives at 5efebfc); owner ACCEPTED the golden substitution (2026-11-15) — cross-host check owed: run ./build/test/lumen-ui-gallery --check on the dev VM at the next VM session and record the result; fix-round b5edbea untracked evidence/ and added /evidence/ to .gitignore so the merge carries it nowhere — task CLOSED 2026-11-15: merge-tree proven to carry 0 evidence files, review 4/4 confirmed-all-dispositioned, then post-close review FIXED AND CLEAN (1 confirmed: the owed VM check was memory-only) fixed by 255e757 — the open condition is now an open `- [ ]` row at .zcode/TODO.md:18 (./build/test/lumen-ui-gallery --check on the dev VM, check off after recording); final tip **255e757** (8 commits over fa11b38, unmerged as of 2026-11-15), gate READY re-verified there 133/133 (76.85 s), ui-gallery cpu 0/255 both themes / gl 1/255, merge-tree main→44479c2 clean"
 metadata:
   node_type: memory
   type: project
@@ -10,7 +10,7 @@ Verified 2026-11-14 on the **notebook** (nouveau card0 + i915 card1 re-read from
 `/sys/class/drm/card*/device/driver` this session). Worktree
 `/home/dimmus/lumen-wt/unit-pair-green`, branch `zcode/task/unit-pair-green` off main
 fa11b38; tip **6b7c81e** (2026-11-15 00:33; later moved to **b5edbea** — see the close
-section below). The studio rewrote the branch locally before
+section below; final tip **255e757** — see the post-close section). The studio rewrote the branch locally before
 merge (never pushed): 42c2aa3→**e29ba04**, 75bf41d→**3917292**, f10183a→**4bcf390**,
 de92ce6→**5efebfc** — trees identical, only e29ba04's message changed (see the
 2026-11-15 section); 1ca2bf9 unchanged. Gate **READY**. Branch diff contains **zero
@@ -198,11 +198,51 @@ time on one host proves determinism, not cross-host stability.
   (SKILL.md:60 "carries `ui_gallery` + `test_task_model`", .dwf.ts:32
   `["ui_gallery","test_task_model"]`) until the owner merges; 4bcf390 travels with the
   branch. The owed VM golden check is recorded **only here** — `.zcode/TODO.md` has no
-  unit-pair row.
+  unit-pair row. *(Superseded the same day: 255e757 adds the row — post-close section below.)*
 - **Acceptance caveat the owner owns:** the card's "host-independent evidence" is met by
   construction (pinned bundled font/icons/hinting, tests/ui_golden.hpp:65-73) plus
   this-host determinism — not by a cross-host render proof; the system FreeType/HarfBuzz
   version remains the one unpinned input.
+
+## 2026-11-15 post-close — review FIXED AND CLEAN, owed VM check tracked in .zcode/TODO.md, gate READY re-run at final tip 255e757 (branch tip and every command below re-run by the memory writer this session)
+
+- **Post-close review round: verdict FIXED AND CLEAN, 1 confirmed / 0 refuted.** The
+  confirmed finding (low): the owed VM golden check — the only open condition of the
+  owner's golden-substitution acceptance — was tracked **only in this memory**;
+  `grep -n -i 'unit-pair|ui.gallery|ui_gallery|golden'` over main's 93-line
+  `.zcode/TODO.md` returned nothing, so the next VM session had no actionable reminder
+  before the branch merges. **Fixed by 255e757** ("docs(zcode): track the owed VM
+  ui-gallery golden check in TODO", 2026-11-15 11:50 +0500): exactly `.zcode/TODO.md`
+  +7 lines, an open `- [ ]` row in the Now section (`:18-24`, before the Host-limited
+  gates section) carrying the exact command (`./build/test/lumen-ui-gallery --check`),
+  where to run it (dev VM, tests-enabled build of the unit-pair-green tree "or main
+  once it merges"), the expected result (cpu 0/255 both themes, gl ≤ 3 vs CPU per G10),
+  the closing action (record the result, check the row off), and the failure
+  disposition (a new FreeType-version-sensitivity finding, "not a regression of the
+  substitution"). The commit honestly states "Not run this session: the check itself" —
+  this host is the notebook.
+- **Gate READY re-verified at the new tip 255e757** (notebook, nouveau card0 + i915
+  card1 re-read from `/sys/class/drm/card*/device/driver`): `cmake --build build/test
+  -j8` → "ninja: no work to do" (255e757 touches no compiled file); suite definition
+  `ctest -N -LE bench` → Total Tests: **133** with `LUMEN_BUILD_TESTS:BOOL=ON` in
+  CMakeCache (the gating build); `ctest --test-dir build/test --output-on-failure -LE
+  bench` → **"100% tests passed out of 133"**, 76.85 s; pair
+  `ctest -R 'test_task_model|ui_gallery'` → 2/2 (0.35 s); `./build/test/lumen-ui-gallery
+  --check` → cpu max **0/255** both themes, gl **1/255** vs CPU (G10 ≤ 3), exit 0.
+- **Merge safety re-proven at the new tip:** `git merge-tree --write-tree main
+  zcode/task/unit-pair-green` → tree **44479c2**, exit 0; main has not touched
+  `.zcode/TODO.md` since fa11b38 (`git log fa11b38..main -- .zcode/TODO.md` empty) and
+  only 255e757 touches it on the branch, so the row merges without conflict and its
+  citation of `.zcode/memories/lumen-unit-pair-green.md` resolves post-merge (that file
+  lives on main, absent from the branch — inherent to memory-on-main). Branch **not yet
+  merged** (`merge-base --is-ancestor` fails) and main's SKILL.md:60 still carries the
+  stale known-red pair — the branch is the truth until merge. Net branch diff outside
+  evidence/ is now **7 files** (adds .zcode/TODO.md +7), still zero compiled code.
+- **New low wart (left as-is under the 42c2aa3 precedent):** 255e757's message cites a
+  "Gate re-verify" entry of this memory file that exists nowhere (`grep -c 'Gate
+  re-verify'` → 0; the real entries are the dated refresh/close sections and the
+  "Owner decision" bullet) — message-only, fixable only by another history rewrite of
+  the unmerged branch, an owner call like the orphaned-hash wart.
 
 **Why:** a tolerated-red set outlives its cause — a65d06b landed Nov 11 and the stale
 checks sat red-tolerated for three days while verifying nothing, and "golden drift" got
@@ -211,12 +251,19 @@ a retirement task turns every future suite run into archaeology, and the first r
 golden failure should be `git log` on the golden, not font config. And a record written
 before the merge is provisional: the studio's local rewrite orphaned four of the six
 hashes this page first cited, and its strongest host-independence claim was one
-unrecorded provenance away from false — refresh the record at close.
+unrecorded provenance away from false — refresh the record at close. And an owed
+condition accepted by the owner must live in the tracker, not only in a memory —
+memories are history a session has to know to search; `.zcode/TODO.md` is where the
+next VM session actually looks first (the review confirmed this gap before the merge).
 
-**How to apply:** `known_red` is empty once b5edbea merges — any suite red is reportable
-immediately (until then main's SKILL.md still shows the stale pair example; the branch is
-the truth); do
-not re-tolerate without an owner decision plus a retirement task. When a golden test goes
+**How to apply:** `known_red` is empty once the branch (tip 255e757) merges — any suite
+red is reportable immediately (until then main's SKILL.md still shows the stale pair
+example; the branch is the truth); do
+not re-tolerate without an owner decision plus a retirement task. At the next dev-VM
+session run `./build/test/lumen-ui-gallery --check` (tests-enabled build) and check off
+the "Owed VM golden check (unit-pair-green)" row in `.zcode/TODO.md` — a VM failure is
+a new FreeType-version-sensitivity finding, not a regression of the golden
+substitution. When a golden test goes
 red: localize the pixel diff to blobs first, then `git log --follow
 docs/images/<golden>.png` and compare the last-regeneration commit against commits
 touching the rendered widget code before suspecting fonts/hinting/hosts. When a change
