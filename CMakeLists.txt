@@ -486,7 +486,7 @@ if(LUMEN_BUILD_PORTAL)
     if(LIBSYSTEMD_FOUND AND WAYLAND_FOUND AND TARGET lumen-protocol-glue)
         lumen_add_module_library(lx.portal modules/lx.portal
             DEPENDS lx.foundation lx.trace lx.text lx.ui lx.ui.host lx.wayland.client
-                lx.runtime lx.gfx lx.layout lx.shell)
+                lx.runtime lx.gfx lx.layout lx.shell lx.config)
         target_link_libraries(lx.portal PRIVATE lumen-protocol-glue)
         target_compile_definitions(lx.portal PRIVATE LUMEN_PORTAL_WAYLAND=1 LUMEN_PORTAL_DBUS=1)
         target_include_directories(lx.portal PRIVATE ${WAYLAND_INCLUDE_DIRS} ${LIBSYSTEMD_INCLUDE_DIRS})
@@ -944,6 +944,15 @@ if(LUMEN_BUILD_TESTS)
         lumen_link_platform(test_portal_compose)
         target_include_directories(test_portal_compose PRIVATE tests)
         add_test(NAME test_portal_compose COMMAND test_portal_compose)
+
+        # The Settings backend's pure half: the appearance mapping, ReadAll's namespace
+        # filter, the watch/reload flip detection over a temp configuration directory.
+        add_executable(test_portal_settings tests/test_portal_settings.cpp)
+        target_link_libraries(test_portal_settings PRIVATE lx.portal lx.config)
+        lumen_apply_module_properties(test_portal_settings)
+        lumen_link_platform(test_portal_settings)
+        target_include_directories(test_portal_settings PRIVATE tests)
+        add_test(NAME test_portal_settings COMMAND test_portal_settings)
     endif()
 
     add_executable(test_content_update tests/test_content_update.cpp)
