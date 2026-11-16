@@ -1823,14 +1823,20 @@ to; it routes each `org.freedesktop.impl.portal.*` interface to a backend by
 | ScreenCast | xdg-desktop-portal-wlr (0.8.4) | A mature PipeWire producer, maintained by the capture protocols' authors, that speaks ext-image-copy-capture: outputs and windows, dma-buf or shm, damage, an embedded or hidden pointer. Writing a second producer would duplicate it, and an in-compositor PipeWire producer (Mutter, KWin; niri through Mutter's D-Bus API for xdg-desktop-portal-gnome) would put PipeWire in the compositor for no gain: with ext-image-copy-capture the cast costs exactly the compositor's one copy. |
 | Screenshot, PickColor | xdg-desktop-portal-lumen | xdpw's Screenshot runs `grim` into the fixed path `/tmp/out.png`, offers no area or window choice and no PickColor. |
 | the cast's source chooser | xdg-desktop-portal-lumen `--choose` | xdpw runs it as its `dmenu` chooser (`deploy/xdg/xdg-desktop-portal-wlr/Lumen`): outputs, then windows, in Lumen's own list. |
+| Settings | xdg-desktop-portal-lumen | `org.freedesktop.appearance` color-scheme (from `[ui]` appearance) and contrast, watched — applications follow the Lumen theme live. gtk's backend never activates under `XDG_CURRENT_DESKTOP=Lumen`, so this takes over nothing that worked. |
 | Inhibit | none | gtk's needs GNOME's session manager; applications fall back to idle-inhibit. |
-| everything else | xdg-desktop-portal-gtk | File chooser, access dialogs, settings. |
+| everything else | xdg-desktop-portal-gtk | File chooser, access dialogs. |
 
 **xdg-desktop-portal-lumen** (`lx.portal`, `executables/xdg-desktop-portal-lumen`) serves
-`org.freedesktop.impl.portal.Screenshot` version 3 on the session bus
+`org.freedesktop.impl.portal.Screenshot` version 3 and `org.freedesktop.impl.portal.Settings`
+version 1 (`ReadAll`/`Read` of `org.freedesktop.appearance` — color-scheme from `[ui]`
+appearance, dark→1/light→2, and contrast 0; `SettingChanged` per key when the layered
+configuration's files change on disk and the served value flips) on the session bus
 (`org.freedesktop.impl.portal.desktop.lumen`, sd-bus), single-threaded: one `poll` over the
-bus, a signalfd and — only while a request runs — a Wayland connection opened for that
-request (an idle backend holds no connection and never wakes; a request sees the outputs as
+bus, a signalfd, the configuration watch's inotify fd (armed unless the configuration is
+disabled, `LUMEN_CONFIG=0`) and — only while a request runs — a Wayland connection opened
+for that request (an idle backend holds no connection and wakes only when the configuration
+changes on disk; a request sees the outputs as
 they are, so hotplug needs no tracking). A request:
 
 - captures every output over ext-image-copy-capture into shm (`:desktop`), turns each frame
