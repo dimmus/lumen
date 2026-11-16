@@ -120,6 +120,10 @@ LUMEN_TEST(reload_flips_only_when_the_served_values_change) {
     LUMEN_CHECK(::rename((path + ".new").c_str(), path.c_str()) == 0);
     LUMEN_CHECK(st.poll_changed().color_scheme);
     LUMEN_CHECK(st.values().color_scheme == k_color_scheme_dark);
+
+    // The scratch directory goes away (test_config's convention).
+    std::string cmd = "rm -rf '" + dir + "'";
+    (void)std::system(cmd.c_str());
 }
 
 LUMEN_TEST(disabled_config_serves_the_defaults_without_a_watch) {
