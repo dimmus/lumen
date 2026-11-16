@@ -139,4 +139,17 @@ LUMEN_TEST(only_a_changed_resolved_theme_value_reexports) {
     LUMEN_CHECK(!re.theme_changed("one-light"));
 }
 
+LUMEN_TEST(a_refused_export_does_not_count_as_carried) {
+    // The user manager refused the start-up export (or never answered): it does not carry
+    // the value, so a reload that resolves to the very same theme must still re-export it —
+    // recording the value before the outcome is known is what `forget` undoes.
+    lx::compositor::env_reexports re;
+    re.theme_sent("one-light");
+    re.theme_forget();
+    LUMEN_CHECK(re.theme_changed("one-light"));
+    // Once a retry really leaves, the gate closes again.
+    re.theme_sent("one-light");
+    LUMEN_CHECK(!re.theme_changed("one-light"));
+}
+
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

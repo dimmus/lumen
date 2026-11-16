@@ -3906,6 +3906,9 @@ void compositor_impl::start_session() {
                 this);
             !exported) {
             log_session.error(exported.get_error());
+            // The theme variable never left: it must not count as carried, or a reload
+            // resolving to the same value would be skipped as unchanged.
+            env_reexports_.theme_forget();
         } else {
             sent = true;
             control_.dispatch(); // the calls leave now, not at the loop's first wake-up
@@ -3924,6 +3927,11 @@ void compositor_impl::on_environment_exported(bool ok) {
     else
         log_session.warn("the user manager refused the session environment "
                          "(or did not answer in 2 s)");
+    // A refused (or timed-out) export carried the start-up `LUMEN_THEME`; without this a
+    // reload resolving to the same value would be skipped as unchanged and the manager
+    // would never receive it.
+    if (!ok)
+        env_reexports_.theme_forget();
     send_ready(ok ? nullptr : "environment export failed");
     // A reload that changed the theme while this export was in flight exports now.
     retry_owed_env_exports();
@@ -4749,7 +4757,14 @@ void compositor_impl::export_theme_environment() {
     const std::string_view vars{uitheme};
     if (auto r = user_env_.export_async(
             std::span<const std::string_view>{&vars, 1}, 2000,
-            [](void* u, bool) { static_cast<compositor_impl*>(u)->retry_owed_env_exports(); },
+            [](void* u, bool ok) {
+                auto* self = static_cast<compositor_impl*>(u);
+                // A refused re-export did not reach the manager: forget the value so the
+                // next reload re-sends it even unchanged.
+                if (!ok)
+                    self->env_reexports_.theme_forget();
+                self->retry_owed_env_exports();
+            },
             this);
         !r) {
         log_config.error(r.get_error());

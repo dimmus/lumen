@@ -124,6 +124,8 @@ void env_reexports::theme_sent(std::string_view resolved) {
                   resolved.data());
 }
 
+void env_reexports::theme_forget() { theme_[0] = '\0'; }
+
 config_state::config_state() : current_{std::make_unique<cfg::config_snapshot>(cfg::default_config())} {}
 config_state::~config_state() = default;
 

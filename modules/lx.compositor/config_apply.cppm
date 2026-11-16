@@ -155,6 +155,9 @@ public:
     /// The export left (start-up's batch, or a re-export that was sent): `resolved` is the
     /// value the user manager now carries.
     void theme_sent(std::string_view resolved);
+    /// The export did not reach the manager (refused, timed out, or never sent): the next
+    /// reload re-sends even the same value, so it must not count as carried.
+    void theme_forget();
 
 private:
     static constexpr unsigned k_cursor = 1u << static_cast<unsigned>(which::cursor);
