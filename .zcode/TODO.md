@@ -22,6 +22,16 @@ current when an item closes.
   (`.zcode/memories/lumen-unit-pair-green.md`): cpu expected 0/255 in both themes, gl ≤ 3 vs
   CPU (G10); a VM failure there is a new finding about FreeType-version sensitivity, to be
   handled then — not a regression of the substitution.
+- [ ] **portal-appearance-settings seat gate red is unattributed** (2026-11-16, gate
+  NOT_READY at worktree HEAD fedbba1, branch unmerged): both seat smokes failed on the
+  final binaries — drag-smoke 9/10 rows FAIL at +0,+0 (after a "another session is running"
+  WARN) and app-smoke 101 FAIL rows incl. Z2/Z4 (the xdg-desktop-portal-lumen backend this
+  diff touches answering but capturing black); no baseline smoke exists for the task, while
+  notebook-full-green-audit was 177/0/0 on this host the day before. Re-run both smokes on
+  a quiet serialized host and record green, or produce the baseline A/B naming a mechanism
+  per FAIL row; also preserve the busctl ReadOne/SettingChanged and idle-strace probe
+  artifacts the review asserted (none survived). See
+  `.zcode/memories/lumen-portal-appearance-settings.md`.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
