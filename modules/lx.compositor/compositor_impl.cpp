@@ -1400,13 +1400,9 @@ struct compositor_impl {
     std::unique_ptr<lx::runtime::event_source> control_source_{};
     /// The environment exported to the user manager in `--session` mode.
     session::user_environment user_env_{};
-    /// The resolved `LUMEN_THEME` value last sent to the user manager ("" = none): a reload
-    /// re-exports only when it changed, so density and font-size edits do not churn the bus.
-    char exported_theme_[96]{};
-    /// A re-export held back while another one was in flight (the bus carries one at a time);
-    /// it leaves when that one's reply arrives.
-    bool cursor_env_owed_ = false;
-    bool theme_env_owed_ = false;
+    /// The re-export bookkeeping of that environment (owed cursor/theme exports, the
+    /// resolved `LUMEN_THEME` last sent): what a reload sends again and when.
+    env_reexports env_reexports_{};
     bool ready_sent_ = false;
     lx::runtime::clock_time started_ns_ = 0;
     /// The systemd watchdog (WatchdogSec=): pinged from wake-ups that happen anyway, at most
@@ -3900,8 +3896,7 @@ void compositor_impl::start_session() {
         const std::string_view theme_name = resolved_ui_theme(config_.current().ui);
         std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%.*s",
                       static_cast<int>(theme_name.size()), theme_name.data());
-        std::snprintf(exported_theme_, sizeof(exported_theme_), "%.*s",
-                      static_cast<int>(theme_name.size()), theme_name.data());
+        env_reexports_.theme_sent(theme_name); // what the manager carries once it takes
         vars[count++] = uitheme;
         if (auto exported = user_env_.export_async(
                 std::span<const std::string_view>{vars.data(), count}, 2000,
@@ -3964,7 +3959,7 @@ void compositor_impl::end_session() {
     // the SetEnvironment, and the UnsetEnvironment sent after it on the same connection is
     // what the manager applies last. A re-export the reply never freed is dropped with it —
     // a retry from inside unset_now's flush would only re-set what this is unsetting.
-    cursor_env_owed_ = theme_env_owed_ = false;
+    env_reexports_.drop();
     if (user_env_.exported() || user_env_.export_pending()) {
         user_env_.unset_now(1000);
         log_session.info("session environment unset");
@@ -4720,7 +4715,7 @@ void compositor_impl::export_cursor_environment() {
         return;
     // The user bus carries one export at a time; a busy one gets this when its reply arrives.
     if (user_env_.export_pending()) {
-        cursor_env_owed_ = true;
+        env_reexports_.owe(env_reexports::which::cursor);
         return;
     }
     if (auto r = user_env_.export_async(
@@ -4743,10 +4738,10 @@ void compositor_impl::export_theme_environment() {
     const std::string_view resolved = resolved_ui_theme(config_.current().ui);
     std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(resolved.size()),
                   resolved.data());
-    if (std::strcmp(name, exported_theme_) == 0)
+    if (!env_reexports_.theme_changed(name))
         return;
     if (user_env_.export_pending()) {
-        theme_env_owed_ = true;
+        env_reexports_.owe(env_reexports::which::theme);
         return;
     }
     char uitheme[128];
@@ -4759,7 +4754,7 @@ void compositor_impl::export_theme_environment() {
         !r) {
         log_config.error(r.get_error());
     } else {
-        std::snprintf(exported_theme_, sizeof(exported_theme_), "%s", name);
+        env_reexports_.theme_sent(name);
         log_config.info("LUMEN_THEME={} exported (configuration)", name);
         control_.dispatch();
     }
@@ -4768,14 +4763,12 @@ void compositor_impl::export_theme_environment() {
 void compositor_impl::retry_owed_env_exports() {
     // An export's reply arrived (the startup one's after READY, or a re-export's): the user
     // bus is free again, so what a busy export held back leaves now.
-    if (cursor_env_owed_) {
-        cursor_env_owed_ = false;
-        export_cursor_environment();
-    }
-    if (theme_env_owed_) {
-        theme_env_owed_ = false;
-        export_theme_environment();
-    }
+    env_reexports_.drain([this](env_reexports::which w) {
+        if (w == env_reexports::which::cursor)
+            export_cursor_environment();
+        else
+            export_theme_environment();
+    });
 }
 
 void compositor_impl::apply_repeat() {

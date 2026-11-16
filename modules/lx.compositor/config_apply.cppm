@@ -115,4 +115,52 @@ void binding_table(const lx::config::config_snapshot& c,
 /// comes up in the configured look; `start_theme_job` resolves the same way.
 [[nodiscard]] std::string_view resolved_ui_theme(const lx::config::ui_settings& ui);
 
+/// The bookkeeping of the session-environment re-exports (ADR-013 §4.7). The user bus
+/// carries one export at a time (`lx.session user_environment`), so a re-export that finds
+/// another in flight is *owed* (`owe`) and leaves when that one's reply arrives (`drain` —
+/// cursor first: a reload exports `[cursor]` before it reaches `[ui]`; a `drain` send that
+/// finds the bus busy again simply owes itself back). The resolved `LUMEN_THEME` last sent
+/// is remembered so only a changed value re-exports (`[ui]` density and font-size edits do
+/// not churn the bus). `drop` is teardown: an export whose reply never came must not
+/// re-export into an environment `unset_now` is clearing.
+class env_reexports {
+public:
+    /// Which re-export a busy bus held back.
+    enum class which : unsigned char { cursor, theme };
+
+    /// This re-export cannot leave now (another one is in flight): send it on the reply.
+    void owe(which w);
+    /// An export's reply arrived, so the bus is free: send what was held back, in the order
+    /// the reload produced it. `send` runs one re-export; it may call `owe` again (an export
+    /// it started first is now the one in flight).
+    template <typename Send>
+    void drain(Send&& send) {
+        if (owed_ & k_cursor) {
+            owed_ &= ~k_cursor;
+            send(which::cursor);
+        }
+        if (owed_ & k_theme) {
+            owed_ &= ~k_theme;
+            send(which::theme);
+        }
+    }
+    /// Teardown (`end_session`): owed re-exports are dropped — a retry from inside
+    /// `unset_now`'s flush would only re-set what it is unsetting — and the remembered
+    /// theme value leaves with the session (the environment is being unset anyway).
+    void drop();
+
+    /// Would this resolved theme value reach the user manager as a re-export? Only a
+    /// changed value does — what start-up exported counts as sent.
+    [[nodiscard]] bool theme_changed(std::string_view resolved) const;
+    /// The export left (start-up's batch, or a re-export that was sent): `resolved` is the
+    /// value the user manager now carries.
+    void theme_sent(std::string_view resolved);
+
+private:
+    static constexpr unsigned k_cursor = 1u << static_cast<unsigned>(which::cursor);
+    static constexpr unsigned k_theme = 1u << static_cast<unsigned>(which::theme);
+    unsigned owed_ = 0;
+    char theme_[96]{}; // the resolved value last sent ("" = none the manager carries)
+};
+
 } // namespace lx::compositor
