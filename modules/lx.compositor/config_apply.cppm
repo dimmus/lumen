@@ -108,4 +108,11 @@ void binding_table(const lx::config::config_snapshot& c,
 /// The keymap names (null for "the system default"); pointers into `k`.
 [[nodiscard]] lx::input::keymap_config keymap_config_of(const lx::config::keyboard_settings& k);
 
+/// The interface theme applications start with ([ui], ADR-013 §4.7): the configured name or
+/// `.lxtheme` path as written, or — when none is configured — the built-in the appearance
+/// selects ("one-light" / "one-dark"). This is what the compositor exports as `LUMEN_THEME`
+/// (at start-up and again when a reload changed it), so an application that starts later
+/// comes up in the configured look; `start_theme_job` resolves the same way.
+[[nodiscard]] std::string_view resolved_ui_theme(const lx::config::ui_settings& ui);
+
 } // namespace lx::compositor

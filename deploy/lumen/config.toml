@@ -141,8 +141,9 @@ default-bindings = true # false: start from no bindings (Lumen's own keys remain
 
 [ui]                    # the interface look (ADR-013); the shell and lumen-settings apply
 theme = ""              # a built-in theme ("one-dark", "one-light") or a .lxtheme path;
-                        # empty: LUMEN_THEME, else One Dark. Exported as LUMEN_THEME for
-                        # applications that start later
+                        # empty: the built-in [ui] appearance selects. Exported as
+                        # LUMEN_THEME for applications that start later, re-exported on
+                        # change
 appearance = "dark"     # dark | light (the built-in fallback pair)
 density = "default"     # compact | default | comfortable
 ui-font-size = 16.0     # the rem base, px (10..24)

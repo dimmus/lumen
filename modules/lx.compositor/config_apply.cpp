@@ -101,6 +101,13 @@ unsigned diff_config(const cfg::config_snapshot& a, const cfg::config_snapshot& 
     return c;
 }
 
+std::string_view resolved_ui_theme(const cfg::ui_settings& ui) {
+    const std::string_view name{ui.theme};
+    if (name.empty())
+        return ui.appearance == cfg::ui_appearance::light ? "one-light" : "one-dark";
+    return name;
+}
+
 config_state::config_state() : current_{std::make_unique<cfg::config_snapshot>(cfg::default_config())} {}
 config_state::~config_state() = default;
 

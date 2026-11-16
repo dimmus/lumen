@@ -682,6 +682,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_input_config PRIVATE tests)
     add_test(NAME test_input_config COMMAND test_input_config)
 
+    # The LUMEN_THEME the compositor exports ([ui] → the value applications start with).
+    add_executable(test_theme_env tests/test_theme_env.cpp)
+    target_link_libraries(test_theme_env PRIVATE lx.compositor lx.config)
+    lumen_apply_module_properties(test_theme_env)
+    lumen_link_platform(test_theme_env)
+    target_include_directories(test_theme_env PRIVATE tests)
+    add_test(NAME test_theme_env COMMAND test_theme_env)
+
     # The session (design-session-and-wm Part 1): health levels, logind session discovery,
     # the control socket, lumen-session against a fake systemctl.
     add_executable(test_health tests/test_health.cpp)
