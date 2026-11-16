@@ -164,6 +164,13 @@ int main(int argc, char* argv[]) {
     static settings::session the_session{true};
     settings::set_active_session(&the_session);
 
+    // The layers the session just read are this app's truth too: one [ui] apply before the
+    // window opens, so the first describe renders the configuration's theme and density
+    // whatever the context inherited (a stale LUMEN_THEME; none at all on a direct
+    // launch). An explicit --theme stays authoritative for the theme — it themed the
+    // context at app.start() — while the config's density still applies.
+    the_session.apply_ui_live(/*theme_too=*/a.theme == nullptr);
+
     lx::app::window_options o{};
     o.title = "Settings";
     o.app_id = "org.lumen.Settings";
