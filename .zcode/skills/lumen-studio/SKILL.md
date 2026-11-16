@@ -37,7 +37,8 @@ park on you — answer them, relaying user decisions when needed; never leave th
 plan → worktree (`../lumen-wt/<id>`, branch from the agreed base) → tests-enabled
 baseline build+ctest → implement (one implementer; commits each logically complete unit
 with a detailed message) → build+test fix loop (≤3) → independent read-only review →
-per-finding independent confirmation → confirmed fixes + re-gate (≤2) → **seat
+per-finding independent confirmation (confirmed pre-existing defects are recorded to
+`.zcode/TODO.md`, not fixed) → confirmed fixes + re-gate (≤2) → **seat
 verification** (drag/app smokes `--join-seat-session`; optional `ui-bench` A/B) →
 read-only gate verdict (READY/BLOCKED/NOT READY) → memory record in `.zcode/memories/` →
 PR description artifact. Worktrees and branches survive the run for inspection.

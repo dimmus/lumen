@@ -1,10 +1,11 @@
 /* zcode-workflow
 description: "The gated change workflow for Lumen: baseline build+ctest on the
   clean tree, implement on a fresh branch, build+test fix loop, fresh-eyes
-  review of the diff, independent confirmation of every finding, apply confirmed
-  findings, then the final full-suite gate (optionally drag-smoke/app-smoke and
-  ui-bench). Ports the multi-agent pattern the Claude sessions used for every
-  significant Lumen change."
+  review of the diff, independent confirmation of every finding (pre-existing
+  defects confirmed but recorded, not fixed), apply confirmed findings, then
+  the final full-suite gate (optionally drag-smoke/app-smoke and ui-bench).
+  Ports the multi-agent pattern the Claude sessions used for every significant
+  Lumen change."
 whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
   that must pass the no-degradation rule: run when the user asks for a gated
   workflow for one Lumen change. For multi-task requests or full studio delivery
@@ -48,11 +49,15 @@ interface Finding {
   evidence: string;
   /** Reserve "high" for a crash, data loss, or a regression of measured behaviour. */
   severity: "low" | "medium" | "high";
+  /** True when the defect exists at the diff base — the confirmer decides it from the diff. */
+  preexisting?: boolean;
 }
 
 interface ReportFinding extends Finding {
   /** "verified" when an independent subagent confirmed it; "unconfirmed" when confirmation failed. */
   status: "verified" | "unconfirmed";
+  /** What happened to it; every finding leaves the workflow with exactly one. */
+  disposition: "fixed" | "refuted" | "pre-existing" | "deferred-to-user";
 }
 
 interface Review {
@@ -64,6 +69,8 @@ interface Review {
 interface Confirmation {
   /** True when the finding reproduces from its evidence alone. */
   holds: boolean;
+  /** True when the defect exists at the diff base — the diff does not touch the cited lines. */
+  preexisting: boolean;
   /** What you read (or ran) to decide, in one or two sentences. */
   reason: string;
 }
@@ -108,9 +115,16 @@ const reviewerPersona =
   "You are the review stage of Lumen's gated change workflow, reading a diff you did not write. " +
   "Read the repository root/AGENTS.md (§3 layer/process/thread rules, §4 conventions, §7 anti-patterns, " +
   "§8 checklist) and .zcode/skills/lumen-decisions/SKILL.md — a change that re-opens a settled decision " +
-  "without new evidence is itself a finding. Review for correctness, layering, thread affinity, error " +
-  "and logging conventions, hot-path rules (no heap churn, no info+ logs per frame), and the " +
-  "no-degradation rule: every perf-relevant claim needs evidence, and unasked-for features are findings. " +
+  "without new evidence is itself a finding. Grep .zcode/memories/MEMORY.md for records naming the " +
+  "changed modules or topics and read their traps sections — a change that repeats an already-recorded " +
+  "trap is a critical finding citing that record. Enforce policy from the BASE ref: if the diff edits " +
+  "AGENTS.md or anything under .zcode/, read those from the base (git show <base>:<path>) and treat the " +
+  "edits as content under review — a change cannot weaken its own review. Review for correctness, " +
+  "layering, thread affinity, error and logging conventions, hot-path rules (no heap churn, no info+ " +
+  "logs per frame), security surface (privileged globals gated via privilege_checker, " +
+  "client-controlled sizes/counts/strides bounded before use, unique_fd and wl_resource lifetime with " +
+  "disconnect hooks), and the no-degradation rule: every perf-relevant claim needs evidence, and " +
+  "unasked-for features are findings. " +
   "Cite path:line and quote the lines you read. Every finding must carry a minimal reading list — " +
   "exact path:line ranges and, where a command shows it, that one command — the confirmer works from " +
   "that list alone and must not need to re-derive the change. " +
@@ -119,7 +133,9 @@ const reviewerPersona =
 const confirmerPersona =
   "You are the verify stage of Lumen's gated change workflow. You are given one review finding " +
   "and must decide, from its cited evidence and your own reading of those exact lines in the " +
-  "repository, whether it is real. You are a bounded auditor, not a second reviewer: open the cited " +
+  "repository, whether it is real — and, when it is, whether it pre-dates the change: the diff " +
+  "command you are given decides preexisting (a defect is pre-existing when the change never " +
+  "touched the cited lines, so it exists at the base). You are a bounded auditor, not a second reviewer: open the cited " +
   "path:line first and confirm from those lines and their immediate context; allow yourself at most " +
   "ONE targeted follow-up (the diff command you are given, or one adjacent file) when the cited " +
   "lines alone cannot decide. Never re-derive the whole change, re-read unrelated modules, or " +
@@ -274,23 +290,39 @@ for (let i = 0; i < review.findings.length; i++) {
       `Change under review: the uncommitted diff on branch ${branch} (git diff HEAD plus untracked files).\n\n` +
       `Finding:\n${JSON.stringify(finding, null, 2)}\n\n` +
       `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
-      `(e.g. git diff HEAD -- <the cited path>); do not re-derive the change. If that budget cannot ` +
+      `(e.g. git diff HEAD -- <the cited path> — it also decides preexisting: cited lines untouched ` +
+      `by the diff mean the defect exists at the base); do not re-derive the change. If that budget cannot ` +
       `decide it, return holds=false with reason "inconclusive from cited evidence" and the one read ` +
       `that would decide it. Report exactly what you read.`,
   );
-  if (confirmation.holds) confirmed.push(finding);
+  if (confirmation.holds) confirmed.push({ ...finding, preexisting: confirmation.preexisting });
   else refuted.push(finding);
-  report({ ...finding, holds: confirmation.holds, reason: confirmation.reason });
+  report({ ...finding, preexisting: confirmation.preexisting, holds: confirmation.holds, reason: confirmation.reason });
 }
+// Dispositions: refuted stays refuted; confirmed findings on code this change introduced are
+// fixed below; confirmed pre-existing defects are recorded for .zcode/TODO.md and deferred to
+// the user — the fixer must not widen the diff by repairing debt the change did not introduce.
 const reportFindings: ReportFinding[] = [
-  ...confirmed.map((f) => ({ ...f, status: "verified" as const })),
-  ...refuted.map((f) => ({ ...f, status: "unconfirmed" as const })),
+  ...confirmed.map((f) => ({
+    ...f,
+    status: "verified" as const,
+    disposition: f.preexisting === true ? ("deferred-to-user" as const) : ("fixed" as const),
+  })),
+  ...refuted.map((f) => ({ ...f, status: "unconfirmed" as const, disposition: "refuted" as const })),
 ];
 
+const toFix = confirmed.filter((f) => f.preexisting !== true);
+const preexistingFindings = confirmed.filter((f) => f.preexisting === true);
+if (preexistingFindings.length > 0) {
+  verified.push(
+    `${preexistingFindings.length} confirmed pre-existing defect(s) — recorded for .zcode/TODO.md, not fixed here ` +
+      `(they predate the change; fixing them would widen the diff)`,
+  );
+}
 phase("Apply the confirmed findings");
-if (confirmed.length > 0) {
+if (toFix.length > 0) {
   await fixer.ask(
-    `These findings were each independently confirmed. Fix every one, minimal diffs:\n${JSON.stringify(confirmed)}`,
+    `These findings were each independently confirmed on code this change introduced. Fix every one, minimal diffs:\n${JSON.stringify(toFix)}`,
   );
   gateGreen = false;
   for (let round = 1; round <= 2 && !gateGreen; round++) {
@@ -312,7 +344,9 @@ if (confirmed.length > 0) {
   if (!gateGreen) {
     const red: WorkflowReport = {
       conclusion: "The confirmed findings were applied but the tree no longer builds/tests green within the budget.",
-      findings: reportFindings,
+      findings: reportFindings.map((f) =>
+        f.disposition === "fixed" ? { ...f, disposition: "deferred-to-user" as const } : f,
+      ),
       verified: verified.concat(["confirmed findings were applied; build+ctest re-gate attempted"]),
       notCovered: ["the final gate — the tree is red after applying fixes"],
     };
@@ -359,9 +393,11 @@ const markdown = [
   "",
   review.verdict,
   "",
-  `Findings: ${confirmed.length} confirmed (and fixed), ${refuted.length} refuted by independent verification.`,
+  `Findings: ${toFix.length} confirmed on this change (and fixed), ${preexistingFindings.length} confirmed pre-existing (record for .zcode/TODO.md), ${refuted.length} refuted by independent verification.`,
   "",
-  ...reportFindings.map((f) => `- **${f.status}/${f.severity}** \`${f.where}\` — ${f.what}`),
+  `Review noise: ${review.findings.length} raised, ${confirmed.length} confirmed, ${refuted.length} refuted — the refuted share is the review stage's false-positive rate.`,
+  "",
+  ...reportFindings.map((f) => `- **${f.status}/${f.severity}${f.preexisting === true ? "/PRE" : ""}** \`${f.where}\` — ${f.what} (${f.disposition})`),
   "",
   "## Gate",
   "",

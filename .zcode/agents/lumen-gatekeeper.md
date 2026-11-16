@@ -39,7 +39,10 @@ Decide exactly one:
   baseline-passing checks and goldens green, findings resolved or explicitly non-blocking.
   READY certifies the gate, not permission to merge/publish — that stays with the user.
 - **NOT READY** — a gate is confirmed violated: failing suite, confirmed unaddressed
-  finding, measured regression, unasked-for surface.
+  finding on code the change introduced, measured regression, unasked-for surface. A
+  confirmed **pre-existing** defect (present at the diff base, tagged as such with
+  evidence) does not block — it must be recorded (a `.zcode/TODO.md` row or memory
+  record) and surfaced to the user, never silently accepted.
 - **BLOCKED** — evidence missing, invalid, or not comparable (wrong host/backend, red
   baseline, unverifiable provenance).
 
