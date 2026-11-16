@@ -272,9 +272,11 @@ Four keys, owner compositor, reload `live`: `theme` (string: built-in name or `.
 path), `appearance` (`dark` | `light`), `density` (`compact` | `default` | `comfortable`),
 `ui-font-size` (number, 10..24 px, the rem base). The compositor already exports
 `XCURSOR_THEME`/`XCURSOR_SIZE` from `[cursor]` into the session environment
-(`compositor_impl.cpp:3734-3738`); it exports `LUMEN_THEME`, `LUMEN_UI_DENSITY` and
-`LUMEN_FONT_SIZE` the same way, and pushes `[ui]` to the shell with the rest of the config
-memfd. Engine apps already honor `LUMEN_THEME` at start (`lx.app/window.cppm:34-54`), so:
+(`compositor_impl.cpp:3734-3738`); it exports `LUMEN_THEME` the same way — always the
+resolved value (the configured theme, else the built-in the appearance selects),
+re-exported when a reload changes it — and pushes `[ui]` to the shell with the rest of the
+config memfd. Engine apps already honor `LUMEN_THEME` at start
+(`lx.app/window.cppm:34-54`), so:
 shell = live (config push), settings app = live (`set_active_builtin_theme`,
 `set_ui_density`, `theme_watcher` for file themes), other apps = next start. That boundary
 is documented in the pane, not hidden.
@@ -598,8 +600,14 @@ The `[ui]` section exists: `theme` (string, ≤96), `appearance` (`dark` | `ligh
 `config_snapshot::ui` — the descriptor rows drive the parser, the deploy example documents
 them (`test_config` enforces that), the settings app renders them with no pane code
 (Appearance → "Theme & density": a text field, two segmented controls, a slider), and the
-compositor exports a set `[ui].theme` as `LUMEN_THEME` into the session environment beside
-the cursor variables. As built, the rest: **the shell applies `[ui]` live** —
+compositor always exports a `LUMEN_THEME` into the session environment beside the cursor
+variables — the resolved value (`resolved_ui_theme`: the configured name or `.lxtheme`
+path as written, or the built-in the appearance selects when no theme is named),
+re-exported when a reload changes that resolved value (density and font-size edits resolve
+to the same value and do not touch the user bus). Like every variable it exports, teardown
+unsets it: a hand-set `LUMEN_THEME` in the user manager is overwritten while the compositor
+runs and deleted when its session ends. As built, the rest: **the shell applies `[ui]`
+live** —
 `shell_app::apply_config` tracks the section and `apply_ui()` re-themes
 (`set_active_builtin_theme` / `load_theme_file` → `set_active_theme`) and re-densifies
 (`set_ui_density`) on a changed reload; the theme change bumps the generation and the
