@@ -359,13 +359,19 @@ int service::on_read_all(sd_bus_message* m, void* user, sd_bus_error*) {
     sd_bus_message* reply = nullptr;
     if ((r = sd_bus_message_new_method_return(m, &reply)) < 0)
         return r;
-    if ((r = sd_bus_message_open_container(reply, 'a', "{sa{sv}}")) < 0)
+    // The only owner of the reply is this handler (sd_bus_send consumes it on success),
+    // so every early return below unrefs it: an append failure otherwise leaks the ref.
+    if ((r = sd_bus_message_open_container(reply, 'a', "{sa{sv}}")) < 0) {
+        sd_bus_message_unref(reply);
         return r;
+    }
     if (namespace_matches(k_appearance_namespace, namespaces)) {
         if ((r = sd_bus_message_open_container(reply, 'e', "sa{sv}")) < 0 ||
             (r = sd_bus_message_append(reply, "s", k_appearance_namespace)) < 0 ||
-            (r = sd_bus_message_open_container(reply, 'a', "{sv}")) < 0)
+            (r = sd_bus_message_open_container(reply, 'a', "{sv}")) < 0) {
+            sd_bus_message_unref(reply);
             return r;
+        }
         const struct {
             const char* key;
             unsigned value;
@@ -374,15 +380,21 @@ int service::on_read_all(sd_bus_message* m, void* user, sd_bus_error*) {
             if ((r = sd_bus_message_open_container(reply, 'e', "sv")) < 0 ||
                 (r = sd_bus_message_append(reply, "s", kv.key)) < 0 ||
                 (r = sd_bus_message_append(reply, "v", "u", kv.value)) < 0 ||
-                (r = sd_bus_message_close_container(reply)) < 0)
+                (r = sd_bus_message_close_container(reply)) < 0) {
+                sd_bus_message_unref(reply);
                 return r;
+            }
         }
         if ((r = sd_bus_message_close_container(reply)) < 0 || // a{sv}
-            (r = sd_bus_message_close_container(reply)) < 0)   // {sa{sv}}
+            (r = sd_bus_message_close_container(reply)) < 0) { // {sa{sv}}
+            sd_bus_message_unref(reply);
             return r;
+        }
     }
-    if ((r = sd_bus_message_close_container(reply)) < 0) // a{sa{sv}}
+    if ((r = sd_bus_message_close_container(reply)) < 0) { // a{sa{sv}}
+        sd_bus_message_unref(reply);
         return r;
+    }
     return sd_bus_send(nullptr, reply, nullptr);
 }
 
