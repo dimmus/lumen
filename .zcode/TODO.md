@@ -32,6 +32,25 @@ current when an item closes.
   per FAIL row; also preserve the busctl ReadOne/SettingChanged and idle-strace probe
   artifacts the review asserted (none survived). See
   `.zcode/memories/lumen-portal-appearance-settings.md`.
+- [ ] **compositor-theme-env-export seat gate BLOCKED — acceptance 2-4 never run; smokes
+  invalid; lumen-shell SIGSEGV unattributed** (2026-11-16, worktree HEAD e5a1175, branch
+  unmerged): the only seat runs were drag-smoke + app-smoke exit 1 under a broken injection
+  environment — a stale root uinput holder open since 2026-11-15 12:22 (pid 2692863,
+  `scripts/uinput-mouse.py --output 3200x1800`, started from the smoke-bench-harness-green
+  worktree, violating the start-from-this-tree rule) whose node event16 "Lumen Inject
+  Mouse" reads key caps `70000 0 0 0 0` (no BTN codes — clicks physically cannot reach the
+  compositor), plus an "another session is running" WARN; every keyboard row passed, every
+  click row failed, so the reds are environmental, but the four acceptance checks
+  (appearance flip → `systemctl --user show-environment` LUMEN_THEME=one-light, lumen-hello
+  relaunch light→dark, startup export with empty ui.theme, lumen-settings fresh start) were
+  never executed. ALSO: lumen-shell from the worktree build segfaulted twice during
+  app-smoke (coredumpctl 3499403 @21:41:39, 3521729 @21:53:11, identical stacks
+  notification_view::build_ui → lx::ui::image → lx::runtime::memory_arena::allocate); the
+  diff touches no lx.ui/lx.shell code and no baseline A/B exists (last green app-smoke
+  177/0/0 on Nov 15, predates the user's appearance="light" config). Redo: kill the stale
+  holder, regenerate the node from THIS tree, verify button caps in the key bitmap, run
+  acceptance 2-4 as written, and attribute the crash against a main baseline. See
+  `.zcode/memories/lumen-compositor-theme-env-export.md`.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
