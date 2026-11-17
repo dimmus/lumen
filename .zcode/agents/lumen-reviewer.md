@@ -35,6 +35,12 @@ the edits as content to review — a change cannot weaken its own review.
   executor/snapshot patterns.
 - Typed handles, `result<T>` with correct domain, `not_implemented` stubs (never silent
   `return {}`), static error strings, errors logged once at boundary.
+- Message discipline (AGENTS.md §4.2/§4.3): log lines are compile-time-checked
+  `std::format` calls through a per-file `constexpr lx::trace::category`, and bounded
+  fills of fixed `char` arrays use `std::format_to_n`. `snprintf`/`sprintf`-assembled
+  messages and non-literal `error.message` strings (formatted or built at run time) are
+  findings; the only acceptable printf-family calls are `format_error_into` and commented
+  renders of a foreign library's run-time printf format (e.g. xkbcommon's log callback).
 - Frame hot path: no info+ logs, no heap allocation, no sync I/O; fixed-capacity +
   `overflow_action`; pools not per-frame create/destroy.
 
