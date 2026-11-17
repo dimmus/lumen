@@ -311,8 +311,19 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
     unsigned slots = 1;
     while (slots < config_.entries * 2)
         slots <<= 1;
-    entries_ = new (std::nothrow) entry[config_.entries];
-    index_ = new (std::nothrow) std::uint32_t[slots]{};
+    // Raw storage as a malloc/free pair: ASan classifies nothrow array-new freed by
+    // delete[] as an "operator new[] vs free" mismatch (same toolchain interplay as
+    // itemize.cppm's buffers). The element-wise placement-new keeps exactly the
+    // initial state the array-new produced (entry's default member initializers;
+    // a zeroed index), and entry is trivially destructible, so free() is the whole
+    // teardown.
+    entries_ = static_cast<entry*>(std::malloc(std::size_t{config_.entries} * sizeof(entry)));
+    index_ = static_cast<std::uint32_t*>(std::malloc(std::size_t{slots} * sizeof(std::uint32_t)));
+    if (entries_)
+        for (std::uint32_t i = 0; i < config_.entries; ++i)
+            new (&entries_[i]) entry{};
+    if (index_)
+        std::memset(index_, 0, std::size_t{slots} * sizeof(std::uint32_t));
     index_mask_ = slots - 1;
     // Anonymous mappings, no constructor run (shaped_glyph is an implicit-lifetime
     // aggregate): an arena's pages become resident only as runs fill them. Heap blocks would
@@ -325,8 +336,8 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
         text_arena_ = reinterpret_cast<char*>(text_memory_.data());
     if (!entries_ || !index_ || !arena_ || !scratch_ || !text_arena_) {
         // Out of memory at construction: every shape call reports it.
-        delete[] entries_;
-        delete[] index_;
+        std::free(entries_);
+        std::free(index_);
         arena_memory_.release();
         scratch_memory_.release();
         text_memory_.release();
@@ -362,8 +373,8 @@ lx::text::shape_cache::~shape_cache() {
     if (buffer_)
         hb_buffer_destroy(static_cast<hb_buffer_t*>(buffer_));
 #endif
-    delete[] entries_;
-    delete[] index_;
+    std::free(entries_);
+    std::free(index_);
 }
 
 lx::text::shape_cache_counters lx::text::shape_cache::counters() const {
