@@ -1,8 +1,8 @@
 # ADR 013 — The Settings application
 
-**Status:** Accepted — Phases A–G implemented (§9's "as built" notes); two named open
-items remain: in-window key capture for the bindings editor, and the per-device override /
-window-rules editors.
+**Status:** Accepted — Phases A–G implemented (§9's "as built" notes); of the two named
+open items, in-window key capture for the bindings editor shipped (`0439bc4`, seat-proven
+2026-11-17 — §9 Phase E) and only the per-device override / window-rules editors remain.
 **Date:** 2026-11-01
 **Scope:** new executable `lumen-settings` (+ its UI module library, `executables/lumen-settings/`),
 `lx.ui` (the controls the settings surface needs and the engine lacks: slider, segmented
@@ -630,9 +630,28 @@ against the effective table ("bound to X — unbind it there first"). A save spl
 `[bindings]` into the user layer (quoted keys flow through the splice editor unchanged —
 its key matcher is text, and the canonical spelling comes from `format_combo`, lowercased
 keysym names as the parser reads them); an empty field writes the `"none"` line that
-removes a default; Reset removes the user layer's line so the default returns. In-window
-key capture (wl_keyboard keysym recording) stays open — the text grammar is the complete
-fallback. Tests: `settings_bindings_editor_validates_conflicts_and_writes` (a real temp
+removes a default; Reset removes the user layer's line so the default returns.
+**In-window key capture shipped** (`0439bc4`, 2026-11-06; proven on the real seat
+2026-11-17, `evidence/2026-11-17-shortcut-capture/`): a **Record shortcut** button in the
+edit modal — explicit opt-in, so the text grammar stays the complete fallback (and the only
+way to enter pointer bindings) — arms `session::capture_binding_key` over the app's own
+`wl_keyboard` handler (in-window focus only, ADR §2.3: `zlm_shell_v1` grab is
+shell-privileged). Keysyms come from xkbcommon against the seat's live keymap and state —
+active layout, level zero, modifiers separate, `xkb_keysym_to_lower`
+(`executables/lumen-settings/main.cpp:105-111`; built only with
+`LUMEN_SETTINGS_HAS_XKBCOMMON`, without it capture consumes keys and records nothing).
+Bare modifier presses arm a tap (a lone Super release records the `Super` tap binding);
+any other key disarms. Capture formats through `format_combo` and re-parses with
+`parse_combo` — one grammar, no second parser — filling the modal's edit buffer with the
+canonical spelling, and every save rides the same `apply_edit_action` validation above
+(reserved, pointer/keyboard-only, conflicts) and the same quoted splice line. Bare Escape
+cancels the edit and bare Backspace clears the field while a modified BackSpace records
+(`Ctrl+BackSpace`); a reserved combination (VT 1–12, `Super+Esc`,
+Ctrl+Alt+Backspace/SysReq/F1–F12) fills the field with the inline reserved error and Save
+refuses. The editor renders at the pane's content bottom (after the action sections).
+Tests: `settings_shortcut_capture_records_keys_and_modifier_taps`,
+`settings_shortcut_capture_cancel_clear_and_reserved`,
+`settings_bindings_editor_validates_conflicts_and_writes` (a real temp
 file: bind → line lands and re-parses; reserved refused with the file unchanged; conflict
 refused; reset removes the line).
 
@@ -668,10 +687,13 @@ compositor feature, not on the app.
 
 ### Status
 
-Phases A–H implemented (H is the Zed design pass above) except the two named open items (in-window key capture; the
-per-device override and window-rules editors). 134/134 tests green, including
-`test_ui_inputs` (5), `test_settings_ui` (5), `test_config_edit` (5); the app opens and
-presents on the automatic tier against a headless compositor, and `lumen-ctl devices` /
+Phases A–H implemented (H is the Zed design pass above); of the named open items only the
+per-device override and window-rules editors remain (in-window key capture shipped in
+`0439bc4`). 136/136 non-bench tests green (worktree `zcode/task/settings-key-capture-close-out`
+@ 99e9950, 2026-11-17), including `test_ui_inputs` (8), `test_settings_ui` (15),
+`test_config_edit` (6); the app opens and presents on the automatic tier (hardware Vulkan
+on the notebook) and has been driven on the real seat — the bindings editor's capture path
+included (`evidence/2026-11-17-shortcut-capture/`) — and `lumen-ctl devices` /
 `outputs` / `version` answer live.
 
 ### Phase H — the Zed design pass — done
