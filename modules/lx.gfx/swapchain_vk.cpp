@@ -167,7 +167,7 @@ lx::result<void> client_gpu::try_vulkan(bool forced, bool allow_software) {
                     lx::vulkan_err::unsupported);
     vk_ = dev;
     software_ = di.is_software_rasterizer;
-    std::snprintf(name_, sizeof(name_), "%s", di.device_name ? di.device_name : "vulkan");
+    *std::format_to_n(name_, sizeof(name_) - 1, "{}", di.device_name ? di.device_name : "vulkan").out = '\0';
     return {};
 #else
     (void)forced;

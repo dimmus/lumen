@@ -376,7 +376,7 @@ lx::session::session_choice lx::session::discover_session(const session_discover
         return f.exists && f.uid == d.uid && f.has_seat && f.user_class;
     };
     const auto take = [&c](const char* id, session_found_by by) {
-        std::snprintf(c.id, sizeof(c.id), "%s", id);
+        *std::format_to_n(c.id, sizeof(c.id) - 1, "{}", id).out = '\0';
         c.found_by = by;
         return c;
     };
@@ -421,7 +421,8 @@ lx::session::session_discovery lx::session::system_session_discovery() {
         char* sid = nullptr;
         if (sd_pid_get_session(0, &sid) < 0 || !sid)
             return false;
-        std::snprintf(out, size, "%s", sid);
+        if (size)
+            *std::format_to_n(out, size - 1, "{}", sid).out = '\0';
         free(sid);
         return true;
     };
@@ -429,7 +430,8 @@ lx::session::session_discovery lx::session::system_session_discovery() {
         char* sid = nullptr;
         if (sd_uid_get_display(static_cast<uid_t>(uid), &sid) < 0 || !sid)
             return false;
-        std::snprintf(out, size, "%s", sid);
+        if (size)
+            *std::format_to_n(out, size - 1, "{}", sid).out = '\0';
         free(sid);
         return true;
     };
@@ -439,7 +441,7 @@ lx::session::session_discovery lx::session::system_session_discovery() {
         unsigned written = 0;
         for (int i = 0; i < n && list && list[i]; ++i) {
             if (written < cap)
-                std::snprintf(out[written++], 64, "%s", list[i]);
+                *std::format_to_n(out[written++], 64 - 1, "{}", list[i]).out = '\0';
             free(list[i]);
         }
         free(list);
@@ -491,13 +493,13 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
         s.session_id_ = "";
         return s;
     }
-    std::snprintf(s.session_id_buf_, sizeof(s.session_id_buf_), "%s", choice.id);
+    *std::format_to_n(s.session_id_buf_, sizeof(s.session_id_buf_) - 1, "{}", choice.id).out = '\0';
     s.session_id_ = s.session_id_buf_;
     s.found_by_ = choice.found_by;
     {
         char* type = nullptr;
         if (sd_session_get_type(s.session_id_, &type) >= 0 && type)
-            std::snprintf(s.type_, sizeof(s.type_), "%s", type);
+            *std::format_to_n(s.type_, sizeof(s.type_) - 1, "{}", type).out = '\0';
         free(type);
     }
 
@@ -519,7 +521,7 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
         sd_bus_message_unref(reply);
         return lx::make_error(lx::io_err::not_found, "logind GetSession bad reply");
     }
-    std::snprintf(s.session_path_, sizeof(s.session_path_), "%s", path);
+    *std::format_to_n(s.session_path_, sizeof(s.session_path_) - 1, "{}", path).out = '\0';
     sd_bus_message_unref(reply);
 
     // Session.Seat (so), VTNr (u), Active (b); Seat.CanTTY (b). One call each, at startup.
@@ -533,7 +535,7 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
             const char* seat_id = nullptr;
             const char* seat_path = nullptr;
             if (sd_bus_message_read(seat_reply, "(so)", &seat_id, &seat_path) >= 0 && seat_path)
-                std::snprintf(s.seat_path_, sizeof(s.seat_path_), "%s", seat_path);
+                *std::format_to_n(s.seat_path_, sizeof(s.seat_path_) - 1, "{}", seat_path).out = '\0';
             sd_bus_message_unref(seat_reply);
         }
         sd_bus_error_free(&perr);

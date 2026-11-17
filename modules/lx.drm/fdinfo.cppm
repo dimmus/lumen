@@ -263,7 +263,8 @@ bool lx::drm::add_fdinfo_client(gpu_memory& into, const fdinfo_client& c) {
         char qualified[32];
         std::string_view name = r.name;
         if (other_driver) {
-            std::snprintf(qualified, sizeof(qualified), "%s:%s", c.driver, r.name);
+            *std::format_to_n(qualified, sizeof(qualified) - 1, "{}:{}", c.driver,
+                              r.name).out = '\0';
             name = qualified;
         }
         gpu_region* sum = find_region(into.regions, name, into.regions_dropped);

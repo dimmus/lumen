@@ -509,12 +509,16 @@ inline void hash_bytes(std::uint64_t& h, const char* s) {
     const char* xdg = std::getenv("XDG_CACHE_HOME");
     int n = 0;
     if (xdg && *xdg) {
-        n = std::snprintf(out, sizeof out, "%s", xdg);
+        const auto seg = std::format_to_n(out, sizeof(out) - 1, "{}", xdg);
+        *seg.out = '\0';
+        n = static_cast<int>(seg.size);
     } else {
         const char* home = std::getenv("HOME");
         if (!home || !*home)
             return false;
-        n = std::snprintf(out, sizeof out, "%s/.cache", home);
+        const auto seg = std::format_to_n(out, sizeof(out) - 1, "{}/.cache", home);
+        *seg.out = '\0';
+        n = static_cast<int>(seg.size);
     }
     if (n <= 0 || static_cast<std::size_t>(n) >= sizeof out - 16)
         return false;
@@ -689,8 +693,8 @@ lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
                 hash_bytes(h, part);
             for (const char* part : fs)
                 hash_bytes(h, part);
-            std::snprintf(path, sizeof path, "%s/gl-program-%016llx.bin", dir,
-                          static_cast<unsigned long long>(h));
+            *std::format_to_n(path, sizeof(path) - 1, "{}/gl-program-{:016x}.bin", dir,
+                              static_cast<unsigned long long>(h)).out = '\0';
             cacheable = true;
         }
     }
@@ -759,7 +763,8 @@ lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
                 if (got > 0) {
                     // Written to a temporary and renamed: a reader never sees half a file.
                     char tmp[660];
-                    std::snprintf(tmp, sizeof tmp, "%s.%d", path, static_cast<int>(::getpid()));
+                    *std::format_to_n(tmp, sizeof(tmp) - 1, "{}.{}", path,
+                                      static_cast<int>(::getpid())).out = '\0';
                     if (std::FILE* out = std::fopen(tmp, "wb")) {
                         const std::uint32_t header[3] = {k_binary_magic, format,
                                                          static_cast<std::uint32_t>(got)};
@@ -805,8 +810,8 @@ lx::result<void> lx::gfx::ui_gl_renderer::initialize(const ui_gl_options& option
     const auto* renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
     if (!version || !renderer)
         return lx::make_error(lx::gl_err::no_context, "ui_gl: no current GL context");
-    std::snprintf(caps_.renderer, sizeof caps_.renderer, "%s", renderer);
-    std::snprintf(caps_.version, sizeof caps_.version, "%s", version);
+    *std::format_to_n(caps_.renderer, sizeof(caps_.renderer) - 1, "{}", renderer).out = '\0';
+    *std::format_to_n(caps_.version, sizeof(caps_.version) - 1, "{}", version).out = '\0';
     caps_.software = software_renderer(caps_.renderer);
     // "OpenGL ES M.m ..." — GL_MAJOR_VERSION does not exist in an ES 2 context, the string does.
     if (std::sscanf(version, "OpenGL ES %d.%d", &caps_.major, &caps_.minor) != 2)

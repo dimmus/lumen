@@ -109,8 +109,8 @@ const char* lx::drm::no_atomic_hint(const char* driver, const char* sys_module) 
     if (driver && std::strcmp(driver, "nouveau") == 0) {
         char path[512];
         char value[16];
-        std::snprintf(path, sizeof(path), "%s/nouveau/parameters/atomic",
-                      sys_module ? sys_module : "/sys/module");
+        *std::format_to_n(path, sizeof(path) - 1, "{}/nouveau/parameters/atomic",
+                          sys_module ? sys_module : "/sys/module").out = '\0';
         // 1, or -1 ("auto", Linux 7.4+): asked for and still refused.
         if (read_attr(path, value, sizeof(value)) && std::strcmp(value, "0") != 0)
             return "nouveau has no atomic modesetting on GPUs before NV50 (GeForce 8); Lumen "
@@ -139,18 +139,20 @@ lx::drm::card_list lx::drm::find_cards(const char* sys_drm) {
             continue;
         card_candidate& c = list.cards[list.count++];
         c.index = static_cast<unsigned>(n);
-        std::snprintf(c.path, sizeof(c.path), "/dev/dri/card%ld", n);
+        *std::format_to_n(c.path, sizeof(c.path) - 1, "/dev/dri/card{}", n).out = '\0';
         char attr[512];
         char value[16];
-        std::snprintf(attr, sizeof(attr), "%s/%s/device/boot_vga", sys_drm, e->d_name);
+        *std::format_to_n(attr, sizeof(attr) - 1, "{}/{}/device/boot_vga", sys_drm,
+                          e->d_name).out = '\0';
         c.boot_vga = read_attr(attr, value, sizeof(value)) && std::strcmp(value, "1") == 0;
-        std::snprintf(attr, sizeof(attr), "%s/%s/device/driver", sys_drm, e->d_name);
+        *std::format_to_n(attr, sizeof(attr) - 1, "{}/{}/device/driver", sys_drm,
+                          e->d_name).out = '\0';
         char target[256];
         const ssize_t len = ::readlink(attr, target, sizeof(target) - 1);
         if (len > 0) {
             target[len] = '\0';
             const char* base = std::strrchr(target, '/');
-            std::snprintf(c.driver, sizeof(c.driver), "%s", base ? base + 1 : target);
+            *std::format_to_n(c.driver, sizeof(c.driver) - 1, "{}", base ? base + 1 : target).out = '\0';
         }
     }
     // Pass 2: their connectors, `cardN-<connector>/status`.
@@ -175,7 +177,8 @@ lx::drm::card_list lx::drm::find_cards(const char* sys_drm) {
             ++c.connectors;
             char attr[512];
             char value[16];
-            std::snprintf(attr, sizeof(attr), "%s/%s/status", sys_drm, e->d_name);
+            *std::format_to_n(attr, sizeof(attr) - 1, "{}/{}/status", sys_drm,
+                              e->d_name).out = '\0';
             if (read_attr(attr, value, sizeof(value)) && std::strcmp(value, "connected") == 0)
                 ++c.connected;
             break;

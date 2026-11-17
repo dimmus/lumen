@@ -75,7 +75,7 @@ bool lx::drm::parse_edid_base_block(const unsigned char* d, unsigned size, edid_
                          static_cast<char>('@' + ((m >> 5) & 0x1f)),
                          static_cast<char>('@' + (m & 0x1f)), '\0'};
     if (pnp[0] > '@' && pnp[1] > '@' && pnp[2] > '@')
-        std::snprintf(out.make, sizeof(out.make), "%s", pnp);
+        *std::format_to_n(out.make, sizeof(out.make) - 1, "{}", pnp).out = '\0';
     const unsigned product = static_cast<unsigned>(d[10]) | (static_cast<unsigned>(d[11]) << 8);
     const unsigned serial_no = static_cast<unsigned>(d[12]) | (static_cast<unsigned>(d[13]) << 8) |
                                (static_cast<unsigned>(d[14]) << 16) |
@@ -91,9 +91,9 @@ bool lx::drm::parse_edid_base_block(const unsigned char* d, unsigned size, edid_
             copy_trimmed(out.serial, reinterpret_cast<const char*>(b + 5), 13);
     }
     if (out.model[0] == '\0')
-        std::snprintf(out.model, sizeof(out.model), "0x%04X", product);
+        *std::format_to_n(out.model, sizeof(out.model) - 1, "0x{:04X}", product).out = '\0';
     if (out.serial[0] == '\0' && serial_no != 0)
-        std::snprintf(out.serial, sizeof(out.serial), "0x%08X", serial_no);
+        *std::format_to_n(out.serial, sizeof(out.serial) - 1, "0x{:08X}", serial_no).out = '\0';
     out.valid = true;
     return true;
 }

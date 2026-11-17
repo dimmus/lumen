@@ -594,8 +594,9 @@ void probe_one(int fd, uint32_t connector_id, lx::drm::connector_probe& e) {
         return;
     e.type = conn->connector_type;
     e.type_id = conn->connector_type_id;
-    std::snprintf(e.name, sizeof(e.name), "%s-%u", lx::drm::connector_type_name(conn->connector_type),
-                  conn->connector_type_id);
+    *std::format_to_n(e.name, sizeof(e.name) - 1, "{}-{}",
+                      lx::drm::connector_type_name(conn->connector_type),
+                      conn->connector_type_id).out = '\0';
     e.status = conn->connection == DRM_MODE_CONNECTED      ? lx::drm::connector_status::connected
                : conn->connection == DRM_MODE_DISCONNECTED ? lx::drm::connector_status::disconnected
                                                            : lx::drm::connector_status::unknown;

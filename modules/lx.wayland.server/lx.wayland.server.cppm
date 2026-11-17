@@ -393,7 +393,7 @@ bool lx::wayland::client_connection::sandboxed() {
     char path[64];
     bool found = false;
     if (cred.pidfd >= 0) {
-        std::snprintf(path, sizeof(path), "/proc/%u/root", cred_.pid);
+        *std::format_to_n(path, sizeof(path) - 1, "/proc/{}/root", cred_.pid).out = '\0';
         const lx::unique_fd root{::open(path, O_PATH | O_DIRECTORY | O_CLOEXEC)};
         if (root.get() < 0 || !peer_confirmed(cred)) {
             sandbox_ = 2;
@@ -410,7 +410,8 @@ bool lx::wayland::client_connection::sandboxed() {
                          cred_.pid);
         return true;
     } else {
-        std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
+        *std::format_to_n(path, sizeof(path) - 1, "/proc/{}/root/.flatpak-info",
+                          cred_.pid).out = '\0';
         found = ::access(path, F_OK) == 0;
     }
     if (found) {
@@ -558,7 +559,8 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
 
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0] != '\0')
-        std::snprintf(socket_path_, sizeof(socket_path_), "%s/%s", runtime, name);
+        *std::format_to_n(socket_path_, sizeof(socket_path_) - 1, "{}/{}", runtime,
+                          name).out = '\0';
 
     listen_fd_ = wl_event_loop_get_fd(wl_display_get_event_loop(display_));
     bound_ = true;
@@ -793,7 +795,7 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
     bool have_exe = false;
     if (cred.pid != 0) {
         char proc[32];
-        std::snprintf(proc, sizeof(proc), "/proc/%u/exe", cred.pid);
+        *std::format_to_n(proc, sizeof(proc) - 1, "/proc/{}/exe", cred.pid).out = '\0';
         const ssize_t n = ::readlink(proc, exe, sizeof(exe) - 1);
         if (n > 0) {
             exe[n] = '\0';
@@ -832,17 +834,17 @@ void lx::wayland::server::set_shell_binary_path(const char* path) {
         char* slash = n > 0 ? std::strrchr(self, '/') : nullptr;
         if (slash) {
             *slash = '\0';
-            std::snprintf(candidate, sizeof(candidate), "%s/%s", self, path);
+            *std::format_to_n(candidate, sizeof(candidate) - 1, "{}/{}", self, path).out = '\0';
         } else {
-            std::snprintf(candidate, sizeof(candidate), "%s", path);
+            *std::format_to_n(candidate, sizeof(candidate) - 1, "{}", path).out = '\0';
         }
     } else {
-        std::snprintf(candidate, sizeof(candidate), "%s", path);
+        *std::format_to_n(candidate, sizeof(candidate) - 1, "{}", path).out = '\0';
     }
     if (::realpath(candidate, shell_binary_path_) == nullptr) {
         // Kept as given: nothing can match it, so every privileged bind is denied (and
         // each denial names this path), rather than the check silently passing.
-        std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", candidate);
+        *std::format_to_n(shell_binary_path_, sizeof(shell_binary_path_) - 1, "{}", candidate).out = '\0';
         log_wayland.warn("shell binary {} not found: zlm_shell_v1 binds will be "
                          "denied",
                          shell_binary_path_);
