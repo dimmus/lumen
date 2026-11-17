@@ -1,4 +1,5 @@
 - [Lumen host build/run environment](lumen-host-build-run-env.md) — vmwgfx VM, no Vulkan headers/ICD, GL path; fetch protocols, release preset, tty-smoke from SSH works
+- [snprintf log migration](lumen-snprintf-log-migration.md) — 2026-11-17: all 329 modules/ snprintf sites → §4.3 format conventions (4 documented exceptions incl. 3 xkb vsnprintf); format_to_n idioms, %g/%.2f parity, scripted-rewrite traps (n = *... mangling), gates 136/136 + smokes PASS + A/B 0/0; lx.shell.cppm is LF at HEAD
 - [Best-in-class bar for Lumen](lumen-best-in-class-bar.md) — state-of-the-art choices, compare to wlroots/KWin/Mutter/niri, measure efficiency
 - [GPU UI engine plan (ADR-010)](lumen-gpu-ui-engine-plan.md) — GPUI-style primitive renderer; plan in PR #31, Phases 0-1 in PR #37; Phase 2 text in PR #38; memory PR #39; Phase 3 in PR #48; Phase 4 in PR #54; next is Phase 5 (shell adoption)
 - [Shell first-paint WIP](lumen-shell-first-paint-wip.md) — font matches merged (PR #44); background cache + loop order still only in WIP c8d4499
