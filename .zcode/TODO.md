@@ -12,6 +12,18 @@ current when an item closes.
   without asking).
 - [ ] **ADR-013 open item 1: in-window key capture** for the bindings editor (wl_keyboard
   keysym recording; the text grammar is the complete fallback today).
+- [ ] **Super tap grab fires mid-chord (compositor tap-arming corner)** (2026-11-17, found
+  by the settings-key-capture seat run; low; pre-existing): during an injected
+  Super+Shift+y chord the shell's Super tap grab armed and fired anyway — the launcher
+  overlay layer mapped and stole keyboard focus ~20 ms after the meta press — although
+  `observe_tap` resets `tap_owner_` on every press
+  (`modules/lx.compositor/keybindings.cppm:420-423`). Evidence:
+  `evidence/2026-11-17-shortcut-capture/` (inj-s2.jsonl t4-chord: shift press 20 ms after
+  meta; launcher-tap-events.txt: layer map surface=6 `lumen-launcher` + focus steal) — see
+  `.zcode/memories/lumen-settings-key-capture-seat.md`. To a capture/smoke run it looks
+  exactly like "capture silently records nothing" (stale client modifier state until the
+  refocus re-sends the keymap). Next: reproduce under real-typing cadence, then decide
+  whether the arming path can observe coalesced/reordered press pairs.
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
   schema-side rows in `lumen-settings` waiting on their own compositor feature (rule store
   behind the inert `zlm_window_rules_v1`; `[[input.device]]` override plumbing), not on the app.
