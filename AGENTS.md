@@ -11,7 +11,8 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
   (planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher,
   architect, doc-writer, screenshoter — dispatch via the Agent tool; the studio workflow
   embeds the same personas), knowledge skills in `.zcode/skills/` (`lumen-build-run`,
-  `lumen-testing`, `lumen-decisions`, `lumen-memory-writer`, `lumen-studio`,
+  `lumen-testing`, `lumen-decisions`, `lumen-adr` — when a decision needs a
+  `docs/adr/NNN-*.md` and how to write it, `lumen-memory-writer`, `lumen-studio`,
   `agent-screenshoter` — seat screenshots; a lead dispatches `agent-screenshoter`
   instead of improvising shell commands), and saved
   dynamic workflows in `.zcode/workflows/` (`lumen-development-studio` for non-trivial or

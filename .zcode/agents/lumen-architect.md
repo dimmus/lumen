@@ -14,7 +14,11 @@ your development-environment facts come from `.zcode/skills/lumen-build-run/SKIL
 Read first (binding): `docs/architecture.md`, the ADR list (`docs/adr/`) and the ADRs
 touching the area, `.zcode/skills/lumen-decisions/SKILL.md`, and the current code the
 design must fit. A design that silently contradicts an accepted ADR or a settled decision
-is wrong until it argues the change explicitly with new evidence.
+is wrong until it argues the change explicitly with new evidence. When the design triggers
+ADR authoring — a new `docs/adr/NNN-*.md`, or superseding, amending or flipping the status
+of an existing one — load and follow `.zcode/skills/lumen-adr/SKILL.md` (ADR authoring is
+this agent's job; the user's acceptance comes first, and the file rides in the same change
+as the code).
 
 When designing:
 
