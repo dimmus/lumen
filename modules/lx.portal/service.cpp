@@ -30,6 +30,7 @@ import :files;
 import :overlay;
 import :png;
 import :service;
+import :settings;
 
 namespace lx::portal {
 
@@ -163,10 +164,14 @@ public:
     static int on_pick_color(sd_bus_message* m, void* user, sd_bus_error* err);
     static int on_close(sd_bus_message* m, void* user, sd_bus_error* err);
     static int on_name_lost(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_read_all(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_read(sd_bus_message* m, void* user, sd_bus_error* err);
     static int get_version(sd_bus*, const char*, const char*, const char*, sd_bus_message* reply, void*,
                            sd_bus_error*);
     static int get_targets(sd_bus*, const char*, const char*, const char*, sd_bus_message* reply, void*,
                            sd_bus_error*);
+    static int get_settings_version(sd_bus*, const char*, const char*, const char*, sd_bus_message* reply,
+                                    void*, sd_bus_error*);
 
 private:
     int accept(sd_bus_message* m, request_state::kind what);
@@ -175,12 +180,17 @@ private:
     void complete_overlay();
     void answer(unsigned response, const std::string& uri = {}, const std::uint32_t* colour = nullptr);
     void save_and_answer(const image& img, const char* what);
+    void emit_setting_changed(const char* key, unsigned value);
 
     service_options options_;
     sd_bus* bus_ = nullptr;
     sd_bus_slot* object_slot_ = nullptr;
+    sd_bus_slot* settings_slot_ = nullptr;
     sd_bus_slot* match_slot_ = nullptr;
     std::unique_ptr<request_state> req_;
+    /// The Settings values: [ui] appearance mapped to the portal's color-scheme/contrast,
+    /// watched and re-read when the configuration changes on disk.
+    settings_state settings_;
     bool quit_ = false;
 };
 
@@ -197,6 +207,17 @@ const sd_bus_vtable k_request_vtable[] = {
     SD_BUS_METHOD("Close", "", "", service::on_close, SD_BUS_VTABLE_UNPRIVILEGED),
     SD_BUS_VTABLE_END};
 
+/// org.freedesktop.impl.portal.Settings, at the same object path as the Screenshot one:
+/// ReadAll's filter and Read's lookups are the pure halves in :settings; SettingChanged is
+/// emitted by the loop when the watched configuration flips what is served.
+const sd_bus_vtable k_settings_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_METHOD("ReadAll", "as", "a{sa{sv}}", service::on_read_all, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_METHOD("Read", "ss", "v", service::on_read, SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_SIGNAL("SettingChanged", "ssv", 0),
+    SD_BUS_PROPERTY("version", "u", service::get_settings_version, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_VTABLE_END};
+
 } // namespace
 
 service::~service() {
@@ -208,6 +229,8 @@ service::~service() {
     }
     if (match_slot_)
         sd_bus_slot_unref(match_slot_);
+    if (settings_slot_)
+        sd_bus_slot_unref(settings_slot_);
     if (object_slot_)
         sd_bus_slot_unref(object_slot_);
     if (bus_) {
@@ -224,6 +247,11 @@ int service::get_version(sd_bus*, const char*, const char*, const char*, sd_bus_
 int service::get_targets(sd_bus*, const char*, const char*, const char*, sd_bus_message* reply, void*,
                          sd_bus_error*) {
     return sd_bus_message_append(reply, "u", k_screenshot_targets);
+}
+
+int service::get_settings_version(sd_bus*, const char*, const char*, const char*, sd_bus_message* reply,
+                                  void*, sd_bus_error*) {
+    return sd_bus_message_append(reply, "u", 1u);
 }
 
 int service::on_name_lost(sd_bus_message* m, void* user, sd_bus_error*) {
@@ -312,6 +340,81 @@ int service::on_close(sd_bus_message* m, void* user, sd_bus_error*) {
         s.req_->closed = true;
     }
     return sd_bus_reply_method_return(m, "");
+}
+
+int service::on_read_all(sd_bus_message* m, void* user, sd_bus_error*) {
+    auto& s = *static_cast<service*>(user);
+    std::vector<std::string> namespaces;
+    const char* ns = nullptr;
+    int r = sd_bus_message_enter_container(m, 'a', "s");
+    if (r < 0)
+        return r;
+    while ((r = sd_bus_message_read(m, "s", &ns)) > 0)
+        namespaces.emplace_back(ns);
+    if (r < 0)
+        return r;
+    if ((r = sd_bus_message_exit_container(m)) < 0)
+        return r;
+    const appearance_values v = s.settings_.values();
+    sd_bus_message* reply = nullptr;
+    if ((r = sd_bus_message_new_method_return(m, &reply)) < 0)
+        return r;
+    // The only owner of the reply is this handler (sd_bus_send consumes it on success),
+    // so every early return below unrefs it: an append failure otherwise leaks the ref.
+    if ((r = sd_bus_message_open_container(reply, 'a', "{sa{sv}}")) < 0) {
+        sd_bus_message_unref(reply);
+        return r;
+    }
+    if (namespace_matches(k_appearance_namespace, namespaces)) {
+        if ((r = sd_bus_message_open_container(reply, 'e', "sa{sv}")) < 0 ||
+            (r = sd_bus_message_append(reply, "s", k_appearance_namespace)) < 0 ||
+            (r = sd_bus_message_open_container(reply, 'a', "{sv}")) < 0) {
+            sd_bus_message_unref(reply);
+            return r;
+        }
+        const struct {
+            const char* key;
+            unsigned value;
+        } served[] = {{"color-scheme", v.color_scheme}, {"contrast", v.contrast}};
+        for (const auto& kv : served) {
+            if ((r = sd_bus_message_open_container(reply, 'e', "sv")) < 0 ||
+                (r = sd_bus_message_append(reply, "s", kv.key)) < 0 ||
+                (r = sd_bus_message_append(reply, "v", "u", kv.value)) < 0 ||
+                (r = sd_bus_message_close_container(reply)) < 0) {
+                sd_bus_message_unref(reply);
+                return r;
+            }
+        }
+        if ((r = sd_bus_message_close_container(reply)) < 0 || // a{sv}
+            (r = sd_bus_message_close_container(reply)) < 0) { // {sa{sv}}
+            sd_bus_message_unref(reply);
+            return r;
+        }
+    }
+    if ((r = sd_bus_message_close_container(reply)) < 0) { // a{sa{sv}}
+        sd_bus_message_unref(reply);
+        return r;
+    }
+    return sd_bus_send(nullptr, reply, nullptr);
+}
+
+int service::on_read(sd_bus_message* m, void* user, sd_bus_error* err) {
+    auto& s = *static_cast<service*>(user);
+    const char* ns = nullptr;
+    const char* key = nullptr;
+    int r = sd_bus_message_read(m, "ss", &ns, &key);
+    if (r < 0)
+        return r;
+    if (std::strcmp(ns, k_appearance_namespace) == 0) {
+        const appearance_values v = s.settings_.values();
+        if (std::strcmp(key, "color-scheme") == 0)
+            return sd_bus_reply_method_return(m, "v", "u", v.color_scheme);
+        if (std::strcmp(key, "contrast") == 0)
+            return sd_bus_reply_method_return(m, "v", "u", v.contrast);
+    }
+    // accent-color and reduced-motion land here too: unserved by design, the portal's
+    // documented answer for anything unknown (what gtk's backend returns).
+    return sd_bus_error_set(err, "org.freedesktop.portal.Error.NotFound", "Requested setting not found");
 }
 
 void service::answer(unsigned response, const std::string& uri, const std::uint32_t* colour) {
@@ -469,6 +572,13 @@ void service::complete_overlay() {
     }
 }
 
+void service::emit_setting_changed(const char* key, unsigned value) {
+    const int r = sd_bus_emit_signal(bus_, k_object_path, "org.freedesktop.impl.portal.Settings",
+                                     "SettingChanged", "ssv", k_appearance_namespace, key, "u", value);
+    if (r < 0)
+        log_portal.warn("could not emit SettingChanged: {}", std::strerror(-r));
+}
+
 void service::after_events() {
     if (req_ && req_->closed) {
         answer(2);
@@ -505,6 +615,12 @@ int service::run() {
         log_portal.error("cannot export the Screenshot object: {}", std::strerror(-r));
         return 1;
     }
+    r = sd_bus_add_object_vtable(bus_, &settings_slot_, k_object_path, "org.freedesktop.impl.portal.Settings",
+                                 k_settings_vtable, this);
+    if (r < 0) {
+        log_portal.error("cannot export the Settings object: {}", std::strerror(-r));
+        return 1;
+    }
     r = sd_bus_match_signal(bus_, &match_slot_, "org.freedesktop.DBus", "/org/freedesktop/DBus",
                             "org.freedesktop.DBus", "NameLost", on_name_lost, this);
     if (r < 0)
@@ -519,6 +635,9 @@ int service::run() {
     log_portal.info("serving {} (Screenshot v{}, targets 0x{:x}) on display {}", k_bus_name,
                     k_screenshot_version, k_screenshot_targets,
                     std::getenv("WAYLAND_DISPLAY") ? std::getenv("WAYLAND_DISPLAY") : "(unset)");
+    log_portal.info("settings: {} color-scheme={} contrast={} (watched: {})", k_appearance_namespace,
+                    settings_.values().color_scheme, settings_.values().contrast,
+                    settings_.fd() >= 0 ? 1 : 0);
 
     sigset_t mask;
     sigemptyset(&mask);
@@ -544,7 +663,7 @@ int service::run() {
         if (quit_)
             break;
         after_events();
-        pollfd fds[4]{};
+        pollfd fds[5]{};
         nfds_t n = 0;
         fds[n++] = {sd_bus_get_fd(bus_), static_cast<short>(sd_bus_get_events(bus_)), 0};
         fds[n++] = {sfd, POLLIN, 0};
@@ -582,6 +701,15 @@ int service::run() {
             if (req_ && req_->ov)
                 (void)req_->ov->pump_ui();
         }
+        // The configuration watch (Settings): last, so the request fds keep their indices
+        // above; its own index depends on which of them are armed.
+        nfds_t cfg_idx = 0;
+        bool with_cfg = false;
+        if (const int cfd = settings_.fd(); cfd >= 0) {
+            cfg_idx = n;
+            fds[n++] = {cfd, POLLIN, 0};
+            with_cfg = true;
+        }
         uint64_t usec = UINT64_MAX;
         int timeout = -1;
         if (sd_bus_get_timeout(bus_, &usec) >= 0 && usec != UINT64_MAX) {
@@ -608,6 +736,16 @@ int service::run() {
         if (with_ui && req_ && req_->ov && (fds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
             (void)req_->ov->pump_ui();
             after_events();
+        }
+        if (with_cfg && (fds[cfg_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+            // Re-read the layers and compare: SettingChanged goes out only for what the
+            // served values actually flipped.
+            const appearance_flip f = settings_.poll_changed();
+            const appearance_values v = settings_.values();
+            if (f.color_scheme)
+                emit_setting_changed("color-scheme", v.color_scheme);
+            if (f.contrast)
+                emit_setting_changed("contrast", v.contrast);
         }
     }
     if (req_)

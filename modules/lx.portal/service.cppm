@@ -2,8 +2,10 @@ module;
 
 // xdg-desktop-portal-lumen (design-app-compat-capture Part E): the portal backend a Lumen
 // session uses for org.freedesktop.impl.portal.Screenshot (version 3: Screenshot with the
-// Screen, Window and Area targets, PickColor), and the source chooser
-// xdg-desktop-portal-wlr runs for ScreenCast (`--choose`, dmenu protocol).
+// Screen, Window and Area targets, PickColor), org.freedesktop.impl.portal.Settings
+// (org.freedesktop.appearance color-scheme and contrast from [ui] appearance, re-read when
+// the configuration changes on disk, the flip emitted as SettingChanged), and the source
+// chooser xdg-desktop-portal-wlr runs for ScreenCast (`--choose`, dmenu protocol).
 //
 // D-Bus (sd-bus, user bus): bus name org.freedesktop.impl.portal.desktop.lumen, object
 // /org/freedesktop/portal/desktop. Each call gets the frontend's Request object at its
@@ -22,8 +24,9 @@ module;
 // screenshot of an app without the permission); a locked session has no capture at all
 // (the compositor stops the sessions) and the request answers 2.
 //
-// Single-threaded: one poll over the bus, a signalfd and — only while a request runs — its
-// Wayland connection. Idle, the process sleeps in poll with no timeout.
+// Single-threaded: one poll over the bus, a signalfd, the configuration watch (Settings)
+// and — only while a request runs — its Wayland connection. Idle, the process sleeps in
+// poll with no timeout.
 
 export module lx.portal:service;
 
