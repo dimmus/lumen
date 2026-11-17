@@ -652,8 +652,12 @@ bool lx::ui::slider_node::apply(const slider_props& p) {
         const float scale = span <= 10.f ? 100.f : span <= 100.f ? 10.f : 1.f;
         const double shown = std::round(static_cast<double>(painted_) * scale) / scale;
         // `scale` decimals: 100 → "0.55", 10 → "12.5", 1 → "300".
-        std::snprintf(value_text_, sizeof(value_text_),
-                      scale >= 100.f ? "%.2f" : scale >= 10.f ? "%.1f" : "%.0f", shown);
+        if (scale >= 100.f)
+            *std::format_to_n(value_text_, sizeof(value_text_) - 1, "{:.2f}", shown).out = '\0';
+        else if (scale >= 10.f)
+            *std::format_to_n(value_text_, sizeof(value_text_) - 1, "{:.1f}", shown).out = '\0';
+        else
+            *std::format_to_n(value_text_, sizeof(value_text_) - 1, "{:.0f}", shown).out = '\0';
     } else {
         value_text_[0] = '0';
         value_text_[1] = '\0';

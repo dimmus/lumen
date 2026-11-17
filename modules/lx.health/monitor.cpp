@@ -42,7 +42,8 @@ health_report evaluate(const health_inputs& in, const health_thresholds& t) {
 
     // ── Parts ──
     if (in.wayland_serving) {
-        std::snprintf(line, sizeof(line), "serving %s", in.socket_name ? in.socket_name : "");
+        *std::format_to_n(line, sizeof(line) - 1, "serving {}",
+                          in.socket_name ? in.socket_name : "").out = '\0';
         add_part(r, "wayland", level::ok, line);
     } else {
         add_part(r, "wayland", level::critical, "no Wayland socket");
@@ -66,34 +67,38 @@ health_report evaluate(const health_inputs& in, const health_thresholds& t) {
 
     {
         const bool headless = std::string_view{r.backend} == "headless" || r.backend[0] == '\0';
-        std::snprintf(line, sizeof(line), "%s composite", headless ? "no" : r.backend);
+        *std::format_to_n(line, sizeof(line) - 1, "{} composite",
+                          headless ? "no" : r.backend).out = '\0';
         add_part(r, "graphics", headless && in.display == display_path::kms ? level::degraded
                                                                              : level::ok,
                  line);
     }
 
     if (in.render_answered) {
-        std::snprintf(line, sizeof(line), "answered in %u ms", in.render_answer_ms);
+        *std::format_to_n(line, sizeof(line) - 1, "answered in {} ms",
+                          in.render_answer_ms).out = '\0';
         add_part(r, "render", level::ok, line);
     } else {
-        std::snprintf(line, sizeof(line), "render thread silent for %u ms", t.render_timeout_ms);
+        *std::format_to_n(line, sizeof(line) - 1, "render thread silent for {} ms",
+                          t.render_timeout_ms).out = '\0';
         add_part(r, "render", level::critical, line);
     }
 
     if (!in.input_open) {
         add_part(r, "input", level::degraded, "no input devices opened");
     } else {
-        std::snprintf(line, sizeof(line), "%u device%s on the seat", in.input_devices,
-                      in.input_devices == 1 ? "" : "s");
+        *std::format_to_n(line, sizeof(line) - 1, "{} device{} on the seat", in.input_devices,
+                          in.input_devices == 1 ? "" : "s").out = '\0';
         add_part(r, "input", in.input_devices == 0 ? level::degraded : level::ok, line);
     }
 
     if (in.logind_control) {
-        std::snprintf(line, sizeof(line), "logind session %s, in control",
-                      in.session_id ? in.session_id : "");
+        *std::format_to_n(line, sizeof(line) - 1, "logind session {}, in control",
+                          in.session_id ? in.session_id : "").out = '\0';
         add_part(r, "session", level::ok, line);
     } else if (in.session_id && in.session_id[0]) {
-        std::snprintf(line, sizeof(line), "logind session %s, not in control", in.session_id);
+        *std::format_to_n(line, sizeof(line) - 1, "logind session {}, not in control",
+                          in.session_id).out = '\0';
         add_part(r, "session", level::degraded, line);
     } else {
         add_part(r, "session", in.display == display_path::virtual_outputs ? level::ok
@@ -111,9 +116,9 @@ health_report evaluate(const health_inputs& in, const health_thresholds& t) {
         } else if (timer == 0) {
             add_part(r, "presentation", level::ok, "every output paced by page flips");
         } else {
-            std::snprintf(line, sizeof(line), "%u of %u output%s timer-paced", timer,
-                          static_cast<unsigned>(in.outputs.size()),
-                          in.outputs.size() == 1 ? "" : "s");
+            *std::format_to_n(line, sizeof(line) - 1, "{} of {} output{} timer-paced", timer,
+                              static_cast<unsigned>(in.outputs.size()),
+                              in.outputs.size() == 1 ? "" : "s").out = '\0';
             add_part(r, "presentation",
                      in.display == display_path::kms ? level::degraded : level::ok, line);
         }

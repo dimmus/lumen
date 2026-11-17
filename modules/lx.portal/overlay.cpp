@@ -709,8 +709,8 @@ lx::ui::child overlay::build_ui(view& v) {
             std::uint32_t c = 0;
             if (swatch_box(v, box) && colour_at(shots_, gx_, gy_, c)) {
                 char hex[16];
-                std::snprintf(hex, sizeof hex, "#%02X%02X%02X", (c >> 16) & 0xFFu,
-                              (c >> 8) & 0xFFu, c & 0xFFu);
+                *std::format_to_n(hex, sizeof(hex) - 1, "#{:02X}{:02X}{:02X}", (c >> 16) & 0xFFu,
+                                  (c >> 8) & 0xFFu, c & 0xFFu).out = '\0';
                 lx::ui::child parts[2];
                 unsigned p = 0;
                 parts[p++] = overlay_box(at({4, 4, 22, 22}), fill_quad(0xFF000000u | (c & 0xFFFFFFu)),

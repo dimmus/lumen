@@ -111,7 +111,7 @@ namespace {
 void note(char* buf, std::size_t cap, unsigned& count, const char* text) {
     const std::size_t n = std::strlen(buf);
     if (n + std::strlen(text) + 2 < cap)
-        std::snprintf(buf + n, cap - n, "%s%s", n ? " " : "", text);
+        *std::format_to_n(buf + n, cap - n - 1, "{}{}", n ? " " : "", text).out = '\0';
     ++count;
 }
 
@@ -140,9 +140,9 @@ void lx::input::apply_pointer_config(void* dev, const device_ops& ops, device_cl
                 ops.set_drag(dev, c.drag);
             if (ops.set_drag_lock)
                 ops.set_drag_lock(dev, c.drag_lock);
-            std::snprintf(t, sizeof(t), "tap=%s tap-button-map=%s drag=%s drag-lock=%s",
-                          c.tap ? "on" : "off", c.tap_button_map ? "lmr" : "lrm",
-                          c.drag ? "on" : "off", c.drag_lock ? "on" : "off");
+            *std::format_to_n(t, sizeof(t) - 1, "tap={} tap-button-map={} drag={} drag-lock={}",
+                              c.tap ? "on" : "off", c.tap_button_map ? "lmr" : "lrm",
+                              c.drag ? "on" : "off", c.drag_lock ? "on" : "off").out = '\0';
             applied(t);
         } else {
             missing("tap");
@@ -174,7 +174,8 @@ void lx::input::apply_pointer_config(void* dev, const device_ops& ops, device_cl
                     ops.set_scroll_method(dev, want);
                 constexpr const char* k_names[] = {"default", "two-finger", "edge",
                                                    "on-button-down", "none"};
-                std::snprintf(t, sizeof(t), "scroll-method=%s", k_names[c.scroll_method]);
+                *std::format_to_n(t, sizeof(t) - 1, "scroll-method={}",
+                                  k_names[c.scroll_method]).out = '\0';
                 applied(t);
             } else {
                 missing("scroll-method");
@@ -219,11 +220,11 @@ void lx::input::apply_pointer_config(void* dev, const device_ops& ops, device_cl
             missing("accel-profile");
         if (ops.set_accel_speed)
             ops.set_accel_speed(dev, c.accel_speed);
-        std::snprintf(t, sizeof(t), "accel-profile=%s accel-speed=%.2f",
-                      c.accel_profile == 1   ? "adaptive"
-                      : c.accel_profile == 2 ? "flat"
-                                             : "default",
-                      c.accel_speed);
+        *std::format_to_n(t, sizeof(t) - 1, "accel-profile={} accel-speed={:.2f}",
+                          c.accel_profile == 1   ? "adaptive"
+                          : c.accel_profile == 2 ? "flat"
+                                                 : "default",
+                          c.accel_speed).out = '\0';
         applied(t);
     } else {
         missing("accel");
@@ -245,7 +246,7 @@ void lx::input::apply_pointer_config(void* dev, const device_ops& ops, device_cl
         }
     }
     if (c.scroll_factor != 1.0) {
-        std::snprintf(t, sizeof(t), "scroll-factor=%.2f", c.scroll_factor);
+        *std::format_to_n(t, sizeof(t) - 1, "scroll-factor={:.2f}", c.scroll_factor).out = '\0';
         applied(t);
     }
 }

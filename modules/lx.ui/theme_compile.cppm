@@ -973,7 +973,7 @@ std::string lx::ui::builtin_theme_source(std::span<const std::uint8_t> dark,
             if (i % 16 == 0)
                 s += "\n   ";
             char b[8];
-            std::snprintf(b, sizeof(b), " 0x%02x,", bytes[i]);
+            *std::format_to_n(b, sizeof(b) - 1, " 0x{:02x},", bytes[i]).out = '\0';
             s += b;
         }
         s += "\n};\n\n";

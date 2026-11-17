@@ -271,13 +271,15 @@ void capture_xkb_log(struct xkb_context* ctx, enum xkb_log_level level, const ch
         return;
     if (!c || !c->out || c->cap == 0 || c->out[0]) {
         // Not captured (or a later one): logged, errors only. xkbcommon hands a printf
-        // format, so this one line is built with vsnprintf.
+        // format at run time; this bounded, non-allocating render of foreign text is the
+        // same documented exception as lx.foundation's format_error_into (AGENTS.md §4.2).
         char line[512];
         std::vsnprintf(line, sizeof(line), format, args);
         line[std::strcspn(line, "\n")] = '\0';
         log_input.error("xkb: {}", line);
         return;
     }
+    // The captured copy: same exception, bounded by the caller's buffer.
     std::vsnprintf(c->out, c->cap, format, args);
     for (char* p = c->out; *p; ++p)
         if (*p == '\n')

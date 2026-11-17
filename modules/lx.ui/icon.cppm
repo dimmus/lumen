@@ -281,9 +281,9 @@ void lx_ui_icon_copy(char* out, std::size_t capacity, const char* in) {
 
 [[nodiscard]] bool lx_ui_icon_path(char (&out)[768], const char* dir, lx::ui::icon id) {
     const std::string_view name = lx::ui::icon_name(id);
-    const int w = std::snprintf(out, sizeof(out), "%s/%.*s.svg", dir, static_cast<int>(name.size()),
-                                name.data());
-    return w > 0 && static_cast<std::size_t>(w) < sizeof(out) && dir[0];
+    const auto seg = std::format_to_n(out, sizeof(out) - 1, "{}/{}.svg", dir, name);
+    *seg.out = '\0';
+    return seg.size > 0 && seg.size < sizeof(out) && dir[0];
 }
 
 } // namespace
@@ -319,9 +319,10 @@ const char* lx::ui::icon_dir() {
                 if (char* slash = std::strrchr(exe, '/'))
                     *slash = '\0';
             char rel[512]{};
-            const int w = std::snprintf(rel, sizeof(rel), "%s/%s", exe,
-                                        LUMEN_ICON_DIR_INSTALL_RELATIVE);
-            if (w > 0 && static_cast<std::size_t>(w) < sizeof(rel) && lx_ui_icon_is_dir(rel)) {
+            const auto seg = std::format_to_n(rel, sizeof(rel) - 1, "{}/{}", exe,
+                                              LUMEN_ICON_DIR_INSTALL_RELATIVE);
+            *seg.out = '\0';
+            if (seg.size > 0 && seg.size < sizeof(rel) && lx_ui_icon_is_dir(rel)) {
                 lx_ui_icon_copy(dir, sizeof(dir), rel);
                 return dir;
             }

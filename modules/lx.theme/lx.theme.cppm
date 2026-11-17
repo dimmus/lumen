@@ -1099,9 +1099,10 @@ const char* lx::ui::theme_dir() {
                 if (char* slash = std::strrchr(exe, '/'))
                     *slash = '\0';
             char rel[512]{};
-            const int w = std::snprintf(rel, sizeof(rel), "%s/%s", exe,
-                                        LUMEN_THEME_DIR_INSTALL_RELATIVE);
-            if (w > 0 && static_cast<std::size_t>(w) < sizeof(rel) && lx_ui_is_dir(rel)) {
+            const auto seg = std::format_to_n(rel, sizeof(rel) - 1, "{}/{}", exe,
+                                              LUMEN_THEME_DIR_INSTALL_RELATIVE);
+            *seg.out = '\0';
+            if (seg.size > 0 && seg.size < sizeof(rel) && lx_ui_is_dir(rel)) {
                 lx_ui_copy_cut(dir, sizeof(dir), rel);
                 return dir;
             }
@@ -1124,8 +1125,9 @@ lx::result<lx::ui::theme> lx::ui::load_theme_file(const char* file_name) {
     if (!dir[0])
         return lx::make_error(lx::io_err::not_found, "load_theme_file: no theme directory");
     char path[768]{};
-    const int w = std::snprintf(path, sizeof(path), "%s/%s.lxtheme", dir, file_name);
-    if (w <= 0 || static_cast<std::size_t>(w) >= sizeof(path))
+    const auto seg = std::format_to_n(path, sizeof(path) - 1, "{}/{}.lxtheme", dir, file_name);
+    *seg.out = '\0';
+    if (seg.size == 0 || seg.size >= sizeof(path))
         return lx::invalid_argument("load_theme_file: path too long");
     return theme::load(path);
 }
