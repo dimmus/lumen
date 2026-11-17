@@ -22,7 +22,19 @@ current when an item closes.
   (ASSERTIONS.md maps every check to artifacts). One finding recorded to memory:
   injected Super-chords can trip the shell's Super tap grab and steal focus mid-chord
   (launcher open/close in the compositor log) — not a capture defect; see
-  `.zcode/memories/lumen-settings-key-capture-seat.md`.
+  `.zcode/memories/lumen-settings-key-capture-seat.md` and the open row below.
+- [ ] **Injected Super-chords can trip the shell's Super tap grab** (2026-11-17,
+  key-capture seat run; split out as its own row — pre-existing, confirmed): an injected
+  `KEY_LEFTMETA+…` chord whose second modifier press landed 20 ms after the meta press
+  fired the launcher tap grab — launcher layer mapped, keyboard focus left the app
+  mid-chord — although `observe_tap` disarms on any other press
+  (`modules/lx.compositor/keybindings.cppm:420-459`); the client's modifier state then
+  held a stale Super (next bare key recorded as `Super+…`) and later keys typed into the
+  launcher. Possible event-coalescing/reordering corner in tap arming; NOT reproduced
+  under real typing so far. First try to reproduce with real typing; if it holds, look at
+  key event coalescing ahead of the key_table. Evidence:
+  `evidence/2026-11-17-shortcut-capture/` (`inj-s2.jsonl` t4-chord timing,
+  `launcher-tap-events.txt`); `.zcode/memories/lumen-settings-key-capture-seat.md`.
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
   schema-side rows in `lumen-settings` waiting on their own compositor feature (rule store
   behind the inert `zlm_window_rules_v1`; `[[input.device]]` override plumbing), not on the app.
