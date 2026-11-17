@@ -146,6 +146,34 @@ binary** in the same serialized session and compare coredump stacks (`coredumpct
 never add a second one-at-a-time user without owing/drain, and never count a value as
 carried before its reply said ok.
 
+## 2026-11-17 seat redo — gate debt closed on merged main (branch merged as eaaf7ba; every number below tester-run, analyst-recounted)
+
+- **Seat gate closed** (evidence `evidence/2026-11-17-seat-redo/`, serialized quiet host,
+  notebook): drag-smoke **10/10 PASS** (g: cursor median 9.0 ms p95 18.8, window-move
+  median 11.3 p95 18.1); app-smoke **177/0/0**; ctest at merged main 9022e74 **136/136**
+  (77.3 s). Acceptance 2-4 run as written incl. the letter — appearance flipped **through
+  the lumen-settings UI** (injected clicks: app wrote exactly the `appearance` line,
+  compositor re-exported `LUMEN_THEME=one-dark` then `one-light`, app re-themed live
+  0.179/0.968); startup export with empty ui.theme → one-light; verbatim `ui.theme="one-dark"`
+  export; lumen-hello relaunch light 0.9189 / dark 0.2061; lumen-settings fresh start;
+  teardown unset; config byte-restored (sha256 082ce0e5…). A supplementary write-and-rename
+  pair had already re-verified the same export machine both directions — the export fires
+  identically regardless of who wrote the file.
+- **The SIGSEGV did NOT reproduce** — zero coredumps across both smokes (incl. N1–N8
+  notification-card draws) and two interactive sessions on merged main. Non-reproduction is
+  not attribution: split to its own TODO row (intermittent, ×2 within 12 min on Nov 16,
+  never before/since; next = ASan lumen-shell + notify-send/shell-relaunch stress). Original
+  stacks preserved at `a-smokes/coredump-originals-Nov16.txt`.
+- **The "no BTN codes" poisoning mechanism in the gate section above was a bitmap
+  misreading** — `/proc/bus/input/devices` prints 64-bit words MSW-first, so `70000 0 0 0 0`
+  IS BTN_MOUSE/RIGHT/MIDDLE; see [[lumen-uinput-key-bitmap-format]]. The Nov-15/16
+  click-loss wall is best attributed to the concurrent-session WARN family. The stale-holder
+  kill and start-from-this-tree discipline were still correct and necessary.
+- Env notes: the export is gated on the compositor's `--session` flag — direct-mode
+  run-desktop exports nothing by design (run1 evidence); a pre-existing failed
+  xdg-desktop-portal-wlr.service preceded the redo session (cleared by its portal restart,
+  not this change).
+
 Related: [[lumen-portal-appearance-settings]] (the D-Bus side of the same ADR-013 appearance
 surface; its plan's part B is this card), [[lumen-app-smoke-known-noise]] (concurrent-session
 WARN = every scenario FAIL), [[lumen-smoke-bench-harness-green]] (holder autodetect +

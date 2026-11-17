@@ -128,6 +128,28 @@ close the TODO row: quiet-host re-run of drag-smoke + app-smoke, or a baseline A
 names each FAIL row's mechanism. When extending the portal poll loop again, append fds at
 the end and capture the new index where armed — fds[0..3] are load-bearing.
 
+## 2026-11-17 seat redo — TODO remediation closed on merged main (branch merged as ebe7046; tester-run, analyst-recounted)
+
+- **Quiet-host serialized re-run green** (`evidence/2026-11-17-seat-redo/`, notebook):
+  drag-smoke 10/10 PASS; app-smoke **177 PASS / 0 WARN / 0 FAIL** with **Z2 interactive
+  Screenshot `colours [(255,0,0)]`** and **Z4 PickColor `255,0,0`** as real-pixel PASSes —
+  the Nov-16 "backend answering but capturing black" reading is **not supported**; the
+  101-FAIL signature matches the concurrent-session WARN family
+  ([[lumen-app-smoke-known-noise]]). ctest 136/136 at merged main 9022e74.
+- **Every asserted probe artifact now preserved** (the round-1 loss is repaired):
+  busctl ReadOne `v u 2` light / `v u 1` dark; SettingChanged dbus-monitor capture +
+  journal `portal.settings: color-scheme 2 -> 1`; unknown key/namespace → exact
+  `org.freedesktop.portal.Error.NotFound` / "Requested setting not found"; ReadAll glob
+  (match / no-match → `a{sa{sv}} 0` / empty = all); **idle-strace**: backend parked in
+  `poll` with timeout −1, zero syscalls and zero CPU over two 30 s windows
+  (`c-portal/`, `d-supplements/strace-*`).
+- Bonus path proof: an accidental injected dropdown commit changed `density` and wrote the
+  config end-to-end — the app's value-control write path works on the seat (immediately
+  restored). New anomaly recorded to TODO: a transient "no writable config.toml" banner on
+  fresh lumen-settings start that vanished after the first write (unexplained; see TODO).
+- The row's "no BTN codes" node claim was a bitmap misreading —
+  see [[lumen-uinput-key-bitmap-format]].
+
 Related: [[lumen-vulkan-capture-green]] (the Screenshot/PickColor backend this builds
 beside; the Z-row family and the portal symlink trap), [[lumen-smoke-bench-harness-green]]
 (portal-session LUMEN_BUILD_DIR rule), [[lumen-notebook-full-green-audit]] (the 177/0/0
