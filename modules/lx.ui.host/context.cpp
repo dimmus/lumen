@@ -177,9 +177,9 @@ lx::result<void> context::start(lx::wayland::display& display, lx::runtime::even
             name = "one-dark";
         char path[768]{};
         if (std::strchr(name, '/'))
-            (void)std::snprintf(path, sizeof(path), "%s", name);
+            *std::format_to_n(path, sizeof(path) - 1, "{}", name).out = '\0';
         else if (const char* dir = lx::ui::theme_dir(); dir && *dir)
-            (void)std::snprintf(path, sizeof(path), "%s/%s.lxtheme", dir, name);
+            *std::format_to_n(path, sizeof(path) - 1, "{}/{}.lxtheme", dir, name).out = '\0';
         if (path[0]) {
             if (auto w = watcher_.watch(path, &lx::runtime::executor::global()); w) {
                 watcher_source_ = std::make_unique<lx::runtime::fd_source>(

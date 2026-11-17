@@ -112,30 +112,36 @@ using lx::shell::clock_text;
     if (s.format == lx::config::clock_format::h12) {
         const unsigned h = hour % 12 ? hour % 12 : 12;
         if (s.show_seconds) {
-            std::snprintf(time, sizeof(time), "%02u:%02u:%02u %s", h,
-                          static_cast<unsigned>(t.tm_min), static_cast<unsigned>(t.tm_sec),
-                          hour < 12 ? "AM" : "PM");
+            *std::format_to_n(time, sizeof(time) - 1, "{:02}:{:02}:{:02} {}", h,
+                              static_cast<unsigned>(t.tm_min), static_cast<unsigned>(t.tm_sec),
+                              hour < 12 ? "AM" : "PM").out = '\0';
         } else {
-            std::snprintf(time, sizeof(time), "%02u:%02u %s", h,
-                          static_cast<unsigned>(t.tm_min), hour < 12 ? "AM" : "PM");
+            *std::format_to_n(time, sizeof(time) - 1, "{:02}:{:02} {}", h,
+                              static_cast<unsigned>(t.tm_min),
+                              hour < 12 ? "AM" : "PM").out = '\0';
         }
     } else if (s.show_seconds) {
-        std::snprintf(time, sizeof(time), "%02u:%02u:%02u", hour,
-                      static_cast<unsigned>(t.tm_min), static_cast<unsigned>(t.tm_sec));
+        *std::format_to_n(time, sizeof(time) - 1, "{:02}:{:02}:{:02}", hour,
+                          static_cast<unsigned>(t.tm_min),
+                          static_cast<unsigned>(t.tm_sec)).out = '\0';
     } else {
-        std::snprintf(time, sizeof(time), "%02u:%02u", hour, static_cast<unsigned>(t.tm_min));
+        *std::format_to_n(time, sizeof(time) - 1, "{:02}:{:02}", hour,
+                          static_cast<unsigned>(t.tm_min)).out = '\0';
     }
     char date[48]{};
     if (s.show_date && s.show_weekday)
-        std::snprintf(date, sizeof(date), "%s, %02u %s", weekdays[t.tm_wday],
-                      static_cast<unsigned>(t.tm_mday), months[t.tm_mon]);
+        *std::format_to_n(date, sizeof(date) - 1, "{}, {:02} {}", weekdays[t.tm_wday],
+                          static_cast<unsigned>(t.tm_mday), months[t.tm_mon]).out = '\0';
     else if (s.show_date)
-        std::snprintf(date, sizeof(date), "%02u %s", static_cast<unsigned>(t.tm_mday), months[t.tm_mon]);
+        *std::format_to_n(date, sizeof(date) - 1, "{:02} {}", static_cast<unsigned>(t.tm_mday),
+                          months[t.tm_mon]).out = '\0';
     else if (s.show_weekday)
-        std::snprintf(date, sizeof(date), "%s", weekdays[t.tm_wday]);
-    std::snprintf(out.panel, sizeof(out.panel), "%s%s%s", date, date[0] ? "  " : "", time);
-    std::snprintf(out.heading, sizeof(out.heading), "%s, %02u %s %04d  %s", full_weekdays[t.tm_wday],
-                  static_cast<unsigned>(t.tm_mday), full_months[t.tm_mon], t.tm_year + 1900, time);
+        *std::format_to_n(date, sizeof(date) - 1, "{}", weekdays[t.tm_wday]).out = '\0';
+    *std::format_to_n(out.panel, sizeof(out.panel) - 1, "{}{}{}", date,
+                      date[0] ? "  " : "", time).out = '\0';
+    *std::format_to_n(out.heading, sizeof(out.heading) - 1, "{}, {:02} {} {:04}  {}",
+                      full_weekdays[t.tm_wday], static_cast<unsigned>(t.tm_mday),
+                      full_months[t.tm_mon], t.tm_year + 1900, time).out = '\0';
     return out;
 }
 } // namespace
@@ -161,8 +167,9 @@ export namespace lx::shell {
     const auto full_size = std::strftime(full, sizeof(full), "%A, %d %B %Y", &t);
     if (time_size == 0 || date_size == 0 || full_size == 0)
         return format_clock_ascii(t, s);
-    std::snprintf(out.panel, sizeof(out.panel), "%s%s%s", date, date[0] ? "  " : "", time);
-    std::snprintf(out.heading, sizeof(out.heading), "%s  %s", full, time);
+    *std::format_to_n(out.panel, sizeof(out.panel) - 1, "{}{}{}", date, date[0] ? "  " : "",
+                      time).out = '\0';
+    *std::format_to_n(out.heading, sizeof(out.heading) - 1, "{}  {}", full, time).out = '\0';
     return out;
 }
 

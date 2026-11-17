@@ -204,7 +204,7 @@ bool lx::shell::user_bus::request_name(const char* name, name_fn fn, void* user)
     if (!s)
         return false;
     *s = {};
-    std::snprintf(s->name, sizeof(s->name), "%s", name);
+    *std::format_to_n(s->name, sizeof(s->name) - 1, "{}", name).out = '\0';
     s->fn = fn;
     s->user = user;
     s->used = true;

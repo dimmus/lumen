@@ -365,7 +365,8 @@ constexpr key_def k_keys[k_key_count] = {
         return true;
     if (v != "false" && log_apps.enabled(lx::trace::level::debug)) {
         char what[96];
-        std::snprintf(what, sizeof(what), "%s is not true or false: read as false", key);
+        *std::format_to_n(what, sizeof(what) - 1, "{} is not true or false: read as false",
+                          key).out = '\0';
         entry_log_debug(file, what);
     }
     return false;
@@ -456,10 +457,8 @@ lx::shell::locale_keys lx::shell::locale_keys::from(const char* lc_all, const ch
     if (language.empty() || language.size() > 20 || country.size() > 20 || modifier.size() > 20)
         return k;
     auto add = [&](std::string_view a, std::string_view b, std::string_view c) {
-        std::snprintf(k.key[k.count], sizeof(k.key[0]), "%.*s%s%.*s%s%.*s",
-                      static_cast<int>(a.size()), a.data(), b.empty() ? "" : "_",
-                      static_cast<int>(b.size()), b.data(), c.empty() ? "" : "@",
-                      static_cast<int>(c.size()), c.data());
+        *std::format_to_n(k.key[k.count], sizeof(k.key[0]) - 1, "{}{}{}{}{}", a,
+                          b.empty() ? "" : "_", b, c.empty() ? "" : "@", c).out = '\0';
         ++k.count;
     };
     if (!country.empty() && !modifier.empty())
@@ -489,7 +488,7 @@ lx::shell::desktop_list lx::shell::desktop_list::from(const char* v) {
     desktop_list d{};
     if (!v || !*v)
         v = "Lumen";
-    std::snprintf(d.buf, sizeof(d.buf), "%s", v);
+    *std::format_to_n(d.buf, sizeof(d.buf) - 1, "{}", v).out = '\0';
     std::string_view s{d.buf};
     while (!s.empty() && d.count < k_max) {
         const std::size_t c = s.find(':');

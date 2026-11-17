@@ -346,8 +346,9 @@ private:
     void teardown_idle();
     /// The power control of one output (for one bound after the setup too).
     void add_power(output_record& o);
-    /// Powers every output off (zwlr_output_power_v1), logging `why`.
-    void blank_outputs(const char* why);
+    /// Powers every output off (zwlr_output_power_v1); false when none was lit, so the
+    /// caller logs its reason only when the outputs actually went off.
+    [[nodiscard]] bool blank_outputs();
 
     // ── zlm v6: icons and the bell ──
     /// The panel's icon source: the icon-theme name, the window's own pixel buffers, the
@@ -831,7 +832,8 @@ struct lx::shell::shell_app::events {
     }
     static void output_scale(void* data, wl_output*, int32_t factor) { out(data).scale = factor; }
     static void output_name(void* data, wl_output*, const char* name) {
-        std::snprintf(out(data).connector, sizeof(out(data).connector), "%s", name ? name : "");
+        *std::format_to_n(out(data).connector, sizeof(out(data).connector) - 1, "{}",
+                          name ? name : "").out = '\0';
     }
     static void output_description(void*, wl_output*, const char*) {}
 
@@ -1254,13 +1256,11 @@ void lx::shell::shell_app::events::idled(void* data, ext_idle_notification_v1*) 
     switch (a.idle_.on_idled()) {
     case idle_action::none:
         return;
-    case idle_action::blank: {
-        char line[128];
-        std::snprintf(line, sizeof(line), "idle for %u s: powering the outputs off",
-                      a.idle_.config().blank_after_s);
-        a.blank_outputs(line);
+    case idle_action::blank:
+        if (a.blank_outputs())
+            log_idle.info("idle for {} s: powering the outputs off",
+                          a.idle_.config().blank_after_s);
         return;
-    }
     case idle_action::lock_then_blank:
         // GNOME's order: never dark while unlocked. The outputs go off once `locked` comes
         // (or after 5 s whatever happened, so a broken locker cannot keep them lit).
@@ -1274,10 +1274,9 @@ void lx::shell::shell_app::events::locked_idled(void* data, ext_idle_notificatio
     auto& a = self(data);
     if (!a.idle_.on_locked_idled())
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "locked and idle for %u s: powering the outputs off",
-                  a.idle_.config().blank_locked_after_s);
-    a.blank_outputs(line);
+    if (a.blank_outputs())
+        log_idle.info("locked and idle for {} s: powering the outputs off",
+                      a.idle_.config().blank_locked_after_s);
 }
 
 void lx::shell::shell_app::events::resumed(void* data, ext_idle_notification_v1*) {
@@ -1310,21 +1309,21 @@ void lx::shell::shell_app::events::power_failed(void* data, zwlr_output_power_v1
 }
 #endif
 
-void lx::shell::shell_app::blank_outputs(const char* why) {
+bool lx::shell::shell_app::blank_outputs() {
     set_timer(t_lock_blank, 0);
 #ifdef LUMEN_SHELL_IDLE
     bool any = false;
     for (auto& o : outputs_)
         any = any || (o->power && !o->off);
     if (!any)
-        return; // already dark (the other timeout, or the lock's blank, came first)
-    log_idle.info("{}", why);
+        return false; // already dark (the other timeout, or the lock's blank, came first)
     for (auto& o : outputs_)
         if (o->power && !o->off)
             zwlr_output_power_v1_set_mode(static_cast<zwlr_output_power_v1*>(o->power),
                                           ZWLR_OUTPUT_POWER_V1_MODE_OFF);
+    return true;
 #else
-    (void)why;
+    return false;
 #endif
 }
 
@@ -1567,7 +1566,7 @@ void lx::shell::shell_app::rebuild_panels() {
 
 lx::shell::panel_clock lx::shell::shell_app::clock_state() {
     panel_clock c{};
-    std::snprintf(c.text, sizeof(c.text), "%s", clock_text_);
+    *std::format_to_n(c.text, sizeof(c.text) - 1, "{}", clock_text_).out = '\0';
     c.width = clock_width_;
     c.rev = clock_rev_;
     return c;
@@ -1584,7 +1583,7 @@ void lx::shell::shell_app::refresh_clock(bool damage_panels) {
     clock_sample_ = ts.tv_sec;
     const auto formatted = format_clock(clock_sample_, clock_settings_);
     const bool changed = std::strcmp(clock_text_, formatted.panel) != 0;
-    std::snprintf(clock_text_, sizeof(clock_text_), "%s", formatted.panel);
+    *std::format_to_n(clock_text_, sizeof(clock_text_) - 1, "{}", formatted.panel).out = '\0';
     clock_width_ = panel_text_width(clock_text_, 1.f);
     ++clock_rev_;
     if (calendar_.is_open())
@@ -1697,7 +1696,7 @@ void lx::shell::shell_app::fill_workspace_cells(const output_record& o, panel_ws
         if (!w)
             continue;
         panel_ws_item& item = in.items[in.count++];
-        std::snprintf(item.name, sizeof(item.name), "%s", w->name);
+        *std::format_to_n(item.name, sizeof(item.name) - 1, "{}", w->name).out = '\0';
         item.id = ids[i];
         item.rev = w->rev;
         item.flags = ((w->state & shell_ws_active) ? ws_cell_active : 0u) |
@@ -1901,8 +1900,8 @@ void lx::shell::shell_app::on_timer() {
         deadline_[t_lock_blank] = 0;
         // The lock did not come in time: dark anyway (the compositor keeps it locked if it
         // comes later; nothing of the session shows while it is off).
-        if (idle_.idle())
-            blank_outputs("idle: no lock within 5 s — powering the outputs off anyway");
+        if (idle_.idle() && blank_outputs())
+            log_idle.info("idle: no lock within 5 s — powering the outputs off anyway");
     }
     arm_timer();
 }
@@ -1944,7 +1943,7 @@ const std::uint32_t* lx::shell::shell_app::resolve_icon(task_handle h, const tas
         ensure_catalog();
         if (const desktop_entry* d = catalog_.find(e.app_id); d && !d->icon.empty()) {
             char name[256];
-            std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(d->icon.size()), d->icon.data());
+            *std::format_to_n(name, sizeof(name) - 1, "{}", d->icon).out = '\0';
             if (const std::uint32_t* p = icons_.lookup(name, px))
                 return p;
         }
@@ -2057,8 +2056,8 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
     // Notifications arriving while locked wait (their timers too) and show after the unlock
     // (design-session-and-wm N.4); nothing of the shell is shown over the lock anyway.
     notes_.set_locked(s != shell_lock::unlocked, now_ns());
-    if (blank)
-        blank_outputs("locked: powering the outputs off");
+    if (blank && blank_outputs())
+        log_idle.info("locked: powering the outputs off");
     update_locked_notification();
 }
 
@@ -2193,13 +2192,15 @@ void lx::shell::shell_app::report_failure(const char* id, const char* name, laun
                                           const char* detail, int error_number, const char* unit) {
     char reason[160];
     if (f == launch_failure::exec_error || f == launch_failure::spawn_error)
-        std::snprintf(reason, sizeof(reason), "%s", std::strerror(error_number));
+        *std::format_to_n(reason, sizeof(reason) - 1, "{}", std::strerror(error_number)).out = '\0';
     else if (f == launch_failure::systemd_error)
-        std::snprintf(reason, sizeof(reason), "systemd error %s", detail ? detail : "");
+        *std::format_to_n(reason, sizeof(reason) - 1, "systemd error {}",
+                          detail ? detail : "").out = '\0';
     else
-        std::snprintf(reason, sizeof(reason), "%s", launch_failure_text(f));
+        *std::format_to_n(reason, sizeof(reason) - 1, "{}", launch_failure_text(f)).out = '\0';
     char text[320];
-    std::snprintf(text, sizeof(text), "Could not start %s: %s", name && *name ? name : id, reason);
+    *std::format_to_n(text, sizeof(text) - 1, "Could not start {}: {}",
+                      name && *name ? name : id, reason).out = '\0';
     show_notice(text);
     // Once per (desktop ID, reason) per catalog generation: a broken entry clicked ten
     // times is one line.
@@ -2243,7 +2244,7 @@ void lx::shell::shell_app::launch_entry(unsigned entry, unsigned serial, bool ot
         p->non_default_gpu = !p->non_default_gpu;
     if (f != launch_failure::none) {
         char id[128];
-        std::snprintf(id, sizeof(id), "%.*s", static_cast<int>(e->id.size()), e->id.data());
+        *std::format_to_n(id, sizeof(id) - 1, "{}", e->id).out = '\0';
         report_failure(id, e->name.data(), f, nullptr, 0, nullptr);
         return; // the launcher stays open, showing why
     }
@@ -2460,10 +2461,9 @@ int lx::shell::shell_app::run() {
     auto* d = wl_display_connect(config_.display);
     if (!d) {
         close(sfd);
-        char line[160];
-        std::snprintf(line, sizeof(line), "cannot connect to the Wayland display %s",
-                      config_.display ? config_.display : "($WAYLAND_DISPLAY)");
-        return fail(line);
+        log_shell.error("cannot connect to the Wayland display {}",
+                        config_.display ? config_.display : "($WAYLAND_DISPLAY)");
+        return 1;
     }
     display_ = d;
     // The views (launcher, panels, background, switcher, bell) draw through their own
@@ -2504,14 +2504,12 @@ int lx::shell::shell_app::run() {
         return 1;
     }
     if (!compositor_ || compositor_version_ < 4 || !shm_ || !layer_shell_ || !shell_) {
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "missing globals:%s%s%s%s", !compositor_ || compositor_version_ < 4
-                          ? " wl_compositor(v4+)" : "",
-                      !shm_ ? " wl_shm" : "", !layer_shell_ ? " zwlr_layer_shell_v1" : "",
-                      !shell_ ? " zlm_shell_v1" : "");
         close(sfd);
-        return fail(line);
+        log_shell.error("missing globals:{}{}{}{}", !compositor_ || compositor_version_ < 4
+                             ? " wl_compositor(v4+)" : "",
+                         !shm_ ? " wl_shm" : "", !layer_shell_ ? " zwlr_layer_shell_v1" : "",
+                         !shell_ ? " zlm_shell_v1" : "");
+        return 1;
     }
     if (!seat_)
         log_shell.warn("no wl_seat: the panel takes no input");
@@ -3171,23 +3169,26 @@ void lx::shell::shell_app::on_config_done(unsigned generation, bool applied, uns
         const std::size_t slash = f.rfind('/');
         const std::string name = slash == std::string::npos ? f : f.substr(slash + 1);
         if (!name.empty() && lines.front().line)
-            std::snprintf(where, sizeof(where), "%s:%u: ", name.c_str(), lines.front().line);
+            *std::format_to_n(where, sizeof(where) - 1, "{}:{}: ", name,
+                              lines.front().line).out = '\0';
         else if (!name.empty())
-            std::snprintf(where, sizeof(where), "%s: ", name.c_str());
+            *std::format_to_n(where, sizeof(where) - 1, "{}: ", name).out = '\0';
     }
-    std::snprintf(text, sizeof(text), "Lumen configuration%s: %u error%s, %u warning%s — %s%s",
-                  applied ? "" : " not used", errors, errors == 1 ? "" : "s", warnings,
-                  warnings == 1 ? "" : "s", where, first);
+    *std::format_to_n(text, sizeof(text) - 1,
+                      "Lumen configuration{}: {} error{}, {} warning{} — {}{}",
+                      applied ? "" : " not used", errors, errors == 1 ? "" : "s", warnings,
+                      warnings == 1 ? "" : "s", where, first).out = '\0';
     log_config.info("notice: {}", text);
     // A notification once the server runs (replacing the previous one about the
     // configuration); the panel's notice before that.
     if (notifications_owned()) {
         char summary[96];
-        std::snprintf(summary, sizeof(summary), "Lumen configuration%s",
-                      applied ? "" : " not used");
+        *std::format_to_n(summary, sizeof(summary) - 1, "Lumen configuration{}",
+                          applied ? "" : " not used").out = '\0';
         char body[400];
-        std::snprintf(body, sizeof(body), "%u error%s, %u warning%s \u2014 %s%s", errors,
-                      errors == 1 ? "" : "s", warnings, warnings == 1 ? "" : "s", where, first);
+        *std::format_to_n(body, sizeof(body) - 1, "{} error{}, {} warning{} — {}{}", errors,
+                          errors == 1 ? "" : "s", warnings, warnings == 1 ? "" : "s", where,
+                          first).out = '\0';
         post_internal(summary, body, errors > 0 ? notify_urgency::critical : notify_urgency::normal,
                       config_note_id_);
         return;

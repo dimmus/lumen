@@ -364,7 +364,7 @@ bool lx::shell::menu_popup::open(lx::ui::host::layer_role& layer, lx::rect2i anc
     on_submenu_ = on_submenu;
     user_ = user;
     last_serial_ = serial;
-    std::snprintf(name_, sizeof(name_), "%s", name ? name : "menu");
+    *std::format_to_n(name_, sizeof(name_) - 1, "{}", name ? name : "menu").out = '\0';
     if (!open_level(0, nullptr, &layer, anchor, &root_, serial, false)) {
         close();
         return false;
@@ -706,7 +706,7 @@ lx::gfx::atlas_tile_id lx::shell::menu_popup::icon_tile(unsigned level_index, co
     if (!made)
         return {};
     icon_slot& s = free_slot ? *free_slot : icon_slots_[level_index][0];
-    std::snprintf(s.name, sizeof(s.name), "%s", name);
+    *std::format_to_n(s.name, sizeof(s.name) - 1, "{}", name).out = '\0';
     s.px = px;
     s.tile = made.value();
     return s.tile;

@@ -744,7 +744,8 @@ bool lx::shell::icon_theme::decode(const std::string& path, int px, std::vector<
         const bool cacheable = !dir.empty() && ::stat(path.c_str(), &st) == 0;
         const std::uint64_t key = cacheable ? icon_cache_key(path, st, px) : 0;
         char name[32];
-        std::snprintf(name, sizeof name, "/%016llx.argb", static_cast<unsigned long long>(key));
+        *std::format_to_n(name, sizeof(name) - 1, "/{:016x}.argb",
+                          static_cast<unsigned long long>(key)).out = '\0';
         const std::string file = dir + name;
         if (cacheable && icon_cache_read(file, key, px, out))
             return true;
