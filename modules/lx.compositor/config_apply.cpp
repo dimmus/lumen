@@ -101,6 +101,31 @@ unsigned diff_config(const cfg::config_snapshot& a, const cfg::config_snapshot& 
     return c;
 }
 
+std::string_view resolved_ui_theme(const cfg::ui_settings& ui) {
+    const std::string_view name{ui.theme};
+    if (name.empty())
+        return ui.appearance == cfg::ui_appearance::light ? "one-light" : "one-dark";
+    return name;
+}
+
+void env_reexports::owe(which w) { owed_ |= 1u << static_cast<unsigned>(w); }
+
+void env_reexports::drop() {
+    owed_ = 0;
+    theme_[0] = '\0';
+}
+
+bool env_reexports::theme_changed(std::string_view resolved) const {
+    return resolved != std::string_view{theme_};
+}
+
+void env_reexports::theme_sent(std::string_view resolved) {
+    std::snprintf(theme_, sizeof(theme_), "%.*s", static_cast<int>(resolved.size()),
+                  resolved.data());
+}
+
+void env_reexports::theme_forget() { theme_[0] = '\0'; }
+
 config_state::config_state() : current_{std::make_unique<cfg::config_snapshot>(cfg::default_config())} {}
 config_state::~config_state() = default;
 

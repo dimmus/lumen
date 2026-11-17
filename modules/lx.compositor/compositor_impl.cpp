@@ -1400,6 +1400,9 @@ struct compositor_impl {
     std::unique_ptr<lx::runtime::event_source> control_source_{};
     /// The environment exported to the user manager in `--session` mode.
     session::user_environment user_env_{};
+    /// The re-export bookkeeping of that environment (owed cursor/theme exports, the
+    /// resolved `LUMEN_THEME` last sent): what a reload sends again and when.
+    env_reexports env_reexports_{};
     bool ready_sent_ = false;
     lx::runtime::clock_time started_ns_ = 0;
     /// The systemd watchdog (WatchdogSec=): pinged from wake-ups that happen anyway, at most
@@ -1528,6 +1531,11 @@ struct compositor_impl {
     /// zlm v7 config + diagnostics + done to `shell_resource` (null: every v7 shell).
     void send_config_to_shell(void* shell_resource, bool with_bytes);
     void export_cursor_environment();
+    /// `LUMEN_THEME` again when a reload changed the resolved theme (`resolved_ui_theme`):
+    /// what applications started later read. Runtime only — never the READY sequence.
+    void export_theme_environment();
+    /// Sends the re-exports an in-flight export held back (its reply just arrived).
+    void retry_owed_env_exports();
     /// Executes a binding's or lumen-ctl's action. `input`: a key or button triggered it
     /// (the shell gets an input serial). `message` explains an invalid_argument.
     control_action_result run_action(lx::config::action_id action, unsigned argument,
@@ -3881,12 +3889,15 @@ void compositor_impl::start_session() {
             vars[count++] = xsize;
         }
         // The interface theme (config.toml [ui], ADR-013 §4.7): what lx.app reads at start
-        // (the shell gets it live over zlm_shell_v1.config; running apps keep theirs).
+        // (the shell gets it live over zlm_shell_v1.config; running apps keep theirs). An
+        // empty [ui] theme resolves by appearance, so applications start in the configured
+        // look even when no theme file is named.
         char uitheme[128];
-        if (config_.current().ui.theme[0]) {
-            std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%s", config_.current().ui.theme);
-            vars[count++] = uitheme;
-        }
+        const std::string_view theme_name = resolved_ui_theme(config_.current().ui);
+        std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%.*s",
+                      static_cast<int>(theme_name.size()), theme_name.data());
+        env_reexports_.theme_sent(theme_name); // what the manager carries once it takes
+        vars[count++] = uitheme;
         if (auto exported = user_env_.export_async(
                 std::span<const std::string_view>{vars.data(), count}, 2000,
                 [](void* u, bool ok) {
@@ -3895,6 +3906,9 @@ void compositor_impl::start_session() {
                 this);
             !exported) {
             log_session.error(exported.get_error());
+            // The theme variable never left: it must not count as carried, or a reload
+            // resolving to the same value would be skipped as unchanged.
+            env_reexports_.theme_forget();
         } else {
             sent = true;
             control_.dispatch(); // the calls leave now, not at the loop's first wake-up
@@ -3913,7 +3927,14 @@ void compositor_impl::on_environment_exported(bool ok) {
     else
         log_session.warn("the user manager refused the session environment "
                          "(or did not answer in 2 s)");
+    // A refused (or timed-out) export carried the start-up `LUMEN_THEME`; without this a
+    // reload resolving to the same value would be skipped as unchanged and the manager
+    // would never receive it.
+    if (!ok)
+        env_reexports_.theme_forget();
     send_ready(ok ? nullptr : "environment export failed");
+    // A reload that changed the theme while this export was in flight exports now.
+    retry_owed_env_exports();
 }
 
 void compositor_impl::send_ready(const char* why) {
@@ -3944,7 +3965,9 @@ void compositor_impl::end_session() {
     }
     // An export still in flight (a stop during start-up) is unset too: close() would flush
     // the SetEnvironment, and the UnsetEnvironment sent after it on the same connection is
-    // what the manager applies last.
+    // what the manager applies last. A re-export the reply never freed is dropped with it —
+    // a retry from inside unset_now's flush would only re-set what this is unsetting.
+    env_reexports_.drop();
     if (user_env_.exported() || user_env_.export_pending()) {
         user_env_.unset_now(1000);
         log_session.info("session environment unset");
@@ -4698,12 +4721,69 @@ void compositor_impl::export_cursor_environment() {
         vars[n++] = size;
     if (n == 0)
         return;
-    if (auto r = user_env_.export_async(std::span<const std::string_view>{vars.data(), n}, 2000,
-                                        [](void*, bool) {}, nullptr);
+    // The user bus carries one export at a time; a busy one gets this when its reply arrives.
+    if (user_env_.export_pending()) {
+        env_reexports_.owe(env_reexports::which::cursor);
+        return;
+    }
+    if (auto r = user_env_.export_async(
+            std::span<const std::string_view>{vars.data(), n}, 2000,
+            [](void* u, bool) { static_cast<compositor_impl*>(u)->retry_owed_env_exports(); },
+            this);
         !r)
         log_config.error(r.get_error());
     else
         control_.dispatch();
+}
+
+void compositor_impl::export_theme_environment() {
+    // Applications started from now on come up in the configured look (those already running
+    // keep theirs; the shell gets it live over zlm_shell_v1.config). Only a changed resolved
+    // value re-exports: [ui] density and font-size edits do not churn the user bus.
+    if (!cfg.session_mode || !user_env_.is_open())
+        return;
+    char name[96];
+    const std::string_view resolved = resolved_ui_theme(config_.current().ui);
+    std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(resolved.size()),
+                  resolved.data());
+    if (!env_reexports_.theme_changed(name))
+        return;
+    if (user_env_.export_pending()) {
+        env_reexports_.owe(env_reexports::which::theme);
+        return;
+    }
+    char uitheme[128];
+    std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%s", name);
+    const std::string_view vars{uitheme};
+    if (auto r = user_env_.export_async(
+            std::span<const std::string_view>{&vars, 1}, 2000,
+            [](void* u, bool ok) {
+                auto* self = static_cast<compositor_impl*>(u);
+                // A refused re-export did not reach the manager: forget the value so the
+                // next reload re-sends it even unchanged.
+                if (!ok)
+                    self->env_reexports_.theme_forget();
+                self->retry_owed_env_exports();
+            },
+            this);
+        !r) {
+        log_config.error(r.get_error());
+    } else {
+        env_reexports_.theme_sent(name);
+        log_config.info("LUMEN_THEME={} exported (configuration)", name);
+        control_.dispatch();
+    }
+}
+
+void compositor_impl::retry_owed_env_exports() {
+    // An export's reply arrived (the startup one's after READY, or a re-export's): the user
+    // bus is free again, so what a busy export held back leaves now.
+    env_reexports_.drain([this](env_reexports::which w) {
+        if (w == env_reexports::which::cursor)
+            export_cursor_environment();
+        else
+            export_theme_environment();
+    });
 }
 
 void compositor_impl::apply_repeat() {
@@ -4801,6 +4881,9 @@ void compositor_impl::finish_config_generation() {
         config_tokens_.clear();
     }
     control_.publish_config(config_.generation());
+    // The generation's jobs are done (the cursor's export, if any, left before this):
+    // `LUMEN_THEME` again when a reload changed the resolved theme.
+    export_theme_environment();
     if (config_again_) {
         // A SIGHUP or a Reload call among the queued requests makes it forced, so it always
         // produces a generation that answers them.
