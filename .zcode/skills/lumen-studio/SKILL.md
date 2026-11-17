@@ -13,8 +13,8 @@ anywhere, and no headless compositor verification).
 
 | Layer | Location | Contents |
 | --- | --- | --- |
-| Role agents (Agent tool / workflow personas) | `.zcode/agents/*.md` | planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher, architect, doc-writer |
-| Knowledge skills | `.zcode/skills/` | `lumen-build-run` (hosts/commands/measurement), `lumen-testing` (matrices/evidence/statuses), `lumen-decisions` (settled), `lumen-memory-writer` (archive format), this skill |
+| Role agents (Agent tool / workflow personas) | `.zcode/agents/*.md` | planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher, architect, doc-writer, screenshoter (`agent-screenshoter`) |
+| Knowledge skills | `.zcode/skills/` | `lumen-build-run` (hosts/commands/measurement), `lumen-testing` (matrices/evidence/statuses), `lumen-decisions` (settled), `lumen-memory-writer` (archive format), `agent-screenshoter` (seat screenshots), this skill |
 | Workflows | `.zcode/workflows/*.dwf.ts` | `lumen-development-studio`, `lumen-gated-change`, `lumen-compositor-bench` |
 
 ## Choosing the orchestration
@@ -25,6 +25,8 @@ anywhere, and no headless compositor verification).
 | Exactly one bounded task, want the light path | `lumen-gated-change` workflow |
 | "How fast/heavy is Lumen vs sway/weston/hyprland" | `lumen-compositor-bench` workflow |
 | Research, architecture assessment, a doc update, a small fix | direct Agent dispatch with the matching `.zcode/agents/` type (no workflow needed) |
+
+A lead needing pixels from the live seat dispatches `agent-screenshoter` (its skill of the same name carries the verified commands) instead of improvising shell commands.
 
 Launch a workflow with `CreateWorkflow` on its saved name plus args, e.g.
 `saved: { name: "lumen-development-studio", args: { task: "..." } }`. A run this session
