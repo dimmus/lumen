@@ -47,8 +47,12 @@ inline std::string card_with_connector() {
             const std::string status =
                 read_file(std::string("/sys/class/drm/") + name + "/status");
             if (status.compare(0, 9, "connected") == 0) {
+                // `name` points into the DIR stream's buffer: copy out of it before
+                // closedir frees the buffer (a read after the free is a use-after-free
+                // even when the bytes usually survive on the heap).
+                const std::string card(name, static_cast<size_t>(std::strchr(name, '-') - name));
                 ::closedir(d);
-                return std::string(name, static_cast<size_t>(std::strchr(name, '-') - name));
+                return card;
             }
         }
         ::closedir(d);
