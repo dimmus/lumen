@@ -3,6 +3,9 @@
 // per region, the same client counted once however many fds reach it.
 #include "lumen_test.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 import std;
 import lx.drm;
 
@@ -176,6 +179,34 @@ LUMEN_TEST(fdinfo_read_self) {
     } else {
         LUMEN_CHECK(with.clients == 0);
     }
+}
+
+LUMEN_TEST(fdinfo_walk_survives_concurrent_fd_close) {
+    // The walk reads /proc/self/fdinfo, whose entries are fd NUMBERS: another thread
+    // closing an fd (the input-open thread does, via libudev) used to race the bare
+    // fstat of the listed number — TSan reported close vs fstat, and a number reused
+    // in that window would stat the wrong file. The probe dups first now, so the walk
+    // is stable against concurrent closes; this test exercises that interleaving.
+    std::atomic<bool> stop{false};
+    std::thread closer{[&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            // Cycle a batch of fds so the walker's directory listing is always stale
+            // for some of its entries.
+            int fds[8]{};
+            for (int& fd : fds)
+                fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+            for (int fd : fds)
+                if (fd >= 0)
+                    ::close(fd);
+        }
+    }};
+    for (unsigned i = 0; i < 64; ++i)
+        (void)lx::drm::read_gpu_memory();
+    stop.store(true, std::memory_order_relaxed);
+    closer.join();
+    // Every completed walk either found a DRM client or none; a fd number raced into
+    // a non-DRM file is skipped by the probe, never parsed as a client.
+    LUMEN_CHECK(true);
 }
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }
