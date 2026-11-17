@@ -29,6 +29,10 @@ compile_commands.json
 /ui-e2e-logs/
 # ... and from scripts/vkmark-bench.sh
 /vkmark-bench-logs/
+# Perfetto traces from scripts/ui-bench.sh --perfetto — local timeline evidence only,
+# never merged (tests/bench/results/ already ignores all of its contents but its own
+# .gitignore; this names the trace policy at the root too)
+/tests/bench/results/**/*.trace.json
 lumen-input-probe.log
 
 # IDE
