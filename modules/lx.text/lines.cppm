@@ -414,6 +414,8 @@ private:
     std::vector<text_attr> attrs_{};
     /// `set_attrs`' normalisation buffer, swapped with `attrs_` on a change (capacity kept).
     std::vector<text_attr> attrs_scratch_{};
+    /// The sort permutation `set_attrs` reuses (capacity kept, like attrs_scratch_).
+    std::vector<unsigned> attrs_order_{};
     char family_[k_face_family_bytes]{};
     bool family_default_ = true;
     float size_pt_ = 11.f;
@@ -594,9 +596,22 @@ void lx::text::text_layout::set_attrs(std::span<const text_attr> attrs) {
     // Normalise into the scratch buffer (its capacity kept): equal input after sorting is
     // no change either.
     std::vector<text_attr>& sorted = attrs_scratch_;
-    sorted.assign(attrs.begin(), attrs.begin() + static_cast<std::ptrdiff_t>(n));
-    std::stable_sort(sorted.begin(), sorted.end(),
-                     [](const text_attr& a, const text_attr& b) { return a.begin < b.begin; });
+    // Stable order without std::stable_sort: its heap-allocated temp buffer trips ASan's
+    // alloc-dealloc-mismatch inside libstdc++'s tempbuf, and the scratch buffer's
+    // capacity is kept anyway. Sorting a permutation of positions by (begin, position)
+    // is a total order that keeps ties in input order — exactly what stable_sort
+    // produced — and gathering through it allocates nothing once warmed.
+    std::vector<unsigned>& order = attrs_order_;
+    order.resize(n);
+    for (unsigned i = 0; i < n; ++i)
+        order[i] = i;
+    std::sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
+        const std::uint32_t ba = attrs[a].begin, bb = attrs[b].begin;
+        return ba != bb ? ba < bb : a < b;
+    });
+    sorted.clear();
+    for (unsigned i = 0; i < n; ++i)
+        sorted.push_back(attrs[order[i]]);
     std::uint32_t prev_end = 0;
     std::size_t out = 0;
     for (std::size_t i = 0; i < sorted.size(); ++i) {

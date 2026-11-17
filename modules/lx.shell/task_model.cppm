@@ -269,10 +269,27 @@ void lx::shell::task_model::end_snapshot() {
     synced_ = true;
     changes_ |= task_change_list;
     // A shell that (re)started knows no focus history: the stacking order is the best record
-    // of it (click to focus raises), top first.
-    std::ranges::stable_sort(mru_, [&](std::uint16_t a, std::uint16_t b) {
-        return entries_[a].stacking > entries_[b].stacking;
-    });
+    // of it (click to focus raises), top first. Equal stacking keeps the current mru order,
+    // exactly as a stable sort would: the permutation sorts by (stacking desc, position),
+    // a total order, and std::sort needs no temp buffer — stable_sort's heap-allocated
+    // buffer trips ASan's alloc-dealloc-mismatch inside libstdc++'s tempbuf.
+    {
+        const unsigned count = static_cast<unsigned>(mru_.size());
+        std::array<unsigned, k_max_tasks> order{};
+        for (unsigned i = 0; i < count; ++i)
+            order[i] = i;
+        std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(count),
+                  [&](unsigned a, unsigned b) {
+                      const unsigned sa = entries_[mru_[a]].stacking;
+                      const unsigned sb = entries_[mru_[b]].stacking;
+                      return sa != sb ? sa > sb : a < b;
+                  });
+        std::array<std::uint16_t, k_max_tasks> src{};
+        for (unsigned i = 0; i < count; ++i)
+            src[i] = mru_[i];
+        for (unsigned i = 0; i < count; ++i)
+            mru_[i] = src[order[i]];
+    }
     tentative_ = false;
 }
 

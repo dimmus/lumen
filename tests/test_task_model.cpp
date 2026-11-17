@@ -66,6 +66,27 @@ LUMEN_TEST(snapshot_lands_whole_and_replaces_the_previous_one) {
     LUMEN_CHECK(m.count() == 1 && std::strcmp(title_at(m, 0), "three") == 0);
 }
 
+// end_snapshot orders the mru list by stacking, and entries with EQUAL stacking keep
+// their insertion order — the stability the sort must preserve (it is a permutation
+// sort with a position tiebreak now, not std::stable_sort, whose temp buffer trips
+// ASan inside libstdc++'s tempbuf).
+LUMEN_TEST(end_snapshot_keeps_insertion_order_for_equal_stacking) {
+    static task_model m;
+    m.clear();
+    m.begin_snapshot();
+    const task_handle a = m.snapshot_add(proxy(1), "a", "A", 0, {}, 0);
+    const task_handle b = m.snapshot_add(proxy(2), "b", "B", 0, {}, 0);
+    const task_handle c = m.snapshot_add(proxy(3), "c", "C", 0, {}, 0);
+    (void)a;
+    (void)b;
+    (void)c;
+    m.end_snapshot();
+    task_handle mru[lx::shell::k_max_tasks];
+    const unsigned n = m.mru(mru, lx::shell::k_max_tasks);
+    LUMEN_CHECK(n == 3);
+    LUMEN_CHECK(mru[0] == a && mru[1] == b && mru[2] == c);
+}
+
 LUMEN_TEST(deltas_during_and_after_the_snapshot_apply_in_order) {
     static task_model m;
     m.clear();
