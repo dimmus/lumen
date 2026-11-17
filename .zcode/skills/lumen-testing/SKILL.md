@@ -54,6 +54,28 @@ input. drag latency gates: median ≤ 1.5 refresh periods + 4 ms; p95 warn at 2 
 on same date/revision — copy/hash after each round; `--update-baseline` needs reviewed
 authorization, never during verification.
 
+## Perfetto timelines (timeline evidence, never a gate)
+
+`scripts/ui-bench.sh --perfetto` records a traced pass of the engine scenarios: each of
+S1–S4 runs once with `LUMEN_TRACE_FILE` (and `LUMEN_TRACE_EVENTS`, bounded) set for
+`lumen-ui-bench` — the env vars `lx.trace` already reads, no others — and writes
+`tests/bench/results/<machine>-<backend>/<date>-<sha>[-N]-S<k>.trace.json` (Chrome
+trace-event JSON, gitignored like every results artifact; the `-S<k>` suffix is the
+per-scenario part convention of the bench JSONs — each scenario is its own process and
+`LUMEN_TRACE_FILE` is per-process). The pass is structurally separate from the measured
+one: it compares nothing and writes no baseline (`--update-baseline`, `--compare`,
+`--client` and `--e2e` are refused) — trace writes cost time on the measured path, so a
+traced run's numbers are never judged. The bench instruments the timeline itself (scenario
+and stage spans, per-frame counters; `tests/bench_ui.cpp`) through the same
+no-op-when-unset path, so an untraced run is unperturbed — `tests/smoke_harness.sh`
+exercises the flag hermetically against a stand-in bench.
+
+The compositor side needs no flag and works the same way:
+`LUMEN_TRACE_FILE=<path> lumen-compositor …` records startup/KMS/power instants and
+UI-thread spans (compositor_impl.cpp `start()` calls `timeline_start_from_env`; the
+contract is documented in docs/subsystems/errors-and-logging.md, §Timeline). Load either
+artifact at ui.perfetto.dev or with trace_processor.
+
 ## Discipline rules
 
 - **Independence**: the agent that implemented does not review; the agent that ran the
