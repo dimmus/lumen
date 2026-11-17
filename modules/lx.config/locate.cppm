@@ -69,7 +69,7 @@ lx::config::config_location lx::config::locate_config(env_lookup env) {
         }
         loc.explicit_file = true;
         config_path p{};
-        std::snprintf(p.path, sizeof(p.path), "%s", forced);
+        *std::format_to_n(p.path, sizeof(p.path) - 1, "{}", forced).out = '\0';
         loc.files.push_back(p);
         loc.user_file = p;
         return loc;
@@ -86,17 +86,18 @@ lx::config::config_location lx::config::locate_config(env_lookup env) {
         if (dir.empty() || dir.front() != '/' || system.size() == system.capacity())
             continue;
         config_path p{};
-        std::snprintf(p.path, sizeof(p.path), "%.*s/lumen/config.toml",
-                      static_cast<int>(dir.size()), dir.data());
+        *std::format_to_n(p.path, sizeof(p.path) - 1, "{}/lumen/config.toml", dir).out = '\0';
         system.push_back(p);
     }
     for (auto it = system.rbegin(); it != system.rend(); ++it)
         loc.files.push_back(*it);
     config_path user{};
     if (const char* home_cfg = lookup(env, "XDG_CONFIG_HOME"); home_cfg && home_cfg[0] == '/')
-        std::snprintf(user.path, sizeof(user.path), "%s/lumen/config.toml", home_cfg);
+        *std::format_to_n(user.path, sizeof(user.path) - 1, "{}/lumen/config.toml",
+                          home_cfg).out = '\0';
     else if (const char* home = lookup(env, "HOME"))
-        std::snprintf(user.path, sizeof(user.path), "%s/.config/lumen/config.toml", home);
+        *std::format_to_n(user.path, sizeof(user.path) - 1, "{}/.config/lumen/config.toml",
+                          home).out = '\0';
     if (user.path[0]) {
         loc.files.push_back(user);
         loc.user_file = user;
