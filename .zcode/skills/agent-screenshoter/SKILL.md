@@ -12,7 +12,7 @@ rule as `lumen-build-run`. Inventories below do **not** transfer between them.
 ## 1. Tool inventory (re-verify every session)
 
 ```bash
-for t in grim slurp import convert magick wl-copy wl-paste busctl gdbus wlr-randr wayland-info; do command -v $t || echo $t ABSENT; done
+for t in grim slurp import convert magick wl-copy wl-paste busctl gdbus wlr-randr wayland-info wf-recorder; do command -v $t || echo $t ABSENT; done
 ```
 
 - **Notebook `iritur`** (i915+nouveau), verified 2026-11-17 by running that line: present
