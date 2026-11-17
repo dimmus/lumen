@@ -87,6 +87,23 @@ current when an item closes.
   worked (`evidence/2026-11-17-seat-redo/d-supplements/shot-pre-flip-banner-zoom.png`);
   no startup path setting the banner's memory_only state was found by source reading.
   Reproduce, then fix the stale banner state.
+- [ ] **snprintf-log-migration gate BLOCKED: seat evidence owed + vsnprintf acceptance
+  unratified** (2026-11-17, branch `zcode/task/snprintf-log-migration` 8e925e5..b556db2,
+  unmerged; code side verified — ctest 136/136 gate-verified at b556db2, interleaved
+  ui-bench A/B vs 9dabcaf 0 FAIL in all 6 pairs, final grep = 4 documented exceptions):
+  the implementer's drag/app-smoke PASS runs left no surviving evidence and the gate-time
+  re-runs (drag-smoke-logs/run.log Nov 17 23:26, app-smoke-logs/run.log 23:48) failed
+  environmentally — uinput holder dead (pid 3845078), pointer fell back to event2
+  "no absolute axis 0" ×13, "another session is running" — every failing row
+  injection-dependent, non-injection rows clean. Remediation: regenerate the holder
+  (`scripts/uinput-mouse.py`), ensure no concurrent session, re-run both smokes
+  `--join-seat-session` on the notebook, commit the logs under `evidence/`, and capture
+  the app-smoke PASS/WARN/FAIL row counts vs the ~140 floor. Separate ratification item
+  for the owner: the acceptance grep as written allows only `error.cppm:200`, but
+  `lx.config/parse.cpp:988` + `lx.input/keymap.cppm:277,283` keep commented vsnprintf
+  renders of xkbcommon's run-time printf format (std::format cannot consume it; the task
+  notes forbade a helper) — ratify the amended acceptance or direct another resolution
+  (see `.zcode/memories/lumen-snprintf-log-migration.md`).
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
