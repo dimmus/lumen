@@ -579,6 +579,13 @@ private:
     unsigned clock_pressed_serial_ = 0;
     /// The clock's text of the layout being drawn.
     char clock_text_[sizeof(panel_clock::text)]{};
+    /// Stable storage for the short strings build_ui() renders into tiles: a stack
+    /// buffer of that frame would dangle, because the retained text blocks read their
+    /// string at the NEXT tick's reconcile (ASan: stack-use-after-return).
+    char task_letters_[k_max_panel_cells][2]{};
+    char tray_letters_[k_max_tray_cells][2]{};
+    char more_text_[16]{};     // "+N" of the taskbar overflow
+    char bell_count_text_[8]{}; // the bell's unread count
     bool menu_keyboard_ = false;
     /// The indicator's input of the layout being drawn (its names).
     panel_ws_input ws_input_{};
@@ -1703,10 +1710,11 @@ lx::ui::child lx::shell::panel::build_ui() {
                     const char* src = e->app_id[0] ? e->app_id : label;
                     if (const char* dot = std::strrchr(src, '.'); dot && dot[1])
                         src = dot + 1;
-                    char letter[2] = {src[0] >= 'a' && src[0] <= 'z'
-                                          ? static_cast<char>(src[0] - 32)
-                                          : src[0],
-                                      0};
+                    char* const letter = task_letters_[i];
+                    letter[0] = src[0] >= 'a' && src[0] <= 'z'
+                                    ? static_cast<char>(src[0] - 32)
+                                    : src[0];
+                    letter[1] = '\0';
                     const lx::ui::child glyph = panel_text(letter[0] ? letter : "?",
                                                            k_text_focused, true,
                                                            0x7301'0000u + i);
@@ -1745,8 +1753,8 @@ lx::ui::child lx::shell::panel::build_ui() {
                 {parts, k}, this, 0x7300'0000u + i);
         }
         if (l.hidden) {
-            char more[16];
-            *std::format_to_n(more, sizeof(more) - 1, "+{}", l.hidden).out = '\0';
+            char* const more = more_text_;
+            *std::format_to_n(more, sizeof(more_text_) - 1, "+{}", l.hidden).out = '\0';
             const lx::ui::child text = panel_text(more, k_text_more, false, 0x7400u);
             kids[n++] = lx::ui::styled(
                 lx::ui::style{}
@@ -1775,9 +1783,9 @@ lx::ui::child lx::shell::panel::build_ui() {
             parts[k++] = lx::ui::image(surface_.atlas(), tile, {k_tray_icon, k_tray_icon},
                                        0x7500'0000u + i);
         } else {
-            char letter[2] = {widgets_.tray_letter ? widgets_.tray_letter(c.key, widgets_.user)
-                                                   : '?',
-                              0};
+            char* const letter = tray_letters_[i];
+            letter[0] = widgets_.tray_letter ? widgets_.tray_letter(c.key, widgets_.user) : '?';
+            letter[1] = '\0';
             if (letter[0] >= 'a' && letter[0] <= 'z')
                 letter[0] = static_cast<char>(letter[0] - 32);
             const lx::ui::child glyph = panel_text(letter[0] ? letter : "?", k_text_focused,
@@ -1828,8 +1836,8 @@ lx::ui::child lx::shell::panel::build_ui() {
         parts[k++] = lx::ui::styled(
             lx::ui::style{}.flex_none().flex_row().items_center(), bell[0]);
         if (l.bell_unread > 0) {
-            char count[8];
-            *std::format_to_n(count, sizeof(count) - 1, "{}",
+            char* const count = bell_count_text_;
+            *std::format_to_n(count, sizeof(bell_count_text_) - 1, "{}",
                               l.bell_unread > 999 ? 999u : l.bell_unread).out = '\0';
             const lx::ui::child label = panel_text(count, k_text_focused, true, 0x7600u);
             parts[k++] = panel_box(
