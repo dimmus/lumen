@@ -10,8 +10,19 @@ current when an item closes.
   main (`ebe7046` portal Settings, `eaaf7ba` LUMEN_THEME export, `9022e74` settings-startup
   apply); 136/136 ctest at merged main. Push/PR remains the owner's call (never pushed
   without asking).
-- [ ] **ADR-013 open item 1: in-window key capture** for the bindings editor (wl_keyboard
-  keysym recording; the text grammar is the complete fallback today).
+- [x] **ADR-013 open item 1: in-window key capture** — closed 2026-11-17: shipped in
+  `0439bc4` all along (capture state machine, Record button, xkbcommon level-0 keysym,
+  shared validation — the TODO text predated that commit); proven live on the notebook
+  seat (quiet serialized session, compositor + lumen-settings, injected keyboard):
+  Super+Shift+y recorded canonically, Save wrote `"Super+Shift+y" = "shell.launcher"` into
+  `[bindings]` with reload generation 2 (57→58 bindings), bare Esc cancelled, bare
+  Backspace cleared while Ctrl+BackSpace recorded, reserved Super+Escape showed the inline
+  error and Save refused byte-unchanged; Ctrl+Alt+F1 is compositor-consumed before the
+  client by design. 136/136 ctest. Evidence: `evidence/2026-11-17-shortcut-capture/`
+  (ASSERTIONS.md maps every check to artifacts). One finding recorded to memory:
+  injected Super-chords can trip the shell's Super tap grab and steal focus mid-chord
+  (launcher open/close in the compositor log) — not a capture defect; see
+  `.zcode/memories/lumen-settings-key-capture-seat.md` and the open row below.
 - [ ] **Super tap grab fires mid-chord (compositor tap-arming corner)** (2026-11-17, found
   by the settings-key-capture seat run; low; pre-existing): during an injected
   Super+Shift+y chord the shell's Super tap grab armed and fired anyway — the launcher
