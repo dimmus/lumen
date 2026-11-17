@@ -81,6 +81,18 @@ wl-copy -t image/png < shot.png                   # clipboard hand-off (wl-copy 
 Escape selection semantics at `scripts/app-smoke.sh:336-348` are the **portal's**
 interactive area picker, §5 — slurp has its own drag selection.)
 
+**grim is not side-effect-free on a Lumen session.** A wlr-screencopy frame counts as
+active capture for 2 s after it (`k_indicator_ns`,
+`modules/lx.compositor/wire_capture.cpp:97,1495-1508`), which pushes
+`zlm_shell_v1.capture_state` (`wire_capture.cpp:1514`) → the shell raises do-not-disturb
+while capturing (`dnd_while_sharing` defaults true;
+`modules/lx.shell/shell_desktop.cpp:318-319`, `notifications.cppm:132,224`) and the panel
+bell swaps to its DND layout. Back-to-back shots catch each other's flip: rapid grim
+probing flipped ~3.4 k px at the bell bbox (notebook, `x2775-3121 y17-46`) — probe-induced,
+settled shots byte-identical (`.zcode/memories/lumen-animations-close-ghost.md:64-66,90`).
+Space panel shots >2 s apart, exclude the bell bbox from cross-shot pixel diffs, and never
+read DND state out of a shot.
+
 ## 5. The portal path (xdg-desktop-portal Screenshot)
 
 Wire contract, read off `tests/clients/lumen-portal-probe.cpp:60-62,253-307`:
@@ -146,3 +158,5 @@ Shots land under the task's evidence run dir, `evidence/<date>-<run>/…` (e.g.
 Portal-written files (Pictures/Screenshots or the private runtime dir) get **copied**
 there — the private runtime file is also expired by the backend, so copy before judging.
 Report each shot as: artifact path + the exact command + host + session socket/compositor.
+Judge panel pixels with §4's side effect in mind: a bell in DND layout is the shot's own
+probe artifact, not session state.
