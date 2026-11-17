@@ -222,8 +222,10 @@ public:
     /// A string key's buffer applies to its field (an input's change or submit).
     void commit_string(unsigned row);
     /// Applies the [ui] section to this app live (the theme and the density; the font size
-    /// applies to applications at their start).
-    void apply_ui_live();
+    /// applies to applications at their start). `theme_too` false keeps the context's
+    /// theme — an explicit `--theme` themed it at app.start() — and applies the density
+    /// only (main's one startup call).
+    void apply_ui_live(bool theme_too = true);
     /// Compiles a Zed theme-family JSON into the user theme directory, loads it live and
     /// writes [ui].theme. `status` gets a short human result either way.
     void import_theme(std::string_view json_path);
@@ -1400,7 +1402,7 @@ void session::commit_string(unsigned row) {
 
 std::vector<std::string> session::g_installed; // NOLINT(cppcoreguidelines-avoid-non-const-global-variable)
 
-void session::apply_ui_live() {
+void session::apply_ui_live(bool theme_too) {
     const lx::config::ui_settings& ui = config_.ui;
     const std::string name =
         ui.theme[0]
@@ -1413,16 +1415,18 @@ void session::apply_ui_live() {
     live_theme_ = name;
     live_appearance_ = ui.appearance;
     live_density_ = ui.density;
-    if (name == "one-dark") {
-        set_active_builtin_theme(lx::ui::appearance::dark);
-    } else if (name == "one-light") {
-        set_active_builtin_theme(lx::ui::appearance::light);
-    } else if (auto loaded = lx::ui::load_theme_file(name.c_str())) {
-        set_active_theme(std::move(loaded).value());
+    if (theme_too) {
+        if (name == "one-dark") {
+            set_active_builtin_theme(lx::ui::appearance::dark);
+        } else if (name == "one-light") {
+            set_active_builtin_theme(lx::ui::appearance::light);
+        } else if (auto loaded = lx::ui::load_theme_file(name.c_str())) {
+            set_active_theme(std::move(loaded).value());
+        }
+        // A theme file that does not load: the row keeps its value and the app keeps the
+        // previous theme (the file write already happened; the compositor and the shell
+        // apply it on their side and report).
     }
-    // A theme file that does not load: the row keeps its value and the app keeps the
-    // previous theme (the file write already happened; the compositor and the shell apply
-    // it on their side and report).
     switch (ui.density) {
     case lx::config::ui_density_kind::compact: set_ui_density(lx::ui::density::compact); break;
     case lx::config::ui_density_kind::comfortable:

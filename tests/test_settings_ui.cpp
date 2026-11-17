@@ -770,6 +770,54 @@ LUMEN_TEST(settings_shortcut_capture_cancel_clear_and_reserved) {
     LUMEN_CHECK(s.state() != settings::session::save_state::written);
 }
 
+LUMEN_TEST(settings_startup_apply_renders_the_config_ui_section) {
+    // Main's one startup call (after the session loaded the layers, before the window
+    // opens): the [ui] section themes this app over whatever the context inherited — a
+    // stale LUMEN_THEME, none at all — and an unchanged config makes the second apply the
+    // live_theme_ no-op. An explicit --theme keeps the context it themed at app.start()
+    // (main passes theme_too=false); the config's density still applies.
+    char dir[] = "/tmp/lumen-settings-ui-XXXXXX";
+    LUMEN_CHECK(::mkdtemp(dir) != nullptr);
+    const std::string file = std::string(dir) + "/config.toml";
+    {
+        std::ofstream out{file};
+        out << "[ui]\nappearance = \"light\"\ndensity = \"compact\"\n";
+    }
+    LUMEN_CHECK(::setenv("LUMEN_CONFIG", file.c_str(), 1) == 0);
+    settings::session s{true};
+    LUMEN_CHECK(s.config().ui.appearance == lx::config::ui_appearance::light);
+    LUMEN_CHECK(s.config().ui.density == lx::config::ui_density_kind::compact);
+
+    // A stale inherited environment had themed the context dark at app.start().
+    set_active_builtin_theme(appearance::dark);
+    set_ui_density(density::standard);
+    const std::uint64_t stale = theme_generation();
+
+    s.apply_ui_live(); // no --theme: the config applies in full
+    LUMEN_CHECK(active_theme().appearance_mode() == appearance::light);
+    LUMEN_CHECK(ui_density() == density::compact);
+    LUMEN_CHECK(theme_generation() > stale);
+
+    // Unchanged config: the live_theme_ guard makes the second apply a no-op.
+    const std::uint64_t applied = theme_generation();
+    s.apply_ui_live();
+    LUMEN_CHECK(theme_generation() == applied);
+
+    // The --theme case is a fresh startup (live_theme_ still seeded): the flag's theme
+    // stays, the config's density lands.
+    settings::session flagged{true};
+    set_active_builtin_theme(appearance::dark); // --theme one-dark while the file says light
+    set_ui_density(density::standard);
+    flagged.apply_ui_live(false);
+    LUMEN_CHECK(active_theme().appearance_mode() == appearance::dark);
+    LUMEN_CHECK(ui_density() == density::compact);
+
+    ::unsetenv("LUMEN_CONFIG");
+    std::filesystem::remove_all(dir);
+    set_active_builtin_theme(appearance::dark);
+    set_ui_density(density::standard);
+}
+
 int main(int argc, char** argv) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     const int status = lumen_test::run_all(argc, argv);
