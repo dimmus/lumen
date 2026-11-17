@@ -9,9 +9,11 @@ Lumen repository. Treat it as binding alongside the docs in `docs/`.
 
 - The project's agent harness lives under `.zcode/`: role agents in `.zcode/agents/*.md`
   (planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher,
-  architect, doc-writer — dispatch via the Agent tool; the studio workflow embeds the
-  same personas), knowledge skills in `.zcode/skills/` (`lumen-build-run`,
-  `lumen-testing`, `lumen-decisions`, `lumen-memory-writer`, `lumen-studio`), and saved
+  architect, doc-writer, screenshoter — dispatch via the Agent tool; the studio workflow
+  embeds the same personas), knowledge skills in `.zcode/skills/` (`lumen-build-run`,
+  `lumen-testing`, `lumen-decisions`, `lumen-memory-writer`, `lumen-studio`,
+  `agent-screenshoter` — seat screenshots; a lead dispatches `agent-screenshoter`
+  instead of improvising shell commands), and saved
   dynamic workflows in `.zcode/workflows/` (`lumen-development-studio` for non-trivial or
   multi-task delivery, `lumen-gated-change` for one bounded task, `lumen-compositor-bench`
   for speed/memory comparison against sway/weston/hyprland). Start with CreateWorkflow
