@@ -23,12 +23,14 @@ using lx::compositor::dnd_target;
 using lx::compositor::root_kind;
 
 // ── Allocation counter: every operator new in the process while `g_counting` is set ──
+#include "alloc_counting.hpp"
 
 namespace {
 std::atomic<bool> g_counting{false};
 std::atomic<unsigned> g_allocs{0};
 } // namespace
 
+#if LUMEN_TEST_ALLOC_COUNTING
 void* operator new(std::size_t n) {
     if (g_counting.load(std::memory_order_relaxed))
         g_allocs.fetch_add(1, std::memory_order_relaxed);
@@ -38,6 +40,7 @@ void* operator new(std::size_t n) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 namespace {
 
@@ -418,7 +421,7 @@ LUMEN_TEST(dnd_dragged_toplevel_motion_and_tick_do_not_allocate) {
     for (int i = 0; i < 200; ++i) {
         f->seat.set_pointer_position(g0.x + 160.5 + i * 0.5, g0.y + 150.5 + i * 0.5);
         f->wm.on_pointer_motion(static_cast<unsigned>(i));
-        f->wm.on_tick(2'000'000'000 + i * 16'666'667);
+        f->wm.on_tick(2'000'000'000LL + i * 16'666'667LL);
     }
     g_counting.store(false);
     const unsigned tick_allocs = g_allocs.load();

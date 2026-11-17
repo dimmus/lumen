@@ -4,6 +4,7 @@
 //
 // The fixtures follow tests/test_ui_components.cpp's harness.
 
+#include "alloc_counting.hpp"
 #include "lumen_test.hpp"
 
 #include <malloc.h>
@@ -24,6 +25,9 @@ namespace {
 std::atomic<unsigned long long> g_allocations{0};
 } // namespace
 
+// See alloc_counting.hpp: not compiled under ThreadSanitizer (its runtime
+// defines the global operators; a replacement is a duplicate-symbol link error).
+#if LUMEN_TEST_ALLOC_COUNTING
 void* operator new(std::size_t n) {
     g_allocations.fetch_add(1, std::memory_order_relaxed);
     if (void* p = std::malloc(n ? n : 1))
@@ -40,6 +44,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif // LUMEN_TEST_ALLOC_COUNTING
 
 namespace {
 
@@ -217,7 +222,11 @@ LUMEN_TEST(slider_drag_keyboard_wheel_and_disabled) {
         LUMEN_CHECK(g_slider_index == 100 || true); // the describer's value is fixed; the
                                                     // point is the frame's allocations
     }
+    #if !LUMEN_TEST_ALLOC_COUNTING // counting not built under TSan (alloc_counting.hpp)
+        std::printf("    skip: allocation counting is not built under TSan\n");
+    #else
     LUMEN_CHECK(g_allocations.load(std::memory_order_relaxed) == before);
+    #endif
 }
 
 // ── segmented ──

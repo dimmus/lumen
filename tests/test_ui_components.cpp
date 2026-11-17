@@ -6,6 +6,7 @@
 // Sizes are checked against Zed's numbers at the default density and the 16 px rem, from
 // zed-industries/zed a5c4ca8 crates/ui/src (and crates/workspace for the status bar and the
 // toolbar); each check names its file.
+#include "alloc_counting.hpp"
 #include "lumen_test.hpp"
 
 #include <malloc.h>
@@ -26,6 +27,9 @@ namespace {
 std::atomic<unsigned long long> g_allocations{0};
 } // namespace
 
+// See alloc_counting.hpp: not compiled under ThreadSanitizer (its runtime
+// defines the global operators; a replacement is a duplicate-symbol link error).
+#if LUMEN_TEST_ALLOC_COUNTING
 void* operator new(std::size_t n) {
     g_allocations.fetch_add(1, std::memory_order_relaxed);
     if (void* p = std::malloc(n ? n : 1))
@@ -42,6 +46,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif // LUMEN_TEST_ALLOC_COUNTING
 
 namespace {
 
@@ -1045,7 +1050,11 @@ LUMEN_TEST(steady_frames_of_every_component_allocate_nothing) {
         }
         const unsigned long long during = g_allocations.load() - allocs_reserved;
         (void)allocs;
+        #if !LUMEN_TEST_ALLOC_COUNTING // counting not built under TSan (alloc_counting.hpp)
+            std::printf("    skip: allocation counting is not built under TSan\n");
+        #else
         LUMEN_CHECK(during == 0);
+        #endif
         LUMEN_CHECK(mallinfo2().uordblks <= heap + 300 * sizeof(double) + 64);
         std::sort(us.begin(), us.end());
         std::printf("    %-28s tick p50 %7.1f us  p95 %7.1f us  allocations %llu  primitives %u\n",
@@ -1766,7 +1775,11 @@ LUMEN_TEST(list_scroll_recycles_a_fixed_pool) {
     std::printf("    list scroll (2 rows/frame, %llu rebuilds): tick p50 %.1f us p95 %.1f us, %llu allocations, %u live rows max\n",
                 static_cast<unsigned long long>(l.rebuilds() - rebuilds), us[us.size() / 2],
                 us[us.size() * 95 / 100], during, max_live);
+    #if !LUMEN_TEST_ALLOC_COUNTING // counting not built under TSan (alloc_counting.hpp)
+        std::printf("    skip: allocation counting is not built under TSan\n");
+    #else
     LUMEN_CHECK(during == 0);
+    #endif
     LUMEN_CHECK(mallinfo2().uordblks <= heap + 300 * sizeof(double) + 64);
 }
 
@@ -2211,7 +2224,11 @@ LUMEN_TEST(steady_frames_with_overlays_allocate_nothing) {
             us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
         }
         const unsigned long long during = g_allocations.load() - before;
+        #if !LUMEN_TEST_ALLOC_COUNTING // counting not built under TSan (alloc_counting.hpp)
+            std::printf("    skip: allocation counting is not built under TSan\n");
+        #else
         LUMEN_CHECK(during == 0);
+        #endif
         LUMEN_CHECK(mallinfo2().uordblks <= heap + 300 * sizeof(double) + 64);
         std::sort(us.begin(), us.end());
         std::printf("    %-30s tick p50 %7.1f us  p95 %7.1f us  allocations %llu\n", what,
