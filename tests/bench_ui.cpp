@@ -1719,8 +1719,10 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         }
 
         // The stage spans sit around the CLOCK_MONOTONIC reads that time them (constructor
-        // before the first, destructor after the second), so an untraced run's numbers are
-        // the numbers an uninstrumented run would read; the timeline stores the literals.
+        // before the first, destructor after the second), and every stage opens its window
+        // on its own read, never the previous stage's closing one — so an untraced run's
+        // stage deltas are the numbers an uninstrumented run would read; the timeline
+        // stores the literals.
         std::uint64_t t_update0 = 0, t_update1 = 0;
         {
             LX_TRACE_SCOPE("bench", "update");
@@ -1785,9 +1787,10 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         if (lx::trace::timeline_enabled())
             lx::trace::timeline_counter("ui.batches", static_cast<long long>(draws.batches().size()));
         std::uint64_t bytes = 0;
-        std::uint64_t t4 = 0;
+        std::uint64_t t_enc0 = 0, t4 = 0;
         {
             LX_TRACE_SCOPE("bench", "encode");
+            t_enc0 = now_ns();
             bytes = encode(draws, ring.data(), ring.size());
             t4 = now_ns();
         }
@@ -1925,11 +1928,11 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_layout].push_back(st.layout);
         samples[st_emit].push_back(st.emit);
         samples[st_order].push_back(t3 - t2);
-        samples[st_encode].push_back(t4 - t3);
-        samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t3));
+        samples[st_encode].push_back(t4 - t_enc0);
+        samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t_enc0));
         samples[st_frame].push_back(t4 - t0);
         samples[st_layout_emit_order_encode].push_back(st.layout + st.emit + (t3 - t2) +
-                                                       (t4 - t3));
+                                                       (t4 - t_enc0));
         samples[st_update_frame].push_back((t_update1 - t_update0) + (t4 - t0));
         if (raster)
             samples[st_raster].push_back(t5 - t_draw);
