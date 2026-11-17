@@ -73,6 +73,10 @@ struct client {
     wl_seat* seat = nullptr;
     wl_data_device_manager* ddm = nullptr;
     std::vector<std::string> globals;
+    /// Every proxy this client created (window roles, buffers): libwayland 1.26 does
+    /// not free remaining proxies at wl_display_disconnect, so disconnect destroys
+    /// what tests did not destroy mid-case.
+    std::vector<wl_proxy*> created;
 };
 
 void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uint32_t version) {
@@ -103,6 +107,43 @@ bool connect(client& c, const char* socket = k_socket) {
     return wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0;
 }
 
+/// Takes a proxy this client created off the tracked list after its typed destroy
+/// request ran (the typed destroy already freed the client proxy; disconnect destroys
+/// only what no case destroyed — a second wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+/// Full client teardown: every proxy still alive is destroyed before the display —
+/// libwayland 1.26 leaks remaining proxies past `wl_display_disconnect` (LSan: one
+/// 96-byte proxy per object per client), so a well-formed client's destroy discipline
+/// happens here for whatever the case left open.
+void disconnect(client& c) {
+    // Dispatch whatever the last roundtrip queued but never delivered (a protocol
+    // error stops dispatch mid-buffer): the listeners this file attaches push the
+    // server-created proxies onto c.created so the sweep below owns them.
+    (void)wl_display_dispatch_pending(c.display);
+    // Reverse creation order: children can hold references on their factories, so the
+    // factories must go last.
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it)
+        wl_proxy_destroy(*it);
+    c.created.clear();
+    if (c.ddm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.ddm));
+    if (c.seat)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.seat));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 bool has_global(const client& c, const char* iface) {
     for (const auto& g : c.globals)
         if (g == iface)
@@ -129,9 +170,16 @@ void* bind_global(client& c, const wl_interface* iface, uint32_t version) {
     wl_registry* r = wl_display_get_registry(c.display);
     wl_registry_add_listener(r, &listener, &f);
     (void)wl_display_roundtrip(c.display);
-    if (!f.name)
+    // The helper's own registry proxy is not freed by wl_display_disconnect (one 96-byte
+    // proxy per call leaked otherwise); the not-found path returns with it destroyed too.
+    if (!f.name) {
+        wl_registry_destroy(r);
         return nullptr;
-    return wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+    }
+    void* bound = wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+    c.created.push_back(static_cast<wl_proxy*>(bound));
+    wl_registry_destroy(r);
+    return bound;
 }
 
 struct outcome {
@@ -148,7 +196,7 @@ outcome finish(client& c) {
         o.code = wl_display_get_protocol_error(c.display, &iface, &id);
         o.interface = iface ? iface->name : "[destroyed]";
     }
-    wl_display_disconnect(c.display);
+    disconnect(c);
     c.display = nullptr;
     return o;
 }
@@ -196,6 +244,7 @@ wl_buffer* make_buffer(client& c, int w, int h, uint32_t argb = 0xFF336699u,
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, format);
     wl_shm_pool_destroy(pool);
     close(fd);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     return b;
 }
 
@@ -219,6 +268,9 @@ void make_window(client& c, window& w, const char* app_id) {
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
     xdg_toplevel_set_app_id(w.toplevel, app_id);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
 }
 
 void map_made(client& c, window& w, int width, int height) {
@@ -332,8 +384,10 @@ void dialog_cases() {
                auto* wm = static_cast<xdg_wm_dialog_v1*>(bind_global(c, &xdg_wm_dialog_v1_interface, 1));
                window w{};
                make_window(c, w, "dialog-twice");
-               (void)xdg_wm_dialog_v1_get_xdg_dialog(wm, w.toplevel);
-               (void)xdg_wm_dialog_v1_get_xdg_dialog(wm, w.toplevel);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   xdg_wm_dialog_v1_get_xdg_dialog(wm, w.toplevel)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   xdg_wm_dialog_v1_get_xdg_dialog(wm, w.toplevel)));
            });
     expect("dialog: a new xdg_dialog_v1 after the first was destroyed", "none", 0, [](client& c) {
         auto* wm = static_cast<xdg_wm_dialog_v1*>(bind_global(c, &xdg_wm_dialog_v1_interface, 1));
@@ -341,9 +395,12 @@ void dialog_cases() {
         make_window(c, w, "dialog-again");
         xdg_dialog_v1_destroy(xdg_wm_dialog_v1_get_xdg_dialog(wm, w.toplevel));
         auto* d = xdg_wm_dialog_v1_get_xdg_dialog(wm, w.toplevel);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(d));
         xdg_dialog_v1_set_modal(d);
         // The toplevel goes first: the dialog is inert, not an error.
         xdg_toplevel_destroy(w.toplevel);
+        untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
+        w.toplevel = nullptr;
         xdg_dialog_v1_unset_modal(d);
     });
 
@@ -356,14 +413,17 @@ void dialog_cases() {
     }
     auto* wm = static_cast<xdg_wm_dialog_v1*>(bind_global(c, &xdg_wm_dialog_v1_interface, 1));
     auto* kb = wl_seat_get_keyboard(c.seat);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(kb));
     wl_keyboard_add_listener(kb, &kb_listener, &k);
     auto* ptr = wl_seat_get_pointer(c.seat);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(ptr));
     wl_pointer_add_listener(ptr, &ptr_listener, &k);
     window parent{}, dialog{};
     map_window(c, parent, "modal-parent", 400, 300);
     make_window(c, dialog, "modal-dialog");
     xdg_toplevel_set_parent(dialog.toplevel, parent.toplevel);
     auto* d = xdg_wm_dialog_v1_get_xdg_dialog(wm, dialog.toplevel);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(d));
     xdg_dialog_v1_set_modal(d);
     map_made(c, dialog, 160, 100);
     settle(c);
@@ -425,7 +485,7 @@ void dialog_cases() {
     wl_surface_commit(dialog.surface);
     settle(c);
     check("dialog: the dialog unmapped, the parent takes focus again", focus_is(p.id), "");
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 // ── xdg-toplevel-icon-v1 ──
@@ -436,6 +496,7 @@ void icon_cases() {
                auto* m = static_cast<xdg_toplevel_icon_manager_v1*>(
                    bind_global(c, &xdg_toplevel_icon_manager_v1_interface, 1));
                auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(icon));
                xdg_toplevel_icon_v1_add_buffer(icon, make_buffer(c, 32, 16), 1);
            });
     expect("icon: set_name after set_icon", "xdg_toplevel_icon_v1",
@@ -445,6 +506,7 @@ void icon_cases() {
                window w{};
                make_window(c, w, "icon-immutable");
                auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(icon));
                xdg_toplevel_icon_v1_set_name(icon, "foot");
                xdg_toplevel_icon_manager_v1_set_icon(m, w.toplevel, icon);
                xdg_toplevel_icon_v1_set_name(icon, "other");
@@ -456,6 +518,7 @@ void icon_cases() {
                window w{};
                make_window(c, w, "icon-immutable2");
                auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(icon));
                xdg_toplevel_icon_manager_v1_set_icon(m, w.toplevel, icon);
                xdg_toplevel_icon_v1_add_buffer(icon, make_buffer(c, 16, 16), 1);
            });
@@ -464,9 +527,11 @@ void icon_cases() {
                auto* m = static_cast<xdg_toplevel_icon_manager_v1*>(
                    bind_global(c, &xdg_toplevel_icon_manager_v1_interface, 1));
                auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(icon));
                wl_buffer* b = make_buffer(c, 16, 16);
                xdg_toplevel_icon_v1_add_buffer(icon, b, 1);
                wl_buffer_destroy(b);
+        untrack(c, reinterpret_cast<wl_proxy*>(b));
            });
     expect("icon: buffers destroyed after set_icon are no error (copied)", "none", 0, [](client& c) {
         auto* m = static_cast<xdg_toplevel_icon_manager_v1*>(
@@ -474,11 +539,14 @@ void icon_cases() {
         window w{};
         make_window(c, w, "icon-copied");
         auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(icon));
         wl_buffer* b = make_buffer(c, 16, 16);
         xdg_toplevel_icon_v1_add_buffer(icon, b, 1);
         xdg_toplevel_icon_manager_v1_set_icon(m, w.toplevel, icon);
         wl_buffer_destroy(b);
+        untrack(c, reinterpret_cast<wl_proxy*>(b));
         xdg_toplevel_icon_v1_destroy(icon);
+        untrack(c, reinterpret_cast<wl_proxy*>(icon));
     });
 
     // The snapshot: name + buffers in sealed memfds, applied by the commit.
@@ -500,11 +568,13 @@ void icon_cases() {
     window w{};
     map_window(c, w, "icon-app");
     auto* icon = xdg_toplevel_icon_manager_v1_create_icon(m);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(icon));
     xdg_toplevel_icon_v1_set_name(icon, "utilities-terminal");
     xdg_toplevel_icon_v1_add_buffer(icon, make_buffer(c, 32, 32, 0xFF112233u), 1);
     xdg_toplevel_icon_v1_add_buffer(icon, make_buffer(c, 16, 16, 0x00445566u, WL_SHM_FORMAT_XRGB8888), 1);
     xdg_toplevel_icon_manager_v1_set_icon(m, w.toplevel, icon);
     xdg_toplevel_icon_v1_destroy(icon);
+    untrack(c, reinterpret_cast<wl_proxy*>(icon));
     settle(c);
     const unsigned before_commit = record("icon-app").icon;
     wl_surface_commit(w.surface);
@@ -544,7 +614,7 @@ void icon_cases() {
     wl_surface_commit(w.surface);
     settle(c);
     check("icon: set_icon(null) resets to the default", record("icon-app").icon == 0, "");
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 // ── xdg-system-bell-v1 ──
@@ -576,18 +646,27 @@ void foreign_cases() {
     expect("foreign v2: export of a surface that is not a toplevel", "zxdg_exporter_v2",
            ZXDG_EXPORTER_V2_ERROR_INVALID_SURFACE, [](client& c) {
                auto* e = static_cast<zxdg_exporter_v2*>(bind_global(c, &zxdg_exporter_v2_interface, 1));
-               (void)zxdg_exporter_v2_export_toplevel(e, wl_compositor_create_surface(c.compositor));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_compositor_create_surface(c.compositor)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   zxdg_exporter_v2_export_toplevel(
+                       e, reinterpret_cast<wl_surface*>(c.created.back()))));
            });
     expect("foreign v2: set_parent_of a surface that is not a toplevel", "zxdg_imported_v2",
            ZXDG_IMPORTED_V2_ERROR_INVALID_SURFACE, [](client& c) {
                auto* i = static_cast<zxdg_importer_v2*>(bind_global(c, &zxdg_importer_v2_interface, 1));
                auto* imp = zxdg_importer_v2_import_toplevel(i, "0123456789abcdef0123456789abcdef");
-               zxdg_imported_v2_set_parent_of(imp, wl_compositor_create_surface(c.compositor));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(imp));
+               wl_surface* ns = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ns));
+               zxdg_imported_v2_set_parent_of(imp, ns);
            });
     expect("foreign v1: a non-toplevel export is no error (its handle imports as destroyed)", "none",
            0, [](client& c) {
                auto* e = static_cast<zxdg_exporter_v1*>(bind_global(c, &zxdg_exporter_v1_interface, 1));
-               (void)zxdg_exporter_v1_export(e, wl_compositor_create_surface(c.compositor));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_compositor_create_surface(c.compositor)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   zxdg_exporter_v1_export(
+                       e, reinterpret_cast<wl_surface*>(c.created.back()))));
            });
 
     client a{}, b{};
@@ -599,6 +678,7 @@ void foreign_cases() {
     auto* bi = static_cast<zxdg_importer_v2*>(bind_global(b, &zxdg_importer_v2_interface, 1));
     int unknown_destroyed = 0;
     auto* bogus = zxdg_importer_v2_import_toplevel(bi, "ffffffffffffffffffffffffffffffff");
+    a.created.push_back(reinterpret_cast<wl_proxy*>(bogus));
     zxdg_imported_v2_add_listener(bogus, &imported_v2_listener, &unknown_destroyed);
     settle(b);
     check("foreign: an unknown handle is destroyed immediately", unknown_destroyed == 1, "");
@@ -608,6 +688,7 @@ void foreign_cases() {
     map_window(a, aw, "foreign-parent", 400, 300);
     exported_handle h{};
     auto* exp = zxdg_exporter_v2_export_toplevel(ae, aw.surface);
+    a.created.push_back(reinterpret_cast<wl_proxy*>(exp));
     zxdg_exported_v2_add_listener(exp, &exported_v2_listener, &h);
     settle(a);
     bool hex = h.handle.size() == 32;
@@ -617,10 +698,13 @@ void foreign_cases() {
     make_window(b, bw, "foreign-child");
     int destroyed = 0;
     auto* imp = zxdg_importer_v2_import_toplevel(bi, h.handle.c_str());
+    b.created.push_back(reinterpret_cast<wl_proxy*>(imp));
     zxdg_imported_v2_add_listener(imp, &imported_v2_listener, &destroyed);
     zxdg_imported_v2_set_parent_of(imp, bw.surface);
     auto* wm = static_cast<xdg_wm_dialog_v1*>(bind_global(b, &xdg_wm_dialog_v1_interface, 1));
-    xdg_dialog_v1_set_modal(xdg_wm_dialog_v1_get_xdg_dialog(wm, bw.toplevel));
+    auto* bd = xdg_wm_dialog_v1_get_xdg_dialog(wm, bw.toplevel);
+    b.created.push_back(reinterpret_cast<wl_proxy*>(bd));
+    xdg_dialog_v1_set_modal(bd);
     map_made(b, bw, 160, 100);
     settle(b);
     const auto pa = record("foreign-parent");
@@ -637,15 +721,18 @@ void foreign_cases() {
     auto* ae1 = static_cast<zxdg_exporter_v1*>(bind_global(a, &zxdg_exporter_v1_interface, 1));
     exported_handle h1{};
     auto* exp1 = zxdg_exporter_v1_export(ae1, aw.surface);
+    a.created.push_back(reinterpret_cast<wl_proxy*>(exp1));
     zxdg_exported_v1_add_listener(exp1, &exported_v1_listener, &h1);
     settle(a);
     int destroyed1 = 0;
     auto* imp1 = zxdg_importer_v2_import_toplevel(bi, h1.handle.c_str());
+    b.created.push_back(reinterpret_cast<wl_proxy*>(imp1));
     zxdg_imported_v2_add_listener(imp1, &imported_v2_listener, &destroyed1);
     settle(b);
     check("foreign: a v1 export imports over v2", destroyed1 == 0 && h1.handle.size() == 32, h1.handle);
     // The exported object goes: the import is told, the relation undone.
     zxdg_exported_v2_destroy(exp);
+    untrack(a, reinterpret_cast<wl_proxy*>(exp));
     settle(a);
     settle(b);
     check("foreign: destroying the export sends destroyed and unparents the child",
@@ -653,11 +740,13 @@ void foreign_cases() {
           "destroyed " + std::to_string(destroyed));
     // The window behind the v1 export goes: that import is told too.
     xdg_toplevel_destroy(aw.toplevel);
+    untrack(a, reinterpret_cast<wl_proxy*>(aw.toplevel));
+    aw.toplevel = nullptr;
     settle(a);
     settle(b);
     check("foreign: destroying the exported window sends destroyed", destroyed1 == 1, "");
-    wl_display_disconnect(a.display);
-    wl_display_disconnect(b.display);
+    disconnect(a);
+    disconnect(b);
 }
 
 // ── keyboard-shortcuts-inhibit ──
@@ -676,8 +765,11 @@ void inhibit_cases() {
                auto* m = static_cast<zwp_keyboard_shortcuts_inhibit_manager_v1*>(
                    bind_global(c, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(m, s, c.seat);
-               (void)zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(m, s, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(m, s, c.seat)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(m, s, c.seat)));
            });
     client c{};
     keys k{};
@@ -686,6 +778,7 @@ void inhibit_cases() {
         return;
     }
     auto* kb = wl_seat_get_keyboard(c.seat);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(kb));
     wl_keyboard_add_listener(kb, &kb_listener, &k);
     auto* m = static_cast<zwp_keyboard_shortcuts_inhibit_manager_v1*>(
         bind_global(c, &zwp_keyboard_shortcuts_inhibit_manager_v1_interface, 1));
@@ -693,6 +786,7 @@ void inhibit_cases() {
     map_window(c, w, "inhibit-app");
     inhibit_events ev{};
     auto* inh = zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(m, w.surface, c.seat);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(inh));
     zwp_keyboard_shortcuts_inhibitor_v1_add_listener(inh, &inhibitor_listener, &ev);
     settle(c);
     check("inhibit: the focused surface's inhibitor is active at once", ev.active == 1,
@@ -756,7 +850,7 @@ void inhibit_cases() {
     for (unsigned key : k.pressed)
         esc_seen = esc_seen || key == k_esc;
     check("inhibit: without an inhibitor Super+Escape reaches the client", esc_seen, "");
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 // ── data control ──
@@ -766,6 +860,11 @@ struct dc_state {
     ext_data_control_offer_v1* selection = nullptr;
     ext_data_control_offer_v1* primary = nullptr;
     zwlr_data_control_offer_v1* wlr_primary = nullptr;
+    /// Every offer that arrived (selections are replaced; the replaced offer is still
+    /// this client's to destroy).
+    std::vector<wl_proxy*> every_offer;
+    /// The owning client, for the listeners that track created proxies on it.
+    client* owner = nullptr;
     unsigned wlr_primary_events = 0;
     const char* payload = "";
     bool cancelled = false;
@@ -777,6 +876,7 @@ const ext_data_control_offer_v1_listener dc_offer_listener = {
 const ext_data_control_device_v1_listener dc_device_listener = {
     [](void* d, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
         static_cast<dc_state*>(d)->events.push_back("data_offer");
+        static_cast<dc_state*>(d)->every_offer.push_back(reinterpret_cast<wl_proxy*>(o));
         ext_data_control_offer_v1_add_listener(o, &dc_offer_listener, d);
     },
     [](void* d, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
@@ -802,17 +902,77 @@ struct app_state {
     wl_data_offer* offer = nullptr;
     const char* payload = "";
     bool cancelled = false;
+    /// Every offer that arrived — replaced selection offers are still ours to destroy.
+    std::vector<wl_proxy*> every_offer;
 };
 const wl_data_offer_listener app_offer_listener = {[](void*, wl_data_offer*, const char*) {},
                                                    [](void*, wl_data_offer*, uint32_t) {},
                                                    [](void*, wl_data_offer*, uint32_t) {}};
-const wl_data_device_listener app_dd_listener = {
-    [](void*, wl_data_device*, wl_data_offer* o) { wl_data_offer_add_listener(o, &app_offer_listener, nullptr); },
+// Data devices receive the seat's current selection the moment they are bound; a client
+// that wants none of it destroys the offer on arrival (the proxies are server-created
+// and not freed by wl_display_disconnect).
+const wl_data_device_listener dd_drop_listener = {
+    [](void* u, wl_data_device*, wl_data_offer* o) {
+        static_cast<client*>(u)->created.push_back(reinterpret_cast<wl_proxy*>(o));
+    },
     [](void*, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t, wl_data_offer*) {},
     [](void*, wl_data_device*) {},
     [](void*, wl_data_device*, uint32_t, wl_fixed_t, wl_fixed_t) {},
     [](void*, wl_data_device*) {},
-    [](void* d, wl_data_device*, wl_data_offer* o) { static_cast<app_state*>(d)->offer = o; }};
+    [](void* u, wl_data_device*, wl_data_offer* o) {
+        if (o) {
+            wl_data_offer_destroy(o);
+            untrack(*static_cast<client*>(u), reinterpret_cast<wl_proxy*>(o));
+        }
+    }};
+
+const ext_data_control_device_v1_listener dc_drop_listener = {
+    [](void* u, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
+        static_cast<client*>(u)->created.push_back(reinterpret_cast<wl_proxy*>(o));
+    },
+    [](void* u, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
+        if (o) {
+            ext_data_control_offer_v1_destroy(o);
+            untrack(*static_cast<client*>(u), reinterpret_cast<wl_proxy*>(o));
+        }
+    },
+    [](void*, ext_data_control_device_v1*) {},
+    [](void* u, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
+        if (o) {
+            ext_data_control_offer_v1_destroy(o);
+            untrack(*static_cast<client*>(u), reinterpret_cast<wl_proxy*>(o));
+        }
+    }};
+const zwlr_data_control_device_v1_listener wlr_drop_listener = {
+    [](void* u, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* o) {
+        static_cast<client*>(u)->created.push_back(reinterpret_cast<wl_proxy*>(o));
+    },
+    [](void* u, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* o) {
+        if (o) {
+            zwlr_data_control_offer_v1_destroy(o);
+            untrack(*static_cast<client*>(u), reinterpret_cast<wl_proxy*>(o));
+        }
+    },
+    [](void*, zwlr_data_control_device_v1*) {},
+    [](void* u, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* o) {
+        if (o) {
+            zwlr_data_control_offer_v1_destroy(o);
+            untrack(*static_cast<client*>(u), reinterpret_cast<wl_proxy*>(o));
+        }
+    }};
+
+const wl_data_device_listener app_dd_listener = {
+    [](void* d, wl_data_device*, wl_data_offer* o) {
+        static_cast<app_state*>(d)->every_offer.push_back(reinterpret_cast<wl_proxy*>(o));
+        wl_data_offer_add_listener(o, &app_offer_listener, nullptr);
+    },
+    [](void*, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t, wl_data_offer*) {},
+    [](void*, wl_data_device*) {},
+    [](void*, wl_data_device*, uint32_t, wl_fixed_t, wl_fixed_t) {},
+    [](void*, wl_data_device*) {},
+    [](void* d, wl_data_device*, wl_data_offer* o) {
+        static_cast<app_state*>(d)->offer = o;
+    }};
 const wl_data_source_listener app_src_listener = {
     [](void*, wl_data_source*, const char*) {},
     [](void* d, wl_data_source*, const char*, int32_t fd) {
@@ -856,9 +1016,16 @@ void data_control_cases() {
                auto* m = static_cast<ext_data_control_manager_v1*>(
                    bind_global(c, &ext_data_control_manager_v1_interface, 1));
                auto* dev = ext_data_control_manager_v1_get_data_device(m, c.seat);
+               ext_data_control_device_v1_add_listener(dev, &dc_drop_listener, &c);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dev));
                auto* src = ext_data_control_manager_v1_create_data_source(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                ext_data_control_source_v1_offer(src, "text/plain");
                ext_data_control_device_v1_set_selection(dev, src);
+               // The valid set broadcasts a fresh selection offer; dispatch it before the
+               // case's error — an event queued behind a protocol error never dispatches
+               // and its new-id proxy is unreachable client-side.
+               (void)wl_display_roundtrip(c.display);
                ext_data_control_device_v1_set_primary_selection(dev, src);
            });
     expect("data control: offer after the source was used", "ext_data_control_source_v1",
@@ -866,8 +1033,12 @@ void data_control_cases() {
                auto* m = static_cast<ext_data_control_manager_v1*>(
                    bind_global(c, &ext_data_control_manager_v1_interface, 1));
                auto* dev = ext_data_control_manager_v1_get_data_device(m, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dev));
+               ext_data_control_device_v1_add_listener(dev, &dc_drop_listener, &c);
                auto* src = ext_data_control_manager_v1_create_data_source(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                ext_data_control_device_v1_set_selection(dev, src);
+               (void)wl_display_roundtrip(c.display); // the broadcast offer, while clean
                ext_data_control_source_v1_offer(src, "text/plain");
            });
     expect("data control (wlr v2): set_primary_selection with a used source",
@@ -875,8 +1046,13 @@ void data_control_cases() {
                auto* m = static_cast<zwlr_data_control_manager_v1*>(
                    bind_global(c, &zwlr_data_control_manager_v1_interface, 2));
                auto* dev = zwlr_data_control_manager_v1_get_data_device(m, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dev));
+               zwlr_data_control_device_v1_add_listener(dev, &wlr_drop_listener, &c);
+               (void)wl_display_roundtrip(c.display); // initial selection offers, while clean
                auto* src = zwlr_data_control_manager_v1_create_data_source(m);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                zwlr_data_control_device_v1_set_primary_selection(dev, src);
+               (void)wl_display_roundtrip(c.display); // the broadcast offer, while clean
                zwlr_data_control_device_v1_set_selection(dev, src);
            });
 
@@ -889,8 +1065,10 @@ void data_control_cases() {
         return;
     }
     auto* akb = wl_seat_get_keyboard(app.seat);
+    app.created.push_back(reinterpret_cast<wl_proxy*>(akb));
     wl_keyboard_add_listener(akb, &kb_listener, &k);
     auto* add = wl_data_device_manager_get_data_device(app.ddm, app.seat);
+    app.created.push_back(reinterpret_cast<wl_proxy*>(add));
     wl_data_device_add_listener(add, &app_dd_listener, &as);
     window aw{};
     map_window(app, aw, "dc-app");
@@ -899,6 +1077,7 @@ void data_control_cases() {
     auto* m = static_cast<ext_data_control_manager_v1*>(
         bind_global(tool, &ext_data_control_manager_v1_interface, 1));
     auto* dev = ext_data_control_manager_v1_get_data_device(m, tool.seat);
+    tool.created.push_back(reinterpret_cast<wl_proxy*>(dev));
     ext_data_control_device_v1_add_listener(dev, &dc_device_listener, &ts);
     settle(tool);
     const bool both_at_bind =
@@ -907,6 +1086,7 @@ void data_control_cases() {
           ts.events.empty() ? "none" : ts.events[0]);
     // The tool sets the clipboard (wl-copy): the focused app is offered it and reads it.
     auto* src = ext_data_control_manager_v1_create_data_source(m);
+    app.created.push_back(reinterpret_cast<wl_proxy*>(src));
     ext_data_control_source_v1_add_listener(src, &dc_source_listener, &ts);
     ext_data_control_source_v1_offer(src, "text/plain;charset=utf-8");
     ts.payload = "from-wl-copy";
@@ -923,6 +1103,7 @@ void data_control_cases() {
     // The app copies (Ctrl+C): the tool hears of it and reads it (cliphist's store); the
     // tool's source is cancelled.
     auto* asrc = wl_data_device_manager_create_data_source(app.ddm);
+    app.created.push_back(reinterpret_cast<wl_proxy*>(asrc));
     wl_data_source_add_listener(asrc, &app_src_listener, &as);
     wl_data_source_offer(asrc, "text/plain");
     as.payload = "from-app";
@@ -940,29 +1121,57 @@ void data_control_cases() {
           "read \"" + watched + "\" cancelled " + std::to_string(ts.cancelled));
     // wlr v2 at bind: primary_selection is sent too.
     dc_state ws{};
+    ws.owner = &tool;
     static const zwlr_data_control_device_v1_listener wl = {
-        [](void*, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1*) {},
-        [](void*, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1*) {},
+        // The offers this third device receives are destroyed at their terminal event
+        // (they are the client's proxies; wl_display_disconnect does not free them).
+        [](void* d, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* o) {
+            auto* s = static_cast<dc_state*>(d);
+            if (s->owner)
+                s->owner->created.push_back(reinterpret_cast<wl_proxy*>(o));
+        },
+        [](void* d, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* o) {
+            auto* s = static_cast<dc_state*>(d);
+            if (o) {
+                zwlr_data_control_offer_v1_destroy(o);
+                if (s->owner)
+                    untrack(*s->owner, reinterpret_cast<wl_proxy*>(o));
+            }
+        },
         [](void*, zwlr_data_control_device_v1*) {},
-        [](void* d, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1*) {
-            static_cast<dc_state*>(d)->wlr_primary_events++;
+        [](void* d, zwlr_data_control_device_v1*, zwlr_data_control_offer_v1* o) {
+            auto* s = static_cast<dc_state*>(d);
+            s->wlr_primary_events++;
+            if (o) {
+                zwlr_data_control_offer_v1_destroy(o);
+                if (s->owner)
+                    untrack(*s->owner, reinterpret_cast<wl_proxy*>(o));
+            }
         }};
     auto* wm = static_cast<zwlr_data_control_manager_v1*>(
         bind_global(tool, &zwlr_data_control_manager_v1_interface, 2));
     auto* wdev = zwlr_data_control_manager_v1_get_data_device(wm, tool.seat);
+    tool.created.push_back(reinterpret_cast<wl_proxy*>(wdev));
     zwlr_data_control_device_v1_add_listener(wdev, &wl, &ws);
     settle(tool);
     check("data control (wlr v2): primary_selection at bind", ws.wlr_primary_events == 1, "");
     // The owner exits: the selection is cleared, the tool told (a manager may take it over).
     ts.events.clear();
-    wl_display_disconnect(app.display);
+    // Every offer that arrived is this client's object (replaced ones included).
+    for (wl_proxy* o : as.every_offer)
+        wl_proxy_destroy(o);
+    disconnect(app);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     settle(tool);
     bool cleared = false;
     for (const auto& e : ts.events)
         cleared = cleared || e == "selection:nil";
     check("data control: the owner's exit clears the selection for the tool", cleared, "");
-    wl_display_disconnect(tool.display);
+    for (wl_proxy* o : ts.every_offer)
+        wl_proxy_destroy(o);
+    if (ts.wlr_primary)
+        zwlr_data_control_offer_v1_destroy(ts.wlr_primary);
+    disconnect(tool);
 }
 
 // ── security-context-v1 ──
@@ -976,7 +1185,8 @@ void security_cases() {
                int p[2];
                if (pipe(p) != 0)
                    return;
-               (void)wp_security_context_manager_v1_create_listener(m, p[0], p[1]);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   wp_security_context_manager_v1_create_listener(m, p[0], p[1])));
                close(p[0]);
                close(p[1]);
            });
@@ -999,6 +1209,7 @@ void security_cases() {
                int p[2];
                (void)!pipe(p);
                auto* ctx = wp_security_context_manager_v1_create_listener(m, fd, p[0]);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ctx));
                close(fd);
                close(p[0]);
                wp_security_context_v1_set_app_id(ctx, "org.example.App");
@@ -1014,6 +1225,7 @@ void security_cases() {
                int p[2];
                (void)!pipe(p);
                auto* ctx = wp_security_context_manager_v1_create_listener(m, fd, p[0]);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ctx));
                close(fd);
                close(p[0]);
                wp_security_context_v1_set_sandbox_engine(ctx, "");
@@ -1028,6 +1240,7 @@ void security_cases() {
                int p[2];
                (void)!pipe(p);
                auto* ctx = wp_security_context_manager_v1_create_listener(m, fd, p[0]);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ctx));
                close(fd);
                close(p[0]);
                wp_security_context_v1_commit(ctx);
@@ -1048,6 +1261,7 @@ void security_cases() {
     int p[2];
     (void)!pipe(p);
     auto* ctx = wp_security_context_manager_v1_create_listener(m, fd, p[0]);
+    creator.created.push_back(reinterpret_cast<wl_proxy*>(ctx));
     close(fd); // "closing listen_fd and close_fd remains the only valid operation"
     close(p[0]);
     wp_security_context_v1_set_sandbox_engine(ctx, "org.flatpak");
@@ -1055,9 +1269,10 @@ void security_cases() {
     wp_security_context_v1_set_instance_id(ctx, "42");
     wp_security_context_v1_commit(ctx);
     wp_security_context_v1_destroy(ctx);
+    untrack(creator, reinterpret_cast<wl_proxy*>(ctx));
     settle(creator);
     // Listening outlives the creator.
-    wl_display_disconnect(creator.display);
+    disconnect(creator);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     client boxed{};
     const bool connected = connect(boxed, path.c_str());
@@ -1093,7 +1308,7 @@ void security_cases() {
           std::string(connected ? "" : "no connection") + (leaked.empty() ? "" : " leaked:" + leaked) +
               (missing.empty() ? "" : " missing:" + missing) + " context " + std::to_string(sandboxed));
     if (connected)
-        wl_display_disconnect(boxed.display);
+        disconnect(boxed);
     // close_fd hangs up: the compositor stops accepting (and closes its listen fd).
     close(p[1]);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1101,7 +1316,7 @@ void security_cases() {
     const bool late_connected = connect(late, path.c_str());
     check("security context: after close_fd hangs up no client is accepted", !late_connected, "");
     if (late.display)
-        wl_display_disconnect(late.display);
+        disconnect(late);
     unlink(path.c_str());
 }
 
@@ -1122,7 +1337,7 @@ void globals_case() {
             missing += std::string(" ") + g;
     check("every Part B global is advertised to an unsandboxed client", missing.empty(),
           missing.empty() ? "all 11" : "missing:" + missing);
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 } // namespace

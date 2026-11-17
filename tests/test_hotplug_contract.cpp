@@ -217,6 +217,15 @@ bool connect(client& c) {
     return wl_display_roundtrip(c.display) >= 0;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 wl_buffer* make_buffer(client& c, int w, int h) {
     const int stride = w * 4;
     const int size = stride * h;
@@ -495,7 +504,7 @@ int main() {
     xdg_surface_destroy(xs);
     wl_surface_destroy(w.surface);
     (void)wl_display_roundtrip(c.display);
-    wl_display_disconnect(c.display);
+    disconnect(c);
 
     pump.store(false, std::memory_order_release);
     pump_thread.join();

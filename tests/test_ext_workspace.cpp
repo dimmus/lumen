@@ -261,6 +261,15 @@ bool connect(client& c) {
     return wl_display_roundtrip(c.display) >= 0;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 void bind_manager(client& c) {
     c.manager = static_cast<ext_workspace_manager_v1*>(
         wl_registry_bind(c.registry, c.ws_name, &ext_workspace_manager_v1_interface, 1));
@@ -559,7 +568,7 @@ void run_cases() {
     ext_workspace_manager_v1_stop(c.manager);
     settle(c);
     check("stop: finished", c.finished && protocol_ok(c));
-    wl_display_disconnect(c.display);
+    disconnect(c);
 
     // A second client binds after all that: it sees the same state.
     client d{};
@@ -569,7 +578,7 @@ void run_cases() {
         group_state* db = d.group_of(d.outputs[1]);
         check("a new client sees the same workspaces", db && d.names(db) == c.names(gb),
               (db ? d.names(db) : "-") + " vs " + c.names(gb));
-        wl_display_disconnect(d.display);
+        disconnect(d);
     } else {
         check("a second client connects", false);
     }

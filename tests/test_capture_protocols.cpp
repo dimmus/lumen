@@ -90,6 +90,7 @@ void check(const char* name, bool ok, const std::string& detail) {
 
 struct client {
     wl_display* display = nullptr;
+    wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
     wl_shm* shm = nullptr;
@@ -146,13 +147,22 @@ bool connect(client& c) {
     c.display = wl_display_connect(k_socket);
     if (!c.display)
         return false;
-    wl_registry* r = wl_display_get_registry(c.display);
-    wl_registry_add_listener(r, &registry_listener, &c);
+    c.registry = wl_display_get_registry(c.display);
+    wl_registry_add_listener(c.registry, &registry_listener, &c);
     if (wl_display_roundtrip(c.display) < 0 || wl_display_roundtrip(c.display) < 0)
         return false;
     if (c.wm_base)
         xdg_wm_base_add_listener(c.wm_base, &wm_listener, nullptr);
     return true;
+}
+
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
 }
 
 struct outcome {
@@ -169,7 +179,7 @@ outcome finish(client& c) {
         o.code = wl_display_get_protocol_error(c.display, &iface, &id);
         o.interface = iface ? iface->name : "[destroyed]";
     }
-    wl_display_disconnect(c.display);
+    disconnect(c);
     c.display = nullptr;
     return o;
 }

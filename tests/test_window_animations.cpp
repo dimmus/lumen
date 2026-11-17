@@ -574,6 +574,16 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
 void on_global_remove(void*, wl_registry*, uint32_t) {}
 const wl_registry_listener registry_listener = {on_global, on_global_remove};
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
+
 struct window {
     wl_surface* surface = nullptr;
     xdg_surface* xdg = nullptr;
@@ -1365,7 +1375,7 @@ void run_cases() {
     check("off mid-motion: every motion ends at once", was && !animating());
     tick();
     check("off mid-motion: the ghost is gone", !window_draw().found);
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 } // namespace

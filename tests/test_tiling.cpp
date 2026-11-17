@@ -76,6 +76,16 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
 void on_global_remove(void*, wl_registry*, uint32_t) {}
 const wl_registry_listener registry_listener = {on_global, on_global_remove};
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
+
 // ── an application window that draws at the size it is configured for ──
 
 struct window {
@@ -538,7 +548,7 @@ void run_cases() {
     destroy_window(w3);
     settle(c, {});
     check("no protocol error", wl_display_get_error(c.display) == 0);
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 } // namespace

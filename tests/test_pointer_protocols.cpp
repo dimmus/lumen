@@ -92,6 +92,15 @@ bool connect(client& c) {
     return wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 uint32_t global_version(const client& c, const char* iface) {
     for (const auto& g : c.globals)
         if (g.name == iface)
@@ -136,7 +145,7 @@ outcome finish(client& c) {
         o.code = wl_display_get_protocol_error(c.display, &iface, &id);
         o.interface = iface ? iface->name : "[destroyed]";
     }
-    wl_display_disconnect(c.display);
+    disconnect(c);
     c.display = nullptr;
     return o;
 }
@@ -413,7 +422,7 @@ void globals_case() {
     check("globals: constraints v1, relative pointer v1, gestures v3", pc == 1 && rp == 1 && pg == 3,
           "constraints " + std::to_string(pc) + " relative " + std::to_string(rp) + " gestures " +
               std::to_string(pg));
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 void error_cases() {
@@ -541,7 +550,7 @@ void lock_cases() {
             check("lock: session lock", false, "ext_session_lock_manager_v1 not bound");
         }
         if (locker.display)
-            wl_display_disconnect(locker.display);
+            disconnect(locker);
     }
 
     // The cursor hint: applied with the next commit; destroying the lock warps there.

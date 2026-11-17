@@ -198,6 +198,15 @@ bool connect(client& c, uint32_t xom_version = 3) {
     return true;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 void bind_output(client& c, output_info& o, uint32_t version = 4) {
     o.output = static_cast<wl_output*>(wl_registry_bind(
         c.registry, c.output_name, &wl_output_interface,
@@ -351,7 +360,7 @@ int main() {
             check(x.dones == 0 && o.dones == 2,
                   "zxdg_output_v1 v3 is closed by wl_output.done, not its own done");
         }
-        wl_display_disconnect(c.display);
+        disconnect(c);
     }
 
     // ── xdg-output v2: its own done ──
@@ -370,7 +379,7 @@ int main() {
         } else {
             check(false, "connect for the xdg-output v2 case");
         }
-        wl_display_disconnect(c.display);
+        disconnect(c);
     }
 
     // ── enter on map, leave on unmap; the preferred scale only when it is not 1 ──
@@ -448,7 +457,7 @@ int main() {
         } else {
             check(false, "connect for the enter/leave case");
         }
-        wl_display_disconnect(c.display);
+        disconnect(c);
     }
 
     // ── a wl_output bound after mapping replays the enter ──
@@ -472,7 +481,7 @@ int main() {
         } else {
             check(false, "connect for the late-bind case");
         }
-        wl_display_disconnect(c.display);
+        disconnect(c);
     }
 
     pump.store(false, std::memory_order_release);

@@ -46,12 +46,24 @@ struct fixture {
         (void)scene.root().add(&layer);
     }
 
+    /// What a client's wl_surface destroy does in production: drop every surface this
+    /// fixture made. `surface_tree::make_root` new'd a container_node per root, freed
+    /// only on remove_surface — abandoning the fixture leaked them (LSan).
+    ~fixture() {
+        for (unsigned i = made_count_; i-- > 0;)
+            tree.remove_surface(made_[i]);
+    }
+
     lx::surface_id make(unsigned n) {
         const lx::surface_id s = sid(n);
         LUMEN_CHECK(surfaces.register_surface(s, nullptr));
         LUMEN_CHECK(tree.add_surface(s));
+        made_[made_count_ < 128 ? made_count_++ : 127] = s;
         return s;
     }
+
+    lx::surface_id made_[128]{};
+    unsigned made_count_ = 0;
 
     /// Content of w x h, as the protocol layer's apply path leaves it.
     void content(lx::surface_id s, int w, int h) {

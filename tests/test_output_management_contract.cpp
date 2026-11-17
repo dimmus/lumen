@@ -249,6 +249,15 @@ bool connect(client& c) {
     return wl_display_roundtrip(c.display) >= 0 && c.manager;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+void disconnect(client& c) {
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 head_info* head_named(client& c, const char* name) {
     for (auto* h : c.heads)
         if (!h->finished && h->name == name)
@@ -653,7 +662,7 @@ int main() {
             const uint32_t code = wl_display_get_protocol_error(e.display, &iface, &id);
             check(wl_display_get_error(e.display) == EPROTO && iface == ec.iface && code == ec.code,
                   ec.what);
-            wl_display_disconnect(e.display);
+            disconnect(e);
         }
         // The compositor survived every error.
         check(wl_display_roundtrip(c.display) >= 0, "the compositor and other clients are unaffected");
@@ -679,7 +688,7 @@ int main() {
                 delete m;
             delete h;
         }
-        wl_display_disconnect(c.display);
+        disconnect(c);
         pump.store(false, std::memory_order_release);
         pump_thread.join();
     }
