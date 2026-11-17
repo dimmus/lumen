@@ -56,7 +56,7 @@ it marks, as a per-phase "as built" note (`lumen-doc-writer.md:30-31`).
    concurrently). At this skill's writing (2026-11-17, main `1355959`) the corpus holds
    001–013, so the next free number is 014.
 2. **Filename** — `NNN-kebab-case.md` (`012-master-stack-tiling.md`); title line
-   `# ADR NNN — Title` (the 011–013 form).
+   `# ADR NNN — Title` (002–003 and 011–013; 001 and 004–010 use `# ADR-NNN: Title`).
 3. **Header block** — the full field set the corpus uses (004–010 and 013):
 
    ```
