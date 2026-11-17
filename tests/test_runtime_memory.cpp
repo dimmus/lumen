@@ -79,6 +79,26 @@ LUMEN_TEST(arena_move_transfers_storage) {
     LUMEN_CHECK(source.allocate(8) == nullptr); // NOLINT(bugprone-use-after-move)
 }
 
+// The arena's used-bytes is a statistic the coordinator's tick reads from the UI thread
+// while the owning thread (render) allocates and resets it — exactly tick_ui vs
+// tick_render. It used to be a plain unsigned, which TSan reported as a
+// reset-vs-used_bytes data race; the reads and writes are relaxed atomics now, and this
+// test exercises that interleaving (its TSan build failed before the fix).
+LUMEN_TEST(arena_used_bytes_is_readable_while_owner_resets) {
+    lx::runtime::memory_arena arena{64 * 1024};
+    std::atomic<bool> stop{false};
+    std::thread owner{[&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            (void)arena.allocate(512, 16);
+            arena.reset();
+        }
+    }};
+    for (unsigned i = 0; i < 20000; ++i)
+        LUMEN_CHECK(arena.used_bytes() <= arena.capacity_bytes());
+    stop.store(true, std::memory_order_relaxed);
+    owner.join();
+}
+
 // Pressure must be evaluated against storage that exists, not against the requested config.
 LUMEN_TEST(budget_coordinator_reports_mapped_capacity) {
     lx::runtime::memory_budget_coordinator coord{
