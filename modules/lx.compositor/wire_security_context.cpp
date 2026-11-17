@@ -135,7 +135,7 @@ bool set_field(wl_resource* r, bool& set, char (&field)[wayland::security_contex
                                "empty, overlong or non-printable metadata");
         return false;
     }
-    std::snprintf(field, sizeof(field), "%s", value);
+    *std::format_to_n(field, sizeof(field) - 1, "{}", value).out = '\0';
     set = true;
     return true;
 }

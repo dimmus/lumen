@@ -850,7 +850,7 @@ lx::result<void> control_server::listen(const char* path) {
                                                    0600);
     if (r < 0)
         return lx::make_error(lx::io_err::permission_denied, "cannot listen on the control socket");
-    std::snprintf(path_, sizeof(path_), "%s", path);
+    *std::format_to_n(path_, sizeof(path_) - 1, "{}", path).out = '\0';
     kicked_ = true;
     return {};
 }

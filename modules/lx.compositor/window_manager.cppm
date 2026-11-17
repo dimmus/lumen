@@ -1134,9 +1134,10 @@ constexpr lx::trace::category log_wm{"compositor.wm"};
 void format_states(unsigned states, char* out, unsigned cap) {
     unsigned n = 0;
     const auto put = [&](const char* name) {
-        const int w = std::snprintf(out + n, cap - n, "%s%s", n ? "," : "", name);
-        if (w > 0 && n + static_cast<unsigned>(w) < cap)
-            n += static_cast<unsigned>(w);
+        const auto seg = std::format_to_n(out + n, cap - n - 1, "{}{}", n ? "," : "", name);
+        *seg.out = '\0';
+        if (seg.size > 0 && n + static_cast<unsigned>(seg.size) < cap)
+            n += static_cast<unsigned>(seg.size);
     };
     out[0] = '\0';
     if (states & lx::compositor::tl_activated)
@@ -1152,7 +1153,7 @@ void format_states(unsigned states, char* out, unsigned cap) {
     if ((states & lx::compositor::tl_tiled_all) == lx::compositor::tl_tiled_all)
         put("tiled");
     if (n == 0)
-        std::snprintf(out, cap, "-");
+        *std::format_to_n(out, cap - 1, "-").out = '\0';
 }
 
 constexpr unsigned k_btn_left = 0x110;
@@ -2112,7 +2113,7 @@ unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fall
         // Home: the first output it was moved off (moved again before returning, it still
         // goes back to where it started).
         if (!rec.home_identifier[0] && identifier && *identifier) {
-            std::snprintf(rec.home_identifier, sizeof(rec.home_identifier), "%s", identifier);
+            *std::format_to_n(rec.home_identifier, sizeof(rec.home_identifier) - 1, "{}", identifier).out = '\0';
             rec.home_rect = {rec.geometry.x - out.x, rec.geometry.y - out.y, rec.geometry.width,
                              rec.geometry.height};
             rec.home_maximized = (rec.desired.states & tl_maximized) != 0;
@@ -4964,9 +4965,10 @@ bool lx::compositor::window_manager::decide_activation_at_map(toplevel_record& r
     if (log_activation.enabled(lx::trace::level::debug)) {
         // The token's own verdict too when the map overrode it.
         char cause[48];
-        std::snprintf(cause, sizeof(cause), " cause=map%s%s",
-                      why != token_reason ? " refused=" : "",
-                      why != token_reason ? activation_reason_name(token_reason) : "");
+        *std::format_to_n(cause, sizeof(cause) - 1, " cause=map{}{}",
+                          why != token_reason ? " refused=" : "",
+                          why != token_reason ? activation_reason_name(token_reason)
+                                              : "").out = '\0';
         log_activation_result(grant ? grant->prefix : nullptr, rec, r, why, cause);
     }
     if (r != activation_result::urgent)
@@ -5368,7 +5370,7 @@ bool lx::compositor::window_manager::switch_workspace(lx::workspace_id ws, const
         return false;
     const int slot = w->output;
     char name[k_workspace_name_bytes];
-    std::snprintf(name, sizeof(name), "%s", w->name);
+    *std::format_to_n(name, sizeof(name) - 1, "{}", w->name).out = '\0';
     // Window animations: the new workspace comes in from the side it lies on (a later one
     // from the right), the old one goes out the other way. Read before `activate`, which may
     // drop the old one (dynamic: empty).

@@ -209,7 +209,7 @@ void do_export(wl_client* client, wl_resource* manager, const wl_interface* ifac
     if (e->reg)
         e->toplevel = rec->id;
     else if (!lx::compositor::foreign_registry::make_handle(handle))
-        std::snprintf(handle, sizeof(handle), "%s", "0");
+        *std::format_to_n(handle, sizeof(handle) - 1, "{}", "0").out = '\0';
     // A handle is sent either way: an unregistered one imports as `destroyed`.
     send_handle(res, handle);
     if (log_foreign.enabled(lx::trace::level::debug)) {

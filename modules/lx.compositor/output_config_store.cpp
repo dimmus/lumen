@@ -29,7 +29,7 @@ constexpr const char* k_transform_names[8] = {"normal",  "90",         "180",   
                                               "flipped", "flipped-90", "flipped-180", "flipped-270"};
 
 void copy_id(char (&dst)[monitor_config::k_id], const char* src) {
-    std::snprintf(dst, sizeof(dst), "%s", src ? src : "");
+    *std::format_to_n(dst, sizeof(dst) - 1, "{}", src ? src : "").out = '\0';
 }
 
 /// What the reader is filling.
@@ -151,7 +151,7 @@ bool want_string(const toml::value& v, toml::parse_error& err, const char* key) 
     if (v.type == toml::value::kind::string)
         return true;
     char msg[96];
-    std::snprintf(msg, sizeof(msg), "`%s` must be a string", key);
+    *std::format_to_n(msg, sizeof(msg) - 1, "`{}` must be a string", key).out = '\0';
     toml::fail(err, msg);
     return false;
 }
@@ -382,9 +382,11 @@ std::string serialize_output_config(const output_config& cfg) {
             } else {
                 char mode[48];
                 if (m.refresh_mhz)
-                    std::snprintf(mode, sizeof(mode), "%ux%u@%u", m.width, m.height, m.refresh_mhz);
+                    *std::format_to_n(mode, sizeof(mode) - 1, "{}x{}@{}", m.width, m.height,
+                                      m.refresh_mhz).out = '\0';
                 else
-                    std::snprintf(mode, sizeof(mode), "%ux%u", m.width, m.height);
+                    *std::format_to_n(mode, sizeof(mode) - 1, "{}x{}", m.width,
+                                      m.height).out = '\0';
                 w.key("mode", mode);
             }
         }
@@ -513,15 +515,15 @@ bool output_config_path(char* out, std::size_t size) {
     if (const char* env = std::getenv("LUMEN_OUTPUT_CONFIG"); env && *env) {
         if (!std::strcmp(env, "0"))
             return false;
-        std::snprintf(out, size, "%s", env);
+        *std::format_to_n(out, size - 1, "{}", env).out = '\0';
         return true;
     }
     if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && xdg[0] == '/') {
-        std::snprintf(out, size, "%s/lumen/outputs.toml", xdg);
+        *std::format_to_n(out, size - 1, "{}/lumen/outputs.toml", xdg).out = '\0';
         return true;
     }
     if (const char* home = std::getenv("HOME"); home && home[0] == '/') {
-        std::snprintf(out, size, "%s/.config/lumen/outputs.toml", home);
+        *std::format_to_n(out, size - 1, "{}/.config/lumen/outputs.toml", home).out = '\0';
         return true;
     }
     return false;
@@ -623,7 +625,7 @@ void output_config_file::write_now() {
     };
     // The directory, made on demand (only the last level: $XDG_CONFIG_HOME exists).
     char dir[sizeof(path_)];
-    std::snprintf(dir, sizeof(dir), "%s", path_);
+    *std::format_to_n(dir, sizeof(dir) - 1, "{}", path_).out = '\0';
     if (char* slash = std::strrchr(dir, '/'); slash && slash != dir) {
         *slash = '\0';
         if (::mkdir(dir, 0700) != 0 && errno != EEXIST)
@@ -631,13 +633,13 @@ void output_config_file::write_now() {
     }
     if (bad_) {
         char bad[sizeof(path_) + 8];
-        std::snprintf(bad, sizeof(bad), "%s.bad", path_);
+        *std::format_to_n(bad, sizeof(bad) - 1, "{}.bad", path_).out = '\0';
         if (::rename(path_, bad) != 0 && errno != ENOENT)
             report("rename to .bad");
         bad_ = false;
     }
     char tmp[sizeof(path_) + 8];
-    std::snprintf(tmp, sizeof(tmp), "%s.tmp", path_);
+    *std::format_to_n(tmp, sizeof(tmp) - 1, "{}.tmp", path_).out = '\0';
     const int fd = ::open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     bool ok = fd >= 0;
     if (!ok)

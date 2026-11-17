@@ -399,8 +399,9 @@ bool sync_manager(manager_obj* m, const workspace_model& model) {
             // A stable id for a workspace the configuration names (the output's, by name).
             if (w.named && w.output >= 0) {
                 char id[96];
-                std::snprintf(id, sizeof(id), "%s/%s",
-                              model.group(static_cast<unsigned>(w.output)).output_name, w.name);
+                *std::format_to_n(id, sizeof(id) - 1, "{}/{}",
+                                  model.group(static_cast<unsigned>(w.output)).output_name,
+                                  w.name).out = '\0';
                 ext_workspace_handle_v1_send_id(res, id);
             }
             sent = true;

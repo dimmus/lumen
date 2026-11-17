@@ -182,7 +182,7 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
             auto* t = toplevel_of(resource);
             if (!t)
                 return;
-            std::snprintf(t->title, sizeof(t->title), "%s", title ? title : "");
+            *std::format_to_n(t->title, sizeof(t->title) - 1, "{}", title ? title : "").out = '\0';
             if (t->id && t->ctx && t->ctx->toplevels) {
                 t->ctx->toplevels->on_xdg_title(t->id, t->title);
                 if (t->ctx->wm)
@@ -196,7 +196,7 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
             auto* t = toplevel_of(resource);
             if (!t)
                 return;
-            std::snprintf(t->app_id, sizeof(t->app_id), "%s", app_id ? app_id : "");
+            *std::format_to_n(t->app_id, sizeof(t->app_id) - 1, "{}", app_id ? app_id : "").out = '\0';
             if (t->id && t->ctx && t->ctx->toplevels) {
                 t->ctx->toplevels->on_xdg_app_id(t->id, t->app_id);
                 if (auto* rec = record_of(t); rec && rec->mapped && t->ctx->shell)

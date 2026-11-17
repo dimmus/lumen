@@ -1206,7 +1206,7 @@ void lx::compositor::decoration_manager::sync(const toplevel_record& rec) {
     }
     const char* title = rec.title ? rec.title : "";
     if (std::strncmp(s->title, title, sizeof(s->title) - 1) != 0) {
-        std::snprintf(s->title, sizeof(s->title), "%s", title);
+        *std::format_to_n(s->title, sizeof(s->title) - 1, "{}", title).out = '\0';
         s->title_changed = true;
         any_dirty_ = true;
     }
@@ -1240,7 +1240,7 @@ void lx::compositor::decoration_manager::on_title_changed(const toplevel_record&
     const char* title = rec.title ? rec.title : "";
     if (std::strncmp(s->title, title, sizeof(s->title) - 1) == 0)
         return;
-    std::snprintf(s->title, sizeof(s->title), "%s", title);
+    *std::format_to_n(s->title, sizeof(s->title) - 1, "{}", title).out = '\0';
     s->title_changed = true;
     any_dirty_ = true;
 }

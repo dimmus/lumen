@@ -2484,7 +2484,7 @@ void compositor_impl::begin_input() {
             ++t.devices;
             if (ms > t.slowest_ms) {
                 t.slowest_ms = ms;
-                std::snprintf(t.slowest, sizeof t.slowest, "%s", path ? path : "?");
+                *std::format_to_n(t.slowest, sizeof(t.slowest) - 1, "{}", path ? path : "?").out = '\0';
             }
             // A device that stalls the seat (start-up waits for it) is named every time.
             if (ms > k_slow_device_open_ms)
@@ -2520,8 +2520,8 @@ void compositor_impl::begin_input() {
             // the configuration's first generation).
             else {
                 if (!keymap_error_[0])
-                    std::snprintf(keymap_error_, sizeof(keymap_error_),
-                                  "xkbcommon gave no reason");
+                    *std::format_to_n(keymap_error_, sizeof(keymap_error_) - 1,
+                                      "xkbcommon gave no reason").out = '\0';
                 if (auto fallback = km.compile(); !fallback)
                     log_input.error(fallback.get_error());
             }
@@ -2834,8 +2834,9 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
     // lumen-screenshot-<n>-<output>.ppm: one file per output of the same request.
     const output_state& o = outputs.slot_state(p.slot);
     char path[512];
-    std::snprintf(path, sizeof(path), "%s/lumen-screenshot-%u-%s.ppm", dir ? dir : "/tmp",
-                  screenshot_count_, outputs.slot_live(p.slot) ? o.name : "gone");
+    *std::format_to_n(path, sizeof(path) - 1, "{}/lumen-screenshot-{}-{}.ppm",
+                      dir ? dir : "/tmp", screenshot_count_,
+                      outputs.slot_live(p.slot) ? o.name : "gone").out = '\0';
     std::FILE* f = std::fopen(path, "wb");
     if (!f) {
         log_render.warn("screenshot: cannot open the output file");
@@ -3145,15 +3146,15 @@ void compositor_impl::settle_frame_clocks(std::uint32_t served, std::uint32_t qu
     if (card_fd < 0 || ::fstat(card_fd, &st) != 0 || !S_ISCHR(st.st_mode))
         return 0;
     char dir[96];
-    std::snprintf(dir, sizeof(dir), "/sys/dev/char/%u:%u/device/drm", major(st.st_rdev),
-                  minor(st.st_rdev));
+    *std::format_to_n(dir, sizeof(dir) - 1, "/sys/dev/char/{}:{}/device/drm", major(st.st_rdev),
+                      minor(st.st_rdev)).out = '\0';
     if (DIR* d = ::opendir(dir)) {
         unsigned long long found = 0;
         while (const dirent* e = ::readdir(d)) {
             if (std::strncmp(e->d_name, "renderD", 7) != 0)
                 continue;
             char node[64];
-            std::snprintf(node, sizeof(node), "/dev/dri/%s", e->d_name);
+            *std::format_to_n(node, sizeof(node) - 1, "/dev/dri/{}", e->d_name).out = '\0';
             struct stat rs {};
             if (::stat(node, &rs) == 0 && S_ISCHR(rs.st_mode)) {
                 found = rs.st_rdev;
@@ -3692,7 +3693,7 @@ void compositor_impl::start_session() {
                         return;
                     control_input_device& d = col->out[col->n++];
                     d = {};
-                    std::snprintf(d.name, sizeof(d.name), "%s", name);
+                    *std::format_to_n(d.name, sizeof(d.name) - 1, "{}", name).out = '\0';
                     d.kind = kind == lx::input::device_class::touchpad   ? "touchpad"
                              : kind == lx::input::device_class::mouse    ? "mouse"
                              : kind == lx::input::device_class::trackpoint ? "trackpoint"
@@ -3711,9 +3712,9 @@ void compositor_impl::start_session() {
                 const output_state& o = self->outputs.slot_state(slot);
                 control_output& c = out[n++];
                 c = {};
-                std::snprintf(c.name, sizeof(c.name), "%s", o.name);
-                std::snprintf(c.description, sizeof(c.description), "%s", o.description);
-                std::snprintf(c.identifier, sizeof(c.identifier), "%s", o.identifier);
+                *std::format_to_n(c.name, sizeof(c.name) - 1, "{}", o.name).out = '\0';
+                *std::format_to_n(c.description, sizeof(c.description) - 1, "{}", o.description).out = '\0';
+                *std::format_to_n(c.identifier, sizeof(c.identifier) - 1, "{}", o.identifier).out = '\0';
                 const lx::rect2i l = o.logical_rect();
                 c.x = l.x;
                 c.y = l.y;
@@ -3729,7 +3730,7 @@ void compositor_impl::start_session() {
                     "flipped-270"};
                 c.transform = o.transform < 8 ? k_transforms[o.transform] : "normal";
                 if (const auto* w = self->wm_.workspaces().find(self->wm_.workspaces().active(slot)))
-                    std::snprintf(c.active_workspace, sizeof(c.active_workspace), "%s", w->name);
+                    *std::format_to_n(c.active_workspace, sizeof(c.active_workspace) - 1, "{}", w->name).out = '\0';
             }
             return n;
         };
@@ -3772,10 +3773,12 @@ void compositor_impl::start_session() {
                 const char* runtime = std::getenv("XDG_RUNTIME_DIR");
                 char path[256];
                 if (cfg.socket_name && cfg.socket_name[0] == '/')
-                    std::snprintf(path, sizeof(path), "%s.varlink", cfg.socket_name);
+                    *std::format_to_n(path, sizeof(path) - 1, "{}.varlink",
+                                      cfg.socket_name).out = '\0';
                 else
-                    std::snprintf(path, sizeof(path), "%s/%s.varlink",
-                                  runtime && *runtime ? runtime : "/tmp", cfg.socket_name);
+                    *std::format_to_n(path, sizeof(path) - 1, "{}/{}.varlink",
+                                      runtime && *runtime ? runtime : "/tmp",
+                                      cfg.socket_name).out = '\0';
                 if (auto listening = control_.listen(path); !listening)
                     log_session.error(listening.get_error());
                 else
@@ -3863,12 +3866,13 @@ void compositor_impl::start_session() {
         char display[96];
         char socket[300];
         char desktop[160];
-        std::snprintf(display, sizeof(display), "WAYLAND_DISPLAY=%s", cfg.socket_name);
-        std::snprintf(socket, sizeof(socket), "LUMEN_SOCKET=%s",
-                      control_.path()[0] ? control_.path() : "");
+        *std::format_to_n(display, sizeof(display) - 1, "WAYLAND_DISPLAY={}",
+                          cfg.socket_name).out = '\0';
+        *std::format_to_n(socket, sizeof(socket) - 1, "LUMEN_SOCKET={}",
+                          control_.path()[0] ? control_.path() : "").out = '\0';
         const char* current = std::getenv("XDG_CURRENT_DESKTOP");
-        std::snprintf(desktop, sizeof(desktop), "XDG_CURRENT_DESKTOP=%s",
-                      names_lumen(current) ? current : "Lumen");
+        *std::format_to_n(desktop, sizeof(desktop) - 1, "XDG_CURRENT_DESKTOP={}",
+                          names_lumen(current) ? current : "Lumen").out = '\0';
         std::array<std::string_view, 8> vars{
             std::string_view{display}, std::string_view{desktop},
             std::string_view{"XDG_SESSION_TYPE=wayland"},
@@ -3881,11 +3885,12 @@ void compositor_impl::start_session() {
         char xsize[40];
         const auto& cur = config_.current().cursor;
         if (cur.theme[0]) {
-            std::snprintf(xtheme, sizeof(xtheme), "XCURSOR_THEME=%s", cur.theme);
+            *std::format_to_n(xtheme, sizeof(xtheme) - 1, "XCURSOR_THEME={}",
+                              cur.theme).out = '\0';
             vars[count++] = xtheme;
         }
         if (cur.size > 0) {
-            std::snprintf(xsize, sizeof(xsize), "XCURSOR_SIZE=%d", cur.size);
+            *std::format_to_n(xsize, sizeof(xsize) - 1, "XCURSOR_SIZE={}", cur.size).out = '\0';
             vars[count++] = xsize;
         }
         // The interface theme (config.toml [ui], ADR-013 §4.7): what lx.app reads at start
@@ -3894,8 +3899,8 @@ void compositor_impl::start_session() {
         // look even when no theme file is named.
         char uitheme[128];
         const std::string_view theme_name = resolved_ui_theme(config_.current().ui);
-        std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%.*s",
-                      static_cast<int>(theme_name.size()), theme_name.data());
+        *std::format_to_n(uitheme, sizeof(uitheme) - 1, "LUMEN_THEME={}",
+                          theme_name).out = '\0';
         env_reexports_.theme_sent(theme_name); // what the manager carries once it takes
         vars[count++] = uitheme;
         if (auto exported = user_env_.export_async(
@@ -3943,8 +3948,8 @@ void compositor_impl::send_ready(const char* why) {
     ready_sent_ = true;
     char status[160];
     const unsigned n = outputs.count();
-    std::snprintf(status, sizeof(status), "Serving %s (%u output%s)%s%s", cfg.socket_name, n,
-                  n == 1 ? "" : "s", why ? "; " : "", why ? why : "");
+    *std::format_to_n(status, sizeof(status) - 1, "Serving {} ({} output{}){}{}", cfg.socket_name,
+                      n, n == 1 ? "" : "s", why ? "; " : "", why ? why : "").out = '\0';
     session::service_notifier::ready(status);
     lx::trace::timeline_instant("startup", "ready");
     if (session::service_notifier::listening())
@@ -4143,13 +4148,12 @@ void compositor_impl::answer_health(unsigned token, bool render_answered, unsign
 void compositor_impl::fill_control_window(const toplevel_record& rec, control_window& out) const {
     out = {};
     out.id = static_cast<unsigned>(rec.id.id());
-    std::snprintf(out.app_id, sizeof(out.app_id), "%s", rec.app_id ? rec.app_id : "");
-    std::snprintf(out.title, sizeof(out.title), "%s", rec.title ? rec.title : "");
+    *std::format_to_n(out.app_id, sizeof(out.app_id) - 1, "{}", rec.app_id ? rec.app_id : "").out = '\0';
+    *std::format_to_n(out.title, sizeof(out.title) - 1, "{}", rec.title ? rec.title : "").out = '\0';
     if (auto* conn = const_cast<wayland::server&>(wayland).find_client(rec.client.id()))
         out.pid = static_cast<int>(conn->credentials().pid);
     if (rec.output >= 0 && outputs.slot_live(static_cast<unsigned>(rec.output)))
-        std::snprintf(out.output, sizeof(out.output), "%s",
-                      outputs.slot_state(static_cast<unsigned>(rec.output)).name);
+        *std::format_to_n(out.output, sizeof(out.output) - 1, "{}", outputs.slot_state(static_cast<unsigned>(rec.output)).name).out = '\0';
     // Snapped to a half or a quarter (design-session-and-wm K.3): "tiled", as the shell sees it.
     out.state = (rec.snap || rec.tiled) && rec.state == lx::toplevel_state::normal
                     ? "tiled"
@@ -4173,10 +4177,9 @@ unsigned compositor_impl::fill_control_workspaces(control_workspace* out, unsign
         c = {};
         c.id = static_cast<unsigned>(w.id.id());
         if (w.output >= 0 && outputs.slot_live(static_cast<unsigned>(w.output)))
-            std::snprintf(c.output, sizeof(c.output), "%s",
-                          outputs.slot_state(static_cast<unsigned>(w.output)).name);
+            *std::format_to_n(c.output, sizeof(c.output) - 1, "{}", outputs.slot_state(static_cast<unsigned>(w.output)).name).out = '\0';
         c.index = w.index + 1;
-        std::snprintf(c.name, sizeof(c.name), "%s", w.name);
+        *std::format_to_n(c.name, sizeof(c.name) - 1, "{}", w.name).out = '\0';
         c.active = w.active;
         c.urgent = w.urgent;
         c.windows = w.windows;
@@ -4222,7 +4225,7 @@ void compositor_impl::apply_workspace_config() {
     c.count = w.count > 0 ? static_cast<unsigned>(w.count) : 1u;
     c.name_count = w.name_count < k_workspaces_per_output ? w.name_count : k_workspaces_per_output;
     for (unsigned i = 0; i < c.name_count; ++i)
-        std::snprintf(c.names[i], sizeof(c.names[i]), "%s", w.names[i]);
+        *std::format_to_n(c.names[i], sizeof(c.names[i]) - 1, "{}", w.names[i]).out = '\0';
     c.switch_on_activate = w.switch_on_activate;
     c.move_follows = w.move_follows;
     wm_.set_workspace_config(c);
@@ -4271,7 +4274,7 @@ control_action_result compositor_impl::run_action(lx::config::action_id action, 
     if (info.owner == lxc::action_owner::shell) {
         char arg[16] = "";
         if (argument)
-            std::snprintf(arg, sizeof(arg), "%u", argument);
+            *std::format_to_n(arg, sizeof(arg) - 1, "{}", argument).out = '\0';
         if (!wire_.send_shell_action || !wire_.send_shell_action(info.name, arg, time_ms, input)) {
             // switcher.next with no shell: the compositor's quick switch (design C.3), so
             // Alt+Tab still works while the shell restarts.
@@ -4371,8 +4374,7 @@ control_action_result compositor_impl::run_action(lx::config::action_id action, 
 void compositor_impl::load_initial_config() {
     config_.init();
     (void)config_.reload(true);
-    std::snprintf(cursor_theme_name_, sizeof(cursor_theme_name_), "%s",
-                  config_.current().cursor.theme);
+    *std::format_to_n(cursor_theme_name_, sizeof(cursor_theme_name_) - 1, "{}", config_.current().cursor.theme).out = '\0';
     // Before any output exists: each takes its render scale as it is added.
     apply_output_config();
 }
@@ -4384,7 +4386,7 @@ void compositor_impl::apply_output_config() {
     for (const auto& o : list) {
         if (n == rules.size())
             break;
-        std::snprintf(rules[n].match, sizeof(rules[n].match), "%s", o.name);
+        *std::format_to_n(rules[n].match, sizeof(rules[n].match) - 1, "{}", o.name).out = '\0';
         rules[n].scale = o.render_scale;
         ++n;
     }
@@ -4500,8 +4502,7 @@ void compositor_impl::run_config_reload(bool force) {
         if ((r.changes & cfg_keymap) || keymap_error_[0])
             start_keymap_job();
         if (r.changes & cfg_cursor) {
-            std::snprintf(cursor_theme_name_, sizeof(cursor_theme_name_), "%s",
-                          config_.current().cursor.theme);
+            *std::format_to_n(cursor_theme_name_, sizeof(cursor_theme_name_) - 1, "{}", config_.current().cursor.theme).out = '\0';
             start_cursor_job();
         }
     } else if (keymap_error_[0]) {
@@ -4630,8 +4631,7 @@ void compositor_impl::finish_keymap_job() {
                         k.layout, k.variant, k.options, km.layout_count(),
                         km.layout_name(km.active_layout()), job->compile_us);
     } else {
-        std::snprintf(keymap_error_, sizeof(keymap_error_), "%s",
-                      job->error[0] ? job->error : "xkbcommon gave no reason");
+        *std::format_to_n(keymap_error_, sizeof(keymap_error_) - 1, "{}", job->error[0] ? job->error : "xkbcommon gave no reason").out = '\0';
         report_keymap_error();
     }
     config_job_done();
@@ -4640,7 +4640,7 @@ void compositor_impl::finish_keymap_job() {
 void compositor_impl::start_cursor_job() {
     cursor_job_ = std::make_unique<cursor_job>();
     cursor_job& j = *cursor_job_;
-    std::snprintf(j.theme, sizeof(j.theme), "%s", cursor_theme_name_);
+    *std::format_to_n(j.theme, sizeof(j.theme) - 1, "{}", cursor_theme_name_).out = '\0';
     j.base_px = cursor_base_px();
     for (unsigned s = 0; s < output_manager::k_max && j.count < k_cursor_scales; ++s) {
         if (!outputs.slot_live(s))
@@ -4711,8 +4711,8 @@ void compositor_impl::export_cursor_environment() {
     const auto& c = config_.current().cursor;
     char theme[96];
     char size[40];
-    std::snprintf(theme, sizeof(theme), "XCURSOR_THEME=%s", c.theme);
-    std::snprintf(size, sizeof(size), "XCURSOR_SIZE=%u", cursor_base_px());
+    *std::format_to_n(theme, sizeof(theme) - 1, "XCURSOR_THEME={}", c.theme).out = '\0';
+    *std::format_to_n(size, sizeof(size) - 1, "XCURSOR_SIZE={}", cursor_base_px()).out = '\0';
     std::array<std::string_view, 2> vars{};
     std::size_t n = 0;
     if (c.theme[0])
@@ -4744,8 +4744,7 @@ void compositor_impl::export_theme_environment() {
         return;
     char name[96];
     const std::string_view resolved = resolved_ui_theme(config_.current().ui);
-    std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(resolved.size()),
-                  resolved.data());
+    *std::format_to_n(name, sizeof(name) - 1, "{}", resolved).out = '\0';
     if (!env_reexports_.theme_changed(name))
         return;
     if (user_env_.export_pending()) {
@@ -4753,7 +4752,7 @@ void compositor_impl::export_theme_environment() {
         return;
     }
     char uitheme[128];
-    std::snprintf(uitheme, sizeof(uitheme), "LUMEN_THEME=%s", name);
+    *std::format_to_n(uitheme, sizeof(uitheme) - 1, "LUMEN_THEME={}", name).out = '\0';
     const std::string_view vars{uitheme};
     if (auto r = user_env_.export_async(
             std::span<const std::string_view>{&vars, 1}, 2000,
@@ -4858,8 +4857,8 @@ void compositor_impl::finish_config_generation() {
     if (config_sighup_) {
         config_sighup_ = false;
         char status[128];
-        std::snprintf(status, sizeof(status), "Serving %s (configuration generation %u)",
-                      cfg.socket_name, config_.generation());
+        *std::format_to_n(status, sizeof(status) - 1, "Serving {} (configuration generation {})",
+                          cfg.socket_name, config_.generation()).out = '\0';
         session::service_notifier::ready(status);
     }
     if (!config_tokens_.empty()) {
@@ -4908,9 +4907,10 @@ void compositor_impl::send_config_to_shell(void* shell_resource, bool with_bytes
     for (std::size_t i = 0; i < d.items().size(); ++i) {
         const lxc::diagnostic& x = d.items()[i];
         if (x.key[0])
-            std::snprintf(texts[i].data(), texts[i].size(), "%s: %s", x.key, x.message);
+            *std::format_to_n(texts[i].data(), texts[i].size() - 1, "{}: {}", x.key,
+                              x.message).out = '\0';
         else
-            std::snprintf(texts[i].data(), texts[i].size(), "%s", x.message);
+            *std::format_to_n(texts[i].data(), texts[i].size() - 1, "{}", x.message).out = '\0';
         const char* path = config_.path_of(x.layer);
         lines[i] = {x.sev == lxc::severity::error ? 0u : 1u, path ? path : "", x.line,
                     texts[i].data()};
@@ -8077,8 +8077,8 @@ void compositor_impl::remove_output(unsigned slot, bool connector_gone, const ch
         return;
     char name[32];
     char identifier[208];
-    std::snprintf(name, sizeof(name), "%s", outputs.slot_state(slot).name);
-    std::snprintf(identifier, sizeof(identifier), "%s", outputs.slot_state(slot).identifier);
+    *std::format_to_n(name, sizeof(name) - 1, "{}", outputs.slot_state(slot).name).out = '\0';
+    *std::format_to_n(identifier, sizeof(identifier) - 1, "{}", outputs.slot_state(slot).identifier).out = '\0';
     const std::uint32_t bit = 1u << slot;
     // Clients always see at least one output: the stand-in comes before this one goes —
     // unless another is on its way (an output configuration enabling one).
@@ -8315,7 +8315,7 @@ unsigned compositor_impl::virtual_key(const char* name) {
         return mgmt::k_virtual_key; // never matched by anything
     virtual_head& v = virtual_heads_.emplace_back();
     v.key = mgmt::k_virtual_key | next_virtual_key_++;
-    std::snprintf(v.name, sizeof(v.name), "%s", name);
+    *std::format_to_n(v.name, sizeof(v.name) - 1, "{}", name).out = '\0';
     return v.key;
 }
 
@@ -8358,7 +8358,8 @@ unsigned compositor_impl::connected_identifiers(const drm::connector_scan& scan,
             if (std::strcmp(ids[j], ids[n]) != 0)
                 continue;
             const std::size_t len = std::strlen(ids[n]);
-            std::snprintf(ids[n] + len, monitor_config::k_id - len, " connector:%s", e.name);
+            *std::format_to_n(ids[n] + len, monitor_config::k_id - len - 1, " connector:{}",
+                              e.name).out = '\0';
             break;
         }
         entries[n++] = i;
@@ -8607,11 +8608,11 @@ void compositor_impl::build_heads(mgmt::head_set& hs) {
         mgmt::head& h = hs.heads[hs.count++];
         h = mgmt::head{};
         h.key = o.connector_id ? o.connector_id : virtual_key(o.name);
-        std::snprintf(h.name, sizeof(h.name), "%s", o.name);
-        std::snprintf(h.description, sizeof(h.description), "%s", o.description);
-        std::snprintf(h.make, sizeof(h.make), "%s", o.make);
-        std::snprintf(h.model, sizeof(h.model), "%s", o.model);
-        std::snprintf(h.serial, sizeof(h.serial), "%s", o.serial);
+        *std::format_to_n(h.name, sizeof(h.name) - 1, "{}", o.name).out = '\0';
+        *std::format_to_n(h.description, sizeof(h.description) - 1, "{}", o.description).out = '\0';
+        *std::format_to_n(h.make, sizeof(h.make) - 1, "{}", o.make).out = '\0';
+        *std::format_to_n(h.model, sizeof(h.model) - 1, "{}", o.model).out = '\0';
+        *std::format_to_n(h.serial, sizeof(h.serial) - 1, "{}", o.serial).out = '\0';
         h.phys_w_mm = o.phys_w_mm;
         h.phys_h_mm = o.phys_h_mm;
         const drm::connector_probe* e =
@@ -8653,13 +8654,13 @@ void compositor_impl::build_heads(mgmt::head_set& hs) {
             mgmt::head& h = hs.heads[hs.count++];
             h = mgmt::head{};
             h.key = e.connector_id;
-            std::snprintf(h.name, sizeof(h.name), "%s", e.name);
+            *std::format_to_n(h.name, sizeof(h.name) - 1, "{}", e.name).out = '\0';
             char id[monitor_config::k_id];
             monitor_identity(e.name, e.make, e.model, e.serial, e.edid, id, sizeof(id),
                              h.description, sizeof(h.description));
-            std::snprintf(h.make, sizeof(h.make), "%s", e.make);
-            std::snprintf(h.model, sizeof(h.model), "%s", e.model);
-            std::snprintf(h.serial, sizeof(h.serial), "%s", e.serial);
+            *std::format_to_n(h.make, sizeof(h.make) - 1, "{}", e.make).out = '\0';
+            *std::format_to_n(h.model, sizeof(h.model) - 1, "{}", e.model).out = '\0';
+            *std::format_to_n(h.serial, sizeof(h.serial) - 1, "{}", e.serial).out = '\0';
             h.phys_w_mm = static_cast<int>(e.phys_w_mm);
             h.phys_h_mm = static_cast<int>(e.phys_h_mm);
             fill_modes(h, e);
@@ -8707,8 +8708,8 @@ void compositor_impl::build_heads(mgmt::head_set& hs) {
         mgmt::head& h = hs.heads[hs.count++];
         h = mgmt::head{};
         h.key = v.key;
-        std::snprintf(h.name, sizeof(h.name), "%s", v.name);
-        std::snprintf(h.description, sizeof(h.description), "%s", v.name);
+        *std::format_to_n(h.name, sizeof(h.name) - 1, "{}", v.name).out = '\0';
+        *std::format_to_n(h.description, sizeof(h.description) - 1, "{}", v.name).out = '\0';
         h.modes[0] = {v.mode.width, v.mode.height, static_cast<int>(v.refresh_mhz), true};
         h.mode_count = 1;
         h.current = 0;
@@ -8766,17 +8767,22 @@ void describe_target(const mgmt::target& t, const mgmt::head_set& heads, char* o
         const mgmt::head_target& h = t.heads[i];
         const mgmt::head* hd = heads.find(h.key);
         const char* name = hd ? hd->name : "?";
-        int n = 0;
-        if (!h.enabled)
-            n = std::snprintf(out + w, size - w, "%s%s off", i ? ", " : "", name);
-        else
-            n = std::snprintf(out + w, size - w, "%s%s %dx%d@%d%s %s%d,%d x%g t%u%s", i ? ", " : "",
-                              name, h.mode.width, h.mode.height, h.mode.refresh_mhz,
-                              h.custom ? " (custom)" : "", h.position_explicit ? "at " : "auto ",
-                              h.x, h.y, h.scale, h.transform, h.adaptive_sync ? " vrr" : "");
-        if (n < 0)
-            break;
-        w += static_cast<unsigned>(n);
+        unsigned n = 0;
+        if (!h.enabled) {
+            const auto seg = std::format_to_n(out + w, size - w - 1, "{}{} off", i ? ", " : "", name);
+            *seg.out = '\0';
+            n = static_cast<unsigned>(seg.size);
+        } else {
+            const auto seg =
+                std::format_to_n(out + w, size - w - 1, "{}{} {}x{}@{}{} {}{},{} x{:.6g} t{}{}",
+                                 i ? ", " : "", name, h.mode.width, h.mode.height,
+                                 h.mode.refresh_mhz, h.custom ? " (custom)" : "",
+                                 h.position_explicit ? "at " : "auto ", h.x, h.y, h.scale,
+                                 h.transform, h.adaptive_sync ? " vrr" : "");
+            *seg.out = '\0';
+            n = static_cast<unsigned>(seg.size);
+        }
+        w += n;
         if (w >= size)
             w = size - 1;
     }
@@ -8923,7 +8929,7 @@ void compositor_impl::on_config_tested(unsigned gen, bool ok, unsigned tests) {
     }
     if (!ok) {
         char why[64];
-        std::snprintf(why, sizeof(why), "TEST_ONLY refused (%u tested)", tests);
+        *std::format_to_n(why, sizeof(why) - 1, "TEST_ONLY refused ({} tested)", tests).out = '\0';
         finish_mgmt_job(mgmt_result::failed, tests ? why : "TEST_ONLY refused");
         return;
     }
@@ -9184,7 +9190,7 @@ void compositor_impl::record_output_config() {
             if (outputs.slot_live(s) && outputs.slot_state(s).connector_id == e.connector_id)
                 slot = static_cast<int>(s);
         setup_output_config& so = setup.outputs[setup.count++];
-        std::snprintf(so.identifier, sizeof(so.identifier), "%s", ids[k]);
+        *std::format_to_n(so.identifier, sizeof(so.identifier) - 1, "{}", ids[k]).out = '\0';
         so.enabled = slot >= 0;
         if (slot < 0) {
             if (const kept_position* kp = kept_position_of(e.connector_id);
@@ -9206,7 +9212,7 @@ void compositor_impl::record_output_config() {
         // the default scale, normal, VRR off), so a later default (`--scale`) still applies
         // where nothing was chosen.
         monitor_config m{};
-        std::snprintf(m.identifier, sizeof(m.identifier), "%s", ids[k]);
+        *std::format_to_n(m.identifier, sizeof(m.identifier) - 1, "{}", ids[k]).out = '\0';
         if (!vm && !o.follow_preferred) {
             m.has_mode = true;
             m.width = static_cast<unsigned>(o.mode.width);
@@ -9601,8 +9607,8 @@ lx::result<void> compositor::start() {
             // The named card, with what sysfs says about it when it lists it (the driver
             // decides what a failure to open it means).
             drm::card_candidate named{};
-            std::snprintf(named.path, sizeof(named.path), "%s", env);
-            std::snprintf(named.driver, sizeof(named.driver), "LUMEN_DRM_DEVICE");
+            *std::format_to_n(named.path, sizeof(named.path) - 1, "{}", env).out = '\0';
+            *std::format_to_n(named.driver, sizeof(named.driver) - 1, "LUMEN_DRM_DEVICE").out = '\0';
             const drm::card_list listed = drm::find_cards();
             for (unsigned i = 0; i < listed.count; ++i)
                 if (std::strcmp(listed.cards[i].path, env) == 0)
@@ -9853,7 +9859,7 @@ lx::result<void> compositor::start() {
     if (const char* spec = impl_->cfg.output_scales; spec && *spec) {
         // NAME=S[,NAME=S...]
         char buf[512];
-        std::snprintf(buf, sizeof(buf), "%s", spec);
+        *std::format_to_n(buf, sizeof(buf) - 1, "{}", spec).out = '\0';
         for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
             char* eq = std::strchr(tok, '=');
             if (!eq)
@@ -9867,7 +9873,7 @@ lx::result<void> compositor::start() {
     impl_->outputs.set_default_render_scale(impl_->cfg.render_scale);
     if (const char* spec = impl_->cfg.output_render_scales; spec && *spec) {
         char buf[512];
-        std::snprintf(buf, sizeof(buf), "%s", spec);
+        *std::format_to_n(buf, sizeof(buf) - 1, "{}", spec).out = '\0';
         for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
             char* eq = std::strchr(tok, '=');
             if (!eq)
@@ -9889,7 +9895,7 @@ lx::result<void> compositor::start() {
         // --virtual-outputs WxH[@S][,WxH[@S]...]: N virtual outputs, laid out automatically,
         // each with its own clock (multi-output protocol tests without hardware).
         char buf[512];
-        std::snprintf(buf, sizeof(buf), "%s", impl_->cfg.virtual_outputs);
+        *std::format_to_n(buf, sizeof(buf) - 1, "{}", impl_->cfg.virtual_outputs).out = '\0';
         unsigned n = 0;
         for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
             int w = 0, h = 0;
@@ -9898,7 +9904,7 @@ lx::result<void> compositor::start() {
                 continue;
             output_desc d{};
             char name[32];
-            std::snprintf(name, sizeof(name), "HEADLESS-%u", ++n);
+            *std::format_to_n(name, sizeof(name) - 1, "HEADLESS-{}", ++n).out = '\0';
             d.name = name;
             d.mode = {w, h};
             d.refresh_mhz = 60000;

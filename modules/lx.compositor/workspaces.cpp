@@ -14,7 +14,7 @@ namespace lx::compositor {
 namespace {
 
 void copy_text(char* dst, unsigned cap, const char* src) {
-    std::snprintf(dst, cap, "%s", src ? src : "");
+    *std::format_to_n(dst, cap - 1, "{}", src ? src : "").out = '\0';
 }
 
 } // namespace
@@ -122,7 +122,7 @@ void workspace_model::rename(unsigned slot) {
             copy_text(name, sizeof(name), config_.names[i]);
             named = true;
         } else {
-            std::snprintf(name, sizeof(name), "%u", i + 1);
+            *std::format_to_n(name, sizeof(name) - 1, "{}", i + 1).out = '\0';
         }
         if (w->index != i || std::strcmp(w->name, name) != 0 || w->named != named) {
             w->index = i;
