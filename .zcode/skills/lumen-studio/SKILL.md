@@ -14,7 +14,7 @@ anywhere, and no headless compositor verification).
 | Layer | Location | Contents |
 | --- | --- | --- |
 | Role agents (Agent tool / workflow personas) | `.zcode/agents/*.md` | planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher, architect, doc-writer, screenshoter (`agent-screenshoter`) |
-| Knowledge skills | `.zcode/skills/` | `lumen-build-run` (hosts/commands/measurement), `lumen-testing` (matrices/evidence/statuses), `lumen-decisions` (settled), `lumen-memory-writer` (archive format), `agent-screenshoter` (seat screenshots), this skill |
+| Knowledge skills | `.zcode/skills/` | `lumen-build-run` (hosts/commands/measurement), `lumen-testing` (matrices/evidence/statuses), `lumen-decisions` (settled), `lumen-adr` (when a decision needs `docs/adr/NNN-*.md` and how to write it), `lumen-memory-writer` (archive format), `agent-screenshoter` (seat screenshots), this skill |
 | Workflows | `.zcode/workflows/*.dwf.ts` | `lumen-development-studio`, `lumen-gated-change`, `lumen-compositor-bench` |
 
 ## Choosing the orchestration
