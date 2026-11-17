@@ -26,11 +26,22 @@ instrumentation + 12f608a script/tests + 9aa7b4d docs):
   raster|submit, none omitted), counters `ui.frame_us/idle_us/raster_us|submit_us/gpu_us`,
   flush after the bench thread joins.
 - **Span placement is what keeps the numbers honest**: every span's ctor runs before the
-  stage's first `now_ns()` and its dtor after the second, so the measured deltas exclude
-  span cost entirely (a span inside the window would tax tick_idle's ~170 ns p50 by %).
+  stage's first `now_ns()` and its dtor after the second, and each stage opens its window
+  on its own read — never on the previous stage's closing one — so the measured deltas
+  exclude span cost entirely (a span inside the window would tax tick_idle's ~170 ns p50
+  by %). Corrigendum (independent review, fixed at 99cfe0a): at 9aa7b4d the encode window
+  opened on order's closing read `t3`, so order's dtor, the `ui.batches` counter check and
+  encode's ctor ran inside the measured `[t3, t4]` — bounded at single-digit ns
+  (lx.trace.cppm:573-593: disabled ctor = one relaxed `timeline_enabled()` load +
+  `should_log` compare, dtor short-circuits on `start_ns_ == 0`) against encode p50s of
+  11.3-79 µs, and the re-run vulkan gate passed (S4 encode +4.9 % = 0.56 µs < the 1.0 µs
+  ABS_FLOOR_US), so the recorded numbers stand; encode now brackets its own reads like
+  every other stage.
   Proof: pre/post-change `--scenario all --frames 60 --backend none` JSONs have identical
   key structure and identical deterministic integers (counters, sample counts, gates); only
-  timings + rss/faults/preemptions move, which move between any two runs; full vulkan gate
+  timings + rss/faults/preemptions move, which move between any two runs (re-proven for
+  99cfe0a the same way: 362 leaf paths identical, only timings + involuntary_switches
+  moved, and a traced S3 pass still emits every stage span); full vulkan gate
   PASS (0 failures, the 4 disclosed-open G5 warnings = the baseline's own 1072 B driver
   growth; warm-up settled probe 1 at 36.674 µs vs the 36.74 µs baseline).
 - Baseline traces recorded on hasvk vulkan at 9aa7b4d (S1 2 177 / S2 117 398 / S3 32 643
@@ -50,4 +61,6 @@ structural (separate pass + refusals), not a promise.
 baseline it; copy artifacts + sha256 + argv under `evidence/<date>-<name>/` per the
 lumen-testing contract. Compositor-side needs no flag: `LUMEN_TRACE_FILE=<path>
 lumen-compositor` (see docs/subsystems/errors-and-logging.md §Timeline). When instrumenting
-a measured loop, put spans around the clock reads, never between them.
+a measured loop, put spans around the clock reads, never between them, and open each
+stage's window on its own read — a window that opens on the previous stage's closing
+read silently swallows that stage's dtor and its own ctor.
