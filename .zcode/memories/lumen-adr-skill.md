@@ -28,7 +28,7 @@ ac0330d, main base 1355959) added the ADR-authoring knowledge skill — docs-onl
   verified. Supersession pattern: 005's Status links ADR-010 (:2, :416).
 - Skill states ADR authoring is the lumen-architect agent's job (read-only agent — the
   file is written by the task's implementer/doc-writer); user acceptance precedes any new
-  ADR or status/contract change (`lumen-architect.md:40-42`, `lumen-doc-writer.md:30-31`);
+  ADR or status/contract change (`lumen-architect.md:44-46`, `lumen-doc-writer.md:30-31`);
   division: ADR = decision+reasoning, `lumen-decisions` = measured outcomes, TODO = open
   work; next number always re-checked at authoring time (race: concurrent tasks can land
   an ADR).

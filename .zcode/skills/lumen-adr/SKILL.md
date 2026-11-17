@@ -10,7 +10,7 @@ that agent's output (`.zcode/agents/lumen-architect.md`). The architect is read-
 a task the file itself is written by the implementer/doc-writer and committed **in the same
 change as the code it decides** (AGENTS.md §9). Nothing lands without the user's acceptance
 of the architecture change first: a new ADR, and any status or contract change to an
-existing one, is a proposal requiring sign-off (`lumen-architect.md:40-42`,
+existing one, is a proposal requiring sign-off (`lumen-architect.md:44-46`,
 `lumen-doc-writer.md:30-31`).
 
 ## WHEN a decision needs an ADR
