@@ -6,10 +6,10 @@ current when an item closes.
 
 ## Now
 
-- [ ] **Commit/PR the ADR-013 settings-app tree** — Phases A–G implemented, 134/134 tests
-  green (incl. `test_ui_inputs`, `test_settings_ui`, `test_config_edit`); the app presents on
-  the automatic tier against a headless compositor; `lumen-ctl devices/outputs/version` answer
-  live. Working tree is uncommitted.
+- [x] **Commit/PR the ADR-013 settings-app tree** — closed 2026-11-17: everything merged to
+  main (`ebe7046` portal Settings, `eaaf7ba` LUMEN_THEME export, `9022e74` settings-startup
+  apply); 136/136 ctest at merged main. Push/PR remains the owner's call (never pushed
+  without asking).
 - [ ] **ADR-013 open item 1: in-window key capture** for the bindings editor (wl_keyboard
   keysym recording; the text grammar is the complete fallback today).
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
@@ -22,35 +22,48 @@ current when an item closes.
   (`.zcode/memories/lumen-unit-pair-green.md`): cpu expected 0/255 in both themes, gl ≤ 3 vs
   CPU (G10); a VM failure there is a new finding about FreeType-version sensitivity, to be
   handled then — not a regression of the substitution.
-- [ ] **portal-appearance-settings seat gate red is unattributed** (2026-11-16, gate
-  NOT_READY at worktree HEAD fedbba1, branch unmerged): both seat smokes failed on the
-  final binaries — drag-smoke 9/10 rows FAIL at +0,+0 (after a "another session is running"
-  WARN) and app-smoke 101 FAIL rows incl. Z2/Z4 (the xdg-desktop-portal-lumen backend this
-  diff touches answering but capturing black); no baseline smoke exists for the task, while
-  notebook-full-green-audit was 177/0/0 on this host the day before. Re-run both smokes on
-  a quiet serialized host and record green, or produce the baseline A/B naming a mechanism
-  per FAIL row; also preserve the busctl ReadOne/SettingChanged and idle-strace probe
-  artifacts the review asserted (none survived). See
-  `.zcode/memories/lumen-portal-appearance-settings.md`.
-- [ ] **compositor-theme-env-export seat gate BLOCKED — acceptance 2-4 never run; smokes
-  invalid; lumen-shell SIGSEGV unattributed** (2026-11-16, worktree HEAD e5a1175, branch
-  unmerged): the only seat runs were drag-smoke + app-smoke exit 1 under a broken injection
-  environment — a stale root uinput holder open since 2026-11-15 12:22 (pid 2692863,
-  `scripts/uinput-mouse.py --output 3200x1800`, started from the smoke-bench-harness-green
-  worktree, violating the start-from-this-tree rule) whose node event16 "Lumen Inject
-  Mouse" reads key caps `70000 0 0 0 0` (no BTN codes — clicks physically cannot reach the
-  compositor), plus an "another session is running" WARN; every keyboard row passed, every
-  click row failed, so the reds are environmental, but the four acceptance checks
-  (appearance flip → `systemctl --user show-environment` LUMEN_THEME=one-light, lumen-hello
-  relaunch light→dark, startup export with empty ui.theme, lumen-settings fresh start) were
-  never executed. ALSO: lumen-shell from the worktree build segfaulted twice during
-  app-smoke (coredumpctl 3499403 @21:41:39, 3521729 @21:53:11, identical stacks
-  notification_view::build_ui → lx::ui::image → lx::runtime::memory_arena::allocate); the
-  diff touches no lx.ui/lx.shell code and no baseline A/B exists (last green app-smoke
-  177/0/0 on Nov 15, predates the user's appearance="light" config). Redo: kill the stale
-  holder, regenerate the node from THIS tree, verify button caps in the key bitmap, run
-  acceptance 2-4 as written, and attribute the crash against a main baseline. See
-  `.zcode/memories/lumen-compositor-theme-env-export.md`.
+- [x] **portal-appearance-settings seat gate red is unattributed** — closed 2026-11-17
+  (quiet-host serialized redo on merged main 9022e74, notebook): drag-smoke **10/10 PASS**,
+  app-smoke **177 PASS / 0 WARN / 0 FAIL** with Z2 Screenshot `colours [(255,0,0)]` and Z4
+  PickColor `255,0,0` as real-pixel PASSes — the Nov-16 "portal answering but capturing
+  black" reading is not supported; the 101-FAIL signature matches the concurrent-session
+  WARN family. All asserted probe artifacts preserved under
+  `evidence/2026-11-17-seat-redo/` (busctl ReadOne u2/u1, SettingChanged dbus-monitor +
+  journal, NotFound error-name/message, ReadAll glob, idle-strace: backend parked in
+  poll(-1), zero syscalls/zero CPU over 30 s windows). Independent analyst recount
+  confirmed every number. Note: this row's "no BTN codes" node reading was a
+  `/proc/bus/input/devices` bitmap misreading — see
+  `.zcode/memories/lumen-uinput-key-bitmap-format.md`.
+- [x] **compositor-theme-env-export seat gate BLOCKED** — closed 2026-11-17 (redo on merged
+  main 9022e74): stale holders killed (pids 3604798/3604800 from Nov 16; the original
+  2692863 died earlier, boot_id unchanged proves no reboot), node regenerated from this
+  tree with button caps EVIOCGBIT-verified, acceptance 2-4 run as written incl. the
+  letter — appearance flipped **through the lumen-settings UI** (app wrote exactly the
+  `appearance` line; compositor re-exported `LUMEN_THEME=one-dark`/`one-light`; app re-themed
+  live 0.179/0.968), startup export with empty ui.theme → one-light, verbatim `ui.theme`
+  name export, lumen-hello relaunch light 0.9189 / dark 0.2061, lumen-settings fresh start,
+  teardown unset, config byte-restored (sha256 082ce0e5…). Smokes green (see the portal row).
+  The lumen-shell SIGSEGV did **not** reproduce — split to its own row below (non-reproduction
+  is not attribution). The row's "no BTN codes" mechanism was a bitmap misreading — see
+  `.zcode/memories/lumen-uinput-key-bitmap-format.md`; the Nov-15/16 click-loss is best
+  attributed to the concurrent-session WARN family. See
+  `.zcode/memories/lumen-compositor-theme-env-export.md` (2026-11-17 section).
+- [ ] **lumen-shell notification_view intermittent SIGSEGV** (split 2026-11-17 from the row
+  above): ×2 on 2026-11-16 (coredumps 3499403 @21:41:39, 3521729 @21:53:11, identical
+  stacks notification_view::build_ui → lx::ui::image → lx::runtime::memory_arena::allocate,
+  SI_KERNEL, EXE = the theme-env worktree build), unreproduced 2026-11-17 on merged main
+  9022e74 across both smokes, the N1–N8 notification rows and two interactive sessions —
+  intermittent, mechanism unattributed. Next: ASan-built lumen-shell on the seat with a
+  notify-send + shell-relaunch stress (targeted repro beats statistical smoke), or an
+  app-smoke A/B on pre-merge main. Original stacks preserved at
+  `evidence/2026-11-17-seat-redo/a-smokes/coredump-originals-Nov16.txt`.
+- [ ] **lumen-settings transient "no writable config.toml" banner** (2026-11-17 seat redo,
+  supplement): a "Changes are not being saved / There is no writable config.toml" banner
+  showed ~10 s after a fresh lumen-settings launch and vanished after the first successful
+  write — while locate_config resolved the real user file and the writes demonstrably
+  worked (`evidence/2026-11-17-seat-redo/d-supplements/shot-pre-flip-banner-zoom.png`);
+  no startup path setting the banner's memory_only state was found by source reading.
+  Reproduce, then fix the stale banner state.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
