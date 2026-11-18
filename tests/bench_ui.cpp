@@ -9,7 +9,10 @@
 // ADR-010 primitives through `draw_scope`, the overlap grid and the `(order, kind, page)`
 // sort of `draw_list::batch_for_render`. Every number is attributed to a stage (§8.1) with
 // CLOCK_MONOTONIC read around the call; the lx.trace spans on the same stages feed Perfetto
-// and are not what the table is made of.
+// and are not what the table is made of. The timeline is off unless LUMEN_TRACE_FILE names
+// an output file when the bench starts — scripts/ui-bench.sh --perfetto runs that pass, and
+// its numbers never reach a comparison or a baseline (writing the events costs time on the
+// measured path even though the buffer is lock-free).
 //
 // Backends: `none` measures the stages through `encode` (the sorted instances gathered into
 // a ring — the bytes a backend uploads) and submits nothing; `cpu` then rasterises each
@@ -70,6 +73,7 @@
 // label dirty (a clock cell) — under "layout_solve" (`--no-layout-solve` skips it).
 
 #include "render_node.hpp"
+#include "lx.trace/scope.hpp" // LX_TRACE_SCOPE (a macro, so a header: modules export none)
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
@@ -1714,17 +1718,35 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             bytes_start = g_new_bytes.load(std::memory_order_relaxed);
         }
 
-        const std::uint64_t t_update0 = now_ns();
-        if (spec.before_frame)
-            spec.before_frame(frame);
-        const std::uint64_t t_update1 = now_ns();
+        // The stage spans sit around the CLOCK_MONOTONIC reads that time them (constructor
+        // before the first, destructor after the second), and every stage opens its window
+        // on its own read, never the previous stage's closing one — so an untraced run's
+        // stage deltas are the numbers an uninstrumented run would read; the timeline
+        // stores the literals.
+        std::uint64_t t_update0 = 0, t_update1 = 0;
+        {
+            LX_TRACE_SCOPE("bench", "update");
+            t_update0 = now_ns();
+            if (spec.before_frame)
+                spec.before_frame(frame);
+            t_update1 = now_ns();
+        }
 
         const lx::ui::layout_counters layout_before = lx::ui::ui_layout_counters();
-        const std::uint64_t t0 = now_ns();
-        const bool produced = root.tick(draws);
-        const std::uint64_t t1 = now_ns();
+        std::uint64_t t0 = 0, t1 = 0;
+        bool produced = false;
+        {
+            LX_TRACE_SCOPE("bench", "tick");
+            t0 = now_ns();
+            produced = root.tick(draws);
+            t1 = now_ns();
+        }
 
         if (!produced) {
+            if (lx::trace::timeline_enabled())
+                lx::trace::timeline_counter(
+                    "ui.idle_us",
+                    static_cast<long long>(((t_update1 - t_update0) + (t1 - t0)) / 1000));
             if (measuring) {
                 samples[st_update].push_back(t_update1 - t_update0);
                 samples[st_tick_idle].push_back(t1 - t0);
@@ -1755,43 +1777,66 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         if (damage.empty())
             damage.set_full();
 
-        const std::uint64_t t2 = now_ns();
-        draws.batch_for_render();
-        const std::uint64_t t3 = now_ns();
+        std::uint64_t t2 = 0, t3 = 0;
+        {
+            LX_TRACE_SCOPE("bench", "order");
+            t2 = now_ns();
+            draws.batch_for_render();
+            t3 = now_ns();
+        }
         if (lx::trace::timeline_enabled())
             lx::trace::timeline_counter("ui.batches", static_cast<long long>(draws.batches().size()));
-        const std::uint64_t bytes = encode(draws, ring.data(), ring.size());
-        const std::uint64_t t4 = now_ns();
+        std::uint64_t bytes = 0;
+        std::uint64_t t_enc0 = 0, t4 = 0;
+        {
+            LX_TRACE_SCOPE("bench", "encode");
+            t_enc0 = now_ns();
+            bytes = encode(draws, ring.data(), ring.size());
+            t4 = now_ns();
+        }
+        if (lx::trace::timeline_enabled())
+            lx::trace::timeline_counter("ui.frame_us", static_cast<long long>((t4 - t0) / 1000));
         // Outside every timed stage: the scenario's counters of this frame.
         text_frame_sample text_sample{};
         if (spec.text_frame)
             spec.text_frame(draws, !gl && !vk, text_sample);
-        const std::uint64_t t_draw = now_ns();
         std::uint64_t raster_px = 0;
-        lx::gfx::ui_stream stream{};
-        stream.refs = draws.refs();
-        stream.batches = draws.batches();
-        stream.quads = draws.quad_instances();
-        stream.shadows = draws.shadow_instances();
-        stream.sprites = draws.sprite_instances();
-        stream.underlines = draws.underline_instances();
-        if (raster) {
-            auto drawn = rasteriser->draw(target, stream, spec.atlas, damage, clear);
-            if (drawn)
-                raster_px = drawn->pixels_shaded;
-        }
         unsigned draw_calls = 0;
-        if (gl && gl_target) {
-            auto drawn = g_gl->renderer.draw(*gl_target, stream, spec.atlas, damage, clear);
-            if (drawn)
-                draw_calls = drawn->draw_calls;
+        std::uint64_t t_draw = 0, t5 = 0;
+        {
+            // The backend's stage — `raster` on `cpu`, `submit` on `gl`/`vulkan`; `none`
+            // draws nothing and gets no span. Outside the timing reads like the others.
+            std::optional<lx::trace::scoped_span> draw_span;
+            if (raster || (gl && gl_target) || (vk && vk_target))
+                draw_span.emplace("bench", raster ? "raster" : "submit");
+            t_draw = now_ns();
+            lx::gfx::ui_stream stream{};
+            stream.refs = draws.refs();
+            stream.batches = draws.batches();
+            stream.quads = draws.quad_instances();
+            stream.shadows = draws.shadow_instances();
+            stream.sprites = draws.sprite_instances();
+            stream.underlines = draws.underline_instances();
+            if (raster) {
+                auto drawn = rasteriser->draw(target, stream, spec.atlas, damage, clear);
+                if (drawn)
+                    raster_px = drawn->pixels_shaded;
+            }
+            if (gl && gl_target) {
+                auto drawn = g_gl->renderer.draw(*gl_target, stream, spec.atlas, damage, clear);
+                if (drawn)
+                    draw_calls = drawn->draw_calls;
+            }
+            if (vk && vk_target) {
+                auto drawn = g_vk->renderer.draw(*vk_target, stream, spec.atlas, damage, clear);
+                if (drawn)
+                    draw_calls = drawn->draw_calls;
+            }
+            t5 = now_ns();
         }
-        if (vk && vk_target) {
-            auto drawn = g_vk->renderer.draw(*vk_target, stream, spec.atlas, damage, clear);
-            if (drawn)
-                draw_calls = drawn->draw_calls;
-        }
-        const std::uint64_t t5 = now_ns();
+        if (lx::trace::timeline_enabled() && ((gl && gl_target) || (vk && vk_target) || raster))
+            lx::trace::timeline_counter(raster ? "ui.raster_us" : "ui.submit_us",
+                                        static_cast<long long>((t5 - t_draw) / 1000));
         // The GPU stage: waiting for it here is outside every CPU stage above.
         std::uint64_t gpu_ns = 0;
         bool gpu_ok = false;
@@ -1811,6 +1856,8 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
                 gpu_ns = timed->ns;
             }
         }
+        if (lx::trace::timeline_enabled() && gpu_ok)
+            lx::trace::timeline_counter("ui.gpu_us", static_cast<long long>(gpu_ns / 1000));
 
         if (!built) {
             built = true;
@@ -1881,11 +1928,11 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_layout].push_back(st.layout);
         samples[st_emit].push_back(st.emit);
         samples[st_order].push_back(t3 - t2);
-        samples[st_encode].push_back(t4 - t3);
-        samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t3));
+        samples[st_encode].push_back(t4 - t_enc0);
+        samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t_enc0));
         samples[st_frame].push_back(t4 - t0);
         samples[st_layout_emit_order_encode].push_back(st.layout + st.emit + (t3 - t2) +
-                                                       (t4 - t3));
+                                                       (t4 - t_enc0));
         samples[st_update_frame].push_back((t_update1 - t_update0) + (t4 - t0));
         if (raster)
             samples[st_raster].push_back(t5 - t_draw);
@@ -2816,6 +2863,7 @@ void* bench_thread(void* raw) {
     bench_job& job = *static_cast<bench_job*>(raw);
     const options& opt = *job.opt;
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    lx::trace::name_thread("bench");
     // The `gl` context belongs to this thread; it is torn down here too, before the stack goes.
     std::optional<gl_backend> gl{};
     if (std::strcmp(opt.backend, "gl") == 0) {
@@ -2844,6 +2892,9 @@ void* bench_thread(void* raw) {
                                    : i == 1 ? make_s2(opt)
                                    : i == 2 ? make_s3(opt)
                                             : make_s4(opt);
+        // The scenario's span: `spec.id` points at a literal, which is what the timeline
+        // stores; the reshape/layout-solve spans nest inside it on Perfetto's thread track.
+        LX_TRACE_SCOPE("bench", spec.id);
         // S2 runs 60 s of 60 Hz frames (60 clock changes) unless `--frames` says otherwise.
         options run = opt;
         if (i == 1 && !opt.frames_given)
@@ -2853,10 +2904,12 @@ void* bench_thread(void* raw) {
             release_s1(); // its text caches are not the next scenario's memory
         print_table(job.results[job.count]);
         if (i == 3 && opt.reshape) {
+            LX_TRACE_SCOPE("bench", "reshape");
             measure_reshape();
             print_reshape();
         }
         if (i == 1 && opt.layout_solve) {
+            LX_TRACE_SCOPE("bench", "layout_solve");
             measure_layout_solve();
             print_layout_solve();
         }
@@ -2901,6 +2954,11 @@ int main(int argc, char** argv) {
 
     // The bench thread inherits the mask.
     const int cpu = pin_cpu(opt.pin);
+    // A Perfetto timeline of this run (lx.trace): off unless LUMEN_TRACE_FILE names an
+    // output file — the pass scripts/ui-bench.sh --perfetto runs. Started before the level
+    // is quieted so a traced run confirms its output file on stderr; an untraced run reads
+    // one getenv and records nothing.
+    lx::trace::timeline_start_from_env();
     // The cap warnings are the only thing the frame path logs; keep them, drop the rest.
     lx::trace::logger::global().set_min_level(lx::trace::level::warn);
 
@@ -2931,6 +2989,9 @@ int main(int argc, char** argv) {
 
     if (opt.json)
         write_json(opt, host, results, job.count);
+
+    // The timeline, if one was recording: the bench thread has joined, nothing records now.
+    (void)lx::trace::timeline_flush();
 
     // Never fail on a number — CTest only checks the exit status.
     return 0;

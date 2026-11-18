@@ -2,7 +2,8 @@
 # The smoke harness's own plumbing, tested without a seat: binary freshness against a
 # synthetic Ninja tree (scripts/build-fresh.sh), injection-node lookup against a sysfs
 # fixture (scripts/inject-devices.sh), inject-input.py's key table and pixel mapping,
-# and the bench warm-up gate against a fake bench (scripts/bench-warmup.sh).
+# the bench warm-up gate against a fake bench (scripts/bench-warmup.sh), and ui-bench.sh's
+# --perfetto traced pass against a stand-in bench (a hermetic copy of the script).
 # Everything here is hermetic: no /dev/input, no real build, no compositor.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -225,6 +226,64 @@ check "a reference with no S2 frame p50 skips the warm-up" 0 $rc
 contains "and says so" "$out" "no S2 frame p50"
 check "skipped: nothing ran" "" "$(cat "$FAKE_LOG")"
 baseline="$ref"
+
+echo "ui-bench.sh --perfetto — a traced pass, never a measured one:"
+# A hermetic copy of the script (its ROOT decides where it reads git state and writes
+# results) with a stand-in bench that logs the environment it was given and writes a
+# minimal valid trace JSON to $LUMEN_TRACE_FILE.
+P=$TMP/perfetto
+mkdir -p "$P/scripts" "$P/build" "$P/tests/bench/results" "$P/tests/bench/baseline"
+cp "$ROOT/scripts/ui-bench.sh" "$P/scripts/"
+cp "$ROOT/scripts/bench-warmup.sh" "$P/scripts/"   # ui-bench.sh sources it before the pass
+# A repo of its own: the trace (and JSON) names carry the tree's sha, and the script's
+# `git rev-parse` is the first thing set -e would die on outside one.
+git -C "$P" init -q -b main
+git -C "$P" -c user.email=smoke@harness -c user.name=smoke_harness commit -q --allow-empty -m x
+echo "CMAKE_BUILD_TYPE:STRING=Release" >"$P/build/CMakeCache.txt"
+FAKE_PLOG="$TMP/perfetto-bench-runs"
+export FAKE_PLOG
+cat >"$P/build/lumen-ui-bench" <<'EOF'
+#!/usr/bin/env bash
+set -u
+printf 'trace=%s events=%s\n' "${LUMEN_TRACE_FILE:-unset}" "${LUMEN_TRACE_EVENTS:-unset}" >>"$FAKE_PLOG"
+printf '{"displayTimeUnit":"ns","traceEvents":[{"ph":"M","name":"process_name","pid":1,"tid":1,"args":{"name":"lumen-ui-bench"}},{"ph":"X","cat":"bench","name":"S1","ts":1.0,"dur":2.0,"pid":1,"tid":1},{"ph":"C","name":"ui.frame_us","ts":1.0,"pid":1,"tid":1,"args":{"value":42}}]}\n' >"$LUMEN_TRACE_FILE"
+EOF
+chmod +x "$P/build/lumen-ui-bench"
+prun() { # extra ui-bench.sh arguments; rc, the run's output in $TMP/prun.log
+  LUMEN_BUILD_DIR="$P/build" bash "$P/scripts/ui-bench.sh" --perfetto --backend vulkan \
+    --no-build "$@" >"$TMP/prun.log" 2>&1
+}
+
+: >"$FAKE_PLOG"
+prun; rc=$?
+(( rc == 0 )) || cat "$TMP/prun.log"
+check "the traced pass runs every scenario and validates each trace" 0 "$rc"
+check "one traced invocation per scenario" 4 "$(wc -l <"$FAKE_PLOG")"
+contains "the bench got a per-scenario trace path and the event bound" "$(head -1 "$FAKE_PLOG")" \
+        "-S1.trace.json events=2000000"
+contains "the traces live under results/<machine>-<backend>/" "$(head -1 "$FAKE_PLOG")" \
+        "/tests/bench/results/"
+contains "each trace is parsed, its spans and counters counted" "$(cat "$TMP/prun.log")" "spans,"
+contains "the pass names what it produced" "$(cat "$TMP/prun.log")" "never compared, never a baseline"
+check "no baseline written" "" "$(ls "$P/tests/bench/baseline")"
+
+prun --update-baseline
+check "--update-baseline is refused from a traced run" 2 $?
+prun --client
+check "--client is refused (per-process trace files)" 2 $?
+prun --e2e
+check "--e2e is refused" 2 $?
+prun --compare "$TMP/ref.json"
+check "--compare is refused (a traced pass feeds no comparison)" 2 $?
+
+: >"$FAKE_PLOG"
+prun; rc=$?
+(( rc == 0 )) || cat "$TMP/prun.log"
+check "a second traced run of the same tree still passes" 0 "$rc"
+check "its traces take the -2 suffix, the first run's kept" 4 \
+      "$(ls "$P"/tests/bench/results/*-vulkan/*-2-S*.trace.json 2>/dev/null | wc -l)"
+check "eight trace files in total (two runs, four scenarios each)" 8 \
+      "$(ls "$P"/tests/bench/results/*-vulkan/*.trace.json 2>/dev/null | wc -l)"
 
 echo "inject-input.py — the key table and the pixel mapping:"
 python3 -I - "$ROOT/scripts/inject-input.py" <<'PY'

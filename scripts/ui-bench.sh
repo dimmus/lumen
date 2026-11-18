@@ -42,8 +42,21 @@
 #   ./scripts/ui-bench.sh                     # build, run, store, compare
 #   ./scripts/ui-bench.sh --update-baseline   # ... and rewrite the baseline (a reviewed change)
 #   ./scripts/ui-bench.sh --compare FILE      # compare against FILE instead of the baseline
+#   ./scripts/ui-bench.sh --perfetto          # a traced pass instead: no run, no comparison
 #
 # Options:
+#   --perfetto         record a Perfetto timeline of the engine scenarios (S1–S4): each runs
+#                      once with LUMEN_TRACE_FILE (and LUMEN_TRACE_EVENTS, bounded) set for
+#                      lumen-ui-bench — the env vars lx.trace already reads, no others — and
+#                      writes tests/bench/results/<machine>-<backend>/<YYYYMMDD>-<sha>[-N]-S<k>.trace.json
+#                      (Chrome trace-event JSON; ui.perfetto.dev and trace_processor load it;
+#                      gitignored like every results artifact). The pass replaces the measured
+#                      one entirely: it compares nothing and writes no baseline — trace writes
+#                      cost time on the measured path, so a traced run's numbers are never
+#                      judged — and --update-baseline, --compare, --client and --e2e are
+#                      refused with it (LUMEN_TRACE_FILE is per-process: a child compositor
+#                      writing the same file would corrupt it). Each scenario is its own
+#                      lumen-ui-bench process, so each writes its own trace file.
 #   --backend B         the backend to measure: none (default), cpu, gl or vulkan; each has its own
 #                       baseline, tests/bench/baseline/<machine>-<backend>.json
 #   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800,
@@ -88,6 +101,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD="${LUMEN_BUILD_DIR:-${ROOT}/build/release}"
 BENCH="${BUILD}/lumen-ui-bench"
 ABS_FLOOR_US=1.0
+# The LUMEN_TRACE_EVENTS bound of a --perfetto pass: lx.trace's own default (the mmap is
+# reserved, not committed — only filled pages become resident; events beyond it drop).
+PERFETTO_EVENT_CAP=2000000
 
 backend=none
 backend_given=0
@@ -97,6 +113,7 @@ warmup_given=0
 pin=""
 build=1
 update_baseline=0
+perfetto=0
 compare=""
 client=0
 short=0
@@ -115,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --pin) pin="$2"; shift 2 ;;
     --no-build) build=0; shift ;;
     --update-baseline) update_baseline=1; shift ;;
+    --perfetto) perfetto=1; shift ;;
     --compare) compare="$2"; shift 2 ;;
     --client) client=1; shift ;;
     --short) short=1; shift ;;
@@ -132,6 +150,26 @@ done
 if ! command -v python3 >/dev/null; then
   echo "FAIL: python3 is needed for the JSON comparison"
   exit 2
+fi
+
+# A traced pass is not a measured one: nothing it produces may be judged or kept as a
+# reference, and the paths that would (baseline write, comparison) or that share one
+# LUMEN_TRACE_FILE across processes (--client, --e2e: a child compositor's writes would
+# corrupt the file) are refused rather than warned about.
+if [[ "$perfetto" -eq 1 ]]; then
+  if [[ "$update_baseline" -eq 1 ]]; then
+    echo "FAIL: --perfetto cannot write a baseline — a traced pass's numbers are never judged"
+    exit 2
+  fi
+  if [[ -n "$compare" ]]; then
+    echo "FAIL: --perfetto compares nothing — a traced pass's numbers are never judged"
+    exit 2
+  fi
+  if [[ "$client" -eq 1 || "$e2e" -eq 1 ]]; then
+    echo "FAIL: --perfetto traces the headless engine scenarios only — LUMEN_TRACE_FILE is"
+    echo "      per-process, and a child compositor writing the same file would corrupt it"
+    exit 2
+  fi
 fi
 
 # ── --e2e: S9 on the real display (and --dry-run on a recorded sample) ─────────
@@ -778,6 +816,53 @@ frames_for() {
     S4) echo 1800 ;;
   esac
 }
+
+# ── --perfetto: one traced pass, never a measured one ──────────────────────────
+#
+# LUMEN_TRACE_FILE and LUMEN_TRACE_EVENTS are what lx.trace reads
+# (timeline_start_from_env, lx.trace.cppm); nothing else is set. Each scenario is its own
+# lumen-ui-bench process, so each writes its own trace, named like the bench JSONs and
+# their per-scenario parts: <YYYYMMDD>-<sha>[-N]-S<k>.trace.json under the same
+# results/<machine>-<backend>/ directory (a second traced run of the same tree takes -2,
+# as the JSONs do). No quiet-CPU hold and no host warm-up: nothing here is measured, and
+# the traces are timeline evidence only.
+if [[ "$perfetto" -eq 1 ]]; then
+  tbase="${results_dir}/${day}-${sha}${dirty}"
+  n=2
+  while [[ -e "${tbase}-S1.trace.json" ]]; do
+    tbase="${results_dir}/${day}-${sha}${dirty}-${n}"
+    n=$((n + 1))
+  done
+  echo "== perfetto traced pass: backend=${backend} pin=${pin} -> ${tbase#"$ROOT"/}-S<k>.trace.json"
+  for scenario in S1 S2 S3 S4; do
+    n="${frames:-$(frames_for "$scenario")}"
+    trace="${tbase}-${scenario}.trace.json"
+    if ! LUMEN_TRACE_FILE="$trace" LUMEN_TRACE_EVENTS="$PERFETTO_EVENT_CAP" \
+         "${runner[@]}" "$BENCH" --scenario "$scenario" --backend "$backend" --frames "$n" \
+         --warmup "$warmup" --pin "$pin" --git "${sha}${dirty}" --preset "$preset"; then
+      echo "FAIL: the traced ${scenario} pass could not run"
+      exit 2
+    fi
+    if ! summary="$(python3 -I - "$trace" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as f:
+    events = json.load(f).get("traceEvents", [])
+spans = sum(1 for e in events if e.get("ph") == "X")
+counters = sum(1 for e in events if e.get("ph") == "C")
+if not spans or not counters:
+    sys.exit(1)
+print(f"{spans} spans, {counters} counters, {len(events)} events")
+PY
+    )"; then
+      echo "FAIL: ${trace#"$ROOT"/} does not parse as a trace with spans and counters"
+      exit 2
+    fi
+    echo "   ${scenario}  ${summary}  $(sha256sum "$trace" | cut -d' ' -f1)"
+  done
+  echo "== traced pass done: timeline evidence only — never compared, never a baseline"
+  exit 0
+fi
 
 quiet_cpu_start "$pin"
 warm_host "$backend"
