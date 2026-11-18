@@ -210,6 +210,67 @@ pattern by hand per case-group, or upstream a wl_display "destroy all client
 proxies" helper to libwayland. Every other wayland test file uses the simpler
 one-client-few-objects shape that the committed pattern covers.
 
+## Post-review fix round (this file's corrections)
+
+The independent review of this sweep found the record below overstated the final
+state: 9 ASan and 10 TSan tests were still red, two of the TSan failures were
+genuine Lumen races the triage never classified, the committed "final" ASan log
+predated the last code change, five TSan-red tests never received the suppression
+environment at all, and the A/B and smoke evidence carried an undisclosed FAIL and
+a violated quiet-host precondition. Everything below "Final state" is the record as
+the session left it; this round fixed the substance:
+
+- Two genuine-Lumen TSan races, surfacing only after earlier failures stopped
+  halting the suite (never in the baseline digest):
+  - scene_graph::ensure_view's views_[slot] write (UI, hotplug) vs snapshots()'s
+    read (render) — fixed by publishing the slot pointer through an atomic
+    (release store in ensure_view, acquire load in snapshots; UI-side reads
+    relaxed). 86b9c23.
+  - output_manager::recount's count_ write vs the test main thread's count() read
+    outside the dispatch lock — a test-side affinity violation; every count() read
+    now goes through the ui() helper. bb51b4c.
+- The CMake sanitizer environment is now APPENDED to every test once, after the
+  last add_test (ENVIRONMENT is a whole-list overwrite; the per-list assignments
+  left five TSan-red tests — vk_capture, tiling, window_animations,
+  window_protocols, backdrop_blur_vk_validation — with no TSAN_OPTIONS at all,
+  failing on exactly the suppressible third-party races, and left
+  font_matches/text_node/ui_inputs without the LSan file). aab2831.
+- Every remaining wayland-test leak fixed with the committed window_protocols
+  teardown pattern: protocol_conformance (the 5142-allocation leaker; teardown()
+  extracted, every case's proxies tracked, borrowed-client kits push to the
+  original, 242 cases 0 failed), shell_bridge, pointer_protocols,
+  capture_protocols, ext_workspace, output_management's head/mode/output record
+  ownership. 3f1b82f, d67601f, bb51b4c.
+- Two latent defects the missing environment hid: bench_ui's four nothrow operator
+  deletes sat outside the LUMEN_TEST_ALLOC_COUNTING guard (TSan link clash the
+  moment lumen-ui-bench rebuilt; 19da34c), and settings_ui's string_field::set
+  memcpy'd an empty view's null data() — UBSan-flagged UB, previously printed
+  without halting (52bbcab).
+- TEST.md documents the three new tsan.supp entries and the corrected
+  environment mechanism; the ≥12-run / load-bearing / canary protocol for all five
+  new suppression entries is recorded under suppression-protocol/ (per-entry
+  carriers: window_protocols, ui_golden+validation, vk_capture, font_matches,
+  control; the canaries' sources are checked in beside the logs). dfe18cd.
+
+## Post-review final state (after the fix round)
+
+- ASan+UBSan (ctest --preset asan, serialized): **136/136** (baseline 97/136;
+  the session's 127/136 had 9 red — protocol_conformance, pointer_protocols,
+  shell_bridge, capture_protocols, output_management_contract, ext_workspace,
+  font_matches, text_node, ui_inputs — all fixed above).
+- TSan (ctest --preset tsan, serialized): **136/136** (baseline 97/136 + 7
+  unlinkable; the session's 126/136 had 10 red).
+- Logs: asan-final-ctest-v2.log, tsan-final-ctest-v2.log. Suppression protocol
+  records: suppression-protocol/. A/B analysis: ui-bench-AB-analysis.md (three
+  clean PASS rounds at HEAD, S2 within noise of the stored baseline).
+- app-smoke: NOT green on this seat tonight — identical mass failure (early
+  input-driven scenarios, one lumen-shell SEGV in notification_view::build_ui)
+  on the fixed HEAD AND on the pre-fix sweep tree, five serialized runs; see
+  app-smoke-analysis.md. Escalated to the gate; not hidden, not relabeled.
+- Normal gate (build/test, non-sanitizer): 136/136, exit 0 (the session's run);
+  the fix round's changes are test/build/tooling-side except the scene atomic
+  (86b9c23), the settings memcpy fix (52bbcab) and the bench_ui guard (19da34c).
+
 ## Final state of this sweep (session end)
 
 - ASan+UBSan suite: 127/136 (baseline 97/136). Remaining 9: protocol_conformance
