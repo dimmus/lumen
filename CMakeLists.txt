@@ -1747,7 +1747,7 @@ if(LUMEN_BUILD_TESTS)
     # Both suppression files apply everywhere. They are scoped to third-party shared
     # objects by name, so a test that never loads a graphics driver simply matches nothing
     # — and any test that later grows a compositor gets the right behavior without being
-    # remembered here. Only the blunt instrument below is opt-in.
+    # remembered here. Only the blunt instruments below are opt-in.
     set(LUMEN_SANITIZER_ENV
         "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp"
         "ASAN_OPTIONS=${LUMEN_ASAN_OPTS}"
@@ -1769,53 +1769,33 @@ if(LUMEN_BUILD_TESTS)
         "LSAN_OPTIONS=detect_leaks=0"
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
-    if(TARGET test_control)
-        set_tests_properties(test_control PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    endif()
-    set_tests_properties(test_health test_session_discovery test_fd_limit
-        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    # Per-test ENVIRONMENT overwrites (it is a whole-list property), so the sanitizer
+    # environment is NOT handed out per test above — it is appended to every test once,
+    # at the bottom of this file, after the last add_test. Tests that need a different
+    # variant of it (the Vulkan-ICD and EGL-display concessions below) are excluded from
+    # that append and set their full environment here.
+    set(LUMEN_SANITIZER_EXCLUDES "")
     if(TARGET test_client_swapchain)
         # Its Vulkan tier brings up lavapipe: the ICD's teardown needs the Vulkan settings.
+        list(APPEND LUMEN_SANITIZER_EXCLUDES test_client_swapchain)
         set_tests_properties(test_client_swapchain PROPERTIES ENVIRONMENT
             "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
     endif()
     if(TARGET test_ui_golden)
         # It brings up a Vulkan device (ui_vk): the ICD's threads and dlclose need the same
         # sanitizer settings as the other Vulkan tests.
+        list(APPEND LUMEN_SANITIZER_EXCLUDES test_ui_golden)
         set_tests_properties(test_ui_golden PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
         if(TEST test_ui_golden_vk_validation)
+            list(APPEND LUMEN_SANITIZER_EXCLUDES test_ui_golden_vk_validation)
             set_tests_properties(test_ui_golden_vk_validation PROPERTIES ENVIRONMENT
                 "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
         endif()
     endif()
-    set_tests_properties(test_result test_snapshot test_primitives test_atlas test_scene_outputs test_damage_region test_wm_geometry
-        test_surface_tree test_positioner test_layer_arrange test_xcursor
-        test_data_transfer test_input_serials test_session_pause test_keybindings test_workspaces
-        test_viewport_geometry test_presentation_feedback
-        test_dnd_grab test_output_membership test_liveness
-        test_activation_policy
-        test_import_cache bench_frame
-        test_runtime_memory test_runtime_psi test_runtime_task test_cpu_composite test_repaint_schedule test_frame_clocks test_input_keymap
-        test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
-        test_output_contract test_multi_output_contract test_hotplug_contract test_render_scale
-        test_output_management_contract
-        test_task_model test_shell_bridge
-        test_desktop_entry test_app_catalog test_app_launch test_launcher_layout test_background
-        test_switcher test_notifications test_tray
-        test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
-        test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
-        test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_ui_multi_root test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
-        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    if(TEST test_ui_components)
-        set_tests_properties(test_ui_components PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    endif()
-    if(TEST ui_gallery)
-        set_tests_properties(ui_gallery PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    endif()
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout test_downsample
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    list(APPEND LUMEN_SANITIZER_EXCLUDES test_dmabuf_composite test_kms_vulkan_scanout test_downsample)
     # Bringing up an EGL display leaks the dri2 driver's process-lifetime globals; on
     # this toolchain those frames symbolize to Mesa source paths, so no object-name
     # leak: pattern can match them (the Vulkan ICD's "<unknown module>" case below with
@@ -1829,8 +1809,10 @@ if(LUMEN_BUILD_TESTS)
     if(lumen_gl_display_tests)
         set_tests_properties(${lumen_gl_display_tests} PROPERTIES ENVIRONMENT
             "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp;ASAN_OPTIONS=${LUMEN_ASAN_OPTS};LSAN_OPTIONS=detect_leaks=0;UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
+        list(APPEND LUMEN_SANITIZER_EXCLUDES ${lumen_gl_display_tests})
     endif()
     if(TARGET test_deco_titles)
+        list(APPEND LUMEN_SANITIZER_EXCLUDES test_deco_titles)
         set_tests_properties(test_deco_titles PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
         if(TEST test_deco_titles_vk_validation)
             # The validation layer embeds SPIRV-Tools, whose internal std::stable_sort
@@ -1840,6 +1822,7 @@ if(LUMEN_BUILD_TESTS)
             # mismatch (every Lumen-owned pair of that shape is fixed; plain
             # test_deco_titles keeps the full check). Disabled for this opt-in
             # validation run only.
+            list(APPEND LUMEN_SANITIZER_EXCLUDES test_deco_titles_vk_validation)
             set_tests_properties(test_deco_titles_vk_validation PROPERTIES ENVIRONMENT
                 "${LUMEN_SANITIZER_ENV_VULKAN_ICD};ASAN_OPTIONS=${LUMEN_ASAN_OPTS}:alloc_dealloc_mismatch=0;LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
         endif()
@@ -1874,6 +1857,9 @@ if(LUMEN_BUILD_FUZZERS)
                 -max_total_time=10 -rss_limit_mb=2048)
     set_tests_properties(fuzz_wayland_dispatch_smoke PROPERTIES TIMEOUT 120
         ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    # Its full environment is set above; the base append below must not re-enable the
+    # leak check the Vulkan ICD variant turns off.
+    list(APPEND LUMEN_SANITIZER_EXCLUDES fuzz_wayland_dispatch_smoke)
 endif()
 
 # No test reads the user's configuration file (~/.config/lumen/config.toml): every test
@@ -1881,6 +1867,21 @@ endif()
 get_property(_lumen_tests DIRECTORY PROPERTY TESTS)
 if(_lumen_tests)
     set_property(TEST ${_lumen_tests} APPEND PROPERTY ENVIRONMENT "LUMEN_CONFIG=0")
+endif()
+
+# The sanitizer environment for every test, appended once here — after the last add_test,
+# so no per-test ENVIRONMENT assignment (a whole-list overwrite) can drop it silently.
+# This is what makes "the suppression files apply everywhere" true: a test that brings up
+# a graphics driver gets the third-party race suppressions without being remembered in a
+# list. The tests whose sanitizer environment is a different variant set their full
+# environment explicitly above and are listed in LUMEN_SANITIZER_EXCLUDES — appending the
+# base variant would re-enable the very check their variant turns off (the last
+# assignment of a variable wins).
+if(LUMEN_BUILD_TESTS AND LUMEN_SANITIZER_ENV)
+    if(LUMEN_SANITIZER_EXCLUDES)
+        list(REMOVE_ITEM _lumen_tests ${LUMEN_SANITIZER_EXCLUDES})
+    endif()
+    set_property(TEST ${_lumen_tests} APPEND PROPERTY ENVIRONMENT ${LUMEN_SANITIZER_ENV})
 endif()
 
 message(STATUS "Lumen ${PROJECT_VERSION} — C++${CMAKE_CXX_STANDARD} — ${CMAKE_CXX_COMPILER_ID}")
