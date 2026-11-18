@@ -99,6 +99,9 @@ struct wl_out {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     zwlr_output_manager_v1* manager = nullptr;
     zxdg_output_manager_v1* xom = nullptr;
@@ -204,9 +207,11 @@ const zxdg_output_v1_listener xdg_output_listener = {xo_position, xo_size, xo_do
 
 void bind_out(client& c, wl_out& o) {
     o.output = static_cast<wl_output*>(wl_registry_bind(c.registry, o.global, &wl_output_interface, 4));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(o.output));
     wl_output_add_listener(o.output, &output_listener, &o);
     if (c.xom) {
         o.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(o.xo));
         zxdg_output_v1_add_listener(o.xo, &xdg_output_listener, &o);
     }
 }
@@ -252,7 +257,25 @@ bool connect(client& c) {
 /// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
 /// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
 /// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
 void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.xom)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.xom));
+    if (c.manager)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.manager));
     if (c.registry)
         wl_registry_destroy(c.registry);
     wl_display_disconnect(c.display);
@@ -614,6 +637,7 @@ int main() {
             head_info* b = head_named(e, "Virtual-1");
             result r{};
             auto* cfg_obj = zwlr_output_manager_v1_create_configuration(e.manager, e.serial);
+            e.created.push_back(reinterpret_cast<wl_proxy*>(cfg_obj));
             zwlr_output_configuration_v1_add_listener(cfg_obj, &cfg_listener, &r);
             if (a && b) {
                 switch (ec.kind) {

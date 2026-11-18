@@ -57,6 +57,9 @@ void check(const char* name, bool ok, const std::string& detail = {}) {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
@@ -79,7 +82,27 @@ const wl_registry_listener registry_listener = {on_global, on_global_remove};
 /// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
 /// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
 /// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
 void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
     if (c.registry)
         wl_registry_destroy(c.registry);
     wl_display_disconnect(c.display);
@@ -140,6 +163,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -192,7 +216,9 @@ void settle(client& c, std::initializer_list<window*> windows) {
 void create_window(client& c, window& w, const char* app_id, xdg_toplevel* parent = nullptr,
                    int fixed = 0) {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
     xdg_toplevel_add_listener(w.toplevel, &toplevel_listener, &w);
@@ -224,10 +250,13 @@ void map_window(client& c, window& w, const char* app_id, std::initializer_list<
     (void)wl_display_roundtrip(c.display);
 }
 
-void destroy_window(window& w) {
+void destroy_window(client& c, window& w) {
     xdg_toplevel_destroy(w.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     w = {};
 }
 
@@ -441,8 +470,8 @@ void run_cases() {
                   order() == "c a b" && at("c", k_master, why) && at("a", k_stack_top, why),
               why + " dialog first configure " + std::to_string(d.first_width));
     }
-    destroy_window(d);
-    destroy_window(f);
+    destroy_window(c, d);
+    destroy_window(c, f);
     settle(c, {&a, &b, &w3});
 
     // Minimized: its place goes; back, it goes last.
@@ -513,7 +542,7 @@ void run_cases() {
     }
 
     // A window that goes leaves a gap the others close.
-    destroy_window(b);
+    destroy_window(c, b);
     settle(c, {&a, &w3});
     {
         std::string why;
@@ -544,8 +573,8 @@ void run_cases() {
               why + " order " + order());
     }
 
-    destroy_window(a);
-    destroy_window(w3);
+    destroy_window(c, a);
+    destroy_window(c, w3);
     settle(c, {});
     check("no protocol error", wl_display_get_error(c.display) == 0);
     disconnect(c);

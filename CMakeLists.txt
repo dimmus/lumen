@@ -1816,11 +1816,32 @@ if(LUMEN_BUILD_TESTS)
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout test_downsample
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    # Bringing up an EGL display leaks the dri2 driver's process-lifetime globals; on
+    # this toolchain those frames symbolize to Mesa source paths, so no object-name
+    # leak: pattern can match them (the Vulkan ICD's "<unknown module>" case below with
+    # a different reason). Same concession, same scope: these tests only.
+    set(lumen_gl_display_tests "")
+    foreach(gl_display_test IN ITEMS test_gl_capture test_backdrop_blur test_color_management)
+        if(TEST ${gl_display_test})
+            list(APPEND lumen_gl_display_tests ${gl_display_test})
+        endif()
+    endforeach()
+    if(lumen_gl_display_tests)
+        set_tests_properties(${lumen_gl_display_tests} PROPERTIES ENVIRONMENT
+            "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp;ASAN_OPTIONS=${LUMEN_ASAN_OPTS};LSAN_OPTIONS=detect_leaks=0;UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
+    endif()
     if(TARGET test_deco_titles)
         set_tests_properties(test_deco_titles PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
         if(TEST test_deco_titles_vk_validation)
+            # The validation layer embeds SPIRV-Tools, whose internal std::stable_sort
+            # allocates its temp buffer with nothrow operator new and frees it with
+            # operator delete — ASan classifies that third-party pair as an
+            # alloc-dealloc-mismatch and no object-name suppression exists for an ASan
+            # mismatch (every Lumen-owned pair of that shape is fixed; plain
+            # test_deco_titles keeps the full check). Disabled for this opt-in
+            # validation run only.
             set_tests_properties(test_deco_titles_vk_validation PROPERTIES ENVIRONMENT
-                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
+                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};ASAN_OPTIONS=${LUMEN_ASAN_OPTS}:alloc_dealloc_mismatch=0;LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
         endif()
     endif()
 endif()

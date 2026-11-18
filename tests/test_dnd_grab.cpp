@@ -111,11 +111,22 @@ struct fixture {
         grab.set_ops(ops);
     }
 
+    /// What a client's wl_surface destroy does in production: drop every surface the
+    /// fixture made (make_root's container_node is freed only on remove_surface).
+    ~fixture() {
+        for (unsigned i = made_count_; i-- > 0;)
+            tree.remove_surface(made_[i]);
+    }
+
+    lx::surface_id made_[64]{};
+    unsigned made_count_ = 0;
+
     /// A root surface with w x h content, made a drag icon.
     lx::surface_id icon(unsigned n, int w, int h) {
         const lx::surface_id s = sid(n);
         LUMEN_CHECK(surfaces.register_surface(s, nullptr));
         LUMEN_CHECK(tree.add_surface(s));
+        made_[made_count_ < 64 ? made_count_++ : 63] = s;
         const lx::buffer_id b{next_buffer++};
         surfaces.register_shm(b, static_cast<unsigned>(w), static_cast<unsigned>(h),
                               static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));
@@ -176,6 +187,7 @@ struct wm_fixture : fixture {
         const lx::surface_id s = sid(n);
         LUMEN_CHECK(surfaces.register_surface(s, &res_a));
         LUMEN_CHECK(tree.add_surface(s));
+        made_[made_count_ < 64 ? made_count_++ : 63] = s;
         const lx::buffer_id b{next_buffer++};
         surfaces.register_shm(b, static_cast<unsigned>(w), static_cast<unsigned>(h),
                               static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));

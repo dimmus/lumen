@@ -89,6 +89,9 @@ void check(bool ok, const char* what) {
 
 struct conn {
     wl_display* display = nullptr;
+    /// Proxies this connection created; disconnect destroys them (libwayland 1.26
+    /// frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_compositor* compositor = nullptr;
     wl_shm* shm = nullptr;
     wl_seat* seat = nullptr;
@@ -203,9 +206,12 @@ wl_buffer* make_buffer(conn& c, int w, int h) {
 
 void map_window(conn& c, window& w, const char* title) {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_toplevel_set_app_id(w.toplevel, "test-app");
     xdg_toplevel_set_title(w.toplevel, title);
     wl_surface_commit(w.surface);
@@ -216,10 +222,45 @@ void map_window(conn& c, window& w, const char* title) {
     (void)wl_display_roundtrip(c.display);
 }
 
+/// Destroys what the connection created, then the globals and the display (libwayland
+/// 1.26 frees no remaining proxy at wl_display_disconnect).
+void disconnect(conn& c) {
+    if (c.display)
+        (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue;
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.shell)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shell));
+    if (c.layer_shell)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.layer_shell));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.seat)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.seat));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    wl_display_disconnect(c.display);
+}
+
+/// Takes a proxy off the tracked list after its typed destroy ran.
+void untrack(conn& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
 void unmap_window(conn& c, window& w) {
     xdg_toplevel_destroy(w.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     (void)wl_display_roundtrip(c.display);
 }
 
@@ -510,7 +551,8 @@ int main() {
     panel.destroy();
     bridge.detach();
     zlm_shell_v1_destroy(sh.shell);
-    wl_display_disconnect(sh.display);
+    sh.shell = nullptr;
+    disconnect(sh);
     static lx::shell::policy_bridge again;
     conn sh2{};
     sh2.bridge = &again;
@@ -548,7 +590,7 @@ int main() {
           "a shell bound at v2 cannot grab keys (not_implemented)");
     again.detach();
     zlm_shell_v1_destroy(sh2.shell);
-    wl_display_disconnect(sh2.display);
+    disconnect(sh2);
 
     // ── Version 4: key grabs ──
     static lx::shell::policy_bridge v4;
@@ -692,10 +734,10 @@ int main() {
         check(state_count == 3 && states[2] == 0 && wl_display_get_error(locker.display) == 0,
               "v5: lock_state unlocked when the locker gives up before locking");
         check(g_kb.enters == enters_before + 1, "unlocked: the application has the keyboard again");
-        wl_display_disconnect(locker.display);
+        disconnect(locker);
         v5.detach();
         zlm_shell_v1_destroy(sh5.shell);
-        wl_display_disconnect(sh5.display);
+        disconnect(sh5);
     }
 #endif
 
@@ -771,9 +813,12 @@ int main() {
         (void)wl_display_roundtrip(app.display);
         // A modal dialog of it.
         dlg.surface = wl_compositor_create_surface(app.compositor);
+        app.created.push_back(reinterpret_cast<wl_proxy*>(dlg.surface));
         dlg.xdg = xdg_wm_base_get_xdg_surface(app.wm_base, dlg.surface);
+        app.created.push_back(reinterpret_cast<wl_proxy*>(dlg.xdg));
         xdg_surface_add_listener(dlg.xdg, &xdg_listener, &dlg);
         dlg.toplevel = xdg_surface_get_toplevel(dlg.xdg);
+        app.created.push_back(reinterpret_cast<wl_proxy*>(dlg.toplevel));
         xdg_toplevel_set_title(dlg.toplevel, "the-dialog");
         xdg_toplevel_set_parent(dlg.toplevel, main_w.toplevel);
         xdg_dialog_v1_set_modal(xdg_wm_dialog_v1_get_xdg_dialog(dialogs, dlg.toplevel));
@@ -821,10 +866,10 @@ int main() {
               "v6: the snapshot carries icons and parents");
         again.detach();
         zlm_shell_v1_destroy(sh6b.shell);
-        wl_display_disconnect(sh6b.display);
+        disconnect(sh6b);
         v6.detach();
         zlm_shell_v1_destroy(sh6.shell);
-        wl_display_disconnect(sh6.display);
+        disconnect(sh6);
     }
 #endif
 
@@ -1203,7 +1248,7 @@ int main() {
         }
         v7.detach();
         zlm_shell_v1_destroy(sh7.shell);
-        wl_display_disconnect(sh7.display);
+        disconnect(sh7);
     }
     if (!cfg_path.empty()) {
         std::remove(cfg_path.c_str());
@@ -1212,10 +1257,10 @@ int main() {
 
     v4.detach();
     zlm_shell_v1_destroy(sh3.shell);
-    wl_display_disconnect(sh3.display);
+    disconnect(sh3);
     wl_keyboard_destroy(kb);
-    wl_display_disconnect(app.display);
-    wl_display_disconnect(app2.display);
+    disconnect(app);
+    disconnect(app2);
     pump.store(false, std::memory_order_release);
     pump_thread.join();
     std::printf("%d checks, %d failed\n", g_ran, g_failed);

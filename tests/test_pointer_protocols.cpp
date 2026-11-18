@@ -55,6 +55,9 @@ std::mutex* g_lock = nullptr;
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
@@ -95,7 +98,29 @@ bool connect(client& c) {
 /// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
 /// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
 /// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
 void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.seat)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.seat));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
     if (c.registry)
         wl_registry_destroy(c.registry);
     wl_display_disconnect(c.display);
@@ -126,9 +151,14 @@ void* bind_global(client& c, const wl_interface* iface, uint32_t version) {
     wl_registry* r = wl_display_get_registry(c.display);
     wl_registry_add_listener(r, &listener, &f);
     (void)wl_display_roundtrip(c.display);
-    if (!f.name)
+    if (!f.name) {
+        wl_registry_destroy(r);
         return nullptr;
-    return wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+    }
+    void* bound = wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+    c.created.push_back(static_cast<wl_proxy*>(bound));
+    wl_registry_destroy(r); // this helper's own registry proxy
+    return bound;
 }
 
 struct outcome {
@@ -189,6 +219,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
     }
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_ARGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -209,7 +240,9 @@ struct window {
 
 void map_window(client& c, window& w, const char* app_id, int width = 300, int height = 200) {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
     xdg_toplevel_set_app_id(w.toplevel, app_id);
@@ -377,12 +410,15 @@ struct pointer_client {
     zwp_relative_pointer_manager_v1* relative = nullptr;
     window w{};
     lx::rect2i geometry{};
+
+    ~pointer_client() { disconnect(c); }
 };
 
 bool open_pointer_client(pointer_client& p, const char* app_id) {
     if (!connect(p.c) || !p.c.seat)
         return false;
     p.pointer = wl_seat_get_pointer(p.c.seat);
+    p.c.created.push_back(reinterpret_cast<wl_proxy*>(p.pointer));
     wl_pointer_add_listener(p.pointer, &ptr_listener, &p.log);
     p.constraints = static_cast<zwp_pointer_constraints_v1*>(
         bind_global(p.c, &zwp_pointer_constraints_v1_interface, 1));
@@ -391,6 +427,7 @@ bool open_pointer_client(pointer_client& p, const char* app_id) {
     if (!p.constraints || !p.relative)
         return false;
     auto* rel = zwp_relative_pointer_manager_v1_get_relative_pointer(p.relative, p.pointer);
+    p.c.created.push_back(reinterpret_cast<wl_proxy*>(rel));
     zwp_relative_pointer_v1_add_listener(rel, &relative_listener, &p.log);
     map_window(p.c, p.w, app_id);
     settle(p.c);
@@ -431,7 +468,9 @@ void error_cases() {
                auto* m = static_cast<zwp_pointer_constraints_v1*>(
                    bind_global(c, &zwp_pointer_constraints_v1_interface, 1));
                wl_pointer* p = wl_seat_get_pointer(c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                (void)zwp_pointer_constraints_v1_lock_pointer(
                    m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
                (void)zwp_pointer_constraints_v1_confine_pointer(
@@ -442,18 +481,23 @@ void error_cases() {
                auto* m = static_cast<zwp_pointer_constraints_v1*>(
                    bind_global(c, &zwp_pointer_constraints_v1_interface, 1));
                wl_pointer* p = wl_seat_get_pointer(c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                zwp_locked_pointer_v1_destroy(zwp_pointer_constraints_v1_lock_pointer(
                    m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT));
                auto* conf = zwp_pointer_constraints_v1_confine_pointer(
                    m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
                // An unknown lifetime is taken as oneshot (no error defined for it).
                wl_surface* s2 = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s2));
                (void)zwp_pointer_constraints_v1_lock_pointer(m, s2, p, nullptr, 7);
                wl_surface_destroy(s);
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                // Inert after its surface went: requests are harmless.
                zwp_confined_pointer_v1_set_region(conf, nullptr);
                zwp_confined_pointer_v1_destroy(conf);
+               untrack(c, reinterpret_cast<wl_proxy*>(conf));
            });
 }
 
@@ -558,6 +602,7 @@ void lock_cases() {
     wl_surface_commit(p.w.surface);
     settle(p.c);
     zwp_locked_pointer_v1_destroy(lock);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(lock));
     settle(p.c);
     // Window geometry may include no offset here (no CSD): the surface origin is the geometry's.
     const bool warped = std::fabs(p.log.last_x - 40) < 0.01 && std::fabs(p.log.last_y - 25) < 0.01;
@@ -584,7 +629,9 @@ void lock_cases() {
     check("lock: a spent oneshot does not block a new constraint",
           wl_display_get_error(p.c.display) == 0, "");
     zwp_confined_pointer_v1_destroy(again);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(again));
     zwp_locked_pointer_v1_destroy(once);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(once));
     settle(p.c);
 
     // Relative motion goes only to the pointer focus's client.
@@ -648,6 +695,7 @@ void confine_cases() {
           "client position " + std::to_string(p.log.last_x) + "," + std::to_string(p.log.last_y));
     // Destroyed: free again.
     zwp_confined_pointer_v1_destroy(conf);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(conf));
     settle(p.c);
     inject_rel(200, 0, 200, 0);
     settle(p.c);
@@ -661,13 +709,17 @@ void confine_cases() {
     zwp_confined_pointer_v1_add_listener(conf2, &confined_listener, &l2);
     settle(p.c);
     xdg_toplevel_destroy(p.w.toplevel);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(p.w.toplevel));
     xdg_surface_destroy(p.w.xdg);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(p.w.xdg));
     wl_surface_destroy(p.w.surface);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(p.w.surface));
     settle(p.c);
     check("confine: its surface destroyed — unconfined, then inert",
           l2.confined == 1 && l2.unconfined == 1 && wl_display_get_error(p.c.display) == 0,
           "confined " + std::to_string(l2.confined) + " unconfined " + std::to_string(l2.unconfined));
     zwp_confined_pointer_v1_destroy(conf2);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(conf2));
     settle(p.c);
     wl_display_disconnect(p.c.display);
     park_pointer();
@@ -797,6 +849,7 @@ void staged_region_case() {
         return;
     }
     wl_surface* child = wl_compositor_create_surface(p.c.compositor);
+    p.c.created.push_back(reinterpret_cast<wl_proxy*>(child));
     wl_subsurface* ss = wl_subcompositor_get_subsurface(sub, child, p.w.surface);
     wl_subsurface_set_position(ss, 0, 0);
     wl_surface_attach(child, make_buffer(p.c, 200, 150), 0, 0);
@@ -837,8 +890,11 @@ void staged_region_case() {
               std::fabs(p.log.last_y - (50 - 1.0 / 256.0)) < 0.01,
           "client position " + std::to_string(p.log.last_x) + "," + std::to_string(p.log.last_y));
     zwp_confined_pointer_v1_destroy(conf);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(conf));
     wl_subsurface_destroy(ss);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(ss));
     wl_surface_destroy(child);
+    untrack(p.c, reinterpret_cast<wl_proxy*>(child));
     settle(p.c);
     park_pointer();
 }

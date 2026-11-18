@@ -731,6 +731,38 @@ Any test that starts a compositor can reach this through
 `compositor_impl::setup_gl_present`, which is the reason the file is applied suite-wide
 rather than to a hand-maintained list of GL tests.
 
+### LSan — `libfontconfig.so` and `libsystemd`
+
+Two more object-scoped entries, both verified by the same protocol as the Mesa ones
+(every leak matched, nothing remaining, across 12 runs; the run without the file
+fails; a deliberate first-party leak — the canary — is still reported with the file
+active):
+
+- `leak:libfontconfig.so` — parsing fontconfig's own system configuration (at `FcInit`,
+  reached from `lx.text`'s face_cache exactly the way the EGL entries are reached from
+  `compositor_impl::setup_gl_present`) allocates pattern state fontconfig keeps for the
+  process lifetime. The allocations themselves are all in fontconfig/expat frames;
+  Lumen appears only as the caller. Reproduce: `LSAN_OPTIONS= ./build/asan/test_font_matches`.
+- `leak:libsystemd` — sd-varlink/sd-event objects retain references past full teardown.
+  Proven third-party by a standalone program with no Lumen code (a varlink server, one
+  connection and an sd-event loop, shutdown/detach/unref in `control_server`'s exact
+  order) leaking the same all-indirect shape `test_control` reports; every leaked byte
+  is allocated inside libsystemd. Reproduce: `LSAN_OPTIONS= ./build/asan/test_control`.
+
+### ASan/LSan — the two documented per-test concessions of this class
+
+- The EGL-display tests (`test_gl_capture`, `test_backdrop_blur`,
+  `test_color_management`) run with `detect_leaks=0`: the dri2 driver's
+  process-lifetime display globals (allocated inside `dri2_display_create`) are
+  reached exactly like the Vulkan ICD case, but their frames symbolize to Mesa
+  source paths, so no object-name `leak:` pattern can match them — the blunt
+  instrument is the only scoping left, and it applies to these tests only.
+- `test_deco_titles_vk_validation` runs with `alloc_dealloc_mismatch=0`: the
+  validation layer embeds SPIRV-Tools, whose `std::stable_sort` temp buffer is
+  the same nothrow-new/delete pair libstdc++ trips ASan with (see the Lumen-side
+  fix that replaced every first-party `stable_sort`); no object-name suppression
+  exists for an ASan mismatch. Plain `test_deco_titles` keeps the full check.
+
 ### LSan — `detect_leaks=0` for the Vulkan ICD
 
 lavapipe leaks 224 bytes in 4 allocations of per-thread state, because the driver is

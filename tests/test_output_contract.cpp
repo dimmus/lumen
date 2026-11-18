@@ -99,6 +99,9 @@ struct client {
     xdg_wm_base* wm_base = nullptr;
     wl_shm* shm = nullptr;
     zxdg_output_manager_v1* xom = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     uint32_t output_name = 0;
     uint32_t output_version = 0;
     uint32_t xom_version = 3;
@@ -201,7 +204,31 @@ bool connect(client& c, uint32_t xom_version = 3) {
 /// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
 /// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
 /// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
 void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.xom)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.xom));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.subcompositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.subcompositor));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
     if (c.registry)
         wl_registry_destroy(c.registry);
     wl_display_disconnect(c.display);
@@ -211,6 +238,7 @@ void bind_output(client& c, output_info& o, uint32_t version = 4) {
     o.output = static_cast<wl_output*>(wl_registry_bind(
         c.registry, c.output_name, &wl_output_interface,
         version < c.output_version ? version : c.output_version));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(o.output));
     wl_output_add_listener(o.output, &output_listener, &o);
 }
 
@@ -224,6 +252,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
     wl_shm_pool_destroy(pool);
     close(fd);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     return b;
 }
 
@@ -245,10 +274,13 @@ struct window {
 /// A mapped 300x200 toplevel with a surface listener.
 void map_window(client& c, window& w) {
     w.info.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.info.surface));
     wl_surface_add_listener(w.info.surface, &surface_listener, &w.info);
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.info.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
     wl_surface_commit(w.info.surface);
     (void)wl_display_roundtrip(c.display);
     xdg_surface_ack_configure(w.xdg, w.cfg.serial);
@@ -351,6 +383,7 @@ int main() {
 
             xdg_output_info x{};
             x.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(x.xo));
             zxdg_output_v1_add_listener(x.xo, &xdg_output_listener, &x);
             (void)wl_display_roundtrip(c.display);
             check(x.x == g_want.x && x.y == g_want.y && x.w == g_want.lw && x.h == g_want.lh,
@@ -372,6 +405,7 @@ int main() {
             (void)wl_display_roundtrip(c.display);
             xdg_output_info x{};
             x.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(x.xo));
             zxdg_output_v1_add_listener(x.xo, &xdg_output_listener, &x);
             (void)wl_display_roundtrip(c.display);
             check(x.dones == 1 && o.dones == 1 && x.name == g_want.name,
@@ -417,9 +451,11 @@ int main() {
             // Subsurface with content: enter as it maps (with the parent's next commit).
             surface_info sub{};
             sub.surface = wl_compositor_create_surface(c.compositor);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(sub.surface));
             wl_surface_add_listener(sub.surface, &surface_listener, &sub);
             wl_subsurface* ss =
                 wl_subcompositor_get_subsurface(c.subcompositor, sub.surface, w.info.surface);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(ss));
             wl_subsurface_set_position(ss, 10, 10);
             wl_surface_attach(sub.surface, make_buffer(c, 40, 40), 0, 0);
             wl_surface_commit(sub.surface);
@@ -429,6 +465,7 @@ int main() {
             // A popup of the window.
             surface_info pop{};
             pop.surface = wl_compositor_create_surface(c.compositor);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(pop.surface));
             wl_surface_add_listener(pop.surface, &surface_listener, &pop);
             xdg_surface* pxs = xdg_wm_base_get_xdg_surface(c.wm_base, pop.surface);
             configured pcfg{};
@@ -438,6 +475,7 @@ int main() {
             xdg_positioner_set_anchor_rect(pos, 5, 5, 10, 10);
             xdg_popup* popup = xdg_surface_get_popup(pxs, w.xdg, pos);
             xdg_positioner_destroy(pos);
+            untrack(c, reinterpret_cast<wl_proxy*>(pos));
             wl_surface_commit(pop.surface);
             (void)wl_display_roundtrip(c.display);
             xdg_surface_ack_configure(pxs, pcfg.serial);
@@ -446,8 +484,11 @@ int main() {
             (void)wl_display_roundtrip(c.display);
             check(pop.events == "+", "a mapped popup gets wl_surface.enter");
             xdg_popup_destroy(popup);
+            untrack(c, reinterpret_cast<wl_proxy*>(popup));
             xdg_surface_destroy(pxs);
+            untrack(c, reinterpret_cast<wl_proxy*>(pxs));
             wl_surface_destroy(pop.surface);
+            untrack(c, reinterpret_cast<wl_proxy*>(pop.surface));
             // Unmap the window: leave for it and its subsurface.
             wl_surface_attach(w.info.surface, nullptr, 0, 0);
             wl_surface_commit(w.info.surface);
