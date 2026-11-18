@@ -678,14 +678,18 @@ symbol name. `race_top:pthread_mutex_destroy` would silence the driver, but Lume
 `std::mutex` lowers to exactly that symbol, so a real "destroyed while another thread held
 it" bug would disappear with it.
 
-Both suppression files apply to every test (`LUMEN_SANITIZER_ENV` in `CMakeLists.txt`).
-That is safe precisely because they match on object name: a test that never loads a
+Both suppression files apply to every test: `CMakeLists.txt` APPENDS the sanitizer
+environment to every test once, after the last `add_test` (`ENVIRONMENT` is a whole-list
+property — a per-test assignment elsewhere replaces the entire list, which is exactly how
+five TSan-red tests once ran with no `TSAN_OPTIONS` at all while their own checks passed).
+That is safe precisely because the files match on object name: a test that never loads a
 graphics driver matches nothing, and a test that later grows a compositor gets the right
 behavior without anyone having to remember to add it to a list.
 
-Only the blunt instrument is opt-in — `LUMEN_SANITIZER_ENV_VULKAN_ICD`, which turns the
-leak check off outright and is applied to just `test_dmabuf_composite` and
-`test_kms_vulkan_scanout`.
+Only the blunt instruments are opt-in, and each is spelled out as a full per-test
+environment in `LUMEN_SANITIZER_EXCLUDES` (see the concessions section at the end of this
+file): `LUMEN_SANITIZER_ENV_VULKAN_ICD`-style `detect_leaks=0` for the tests whose ICD or
+EGL display cannot be matched by object name, and one `alloc_dealloc_mismatch=0`.
 
 ### TSan — `tests/sanitizers/tsan.supp`
 
@@ -702,6 +706,21 @@ any racing access; Lumen appears only at `#2`+ in the thread-creation stack, bec
 `race:libvulkan_lvp.so` is the narrowest form that works. `called_from_lib:` does not
 suppress these — the reports come from TSan's pthread interceptors rather than from
 instrumented driver code (verified: 4/4 runs still failed).
+
+Three more entries of the same class, each verified by the same protocol (protocol logs
+under `evidence/2026-11-18-sanitizer-sweep/suppression-protocol/`):
+
+- `race:libvulkan_intel_hasvk.so` — the hasvk analog of the lavapipe entry:
+  `util_queue_thread_func` (u_queue.c:300) destroys a `pthread_barrier_t` its own worker
+  threads still wait on. Observed in six tests of the TSan baseline; every racing frame
+  inside `libvulkan_intel_hasvk.so`, Lumen only as the device-selection caller.
+- `race:libVkLayer_khronos_validation.so` — the validation layer's chassis `DestroyFence`
+  races its own `Fence::Retire` worker (vulkan_layer_chassis.cpp vs
+  state_tracker/fence_state.cpp). Both sides inside the layer; Lumen is the API caller
+  (`test_*_vk_validation` only).
+- `race:libgallium` — ralloc freeing context state races driver-internal access on Mesa's
+  own threads (`ralloc.c` `unsafe_free`); the same Mesa-version-in-filename prefix scoping
+  as the LSan entry below. Reached by the GL-composite tests.
 
 Confirm the suppression is still doing exactly its job, and nothing more:
 
@@ -749,7 +768,21 @@ active):
   order) leaking the same all-indirect shape `test_control` reports; every leaked byte
   is allocated inside libsystemd. Reproduce: `LSAN_OPTIONS= ./build/asan/test_control`.
 
+The ≥12-run, load-bearing and canary results for both entries (and the three TSan
+entries above) are recorded in
+`evidence/2026-11-18-sanitizer-sweep/suppression-protocol/` — each entry's file holds the
+12 passing runs, the failing run with the suppression removed, and the canary (a
+deliberate race/leak in a standalone program) still reported with the file active.
+
 ### ASan/LSan — the two documented per-test concessions of this class
+
+Both are deviations from the object-name-only rule and were accepted as a conscious gate
+decision, not silently: no `leak:`/mismatch pattern can match frames that symbolize to
+source paths inside a driver (`<unknown module>` after the ICD's dlclose, Mesa source
+paths for the EGL display), so the blunt instrument scoped to the few affected tests is
+the narrowest suppression that exists. Every other check stays active for those tests,
+the rest of the suite keeps full detection, and if a way to scope by object name appears
+(e.g. a future ASan `mismatch:` module pattern), these should be retried first.
 
 - The EGL-display tests (`test_gl_capture`, `test_backdrop_blur`,
   `test_color_management`) run with `detect_leaks=0`: the dri2 driver's
