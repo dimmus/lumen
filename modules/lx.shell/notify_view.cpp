@@ -805,7 +805,7 @@ lx::ui::child lx::shell::notification_view::build_ui() {
     // The "+n more" line under the waiting ones (a label; the canvas took no clicks on it).
     if (layout_.more > 0) {
         char text[32];
-        std::snprintf(text, sizeof(text), "+%u more", layout_.more);
+        *std::format_to_n(text, sizeof(text) - 1, "+{} more", layout_.more).out = '\0';
         const lx::ui::child line[1] = {notify_text(text, k_body_color, k_button_font, 0x6200u)};
         lx::ui::quad_style q{};
         q.background = shell_color(k_more_bg);

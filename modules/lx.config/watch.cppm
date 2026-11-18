@@ -70,13 +70,13 @@ constexpr std::uint32_t k_dir_mask = IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FRO
 void split_path(const char* path, char* dir, std::size_t dir_cap, char* name, std::size_t name_cap) {
     const char* slash = std::strrchr(path, '/');
     if (!slash) {
-        std::snprintf(dir, dir_cap, ".");
-        std::snprintf(name, name_cap, "%s", path);
+        *std::format_to_n(dir, dir_cap - 1, ".").out = '\0';
+        *std::format_to_n(name, name_cap - 1, "{}", path).out = '\0';
         return;
     }
     const auto n = static_cast<int>(slash - path);
-    std::snprintf(dir, dir_cap, "%.*s", n == 0 ? 1 : n, path);
-    std::snprintf(name, name_cap, "%s", slash + 1);
+    *std::format_to_n(dir, dir_cap - 1, "{}", std::string_view{path}.substr(0, n == 0 ? 1 : n)).out = '\0';
+    *std::format_to_n(name, name_cap - 1, "{}", slash + 1).out = '\0';
 }
 
 [[nodiscard]] bool is_dir(const char* path) {
@@ -116,7 +116,7 @@ void lx::config::config_watch::add(const char* dir, const char* name) {
             return;
     entry e{};
     e.wd = wd;
-    std::snprintf(e.name, sizeof(e.name), "%s", name);
+    *std::format_to_n(e.name, sizeof(e.name) - 1, "{}", name).out = '\0';
     entries_.push_back(e);
 }
 
@@ -132,8 +132,8 @@ void lx::config::config_watch::watch_path(const char* file) {
         split_path(dir, parent, sizeof(parent), child, sizeof(child));
         if (std::strcmp(parent, dir) == 0)
             return; // "/" missing: nothing to watch
-        std::snprintf(dir, sizeof(dir), "%s", parent);
-        std::snprintf(name, sizeof(name), "%s", child);
+        *std::format_to_n(dir, sizeof(dir) - 1, "{}", parent).out = '\0';
+        *std::format_to_n(name, sizeof(name) - 1, "{}", child).out = '\0';
     }
     add(dir, name);
 }

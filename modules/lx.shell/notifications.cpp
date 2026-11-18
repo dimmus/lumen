@@ -888,8 +888,10 @@ bool lx::shell::save_shell_state(const char* path, const shell_state& s) {
     if (fd < 0)
         return false;
     char buf[64];
-    const int n = std::snprintf(buf, sizeof(buf), "next-id %u\ndnd %u\n", s.next_id, s.dnd ? 1u : 0u);
-    const bool ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n;
+    const auto seg = std::format_to_n(buf, sizeof(buf) - 1, "next-id {}\ndnd {}\n", s.next_id,
+                                      s.dnd ? 1u : 0u);
+    *seg.out = '\0';
+    const bool ok = seg.size > 0 && ::write(fd, buf, seg.size) == seg.size;
     ::close(fd);
     if (!ok || std::rename(tmp.c_str(), path) != 0) {
         (void)::unlink(tmp.c_str());

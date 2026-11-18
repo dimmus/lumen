@@ -120,7 +120,7 @@ lx::drm::kms_mode to_mode(const cvt_result& t, lx::drm::cvt_blanking blanking) {
         (static_cast<unsigned long long>(mi.clock) * 1'000'000ull / mi.htotal + mi.vtotal / 2) /
         mi.vtotal;
     mi.vrefresh = static_cast<unsigned>((mhz + 500) / 1000);
-    std::snprintf(mi.name, sizeof(mi.name), "%ux%u", t.h_active, t.v_active);
+    *std::format_to_n(mi.name, sizeof(mi.name) - 1, "{}x{}", t.h_active, t.v_active).out = '\0';
     m.width = t.h_active;
     m.height = t.v_active;
     m.refresh_mhz = static_cast<unsigned>(mhz);

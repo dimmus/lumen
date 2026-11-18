@@ -966,7 +966,7 @@ const struct ext_foreign_toplevel_image_capture_source_manager_v1_interface
                 if (t) {
                     s->kind = capture_source_kind::toplevel;
                     s->toplevel = t;
-                    std::snprintf(s->identifier, sizeof(s->identifier), "%s", identifier);
+                    *std::format_to_n(s->identifier, sizeof(s->identifier) - 1, "{}", identifier).out = '\0';
                 }
             },
         .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },

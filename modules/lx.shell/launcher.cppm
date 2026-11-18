@@ -759,8 +759,7 @@ lx::ui::child lx::shell::launcher::build_ui() {
         unsigned m = 0;
         if (icon_px > 0 && !e->icon.empty()) {
             char icon_name[128];
-            std::snprintf(icon_name, sizeof(icon_name), "%.*s",
-                          static_cast<int>(e->icon.size()), e->icon.data());
+            *std::format_to_n(icon_name, sizeof(icon_name) - 1, "{}", e->icon).out = '\0';
             if (const lx::gfx::atlas_tile_id tile = icon_tile(icon_name, icon_px); tile.valid())
                 inside[m++] = lx::ui::image(surface_.atlas(), tile, {icon_px, icon_px},
                                             0x8200'0000u + i);
@@ -816,9 +815,8 @@ lx::ui::child lx::shell::launcher::build_ui() {
         if (layout_.notice) {
             text = notice_;
         } else {
-            std::snprintf(line, sizeof(line),
-                          layout_.total == 1 ? "%u application" : "%u applications",
-                          layout_.total);
+            *std::format_to_n(line, sizeof(line) - 1, "{} application{}", layout_.total,
+                              layout_.total == 1 ? "" : "s").out = '\0';
         }
         lx::ui::child status = lx::ui::label(text)
                                    .size(lx::ui::label_size::small)
@@ -856,7 +854,7 @@ void lx::shell::launcher::set_notice(const char* text) {
     const char* t = text ? text : "";
     if (std::strcmp(t, notice_) == 0)
         return;
-    std::snprintf(notice_, sizeof(notice_), "%s", t);
+    *std::format_to_n(notice_, sizeof(notice_) - 1, "{}", t).out = '\0';
     ++notice_rev_;
     dirty_ = true;
 }
@@ -1020,7 +1018,7 @@ lx::gfx::atlas_tile_id lx::shell::launcher::icon_tile(const char* name, int px) 
     if (!made)
         return {};
     icon_slot& s = free_slot ? *free_slot : icon_slots_[0];
-    std::snprintf(s.name, sizeof(s.name), "%s", name);
+    *std::format_to_n(s.name, sizeof(s.name) - 1, "{}", name).out = '\0';
     s.px = px;
     s.tile = made.value();
     return s.tile;

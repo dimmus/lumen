@@ -145,7 +145,7 @@ void append_string(std::string& out, std::string_view s) {
         default:
             if (uc < 0x20 || uc == 0x7f) {
                 char esc[8];
-                std::snprintf(esc, sizeof(esc), "\\u%04x", uc);
+                *std::format_to_n(esc, sizeof(esc) - 1, "\\u{:04x}", uc).out = '\0';
                 out += esc;
             } else {
                 out += c;
@@ -165,7 +165,7 @@ void append_value(std::string& out, const lx::config::edit_value& v,
         return;
     case kind::integer: {
         char buf[24];
-        std::snprintf(buf, sizeof(buf), "%lld", v.i);
+        *std::format_to_n(buf, sizeof(buf) - 1, "{}", v.i).out = '\0';
         out += buf;
         return;
     }

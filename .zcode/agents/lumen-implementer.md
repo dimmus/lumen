@@ -21,6 +21,14 @@ Rules of the stage:
   conventions and stub style.
 - **No unasked surface**: no new config keys, env vars, or user-facing features the task
   did not request.
+- **Logging and errors** (AGENTS.md §4.2/§4.3): log through the file's `constexpr
+  lx::trace::category` with compile-time-checked `std::format` calls; a bounded fill of a
+  fixed `char` array uses `std::format_to_n` (the `lx.config/diagnostics.cppm` `addf` /
+  `lx.app/clipboard.cpp` idiom) — never `snprintf` into a stack buffer. `error.message` is
+  a static string literal; dynamic detail goes in the log line, not the error. The only
+  printf-family calls to keep are commented renders of a foreign library's run-time printf
+  format (e.g. xkbcommon's log callback) — the same documented exception as
+  `lx.foundation`'s `format_error_into`.
 - **Tests**: new functionality gets focused tests that exercise it (unit tests in the
   tests-enabled build; smoke-visible behavior gets smoke-script coverage when the task
   says so). Run narrow checks yourself (`ninja -C <build> <target>`, single ctest tests);

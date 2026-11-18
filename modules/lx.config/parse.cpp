@@ -82,9 +82,9 @@ struct parse_state {
 /// "section.key" into `out`.
 void full_key(const char* section, const char* key, char* out, std::size_t cap) {
     if (section && *section)
-        std::snprintf(out, cap, "%s.%s", section, key);
+        *std::format_to_n(out, cap - 1, "{}.{}", section, key).out = '\0';
     else
-        std::snprintf(out, cap, "%s", key);
+        *std::format_to_n(out, cap - 1, "{}", key).out = '\0';
 }
 
 /// The value as the file wrote it, for a message: strings quoted and cut at 64 bytes.
@@ -93,15 +93,22 @@ void quote_value(const toml::value& v, char* out, std::size_t cap) {
     case toml::value::kind::string: {
         const std::size_t n = std::strlen(v.str);
         if (n > 64)
-            std::snprintf(out, cap, "\"%.61s...\"", v.str);
+            *std::format_to_n(out, cap - 1, "\"{}...\"",
+                              std::string_view{v.str}.substr(0, 61)).out = '\0';
         else
-            std::snprintf(out, cap, "\"%s\"", v.str);
+            *std::format_to_n(out, cap - 1, "\"{}\"", v.str).out = '\0';
         return;
     }
-    case toml::value::kind::integer: std::snprintf(out, cap, "%lld", v.integer); return;
-    case toml::value::kind::floating: std::snprintf(out, cap, "%g", v.floating); return;
-    case toml::value::kind::boolean: std::snprintf(out, cap, "%s", v.boolean ? "true" : "false"); return;
-    case toml::value::kind::array: std::snprintf(out, cap, "[%u items]", v.count); return;
+    case toml::value::kind::integer:
+        *std::format_to_n(out, cap - 1, "{}", v.integer).out = '\0';
+        return;
+    case toml::value::kind::floating:
+        *std::format_to_n(out, cap - 1, "{:.6g}", v.floating).out = '\0';
+        return;
+    case toml::value::kind::boolean:
+        *std::format_to_n(out, cap - 1, "{}", v.boolean ? "true" : "false").out = '\0';
+        return;
+    case toml::value::kind::array: *std::format_to_n(out, cap - 1, "[{} items]", v.count).out = '\0'; return;
     }
     if (cap)
         out[0] = '\0';
@@ -112,24 +119,31 @@ void format_field(value_kind kind, const void* p, const char* const* names, unsi
                   char* out, std::size_t cap) {
     switch (kind) {
     case value_kind::boolean:
-        std::snprintf(out, cap, "%s", *static_cast<const bool*>(p) ? "true" : "false");
+        *std::format_to_n(out, cap - 1, "{}",
+                          *static_cast<const bool*>(p) ? "true" : "false").out = '\0';
         return;
-    case value_kind::integer: std::snprintf(out, cap, "%d", *static_cast<const int*>(p)); return;
+    case value_kind::integer:
+        *std::format_to_n(out, cap - 1, "{}", *static_cast<const int*>(p)).out = '\0';
+        return;
     case value_kind::number: {
         char buf[32];
         auto r = std::to_chars(buf, buf + sizeof(buf) - 1, *static_cast<const double*>(p));
         *r.ptr = '\0';
-        std::snprintf(out, cap, "%s", buf);
+        *std::format_to_n(out, cap - 1, "{}", buf).out = '\0';
         return;
     }
-    case value_kind::string: std::snprintf(out, cap, "\"%.60s\"", static_cast<const char*>(p)); return;
+    case value_kind::string:
+        *std::format_to_n(out, cap - 1, "\"{}\"",
+                          std::string_view{static_cast<const char*>(p)}.substr(0, 60)).out = '\0';
+        return;
     case value_kind::enumeration:
-        std::snprintf(out, cap, "%s",
-                      enum_word(names, name_count, *static_cast<const unsigned char*>(p)));
+        *std::format_to_n(out, cap - 1, "{}",
+                          enum_word(names, name_count,
+                                    *static_cast<const unsigned char*>(p))).out = '\0';
         return;
     case value_kind::string_list: {
         const auto* w = static_cast<const workspace_settings*>(p);
-        std::snprintf(out, cap, "[%u names]", w->name_count);
+        *std::format_to_n(out, cap - 1, "[{} names]", w->name_count).out = '\0';
         return;
     }
     }
@@ -141,7 +155,8 @@ void copy_field(value_kind kind, void* dst, const void* src, unsigned capacity) 
     case value_kind::integer: *static_cast<int*>(dst) = *static_cast<const int*>(src); break;
     case value_kind::number: *static_cast<double*>(dst) = *static_cast<const double*>(src); break;
     case value_kind::string:
-        std::snprintf(static_cast<char*>(dst), capacity, "%s", static_cast<const char*>(src));
+        *std::format_to_n(static_cast<char*>(dst), capacity - 1, "{}",
+                          static_cast<const char*>(src)).out = '\0';
         break;
     case value_kind::enumeration:
         *static_cast<unsigned char*>(dst) = *static_cast<const unsigned char*>(src);
@@ -173,30 +188,32 @@ bool store_value(const field_ref& f, const toml::value& v, void* dst, char* why,
     switch (f.kind) {
     case value_kind::boolean:
         if (v.type != toml::value::kind::boolean) {
-            std::snprintf(why, cap, "must be true or false (got %s)", got);
+            *std::format_to_n(why, cap - 1, "must be true or false (got {})", got).out = '\0';
             return false;
         }
         *static_cast<bool*>(dst) = v.boolean;
         return true;
     case value_kind::integer:
         if (v.type != toml::value::kind::integer) {
-            std::snprintf(why, cap, "must be a whole number (got %s)", got);
+            *std::format_to_n(why, cap - 1, "must be a whole number (got {})", got).out = '\0';
             return false;
         }
         if (static_cast<double>(v.integer) < f.lo || static_cast<double>(v.integer) > f.hi) {
-            std::snprintf(why, cap, "%s is outside %g..%g", got, f.lo, f.hi);
+            *std::format_to_n(why, cap - 1, "{} is outside {:.6g}..{:.6g}", got, f.lo,
+                              f.hi).out = '\0';
             return false;
         }
         *static_cast<int*>(dst) = static_cast<int>(v.integer);
         return true;
     case value_kind::number: {
         if (!v.is_number()) {
-            std::snprintf(why, cap, "must be a number (got %s)", got);
+            *std::format_to_n(why, cap - 1, "must be a number (got {})", got).out = '\0';
             return false;
         }
         const double d = v.number();
         if (!std::isfinite(d) || d < f.lo || d > f.hi) {
-            std::snprintf(why, cap, "%s is outside %g..%g", got, f.lo, f.hi);
+            *std::format_to_n(why, cap - 1, "{} is outside {:.6g}..{:.6g}", got, f.lo,
+                              f.hi).out = '\0';
             return false;
         }
         *static_cast<double*>(dst) = d;
@@ -204,27 +221,28 @@ bool store_value(const field_ref& f, const toml::value& v, void* dst, char* why,
     }
     case value_kind::string: {
         if (v.type != toml::value::kind::string) {
-            std::snprintf(why, cap, "must be a string (got %s)", got);
+            *std::format_to_n(why, cap - 1, "must be a string (got {})", got).out = '\0';
             return false;
         }
         if (std::strlen(v.str) + 1 > f.capacity) {
-            std::snprintf(why, cap, "is longer than %u bytes", f.capacity - 1);
+            *std::format_to_n(why, cap - 1, "is longer than {} bytes", f.capacity - 1).out = '\0';
             return false;
         }
-        std::snprintf(static_cast<char*>(dst), f.capacity, "%s", v.str);
+        *std::format_to_n(static_cast<char*>(dst), f.capacity - 1, "{}", v.str).out = '\0';
         return true;
     }
     case value_kind::enumeration: {
         char choices[128] = "";
         std::size_t n = 0;
         for (unsigned i = 0; i < f.name_count; ++i) {
-            const int w = std::snprintf(choices + n, sizeof(choices) - n, "%s%s", i ? ", " : "",
-                                        f.names[i]);
-            if (w > 0)
-                n = std::min(sizeof(choices) - 1, n + static_cast<std::size_t>(w));
+            const auto seg = std::format_to_n(choices + n, sizeof(choices) - n - 1, "{}{}",
+                                             i ? ", " : "", f.names[i]);
+            *seg.out = '\0';
+            if (seg.size > 0)
+                n = std::min(sizeof(choices) - 1, n + seg.size);
         }
         if (v.type != toml::value::kind::string) {
-            std::snprintf(why, cap, "must be one of %s (got %s)", choices, got);
+            *std::format_to_n(why, cap - 1, "must be one of {} (got {})", choices, got).out = '\0';
             return false;
         }
         for (unsigned i = 0; i < f.name_count; ++i) {
@@ -238,35 +256,38 @@ bool store_value(const field_ref& f, const toml::value& v, void* dst, char* why,
             if (edit_distance(v.str, f.names[i], 2) <= 2)
                 near = f.names[i];
         if (near)
-            std::snprintf(why, cap, "%s is not one of %s (did you mean %s?)", got, choices, near);
+            *std::format_to_n(why, cap - 1, "{} is not one of {} (did you mean {}?)", got, choices,
+                              near).out = '\0';
         else
-            std::snprintf(why, cap, "%s is not one of %s", got, choices);
+            *std::format_to_n(why, cap - 1, "{} is not one of {}", got, choices).out = '\0';
         return false;
     }
     case value_kind::string_list: {
         auto* w = static_cast<workspace_settings*>(dst);
         if (v.type != toml::value::kind::array) {
-            std::snprintf(why, cap, "must be an array of strings (got %s)", got);
+            *std::format_to_n(why, cap - 1, "must be an array of strings (got {})",
+                              got).out = '\0';
             return false;
         }
         if (v.count > workspace_settings::k_max_names) {
-            std::snprintf(why, cap, "has %u names, at most %u", v.count,
-                          workspace_settings::k_max_names);
+            *std::format_to_n(why, cap - 1, "has {} names, at most {}", v.count,
+                              workspace_settings::k_max_names).out = '\0';
             return false;
         }
         for (unsigned i = 0; i < v.count; ++i) {
             if (v.items[i].type != toml::value::kind::string) {
-                std::snprintf(why, cap, "must be an array of strings");
+                *std::format_to_n(why, cap - 1, "must be an array of strings").out = '\0';
                 return false;
             }
             if (std::strlen(v.items[i].str) + 1 > f.capacity) {
-                std::snprintf(why, cap, "has a name longer than %u bytes", f.capacity - 1);
+                *std::format_to_n(why, cap - 1, "has a name longer than {} bytes",
+                                  f.capacity - 1).out = '\0';
                 return false;
             }
         }
         w->name_count = v.count;
         for (unsigned i = 0; i < v.count; ++i)
-            std::snprintf(w->names[i], sizeof(w->names[i]), "%s", v.items[i].str);
+            *std::format_to_n(w->names[i], sizeof(w->names[i]) - 1, "{}", v.items[i].str).out = '\0';
         return true;
     }
     }
@@ -405,7 +426,7 @@ void on_output(parse_state& st, const char* key, const toml::value& v) {
                          "(\"make model serial\") or \"*\"");
             return;
         }
-        std::snprintf(st.output.name, sizeof(st.output.name), "%s", v.str);
+        *std::format_to_n(st.output.name, sizeof(st.output.name) - 1, "{}", v.str).out = '\0';
         return;
     }
     if (std::strcmp(key, "render-scale") == 0) {
@@ -428,7 +449,7 @@ void on_output(parse_state& st, const char* key, const toml::value& v) {
 void add_binding(parse_state& st, const char* key_text, unsigned line, const char* action_text,
                  const char* argument_text, unsigned char options) {
     char fk[96];
-    std::snprintf(fk, sizeof(fk), "bindings.%s", key_text);
+    *std::format_to_n(fk, sizeof(fk) - 1, "bindings.{}", key_text).out = '\0';
     combo c{};
     const char* error = nullptr;
     if (!parse_combo(key_text, c, error)) {
@@ -537,13 +558,12 @@ void binding_from_string(parse_state& st, const char* key, const char* text) {
     char argument[32]{};
     const std::size_t sp = s.find(' ');
     const std::string_view a = s.substr(0, sp);
-    std::snprintf(action, sizeof(action), "%.*s", static_cast<int>(a.size()), a.data());
+    *std::format_to_n(action, sizeof(action) - 1, "{}", a).out = '\0';
     if (sp != std::string_view::npos) {
         std::string_view rest = s.substr(sp + 1);
         while (!rest.empty() && rest.front() == ' ')
             rest.remove_prefix(1);
-        std::snprintf(argument, sizeof(argument), "%.*s", static_cast<int>(rest.size()),
-                      rest.data());
+        *std::format_to_n(argument, sizeof(argument) - 1, "{}", rest).out = '\0';
     }
     add_binding(st, key, st.line, action, argument, 0);
 }
@@ -556,7 +576,7 @@ bool on_table(void* user, const char* name, bool array, toml::parse_error& err) 
     finish_device(st);
     finish_output(st);
     st.ptr = nullptr;
-    std::snprintf(st.section, sizeof(st.section), "%s", name);
+    *std::format_to_n(st.section, sizeof(st.section) - 1, "{}", name).out = '\0';
     const std::string_view n{name};
     if (array) {
         if (n == "input.device") {
@@ -694,20 +714,21 @@ bool on_key_value(void* user, const char* key, const toml::value& v, toml::parse
         if (st.in.ignored)
             return true;
         char fk[128];
-        std::snprintf(fk, sizeof(fk), "bindings.%s.%s", st.in.key, key);
+        *std::format_to_n(fk, sizeof(fk) - 1, "bindings.{}.{}", st.in.key, key).out = '\0';
         const std::string_view k{key};
         if (k == "action") {
             if (v.type != toml::value::kind::string) {
                 st.diag->add(severity::error, st.layer, st.line, fk, "must be an action name");
                 return true;
             }
-            std::snprintf(st.in.action, sizeof(st.in.action), "%s", v.str);
+            *std::format_to_n(st.in.action, sizeof(st.in.action) - 1, "{}", v.str).out = '\0';
             st.in.have_action = true;
         } else if (k == "argument") {
             if (v.type == toml::value::kind::integer)
-                std::snprintf(st.in.argument, sizeof(st.in.argument), "%lld", v.integer);
+                *std::format_to_n(st.in.argument, sizeof(st.in.argument) - 1, "{}",
+                                  v.integer).out = '\0';
             else if (v.type == toml::value::kind::string)
-                std::snprintf(st.in.argument, sizeof(st.in.argument), "%s", v.str);
+                *std::format_to_n(st.in.argument, sizeof(st.in.argument) - 1, "{}", v.str).out = '\0';
             else
                 st.diag->add(severity::error, st.layer, st.line, fk,
                              "must be a number or a string");
@@ -779,7 +800,7 @@ bool on_key_value(void* user, const char* key, const toml::value& v, toml::parse
                              "status lists them)");
                 return true;
             }
-            std::snprintf(st.device.name, sizeof(st.device.name), "%s", v.str);
+            *std::format_to_n(st.device.name, sizeof(st.device.name) - 1, "{}", v.str).out = '\0';
             return true;
         }
         st.ptr_name = "device";
@@ -789,7 +810,7 @@ bool on_key_value(void* user, const char* key, const toml::value& v, toml::parse
     case section_kind::bindings:
         if (v.type != toml::value::kind::string) {
             char fk[96];
-            std::snprintf(fk, sizeof(fk), "bindings.%s", key);
+            *std::format_to_n(fk, sizeof(fk) - 1, "bindings.{}", key).out = '\0';
             st.diag->add(severity::error, st.layer, st.line, fk,
                          "must be \"action [argument]\" or { action = \"…\", … }; binding "
                          "ignored");
@@ -809,7 +830,7 @@ bool on_inline(void* user, const char* key, bool begin, toml::parse_error& err) 
         st.in = inline_state{};
         st.in.open = true;
         st.in.line = err.line;
-        std::snprintf(st.in.key, sizeof(st.in.key), "%s", key);
+        *std::format_to_n(st.in.key, sizeof(st.in.key) - 1, "{}", key).out = '\0';
         if (st.kind != section_kind::bindings) {
             st.in.ignored = true;
             if (st.kind != section_kind::unknown) {
@@ -827,7 +848,7 @@ bool on_inline(void* user, const char* key, bool begin, toml::parse_error& err) 
         return true;
     if (!in.have_action) {
         char fk[96];
-        std::snprintf(fk, sizeof(fk), "bindings.%s", in.key);
+        *std::format_to_n(fk, sizeof(fk) - 1, "bindings.{}", in.key).out = '\0';
         st.diag->add(severity::error, st.layer, in.line, fk,
                      "a binding table needs action = \"…\"; binding ignored");
         return true;
@@ -844,8 +865,7 @@ bool config_text::add_layer(std::string_view path, std::string_view content) {
     if (layers.size() == k_max_layers)
         return false;
     layer_info info{};
-    std::snprintf(info.path, sizeof(info.path), "%.*s", static_cast<int>(path.size()),
-                  path.data());
+    *std::format_to_n(info.path, sizeof(info.path) - 1, "{}", path).out = '\0';
     bytes.append(k_layer_marker);
     bytes.append(info.path);
     bytes.push_back('\n');
@@ -877,8 +897,7 @@ config_text split_layers(std::string_view bytes) {
             }
             cur = layer_info{};
             const std::string_view p = line.substr(k_layer_marker.size());
-            std::snprintf(cur.path, sizeof(cur.path), "%.*s", static_cast<int>(p.size()),
-                          p.data());
+            *std::format_to_n(cur.path, sizeof(cur.path) - 1, "{}", p).out = '\0';
             cur.begin = line_end < size ? line_end + 1 : size;
             open = true;
         } else if (!open) {
@@ -964,6 +983,8 @@ void xkb_log(struct xkb_context* ctx, enum xkb_log_level level, const char* form
     auto* cap = static_cast<xkb_capture*>(xkb_context_get_user_data(ctx));
     if (!cap || cap->first[0] || level > XKB_LOG_LEVEL_ERROR)
         return;
+    // xkbcommon hands a printf format at run time; this bounded, non-allocating render of
+    // foreign text is the same documented exception as lx.foundation's format_error_into.
     std::vsnprintf(cap->first, sizeof(cap->first), format, args);
     // One line, no trailing newline.
     for (char* p = cap->first; *p; ++p)

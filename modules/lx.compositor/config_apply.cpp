@@ -120,8 +120,7 @@ bool env_reexports::theme_changed(std::string_view resolved) const {
 }
 
 void env_reexports::theme_sent(std::string_view resolved) {
-    std::snprintf(theme_, sizeof(theme_), "%.*s", static_cast<int>(resolved.size()),
-                  resolved.data());
+    *std::format_to_n(theme_, sizeof(theme_) - 1, "{}", resolved).out = '\0';
 }
 
 void env_reexports::theme_forget() { theme_[0] = '\0'; }
@@ -132,15 +131,17 @@ config_state::~config_state() = default;
 void config_state::init(cfg::env_lookup env) {
     location_ = cfg::locate_config(env);
     if (location_.disabled)
-        std::snprintf(source_, sizeof(source_), "(none: LUMEN_CONFIG=0)");
+        *std::format_to_n(source_, sizeof(source_) - 1, "(none: LUMEN_CONFIG=0)").out = '\0';
     else if (const char* home = std::getenv("HOME");
              home && *home && std::strncmp(location_.user_file.path, home, std::strlen(home)) == 0 &&
              location_.user_file.path[std::strlen(home)] == '/')
-        std::snprintf(source_, sizeof(source_), "~%s", location_.user_file.path + std::strlen(home));
+        *std::format_to_n(source_, sizeof(source_) - 1, "~{}",
+                          location_.user_file.path + std::strlen(home)).out = '\0';
     else
-        std::snprintf(source_, sizeof(source_), "%s", location_.user_file.path);
+        *std::format_to_n(source_, sizeof(source_) - 1, "{}", location_.user_file.path).out = '\0';
     if (!location_.disabled)
-        std::snprintf(defaults_, sizeof(defaults_), "built-in defaults (no %s)", source_);
+        *std::format_to_n(defaults_, sizeof(defaults_) - 1, "built-in defaults (no {})",
+                          source_).out = '\0';
     (void)watch_.open(location_);
 }
 

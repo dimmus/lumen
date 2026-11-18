@@ -103,7 +103,7 @@ unsigned toplevel_icon_table::create(const char* name) {
         e.used = true;
         e.refs = 1;
         if (name)
-            std::snprintf(e.name, sizeof(e.name), "%s", name);
+            *std::format_to_n(e.name, sizeof(e.name) - 1, "{}", name).out = '\0';
         ++live_;
         return i + 1;
     }

@@ -445,9 +445,10 @@ bool lx::text::face_cache::init_ft_locked() {
                     if (char* slash = std::strrchr(exe, '/'))
                         *slash = '\0';
                 char rel[k_face_path_bytes]{};
-                const int w = std::snprintf(rel, sizeof(rel), "%s/%s", exe,
-                                            LUMEN_FONT_DIR_INSTALL_RELATIVE);
-                if (w > 0 && static_cast<std::size_t>(w) < sizeof(rel) && is_dir(rel))
+                const auto seg = std::format_to_n(rel, sizeof(rel) - 1, "{}/{}", exe,
+                                                  LUMEN_FONT_DIR_INSTALL_RELATIVE);
+                *seg.out = '\0';
+                if (seg.size > 0 && seg.size < sizeof(rel) && is_dir(rel))
                     copy_cut(candidate, k_face_path_bytes, rel);
             }
         }
@@ -913,10 +914,13 @@ std::string path_identity(const std::string& path) {
     if (::stat(path.c_str(), &st) != 0)
         return "-";
     char line[96];
-    std::snprintf(line, sizeof line, "%llu %lld %lld %lld",
-                  static_cast<unsigned long long>(st.st_ino), static_cast<long long>(st.st_size),
-                  static_cast<long long>(st.st_mtim.tv_sec) * 1'000'000'000ll + st.st_mtim.tv_nsec,
-                  static_cast<long long>(st.st_ctim.tv_sec) * 1'000'000'000ll + st.st_ctim.tv_nsec);
+    *std::format_to_n(line, sizeof(line) - 1, "{} {} {} {}",
+                      static_cast<unsigned long long>(st.st_ino),
+                      static_cast<long long>(st.st_size),
+                      static_cast<long long>(st.st_mtim.tv_sec) * 1'000'000'000ll +
+                          st.st_mtim.tv_nsec,
+                      static_cast<long long>(st.st_ctim.tv_sec) * 1'000'000'000ll +
+                          st.st_ctim.tv_nsec).out = '\0';
     return line;
 }
 
@@ -925,8 +929,8 @@ constexpr std::string_view k_match_magic = "lumen-font-matches 2 ";
 
 std::string match_header(std::uint64_t inputs) {
     char header[64];
-    std::snprintf(header, sizeof header, "%.*s%016llx\n", static_cast<int>(k_match_magic.size()),
-                  k_match_magic.data(), static_cast<unsigned long long>(inputs));
+    *std::format_to_n(header, sizeof(header) - 1, "{}{:016x}\n", k_match_magic,
+                      static_cast<unsigned long long>(inputs)).out = '\0';
     return header;
 }
 
@@ -1012,8 +1016,9 @@ bool lx::text::write_font_matches(const char* path, std::uint64_t inputs,
             !clean(m.matched_family))
             return false;
         char nums[48];
-        std::snprintf(nums, sizeof nums, "m %d %d %d ", m.weight == weight::bold ? 1 : 0,
-                      m.style == style::italic ? 1 : 0, m.index);
+        *std::format_to_n(nums, sizeof(nums) - 1, "m {} {} {} ",
+                          m.weight == weight::bold ? 1 : 0,
+                          m.style == style::italic ? 1 : 0, m.index).out = '\0';
         text += nums + m.family + '\t' + m.file + '\t' + m.matched_family + '\n';
     }
     // mkdir -p of the directories above the file; one that fails fails the open below.
@@ -1064,7 +1069,7 @@ std::uint64_t lx::text::face_cache::store_inputs_locked() const {
     };
 #ifdef LUMEN_HAS_TEXT
     char version[16];
-    std::snprintf(version, sizeof version, "%d", FcGetVersion());
+    *std::format_to_n(version, sizeof(version) - 1, "{}", FcGetVersion()).out = '\0';
     mix(version);
     // What each request is matched with besides its family.
     for (const char* family : {lx::text::k_ui_family, lx::text::k_mono_family})

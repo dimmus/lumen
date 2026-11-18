@@ -352,13 +352,15 @@ void lx::shell::app_catalog::scan() {
             if (wd >= 0)
                 parents.push_back(wd);
         }
-        const int n = std::snprintf(path, sizeof(path), "%s/applications", base->c_str());
-        if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(path))
+        const auto seg = std::format_to_n(path, sizeof(path) - 1, "{}/applications",
+                                          base->c_str());
+        *seg.out = '\0';
+        if (seg.size >= sizeof(path))
             continue;
         const int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0)
             continue;
-        walk(w, fd, path, static_cast<std::size_t>(n), prefix, 0, 0);
+        walk(w, fd, path, seg.size, prefix, 0, 0);
     }
 
     std::vector<unsigned> listed;
@@ -483,11 +485,11 @@ void lx::shell::app_catalog::choose_terminal() {
             return false;
         terminal_.found = true;
         terminal_.entry = -1;
-        std::snprintf(terminal_.argv0, sizeof(terminal_.argv0), "%.*s",
-                      static_cast<int>(argv0.size()), argv0.data());
+        *std::format_to_n(terminal_.argv0, sizeof(terminal_.argv0) - 1, "{}",
+                          argv0).out = '\0';
         std::memcpy(terminal_.program, resolved, sizeof(resolved));
-        std::snprintf(terminal_.exec_flag, sizeof(terminal_.exec_flag), "%s", flag);
-        std::snprintf(terminal_.source, sizeof(terminal_.source), "%s", source);
+        *std::format_to_n(terminal_.exec_flag, sizeof(terminal_.exec_flag) - 1, "{}", flag).out = '\0';
+        *std::format_to_n(terminal_.source, sizeof(terminal_.source) - 1, "{}", source).out = '\0';
         return true;
     };
     if (raw(cfg_.terminal_env, "-e", "$TERMINAL"))
@@ -510,10 +512,9 @@ void lx::shell::app_catalog::choose_terminal() {
         terminal_.entry = static_cast<int>(i);
         const std::string_view flag = e.terminal_arg_exec.empty() ? std::string_view{"-e"}
                                                                    : e.terminal_arg_exec;
-        std::snprintf(terminal_.exec_flag, sizeof(terminal_.exec_flag), "%.*s",
-                      static_cast<int>(flag.size()), flag.data());
-        std::snprintf(terminal_.source, sizeof(terminal_.source), "%.*s",
-                      static_cast<int>(e.id.size()), e.id.data());
+        *std::format_to_n(terminal_.exec_flag, sizeof(terminal_.exec_flag) - 1, "{}",
+                          flag).out = '\0';
+        *std::format_to_n(terminal_.source, sizeof(terminal_.source) - 1, "{}", e.id).out = '\0';
     };
     for (std::string_view want : k_terminal_preference)
         for (unsigned i = 0; i < entries_.size(); ++i)

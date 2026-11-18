@@ -428,7 +428,7 @@ public:
     void workspaces_changed() { dirty_ = true; }
     /// The output's name, for the log.
     void set_output_name(const char* name) {
-        std::snprintf(output_name_, sizeof(output_name_), "%s", name ? name : "");
+        *std::format_to_n(output_name_, sizeof(output_name_) - 1, "{}", name ? name : "").out = '\0';
     }
     /// Where task icons come from (none: letter tiles).
     void set_icons(panel_icons icons) {
@@ -1460,7 +1460,7 @@ void lx::shell::panel::relayout() {
     panel_clock clock = widgets_.clock ? widgets_.clock(widgets_.user) : panel_clock{};
     clock.flags |= (clock_hovered_ ? bell_flag_hover : 0u) |
                    (clock_pressed_ ? bell_flag_pressed : 0u);
-    std::snprintf(clock_text_, sizeof(clock_text_), "%s", clock.text);
+    *std::format_to_n(clock_text_, sizeof(clock_text_) - 1, "{}", clock.text).out = '\0';
     layout_panel(bridge_->model(), width(), k_panel_height, pointer_x_, pointer_y_, pressed_,
                  next_, panel_logout{bridge_->can_logout(), logout_pressed_},
                  panel_apps{apps_shown_, apps_open_, apps_pressed_},
@@ -1581,14 +1581,15 @@ lx::ui::child lx::shell::panel::build_ui() {
         line[0] = '\0';
         for (unsigned i = 0; i < l.ws_count && i < ws_input_.count; ++i) {
             const unsigned f = l.ws[i].flags;
-            const int w = std::snprintf(line + n, sizeof(line) - n, "%s%s%s%s%s", i ? " " : "",
-                                        ws_input_.items[i].name,
-                                        (f & ws_cell_active) ? "*" : "",
-                                        (f & ws_cell_occupied) ? "+" : "",
-                                        (f & ws_cell_urgent) ? "!" : "");
-            if (w <= 0 || n + static_cast<unsigned>(w) >= sizeof(line))
+            const auto seg = std::format_to_n(line + n, sizeof(line) - n - 1, "{}{}{}{}{}",
+                                             i ? " " : "", ws_input_.items[i].name,
+                                             (f & ws_cell_active) ? "*" : "",
+                                             (f & ws_cell_occupied) ? "+" : "",
+                                             (f & ws_cell_urgent) ? "!" : "");
+            *seg.out = '\0';
+            if (seg.size == 0 || n + static_cast<unsigned>(seg.size) >= sizeof(line))
                 break;
-            n += static_cast<unsigned>(w);
+            n += static_cast<unsigned>(seg.size);
         }
         if (std::strcmp(line, ws_logged_) != 0) {
             std::memcpy(ws_logged_, line, sizeof(line));
@@ -1745,7 +1746,7 @@ lx::ui::child lx::shell::panel::build_ui() {
         }
         if (l.hidden) {
             char more[16];
-            std::snprintf(more, sizeof(more), "+%u", l.hidden);
+            *std::format_to_n(more, sizeof(more) - 1, "+{}", l.hidden).out = '\0';
             const lx::ui::child text = panel_text(more, k_text_more, false, 0x7400u);
             kids[n++] = lx::ui::styled(
                 lx::ui::style{}
@@ -1828,7 +1829,8 @@ lx::ui::child lx::shell::panel::build_ui() {
             lx::ui::style{}.flex_none().flex_row().items_center(), bell[0]);
         if (l.bell_unread > 0) {
             char count[8];
-            std::snprintf(count, sizeof(count), "%u", l.bell_unread > 999 ? 999u : l.bell_unread);
+            *std::format_to_n(count, sizeof(count) - 1, "{}",
+                              l.bell_unread > 999 ? 999u : l.bell_unread).out = '\0';
             const lx::ui::child label = panel_text(count, k_text_focused, true, 0x7600u);
             parts[k++] = panel_box(
                 lx::ui::style{}.flex_none().h(lx::layout::px(16.f))
@@ -1936,7 +1938,7 @@ void lx::shell::panel::set_notice(const char* text) {
     const char* t = text ? text : "";
     if (std::strcmp(t, notice_) == 0)
         return;
-    std::snprintf(notice_, sizeof(notice_), "%s", t);
+    *std::format_to_n(notice_, sizeof(notice_) - 1, "{}", t).out = '\0';
     ++notice_rev_;
     dirty_ = true;
 }

@@ -114,7 +114,7 @@ void token_set_app_id(wl_client*, wl_resource* resource, const char* app_id) {
     token_builder* b = builder_from(resource);
     if (!b || b->committed)
         return;
-    std::snprintf(b->app_id, sizeof(b->app_id), "%s", app_id ? app_id : "");
+    *std::format_to_n(b->app_id, sizeof(b->app_id) - 1, "{}", app_id ? app_id : "").out = '\0';
 }
 
 void token_set_surface(wl_client*, wl_resource* resource, wl_resource* surface) {

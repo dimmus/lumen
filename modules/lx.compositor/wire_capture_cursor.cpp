@@ -427,7 +427,7 @@ void capture_cursor_session_create(wl_client* client, wl_resource* manager, uint
     wl_resource_set_implementation(res, &cursor_impl, c, &cursor_destroy_resource);
     const char* identifier = "";
     (void)capture_source_of(source, c->kind, c->slot, c->output, c->toplevel, identifier);
-    std::snprintf(c->identifier, sizeof(c->identifier), "%s", identifier);
+    *std::format_to_n(c->identifier, sizeof(c->identifier) - 1, "{}", identifier).out = '\0';
     bool linked = false;
     for (auto*& slot : g_cursors) {
         if (!slot) {

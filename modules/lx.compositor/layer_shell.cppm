@@ -558,7 +558,7 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
         r.output = output < k_max_outputs ? output : 0;
         r.pending.layer = layer;
         r.current.layer = layer;
-        std::snprintf(r.name_space, sizeof(r.name_space), "%s", name_space ? name_space : "");
+        *std::format_to_n(r.name_space, sizeof(r.name_space) - 1, "{}", name_space ? name_space : "").out = '\0';
         r.created_seq = next_seq_++;
         all_.push_back(i);
         tree_->set_root_tag(surface, 0);

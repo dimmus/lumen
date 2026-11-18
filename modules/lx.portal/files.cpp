@@ -110,8 +110,9 @@ std::string pictures_dir(const char* home, const char* config_home, const char* 
 
 std::string screenshot_stem(const std::tm& t) {
     char buf[64];
-    std::snprintf(buf, sizeof buf, "Screenshot from %04d-%02d-%02d %02d-%02d-%02d", t.tm_year + 1900,
-                  t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    *std::format_to_n(buf, sizeof(buf) - 1,
+                      "Screenshot from {:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.tm_year + 1900,
+                      t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec).out = '\0';
     return buf;
 }
 

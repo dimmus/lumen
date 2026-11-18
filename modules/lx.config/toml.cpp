@@ -32,7 +32,7 @@ struct reader {
     }
     bool error(const char* msg) {
         err->line = line;
-        std::snprintf(err->message, sizeof(err->message), "%s", msg);
+        *std::format_to_n(err->message, sizeof(err->message) - 1, "{}", msg).out = '\0';
         return false;
     }
     void skip_space() {
@@ -408,7 +408,7 @@ bool read_inline_table(reader& r, const char* key, unsigned key_line, const hand
 } // namespace
 
 void fail(parse_error& err, const char* message) {
-    std::snprintf(err.message, sizeof(err.message), "%s", message ? message : "invalid");
+    *std::format_to_n(err.message, sizeof(err.message) - 1, "{}", message ? message : "invalid").out = '\0';
 }
 
 bool parse(const char* text, std::size_t length, const handler& h, parse_error& err) {
@@ -551,7 +551,7 @@ void writer::put_string(const char* s) {
         default:
             if (uc < 0x20 || uc == 0x7f) {
                 char esc[8];
-                std::snprintf(esc, sizeof(esc), "\\u%04x", uc);
+                *std::format_to_n(esc, sizeof(esc) - 1, "\\u{:04x}", uc).out = '\0';
                 out_ += esc;
             } else {
                 out_ += *c;

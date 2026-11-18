@@ -124,7 +124,7 @@ const struct xdg_toplevel_icon_v1_interface icon_impl = {
                                        "the icon was already set on a toplevel");
                 return;
             }
-            std::snprintf(icon->name, sizeof(icon->name), "%s", name ? name : "");
+            *std::format_to_n(icon->name, sizeof(icon->name) - 1, "{}", name ? name : "").out = '\0';
         },
     .add_buffer =
         [](struct wl_client*, struct wl_resource* r, struct wl_resource* buffer, int32_t scale) {

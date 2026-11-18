@@ -587,8 +587,8 @@ bool lx::shell::tray_service::attach_raw(void* b) {
     }
     bus_ = b;
     watcher_slot_ = slot;
-    std::snprintf(host_name_, sizeof(host_name_), "org.kde.StatusNotifierHost-%d",
-                  static_cast<int>(::getpid()));
+    *std::format_to_n(host_name_, sizeof(host_name_) - 1, "org.kde.StatusNotifierHost-{}",
+                      static_cast<int>(::getpid())).out = '\0';
     // This shell is a host (the panel) whichever watcher there is.
     (void)registry_.add_host(host_name_);
     return true;
@@ -667,16 +667,16 @@ void lx::shell::tray_service::add_item(const std::string& bus, const std::string
     rec->service = bus + path;
     auto* b = static_cast<sd_bus*>(bus_);
     char match[600];
-    std::snprintf(match, sizeof(match),
-                  "type='signal',sender='%s',path='%s',interface='org.kde.StatusNotifierItem'",
-                  bus.c_str(), path.c_str());
+    *std::format_to_n(match, sizeof(match) - 1,
+                      "type='signal',sender='{}',path='{}',interface='org.kde.StatusNotifierItem'",
+                      bus, path).out = '\0';
     sd_bus_slot* slot = nullptr;
     if (sd_bus_add_match_async(b, &slot, match, events::item_signal, nullptr, rec.get()) >= 0)
         rec->signal_slot = slot;
-    std::snprintf(match, sizeof(match),
-                  "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',"
-                  "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='%s'",
-                  bus.c_str());
+    *std::format_to_n(match, sizeof(match) - 1,
+                      "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',"
+                      "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{}'",
+                      bus).out = '\0';
     slot = nullptr;
     if (sd_bus_add_match_async(b, &slot, match, events::item_owner, nullptr, rec.get()) >= 0)
         rec->owner_slot = slot;
@@ -764,10 +764,10 @@ void lx::shell::tray_service::go_remote() {
                                   nullptr, this) >= 0)
         remote_slot_[1] = slot;
     char match[256];
-    std::snprintf(match, sizeof(match),
-                  "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',"
-                  "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='%s'",
-                  k_watcher_name);
+    *std::format_to_n(match, sizeof(match) - 1,
+                      "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',"
+                      "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{}'",
+                      k_watcher_name).out = '\0';
     slot = nullptr;
     if (sd_bus_add_match_async(b, &slot, match, events::remote_owner, nullptr, this) >= 0)
         remote_slot_[2] = slot;
@@ -870,9 +870,9 @@ void lx::shell::tray_service::set_menu_shown(unsigned key) {
     if (!r || !bus_ || !r->has_menu())
         return;
     char match[600];
-    std::snprintf(match, sizeof(match),
-                  "type='signal',sender='%s',path='%s',interface='com.canonical.dbusmenu'",
-                  r->bus.c_str(), r->menu_path.c_str());
+    *std::format_to_n(match, sizeof(match) - 1,
+                      "type='signal',sender='{}',path='{}',interface='com.canonical.dbusmenu'",
+                      r->bus, r->menu_path).out = '\0';
     sd_bus_slot* slot = nullptr;
     if (sd_bus_add_match_async(static_cast<sd_bus*>(bus_), &slot, match, events::menu_changed,
                                nullptr, this) >= 0)

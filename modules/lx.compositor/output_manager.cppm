@@ -405,7 +405,7 @@ namespace {
 }
 
 void copy_str(char* dst, unsigned cap, const char* src) {
-    std::snprintf(dst, cap, "%s", src ? src : "");
+    *std::format_to_n(dst, cap - 1, "{}", src ? src : "").out = '\0';
 }
 
 } // namespace
@@ -659,15 +659,16 @@ void lx::compositor::monitor_identity(const char* name, const char* make_in,
         const char* serial_s = serial_in ? serial_in : "";
         const char* serial = serial_s[0] ? serial_s : "Unknown";
         if (identifier && identifier_size)
-            std::snprintf(identifier, identifier_size, "%s %s %s", make, model, serial);
+            *std::format_to_n(identifier, identifier_size - 1, "{} {} {}", make, model,
+                              serial).out = '\0';
         if (description && description_size)
-            std::snprintf(description, description_size, "%s %s%s%s (%s)", make, model,
-                          serial_s[0] ? " " : "", serial_s, nm);
+            *std::format_to_n(description, description_size - 1, "{} {}{}{} ({})", make, model,
+                              serial_s[0] ? " " : "", serial_s, nm).out = '\0';
     } else {
         if (identifier && identifier_size)
-            std::snprintf(identifier, identifier_size, "connector:%s", nm);
+            *std::format_to_n(identifier, identifier_size - 1, "connector:{}", nm).out = '\0';
         if (description && description_size)
-            std::snprintf(description, description_size, "%s", nm);
+            *std::format_to_n(description, description_size - 1, "{}", nm).out = '\0';
     }
 }
 
@@ -703,7 +704,8 @@ void lx::compositor::output_manager::make_identity(output_state& o, bool edid) {
         if (!live_[s] || &outputs_[s] == &o || std::strcmp(outputs_[s].identifier, o.identifier) != 0)
             continue;
         const std::size_t n = std::strlen(o.identifier);
-        std::snprintf(o.identifier + n, sizeof(o.identifier) - n, " connector:%s", o.name);
+        *std::format_to_n(o.identifier + n, sizeof(o.identifier) - n - 1, " connector:{}",
+                          o.name).out = '\0';
         break;
     }
 }
@@ -820,7 +822,7 @@ int lx::compositor::output_manager::add_virtual(const char* name, lx::rect2i lay
     output_desc d{};
     char generated[32];
     if (!name || !*name) {
-        std::snprintf(generated, sizeof(generated), "HEADLESS-%u", next_virtual_);
+        *std::format_to_n(generated, sizeof(generated) - 1, "HEADLESS-{}", next_virtual_).out = '\0';
         name = generated;
     }
     ++next_virtual_;

@@ -29,9 +29,9 @@ namespace {
 void notify_with_status(const char* head, const char* status) {
     char msg[320];
     if (status && *status)
-        std::snprintf(msg, sizeof(msg), "%s\nSTATUS=%s", head, status);
+        *std::format_to_n(msg, sizeof(msg) - 1, "{}\nSTATUS={}", head, status).out = '\0';
     else
-        std::snprintf(msg, sizeof(msg), "%s", head);
+        *std::format_to_n(msg, sizeof(msg) - 1, "{}", head).out = '\0';
     (void)sd_notify(0, msg);
 }
 #endif
@@ -52,9 +52,9 @@ void service_notifier::reloading(const char* status) {
     timespec ts{};
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
     char head[96];
-    std::snprintf(head, sizeof(head), "RELOADING=1\nMONOTONIC_USEC=%llu",
-                  static_cast<unsigned long long>(ts.tv_sec) * 1'000'000ull +
-                      static_cast<unsigned long long>(ts.tv_nsec) / 1000ull);
+    *std::format_to_n(head, sizeof(head) - 1, "RELOADING=1\nMONOTONIC_USEC={}",
+                      static_cast<unsigned long long>(ts.tv_sec) * 1'000'000ull +
+                          static_cast<unsigned long long>(ts.tv_nsec) / 1000ull).out = '\0';
     notify_with_status(head, status);
 #else
     (void)status;
@@ -74,7 +74,7 @@ void service_notifier::status(const char* status) {
     if (!status)
         return;
     char msg[288];
-    std::snprintf(msg, sizeof(msg), "STATUS=%s", status);
+    *std::format_to_n(msg, sizeof(msg) - 1, "STATUS={}", status).out = '\0';
     (void)sd_notify(0, msg);
 #else
     (void)status;

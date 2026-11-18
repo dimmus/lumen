@@ -748,12 +748,16 @@ private:
     const char* xdg = std::getenv("XDG_CACHE_HOME");
     int n = 0;
     if (xdg && *xdg) {
-        n = std::snprintf(out, sizeof out, "%s", xdg);
+        const auto seg = std::format_to_n(out, sizeof(out) - 1, "{}", xdg);
+        *seg.out = '\0';
+        n = static_cast<int>(seg.size);
     } else {
         const char* home = std::getenv("HOME");
         if (!home || !*home)
             return false;
-        n = std::snprintf(out, sizeof out, "%s/.cache", home);
+        const auto seg = std::format_to_n(out, sizeof(out) - 1, "{}/.cache", home);
+        *seg.out = '\0';
+        n = static_cast<int>(seg.size);
     }
     if (n <= 0 || static_cast<std::size_t>(n) >= sizeof out - 16)
         return false;
@@ -1014,13 +1018,14 @@ lx::result<void> lx::gfx::ui_vk_renderer::initialize(const vk_context& ctx,
 
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(phys, &props);
-    std::snprintf(caps_.device_name, sizeof caps_.device_name, "%s", props.deviceName);
+    *std::format_to_n(caps_.device_name, sizeof(caps_.device_name) - 1, "{}", props.deviceName).out = '\0';
     caps_.vendor_id = props.vendorID;
     caps_.device_id = props.deviceID;
     caps_.api_version = props.apiVersion;
     caps_.software = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
     for (unsigned i = 0; i < VK_UUID_SIZE; ++i)
-        std::snprintf(caps_.pipeline_cache_uuid + 2 * i, 3, "%02x", props.pipelineCacheUUID[i]);
+        *std::format_to_n(caps_.pipeline_cache_uuid + 2 * i, 2, "{:02x}",
+                          props.pipelineCacheUUID[i]).out = '\0';
     caps_.timestamp_period_ns = static_cast<double>(props.limits.timestampPeriod);
     if (props.limits.minUniformBufferOffsetAlignment > k_globals_stride ||
         props.limits.minStorageBufferOffsetAlignment > k_globals_stride)
@@ -1258,8 +1263,9 @@ lx::result<void> lx::gfx::ui_vk_renderer::initialize(const vk_context& ctx,
         if (options.pipeline_cache) {
             char dir[512];
             if (cache_dir(dir)) {
-                std::snprintf(caps_.pipeline_cache_path, sizeof caps_.pipeline_cache_path,
-                              "%s/pipeline-cache-%s.bin", dir, caps_.pipeline_cache_uuid);
+                *std::format_to_n(caps_.pipeline_cache_path, sizeof(caps_.pipeline_cache_path) - 1,
+                                  "{}/pipeline-cache-{}.bin", dir,
+                                  caps_.pipeline_cache_uuid).out = '\0';
                 caps_.pipeline_cache = true;
                 if (std::FILE* f = std::fopen(caps_.pipeline_cache_path, "rb")) {
                     if (std::fseek(f, 0, SEEK_END) == 0) {
@@ -1453,7 +1459,8 @@ void lx::gfx::ui_vk_renderer::save_pipeline_cache() {
         return;
     // A temporary renamed over the file: a reader never sees half a cache.
     char tmp[640];
-    std::snprintf(tmp, sizeof tmp, "%s.%d", caps_.pipeline_cache_path, static_cast<int>(::getpid()));
+    *std::format_to_n(tmp, sizeof(tmp) - 1, "{}.{}", caps_.pipeline_cache_path,
+                      static_cast<int>(::getpid())).out = '\0';
     std::FILE* out = std::fopen(tmp, "wb");
     if (!out)
         return;

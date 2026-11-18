@@ -222,7 +222,7 @@ int lx::shell::workspace_view::add_workspace(void* proxy) {
 void lx::shell::workspace_view::set_name(int w, const char* name) {
     if (const shell_workspace* e = get(w)) {
         (void)e;
-        std::snprintf(ws_[w].name, sizeof(ws_[w].name), "%s", name ? name : "");
+        *std::format_to_n(ws_[w].name, sizeof(ws_[w].name) - 1, "{}", name ? name : "").out = '\0';
         ++ws_[w].rev;
         dirty_ = true;
     }

@@ -443,7 +443,7 @@ void lx::trace::timeline_start_from_env() {
     }
     s.events = static_cast<tl_event*>(mem);
     s.capacity = cap;
-    std::snprintf(s.path, sizeof(s.path), "%s", path);
+    *std::format_to_n(s.path, sizeof(s.path) - 1, "{}", path).out = '\0';
     s.on.store(true, std::memory_order_release);
     log_trace.info("timeline recording to {} (up to {} events)", s.path, cap);
 #endif
@@ -458,20 +458,22 @@ void lx::trace::name_thread(const char* name) {
     // renaming it turned "lumen-compositor" into "lx-ui". The timeline still labels it.
     if (tid != static_cast<int>(::getpid())) {
         char os_name[16];
-        std::snprintf(os_name, sizeof(os_name), "%s", name); // the kernel keeps 15 bytes
+        // the kernel keeps 15 bytes
+        *std::format_to_n(os_name, sizeof(os_name) - 1, "{}", name).out = '\0';
         (void)pthread_setname_np(pthread_self(), os_name);
     }
     tl_state& s = tl();
     std::lock_guard lock{s.names_mutex};
     for (unsigned i = 0; i < s.name_count; ++i) {
         if (s.names[i].tid == tid) {
-            std::snprintf(s.names[i].name, sizeof(s.names[i].name), "%s", name);
+            *std::format_to_n(s.names[i].name, sizeof(s.names[i].name) - 1, "{}", name).out = '\0';
             return;
         }
     }
     if (s.name_count < 64) {
         s.names[s.name_count].tid = tid;
-        std::snprintf(s.names[s.name_count].name, sizeof(s.names[s.name_count].name), "%s", name);
+        *std::format_to_n(s.names[s.name_count].name, sizeof(s.names[s.name_count].name) - 1,
+                          "{}", name).out = '\0';
         ++s.name_count;
     }
 #else

@@ -191,7 +191,7 @@ void lx::config::keysym_name(unsigned sym, char* out, std::size_t cap) {
     out[0] = '\0';
     // xkbcommon names these Prior and Next (their first names); nobody writes that.
     if (sym == 0xff55 || sym == 0xff56) {
-        std::snprintf(out, cap, "%s", sym == 0xff55 ? "Page_Up" : "Page_Down");
+        *std::format_to_n(out, cap - 1, "{}", sym == 0xff55 ? "Page_Up" : "Page_Down").out = '\0';
         return;
     }
 #ifdef LUMEN_HAS_XKBCOMMON
@@ -199,20 +199,20 @@ void lx::config::keysym_name(unsigned sym, char* out, std::size_t cap) {
         out[0] = '\0';
 #else
     if ((sym >= 'a' && sym <= 'z') || (sym >= '0' && sym <= '9')) {
-        std::snprintf(out, cap, "%c", static_cast<char>(sym));
+        *std::format_to_n(out, cap - 1, "{}", static_cast<char>(sym)).out = '\0';
         return;
     }
     if (sym >= 0xffbe && sym <= 0xffd5) {
-        std::snprintf(out, cap, "F%u", sym - 0xffbe + 1);
+        *std::format_to_n(out, cap - 1, "F{}", sym - 0xffbe + 1).out = '\0';
         return;
     }
     for (const auto& k : k_fallback_keysyms) {
         if (k.sym == sym) {
-            std::snprintf(out, cap, "%s", k.name);
+            *std::format_to_n(out, cap - 1, "{}", k.name).out = '\0';
             return;
         }
     }
-    std::snprintf(out, cap, "0x%x", sym);
+    *std::format_to_n(out, cap - 1, "0x{:x}", sym).out = '\0';
 #endif
 }
 
@@ -300,9 +300,10 @@ void lx::config::format_combo(const combo& c, char* out, std::size_t cap) {
         return;
     std::size_t n = 0;
     const auto put = [&](const char* s) {
-        const int w = std::snprintf(out + n, cap - n, "%s", s);
-        if (w > 0)
-            n = std::min(cap - 1, n + static_cast<std::size_t>(w));
+        const auto seg = std::format_to_n(out + n, cap - n - 1, "{}", s);
+        *seg.out = '\0';
+        if (seg.size > 0)
+            n = std::min(cap - 1, n + seg.size);
     };
     out[0] = '\0';
     if (c.kind == combo_kind::tap) {
@@ -329,7 +330,7 @@ void lx::config::format_combo(const combo& c, char* out, std::size_t cap) {
     char name[64];
     keysym_name(c.code, name, sizeof(name));
     if (!name[0])
-        std::snprintf(name, sizeof(name), "0x%x", c.code);
+        *std::format_to_n(name, sizeof(name) - 1, "0x{:x}", c.code).out = '\0';
     put(name);
 }
 

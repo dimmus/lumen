@@ -173,7 +173,7 @@ lx::result<render_node> open_render_node(std::uint64_t main_device) {
     // render node, reported as unmatched.
     for (int minor = 128; minor < 192; ++minor) {
         char path[32];
-        std::snprintf(path, sizeof(path), "/dev/dri/renderD%d", minor);
+        *std::format_to_n(path, sizeof(path) - 1, "/dev/dri/renderD{}", minor).out = '\0';
         if (open_path(path, false))
             return out;
     }

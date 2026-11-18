@@ -99,7 +99,7 @@ void lx::config::diagnostics::add(severity sev, unsigned layer, unsigned line,
     const std::size_t kn = std::min(key.size(), sizeof(d.key) - 1);
     std::memcpy(d.key, key.data(), kn);
     d.key[kn] = '\0';
-    std::snprintf(d.message, sizeof(d.message), "%s", message ? message : "");
+    *std::format_to_n(d.message, sizeof(d.message) - 1, "{}", message ? message : "").out = '\0';
     items_.push_back(d);
 }
 
@@ -145,13 +145,14 @@ void lx::config::format_diagnostic(const diagnostic& d, const char* file, bool f
     if (!*name)
         name = "lumen";
     if (at_line && d.key[0])
-        std::snprintf(out, cap, "%s:%u: %s: %s", name, d.line, d.key, d.message);
+        *std::format_to_n(out, cap - 1, "{}:{}: {}: {}", name, d.line, d.key,
+                          d.message).out = '\0';
     else if (at_line)
-        std::snprintf(out, cap, "%s:%u: %s", name, d.line, d.message);
+        *std::format_to_n(out, cap - 1, "{}:{}: {}", name, d.line, d.message).out = '\0';
     else if (d.key[0])
-        std::snprintf(out, cap, "%s: %s: %s", name, d.key, d.message);
+        *std::format_to_n(out, cap - 1, "{}: {}: {}", name, d.key, d.message).out = '\0';
     else
-        std::snprintf(out, cap, "%s: %s", name, d.message);
+        *std::format_to_n(out, cap - 1, "{}: {}", name, d.message).out = '\0';
 }
 
 unsigned lx::config::edit_distance(std::string_view a, std::string_view b, unsigned limit) {

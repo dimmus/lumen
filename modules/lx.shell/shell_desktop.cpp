@@ -365,7 +365,7 @@ const std::uint32_t* lx::shell::shell_app::image_icon(std::string_view what, int
     if (what.starts_with("file://"))
         name = uri_path(what);
     char buf[512];
-    std::snprintf(buf, sizeof(buf), "%s", name.c_str());
+    *std::format_to_n(buf, sizeof(buf) - 1, "{}", name.c_str()).out = '\0';
     // Icon names and PNG/SVG files: the icon theme (cached by name and size).
     if (const std::uint32_t* p = icons_.lookup(buf, px))
         return p;
@@ -637,7 +637,7 @@ void lx::shell::shell_app::open_history(output_record& o, const panel_widget_eve
         std::tm tm{};
         localtime_r(&at, &tm);
         char when[8];
-        std::snprintf(when, sizeof(when), "%02d:%02d", tm.tm_hour, tm.tm_min);
+        *std::format_to_n(when, sizeof(when) - 1, "{:02}:{:02}", tm.tm_hour, tm.tm_min).out = '\0';
         std::string label = std::string{when} + "  ";
         if (!note.req.app_name.empty())
             label += note.req.app_name + ": ";

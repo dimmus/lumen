@@ -395,10 +395,10 @@ void lx::shell::notification_server::watch_sender(const std::string& sender) {
     w->owner = this;
     w->name = sender;
     char match[256];
-    std::snprintf(match, sizeof(match),
-                  "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',"
-                  "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='%s'",
-                  sender.c_str());
+    *std::format_to_n(match, sizeof(match) - 1,
+                      "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',"
+                      "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='{}'",
+                      sender).out = '\0';
     sd_bus_slot* slot = nullptr;
     if (sd_bus_add_match_async(static_cast<sd_bus*>(bus_), &slot, match, events::sender_changed,
                                nullptr, w.get()) < 0)
