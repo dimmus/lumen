@@ -986,7 +986,9 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_keybindings COMMAND test_keybindings)
 
     add_executable(test_workspaces tests/test_workspaces.cpp)
-    target_link_libraries(test_workspaces PRIVATE lx.compositor)
+    # lx.shell's workspace_view (the ext-workspace client side) is tested alongside the
+    # compositor-side workspace model here.
+    target_link_libraries(test_workspaces PRIVATE lx.compositor lx.shell)
     lumen_apply_module_properties(test_workspaces)
     lumen_link_platform(test_workspaces)
     target_include_directories(test_workspaces PRIVATE tests)

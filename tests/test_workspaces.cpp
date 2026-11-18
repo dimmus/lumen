@@ -10,6 +10,7 @@
 import std;
 import lx.foundation;
 import lx.compositor;
+import lx.shell;
 
 using namespace lx::compositor;
 
@@ -124,6 +125,31 @@ LUMEN_TEST(dynamic_removes_an_empty_workspace_when_it_is_left) {
     LUMEN_CHECK(names(m, 0) == "1* 2 3");
     f.remove(m, last);
     LUMEN_CHECK(names(m, 0) == "1* 2");
+}
+
+// of_output (the ext-workspace client view) orders by coordinate, and workspaces with
+// EQUAL coordinates keep their arrival order — exactly the stability the permutation sort
+// that replaced std::stable_sort must preserve (equal coordinates are reachable: multiple
+// used workspaces may share one). The index tiebreak makes the order total.
+LUMEN_TEST(of_output_keeps_arrival_order_for_equal_coordinates) {
+    lx::shell::workspace_view v;
+    int out[8]{};
+    LUMEN_CHECK(v.of_output(nullptr, out, 8) == 0);
+    const int g = v.add_group(nullptr);
+    int output = 0;
+    v.output_enter(g, &output);
+    const int first = v.add_workspace(nullptr);
+    const int second = v.add_workspace(nullptr);
+    const int third = v.add_workspace(nullptr);
+    v.enter(g, first);
+    v.enter(g, second);
+    v.enter(g, third);
+    v.set_coordinate(first, 1);
+    v.set_coordinate(second, 1); // equal: arrival order must decide
+    v.set_coordinate(third, 0);
+    v.done();
+    const unsigned n = v.of_output(&output, out, 8);
+    LUMEN_CHECK(n == 3 && out[0] == third && out[1] == first && out[2] == second);
 }
 
 LUMEN_TEST(neighbours_do_not_wrap) {
