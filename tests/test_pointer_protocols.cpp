@@ -106,13 +106,8 @@ void untrack(client& c, wl_proxy* p) {
 }
 
 void disconnect(client& c) {
-    (void)wl_display_dispatch_pending(c.display);
-    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
-        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
-            continue; // tracked twice: destroy once, at its newest position
-        wl_proxy_destroy(*it);
-    }
-    c.created.clear();
+    if (!c.display)
+        return; // already torn down (cases that disconnect manually)
     if (c.seat)
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.seat));
     if (c.shm)
@@ -124,6 +119,7 @@ void disconnect(client& c) {
     if (c.registry)
         wl_registry_destroy(c.registry);
     wl_display_disconnect(c.display);
+    c.display = nullptr;
 }
 
 uint32_t global_version(const client& c, const char* iface) {
@@ -641,8 +637,8 @@ void lock_cases() {
     settle(other.c);
     check("relative: only the pointer focus's client hears it", other.log.relative == other_rel,
           "other got " + std::to_string(other.log.relative - other_rel));
-    wl_display_disconnect(other.c.display);
-    wl_display_disconnect(p.c.display);
+    disconnect(other.c);
+    disconnect(p.c);
     park_pointer();
 }
 
@@ -721,7 +717,7 @@ void confine_cases() {
     zwp_confined_pointer_v1_destroy(conf2);
     untrack(p.c, reinterpret_cast<wl_proxy*>(conf2));
     settle(p.c);
-    wl_display_disconnect(p.c.display);
+    disconnect(p.c);
     park_pointer();
 }
 
@@ -829,7 +825,7 @@ void gesture_cases() {
     zwp_pointer_gestures_v1_release(g);
     settle(p.c);
     check("gestures: release (v2) destroys the manager cleanly", wl_display_get_error(p.c.display) == 0, "");
-    wl_display_disconnect(p.c.display);
+    disconnect(p.c);
     park_pointer();
 }
 

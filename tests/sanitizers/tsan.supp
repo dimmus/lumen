@@ -26,3 +26,25 @@
 # Reproduce the underlying reports with:
 #   TSAN_OPTIONS= ./build/tsan/test_dmabuf_composite
 race:libvulkan_lvp.so
+
+# ── libvulkan_intel_hasvk.so (Mesa hasvk, this host's hardware Vulkan ICD) ────────
+#
+# The hasvk analog of the lavapipe entry above: util_queue_thread_func (u_queue.c:300)
+# calls pthread_barrier_destroy on a barrier its own worker threads still use. Genuine
+# race — Mesa's, in Mesa's threads, on Mesa's objects; observed in 6 tests of the TSan
+# baseline with every racing frame inside libvulkan_intel_hasvk.so.
+race:libvulkan_intel_hasvk.so
+
+# ── libVkLayer_khronos_validation.so (the Vulkan validation layer) ────────────────
+#
+# The layer's chassis DestroyFence races its own Fence::Retire worker thread
+# (vulkan_layer_chassis.cpp vs state_tracker/fence_state.cpp). Both sides inside the
+# layer; Lumen appears only as the Vulkan API caller (test_*_vk_validation tests).
+race:libVkLayer_khronos_validation.so
+
+# ── libgallium (Mesa's gallium ralloc state) ──────────────────────────────────────
+#
+# ralloc_free of context state races driver-internal access on Mesa's own threads
+# (ralloc.c unsafe_free). The GL-composite tests hit it; every racing frame is inside
+# libgallium, same shape as the libEGL/libgbm leak entries in lsan.supp.
+race:libgallium

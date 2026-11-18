@@ -225,14 +225,8 @@ void map_window(conn& c, window& w, const char* title) {
 /// Destroys what the connection created, then the globals and the display (libwayland
 /// 1.26 frees no remaining proxy at wl_display_disconnect).
 void disconnect(conn& c) {
-    if (c.display)
-        (void)wl_display_dispatch_pending(c.display);
-    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
-        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
-            continue;
-        wl_proxy_destroy(*it);
-    }
-    c.created.clear();
+    if (!c.display)
+        return; // already torn down (cases that disconnect manually)
     if (c.shell)
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shell));
     if (c.layer_shell)
@@ -246,6 +240,7 @@ void disconnect(conn& c) {
     if (c.compositor)
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
     wl_display_disconnect(c.display);
+    c.display = nullptr;
 }
 
 /// Takes a proxy off the tracked list after its typed destroy ran.
@@ -590,6 +585,7 @@ int main() {
           "a shell bound at v2 cannot grab keys (not_implemented)");
     again.detach();
     zlm_shell_v1_destroy(sh2.shell);
+    sh2.shell = nullptr;
     disconnect(sh2);
 
     // ── Version 4: key grabs ──
@@ -737,6 +733,7 @@ int main() {
         disconnect(locker);
         v5.detach();
         zlm_shell_v1_destroy(sh5.shell);
+        sh5.shell = nullptr;
         disconnect(sh5);
     }
 #endif
@@ -866,9 +863,11 @@ int main() {
               "v6: the snapshot carries icons and parents");
         again.detach();
         zlm_shell_v1_destroy(sh6b.shell);
+        sh6b.shell = nullptr;
         disconnect(sh6b);
         v6.detach();
         zlm_shell_v1_destroy(sh6.shell);
+        sh6.shell = nullptr;
         disconnect(sh6);
     }
 #endif
@@ -1248,6 +1247,7 @@ int main() {
         }
         v7.detach();
         zlm_shell_v1_destroy(sh7.shell);
+        sh7.shell = nullptr;
         disconnect(sh7);
     }
     if (!cfg_path.empty()) {
@@ -1257,6 +1257,7 @@ int main() {
 
     v4.detach();
     zlm_shell_v1_destroy(sh3.shell);
+    sh3.shell = nullptr;
     disconnect(sh3);
     wl_keyboard_destroy(kb);
     disconnect(app);
