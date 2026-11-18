@@ -303,12 +303,9 @@ void teardown(client& c) {
     if (!c.display)
         return;
     (void)wl_display_dispatch_pending(c.display);
-    for (std::size_t i = 0; i < c.created.size(); ++i)
-        std::fprintf(stderr, "DBG3 [%zu] %p\n", i, (void*)c.created[i]);
     for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
         if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
             continue; // tracked twice: destroy once, at its oldest position
-        std::fprintf(stderr, "DBG2 %s %p\n", wl_proxy_get_class(*it), (void*)*it);
         wl_proxy_destroy(*it);
     }
     c.created.clear();
@@ -384,7 +381,6 @@ void expect(const char* name, const char* interface, uint32_t code,
         return;
     }
     body(c);
-    std::fprintf(stderr, "DBGcase %s\n", name); std::fflush(stderr);
     const outcome o = finish(c);
     const bool ok = std::strcmp(o.interface, interface) == 0 && o.code == code;
     std::printf("  %s  %s — got %s/%u, want %s/%u\n", ok ? "PASS" : "FAIL", name, o.interface,
