@@ -421,11 +421,21 @@ private:
     /// An anchor container whose `node_animation` is active: its subtree, mapped.
     void emit_animated(container_node& box, draw_list& out, const emit_context& ctx);
     [[nodiscard]] view& ensure_view(unsigned slot);
+    /// The slot pointer as the UI thread sees it. UI is the only writer of a slot; the
+    /// render thread goes through `snapshots`, which loads with acquire so a view
+    /// published by `ensure_view` is fully constructed before render can reach it.
+    [[nodiscard]] view* view_at(unsigned slot) const {
+        return slot < k_max_views ? views_[slot].load(std::memory_order_relaxed) : nullptr;
+    }
 
     container_node root_{};
     lx::color clear_color_ = lx::color::rgb(0.f, 0.f, 0.f);
     snapshot_config snapshot_config_{};
-    view* views_[k_max_views]{};
+    /// A slot's pointer is written once by UI (`ensure_view`) and read by render
+    /// (`snapshots`) without a lock — the pointer itself is the only thing that crosses
+    /// threads, so the slots are atomic (the view's contents follow the snapshot
+    /// buffer's own handoff). Views are never freed while the scene lives.
+    std::atomic<view*> views_[k_max_views]{};
     std::uint32_t live_views_ = 0;
     /// UI scratch of the visibility pass, parallel to the draw list being built: the node
     /// that emitted each draw, and whether the pass found it on screen. Never leaves the UI
@@ -813,18 +823,20 @@ lx::scene::scene_graph::scene_graph() {
 }
 
 lx::scene::scene_graph::~scene_graph() {
-    for (view*& v : views_) {
-        delete v;
-        v = nullptr;
+    for (std::atomic<view*>& slot : views_) {
+        delete slot.load(std::memory_order_relaxed);
+        slot.store(nullptr, std::memory_order_relaxed);
     }
 }
 
 lx::scene::scene_graph::view& lx::scene::scene_graph::ensure_view(unsigned slot) {
-    if (!views_[slot]) {
-        views_[slot] = new view{};
-        views_[slot]->snapshots.set_config(snapshot_config_);
-    }
-    return *views_[slot];
+    if (view* existing = view_at(slot))
+        return *existing;
+    view* v = new view{};
+    v->snapshots.set_config(snapshot_config_);
+    // Release: render's acquire load in `snapshots` must see the constructed view.
+    views_[slot].store(v, std::memory_order_release);
+    return *v;
 }
 
 lx::scene::container_node& lx::scene::scene_graph::root() { return root_; }
@@ -866,8 +878,8 @@ void lx::scene::scene_graph::remove_output_view(unsigned slot) {
     if (slot >= k_max_views)
         return;
     live_views_ &= ~(1u << slot);
-    if (views_[slot])
-        views_[slot]->damage.clear();
+    if (view* v = view_at(slot))
+        v->damage.clear();
 }
 
 bool lx::scene::scene_graph::has_view(unsigned slot) const {
@@ -876,7 +888,9 @@ bool lx::scene::scene_graph::has_view(unsigned slot) const {
 
 const lx::scene::output_view_config& lx::scene::scene_graph::view_config(unsigned slot) const {
     static const output_view_config k_none{};
-    return slot < k_max_views && views_[slot] ? views_[slot]->config : k_none;
+    return slot < k_max_views && views_[slot].load(std::memory_order_relaxed)
+               ? views_[slot].load(std::memory_order_relaxed)->config
+               : k_none;
 }
 
 void lx::scene::scene_graph::set_projection(output_projection projection) {
@@ -895,8 +909,8 @@ void lx::scene::scene_graph::set_projection(output_projection projection) {
 
 void lx::scene::scene_graph::set_snapshot_config(snapshot_config config) {
     snapshot_config_ = config;
-    for (view* v : views_)
-        if (v)
+    for (std::atomic<view*>& slot : views_)
+        if (view* v = slot.load(std::memory_order_relaxed))
             v->snapshots.set_config(config);
 }
 
@@ -917,7 +931,7 @@ void lx::scene::scene_graph::note_damage_views(lx::rect2i region, int margin_px,
     for (unsigned slot = 0; slot < k_max_views; ++slot) {
         if (!((live_views_ >> slot) & 1u) || !((view_mask >> slot) & 1u))
             continue;
-        view& v = *views_[slot];
+        view& v = *view_at(slot);
         const lx::rect2i l = v.config.logical;
         if (l.width > 0 && l.height > 0 &&
             (rx1 <= l.x || ry1 <= l.y || rx0 >= static_cast<long long>(l.x) + l.width ||
@@ -952,37 +966,37 @@ void lx::scene::scene_graph::note_damage_output(unsigned slot, lx::rect2i region
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (!has_view(slot))
         return;
-    views_[slot]->damage.add(region);
+    view_at(slot)->damage.add(region);
 }
 
 void lx::scene::scene_graph::note_full_damage() {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     for (unsigned slot = 0; slot < k_max_views; ++slot)
         if ((live_views_ >> slot) & 1u)
-            views_[slot]->damage.set_full();
+            view_at(slot)->damage.set_full();
 }
 
 void lx::scene::scene_graph::note_full_damage_output(unsigned slot) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (has_view(slot))
-        views_[slot]->damage.set_full();
+        view_at(slot)->damage.set_full();
 }
 
 std::uint32_t lx::scene::scene_graph::pending_damage_mask() const {
     std::uint32_t mask = 0;
     for (unsigned slot = 0; slot < k_max_views; ++slot)
-        if (((live_views_ >> slot) & 1u) && !views_[slot]->damage.empty())
+        if (((live_views_ >> slot) & 1u) && !view_at(slot)->damage.empty())
             mask |= 1u << slot;
     return mask;
 }
 
 const lx::gfx::damage_region& lx::scene::scene_graph::pending_damage(unsigned slot) const {
     static const lx::gfx::damage_region k_none{};
-    return slot < k_max_views && views_[slot] ? views_[slot]->damage : k_none;
+    return slot < k_max_views && view_at(slot) ? view_at(slot)->damage : k_none;
 }
 
 unsigned lx::scene::scene_graph::last_culled(unsigned slot) const {
-    return slot < k_max_views && views_[slot] ? views_[slot]->last_culled : 0;
+    return slot < k_max_views && view_at(slot) ? view_at(slot)->last_culled : 0;
 }
 
 void lx::scene::scene_graph::emit_node(scene_node* node, draw_list& out,
@@ -1475,7 +1489,7 @@ bool lx::scene::scene_graph::commit_frame(unsigned slot, unsigned frame_index) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (!has_view(slot))
         return false;
-    view& v = *views_[slot];
+    view& v = *view_at(slot);
 
     // Take the slot before building. Beyond correctness this skips the whole scene walk
     // and sort when there is nowhere to publish, instead of doing the work and throwing
@@ -1521,5 +1535,10 @@ void lx::scene::scene_graph::release_render_frame(unsigned slot,
 lx::scene::snapshot_buffer& lx::scene::scene_graph::snapshots(unsigned slot) {
     // Never creates a view: render asks only for views UI configured (views are created on
     // UI by `set_output_view` and never freed while the scene lives). View 0 always exists.
-    return slot < k_max_views && views_[slot] ? views_[slot]->snapshots : views_[0]->snapshots;
+    // Acquire pairs with ensure_view's release store, so a hotplug's new view is fully
+    // constructed before the render thread can reach its snapshot buffer.
+    view* v = slot < k_max_views ? views_[slot].load(std::memory_order_acquire) : nullptr;
+    if (!v)
+        v = views_[0].load(std::memory_order_acquire);
+    return v->snapshots;
 }
