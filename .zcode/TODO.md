@@ -71,15 +71,31 @@ current when an item closes.
   `.zcode/memories/lumen-uinput-key-bitmap-format.md`; the Nov-15/16 click-loss is best
   attributed to the concurrent-session WARN family. See
   `.zcode/memories/lumen-compositor-theme-env-export.md` (2026-11-17 section).
-- [ ] **lumen-shell notification_view intermittent SIGSEGV** (split 2026-11-17 from the row
+- [x] **lumen-shell notification_view intermittent SIGSEGV** (split 2026-11-17 from the row
   above): ×2 on 2026-11-16 (coredumps 3499403 @21:41:39, 3521729 @21:53:11, identical
   stacks notification_view::build_ui → lx::ui::image → lx::runtime::memory_arena::allocate,
   SI_KERNEL, EXE = the theme-env worktree build), unreproduced 2026-11-17 on merged main
   9022e74 across both smokes, the N1–N8 notification rows and two interactive sessions —
-  intermittent, mechanism unattributed. Next: ASan-built lumen-shell on the seat with a
-  notify-send + shell-relaunch stress (targeted repro beats statistical smoke), or an
-  app-smoke A/B on pre-merge main. Original stacks preserved at
+  intermittent, mechanism unattributed. Original stacks preserved at
   `evidence/2026-11-17-seat-redo/a-smokes/coredump-originals-Nov16.txt`.
+  **RESOLVED 2026-11-18** (the TODO's own ASan-shell-on-the-seat prescription, run during the
+  sanitizer-sweep seat bisect): the class is **retained text blocks holding pointers into
+  build_ui() frame storage** — `text_block_node::apply` re-`strlen`s the pointer at every
+  tick's reconcile; notification_view was a downstream victim consuming the poisoned stack,
+  never the origin. ASan caught three origins: panel tiles (fixed 655ae13 on this branch),
+  switcher letters (`switcher.cppm` `letters_[]` member), menu row labels (`menu_popup.cpp`
+  `level::label[]` — the mnemonic-stripped `std::string`'s SSO dangled), plus the launcher
+  status line (`launcher.cppm` `status_line_[]`). The 2026-11-18 deterministic 5/5 mass-FAIL
+  on this branch vs green base was the panel fix's stack perturbation flipping the
+  intermittent bug — evidence in `evidence/2026-11-18-sanitizer-sweep/seat-regression/`.
+- [ ] **lumen-shell heap-use-after-free at tray-menu close** (found 2026-11-18, ASan shell
+  on the seat, sanitizer-sweep branch): after `shell.menu: menu tray: closed` the ASan
+  lumen-shell reports `heap-use-after-free READ of size 8` and dies before printing a stack
+  (`abort_on_error` + log truncation) — shell-n.log:184-186 of
+  `evidence/2026-11-18-sanitizer-sweep/seat-regression/asan-final-shell-n.log`. The tray
+  rows had already passed; menu/tray code is untouched by the branch → pre-existing on
+  main, only observable under ASan. Next: targeted repro (ASan shell + tray menu
+  open/activate/close loop) to capture the full report.
 - [ ] **lumen-settings transient "no writable config.toml" banner** (2026-11-17 seat redo,
   supplement): a "Changes are not being saved / There is no writable config.toml" banner
   showed ~10 s after a fresh lumen-settings launch and vanished after the first successful

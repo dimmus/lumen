@@ -1,0 +1,186 @@
+[DEBUG] wayland.client.dmabuf: feedback 1: main device 0xe280, 2 table entries, 1 tranches
+[INFO] wayland.client: connected: wl_compositor v6 xdg_wm_base v6 wl_seat×1 wl_output×1 linux-dmabuf v5 syncobj v1 fractional-scale v1 presentation v2 text-input v2; absent: none
+[INFO] shell.bridge: capabilities flags=0x0 version=7
+[INFO] shell.bridge: session lock unlocked
+[INFO] shell.bridge: configuration generation 7 (0 bytes)
+[INFO] config: ui: theme "one-dark" density default font-size 16 px
+[INFO] shell.workspaces: ext-workspace: 2 workspaces
+[INFO] gfx.swapchain: client tier vulkan: Intel(R) HD Graphics 5500 (BDW GT2) on /dev/dri/renderD128 (the device asked for) — vulkan: taken gl: not tried explicit sync: timeline syncobjs
+[DEBUG] ui.host.surface: pixel path: vulkan in 89150 µs
+[INFO] shell: panel requested on output eDP-1 (3200x1800+0+0)
+[INFO] shell: key bindings: the compositor's (zlm v7 actions)
+[INFO] shell.idle: blanking the outputs after 600 s without input
+[INFO] shell: connected to $WAYLAND_DISPLAY; panel requested
+[INFO] shell.panel: workspaces [1* 2] output=eDP-1
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] ui.host.surface: first frame 3200×32 (vulkan): geometry+swapchain+acquire 6258 µs, tick 9164 µs (describe 123 reconcile 110 layout 649 emit 8219), render+present 2312 µs
+[INFO] shell.panel: configure w=3200 h=32
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.panel: panel drawn 3200×32 output=eDP-1
+[INFO] shell.apps: apps: catalog 35 entries, 20 listed (35 files, 1 dirs) in 0.99 ms; terminal foot.desktop
+[INFO] shell.notify: notifications and tray on the user bus as :1.28621 (next id 1, do not disturb off)
+[INFO] shell.bridge: snapshot toplevels=0
+[DEBUG] shell.bridge: focus handle=none
+[DEBUG] shell.idle: output power on (eDP-1)
+[INFO] shell.bus: bus name org.freedesktop.Notifications: owned
+[INFO] shell.bus: bus name org.kde.StatusNotifierWatcher: owned
+[INFO] shell.tray: tray: watcher and host (org.kde.StatusNotifierWatcher)
+[INFO] shell.bus: bus name org.kde.StatusNotifierHost-269292: owned
+[INFO] shell.apps: apps: 2 GPUs, no switcheroo-control (org.freedesktop.DBus.Error.ServiceUnknown): apps that prefer the non-default one get DRI_PRIME=1
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] shell.panel: layout bell x=3136 w=28 output=eDP-1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1(full) repaint=1
+[INFO] shell.background: background 3200x1800 px, rendered in 228.3 ms
+[INFO] shell.notify: notify id=1 app="smoke" urgency=normal timeout=1500 actions=0 summary="n1 normal" popup
+[DEBUG] ui.host.surface: pixel path: vulkan in 4 µs
+[INFO] shell.notify: notifications: shown (1 card, top layer)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=1 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] ui.host.surface: first frame 360×67 (vulkan): geometry+swapchain+acquire 406 µs, tick 794 µs (describe 283 reconcile 72 layout 192 emit 233), render+present 363 µs
+[INFO] shell.notify: notify id=2 app="smoke" urgency=critical timeout=-1 actions=0 summary="n1 critical" popup
+[INFO] shell.notify: notifications: overlay layer (a critical one shown)
+[DEBUG] shell.notify: notifications: draw cards=2 more=0 360x142
+[DEBUG] shell.notify: notifications: card id=2 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] shell.notify: notifications: card id=1 box=0,75,360,67 close=334,81,20,20 buttons=-
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notify id=1 closed reason=1 (expired)
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=2 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=2 box=0,0,360,67 close=334,6,20,20 buttons=-
+[INFO] shell.notify: notify id=2 closed reason=3 (CloseNotification)
+[INFO] shell.notify: notifications: hidden (4 frames)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.notify: CloseNotification 999999: no such notification
+[INFO] shell.notify: notify id=3 app="smoke" urgency=normal timeout=0 actions=0 summary="n2 first" popup
+[DEBUG] ui.host.surface: pixel path: vulkan in 3 µs
+[INFO] shell.notify: notifications: shown (1 card, top layer)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=3 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] ui.host.surface: first frame 360×67 (vulkan): geometry+swapchain+acquire 446 µs, tick 445 µs (describe 94 reconcile 61 layout 156 emit 118), render+present 175 µs
+[INFO] shell.notify: notify id=3 (replaced) app="smoke" urgency=normal timeout=0 actions=0 summary="n2 second" popup
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=3 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notify id=3 closed reason=3 (CloseNotification)
+[INFO] shell.notify: notifications: hidden (2 frames)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notify id=4 app="smoke" urgency=normal timeout=-1 actions=2 summary="n3 action" popup
+[DEBUG] ui.host.surface: pixel path: vulkan in 3 µs
+[INFO] shell.notify: notifications: shown (1 card, top layer)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x105
+[DEBUG] shell.notify: notifications: card id=4 box=0,0,360,105 close=334,6,20,20 buttons=12,65,164,28;184,65,164,28
+[DEBUG] ui.host.surface: first frame 360×105 (vulkan): geometry+swapchain+acquire 274 µs, tick 597 µs (describe 87 reconcile 94 layout 225 emit 178), render+present 154 µs
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x105
+[DEBUG] shell.notify: notifications: card id=4 box=0,0,360,105 close=334,6,20,20 buttons=12,65,164,28;184,65,164,28
+[INFO] shell.notify: notifications: hidden (4 frames)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notify id=4 action "ok" invoked token=yes
+[INFO] shell.notify: notify id=4 closed reason=2 (dismissed)
+[DEBUG] shell.notify: CloseNotification 4: no such notification
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notify id=5 app="smoke" urgency=normal timeout=0 actions=0 summary="n3b body click" popup
+[DEBUG] ui.host.surface: pixel path: vulkan in 3 µs
+[INFO] shell.notify: notifications: shown (1 card, top layer)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=5 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] ui.host.surface: first frame 360×67 (vulkan): geometry+swapchain+acquire 358 µs, tick 593 µs (describe 90 reconcile 60 layout 210 emit 194), render+present 175 µs
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=5 box=0,0,360,67 close=334,6,20,20 buttons=-
+[INFO] shell.notify: notify id=5 closed reason=2 (dismissed)
+[INFO] shell.notify: notifications: hidden (4 frames)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.bridge: session lock locking
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.bridge: session lock locked
+[INFO] shell.notify: notify id=6 app="smoke" urgency=normal timeout=2000 actions=0 summary="n4 locked" queued (locked)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.bridge: session lock unlocked
+[DEBUG] ui.host.surface: pixel path: vulkan in 5 µs
+[INFO] shell.notify: notifications: shown (1 card, top layer)
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] shell.panel: layout bell x=3136 w=28 output=eDP-1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1(full) repaint=1
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=6 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] ui.host.surface: first frame 360×67 (vulkan): geometry+swapchain+acquire 355 µs, tick 538 µs (describe 79 reconcile 62 layout 209 emit 168), render+present 170 µs
+[INFO] shell.notify: notify id=6 closed reason=1 (expired)
+[INFO] shell.notify: notifications: hidden (1 frame)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.bridge: screen capture active
+[INFO] shell.notify: notifications: do not disturb on (screen captured)
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] shell.panel: layout bell x=3116 w=28 output=eDP-1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1(full) repaint=1
+[INFO] shell.notify: notify id=7 app="smoke" urgency=normal timeout=-1 actions=0 summary="n5 quiet" history (do not disturb)
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] shell.panel: layout bell x=3103 w=41 output=eDP-1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1(full) repaint=1
+[INFO] shell.notify: notify id=8 app="smoke" urgency=critical timeout=-1 actions=0 summary="n5 critical" popup
+[DEBUG] ui.host.surface: pixel path: vulkan in 5 µs
+[INFO] shell.notify: notifications: shown (1 card, overlay layer)
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=8 box=0,0,360,67 close=334,6,20,20 buttons=-
+[DEBUG] ui.host.surface: first frame 360×67 (vulkan): geometry+swapchain+acquire 322 µs, tick 827 µs (describe 103 reconcile 227 layout 193 emit 280), render+present 248 µs
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.bridge: screen capture ended
+[DEBUG] shell.notify: notifications: draw cards=1 more=0 360x67
+[DEBUG] shell.notify: notifications: card id=8 box=0,0,360,67 close=334,6,20,20 buttons=-
+[INFO] shell.notify: notifications: do not disturb off
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] shell.panel: layout bell x=3123 w=41 output=eDP-1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1(full) repaint=1
+[INFO] shell.notify: notify id=8 closed reason=3 (CloseNotification)
+[INFO] shell.notify: notifications: hidden (2 frames)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notifications: do not disturb set (a middle click on the indicator)
+[INFO] shell.notify: notifications: do not disturb on
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notify id=9 app="smoke" urgency=normal timeout=-1 actions=0 summary="n5b quiet" history (do not disturb)
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.notify: notifications: do not disturb cleared (a middle click on the indicator)
+[INFO] shell.notify: notifications: do not disturb off
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.tray: tray: item registered org.kde.StatusNotifierItem-269585-1/StatusNotifierItem (by :1.28637)
+[INFO] shell.tray: tray: item org.kde.StatusNotifierItem-269585-1/StatusNotifierItem id="lumen-probe" title="Smoke item" status=Active icon=- (pixmap) menu=/MenuBar
+[DEBUG] shell.panel: layout apps x=4 w=64
+[DEBUG] shell.panel: layout tray key=1 x=3095 w=24 output=eDP-1
+[DEBUG] shell.panel: layout bell x=3123 w=41 output=eDP-1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1(full) repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] ui.host.surface: pixel path: vulkan in 5 µs
+[DEBUG] shell.tray: tray: tooltip "Smoke item"
+[DEBUG] ui.host.surface: first frame 235×61 (vulkan): geometry+swapchain+acquire 833 µs, tick 1862 µs (describe 65 reconcile 139 layout 428 emit 1196), render+present 861 µs
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.tray: tray: org.kde.StatusNotifierItem-269585-1/StatusNotifierItem Activate x=3107 y=28 token=yes
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.tray: tray: menu of item 1 revision 1 items 5
+[DEBUG] ui.host.surface: pixel path: vulkan in 5 µs
+[INFO] shell.menu: menu tray: open (5 items, 187x121)
+[INFO] shell.icon: icon theme Adwaita (3 themes in the chain; png=1 svg=1)
+[DEBUG] shell.icon: icon application-exit 16px -> /usr/share/icons/AdwaitaLegacy/16x16/legacy/application-exit.png
+[DEBUG] ui.host.surface: first frame 187×121 (vulkan): geometry+swapchain+acquire 499 µs, tick 55413 µs (describe 10167 reconcile 129 layout 44780 emit 306), render+present 246 µs
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[DEBUG] shell.panel: draw entries=0 hidden=0 focused=-1 damage=1 repaint=1
+[INFO] shell.menu: menu tray: activate id=1 "Open"
+[INFO] shell.tray: tray: org.kde.StatusNotifierItem-269585-1/StatusNotifierItem menu Event id=1 clicked
+[INFO] shell.menu: menu tray: closed
+=================================================================
+==269292==ERROR: AddressSanitizer: heap-use-after-free on address 0x7cc5aac071c0 at pc 0x7f15acf44ea0 bp 0x7ffc98fe0170 sp 0x7ffc98fe0168
+READ of size 8 at 0x7cc5aac071c0 thread T0
