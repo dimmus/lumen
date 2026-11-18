@@ -65,3 +65,39 @@ TSan could not even link 7 targets (duplicate operator new/delete) and after -k0
 ASan 127/136, TSan 126/136 (both from 97), normal gate 136/136 exit 0, drag-smoke
 VERDICT PASS, app-smoke 176/0/1 (the 1 is the known-environmental PSI critical-pressure
 WARN of lumen-build-run). ui-bench A/B vs 95372af: see the evidence dir.
+
+## Review-fix round (same day, evening) — the record above corrected
+
+An independent review found the session-end record overstated: 9 ASan + 10 TSan tests
+were still red, two genuine TSan races were never classified, the committed final ASan
+log predated the last code change, five TSan-red tests never got the suppression env at
+all (CMake ENVIRONMENT is a whole-list overwrite — per-test assignments elsewhere had
+replaced it; now appended once after the last add_test), the A/B carried an undisclosed
+FAIL round, and the app-smoke 176/0/1 was recorded against a violated quiet-host
+precondition. All fixed in the worktree (commits 86b9c23..9668aef):
+
+- The two follow-on TSan races: scene_graph::ensure_view writes views_[slot] on UI while
+  render reads it in snapshots() — the slot pointer is now an atomic (release/acquire);
+  output_manager::recount vs the test main's unlocked count() read — test-side fix.
+- protocol_conformance's ~900 leaks ARE tractable after all: track every creation
+  (helpers AND case bodies), untrack before every typed destroy (untrack erases ALL
+  occurrences), teardown() = dispatch_pending → reverse sweep → registry → disconnect;
+  kits that copy a client (self_drag/own_offer) mark borrowed so pushes reach the
+  original's list — a push to the copy's list is an invisible leak. Cross-client pushes
+  (a proxy of client B tracked on A) SEGV at teardown: that was the "untrackable" crash
+  class, not libwayland magic. 242 cases, 0 failed, 0 leaked.
+- Two latent defects the missing env hid: bench_ui's four nothrow operator deletes sat
+  outside the LUMEN_TEST_ALLOC_COUNTING guard (TSan link clash), settings_ui's
+  string_field::set memcpy'd an empty view's null data() (UBSan UB).
+- Suppression protocol records for all five new entries live in the evidence dir
+  (12-run/load-bearing/canary per entry, canary sources included); ui-bench re-run
+  cleanly: 3/3 PASS at HEAD, S2 tick p50 26.1-27.5 us vs 26.385 baseline — the A/B's
+  base-r1 FAIL (+44 % on EVERY stage at identical code) was a host-frequency artifact.
+
+Gates after the round: ASan 136/136, TSan 136/136 (serialized ctest presets), normal
+gate unchanged. OPEN: app-smoke on this seat fails identically on the fixed HEAD and on
+the pre-fix sweep tree (5 serialized runs: early input-driven scenarios mass-fail with
+"grab=-" though pointer motion demonstrably arrives, plus one lumen-shell SEGV in
+notification_view::build_ui → ui::image → memory_arena::allocate) — environmental or
+pre-existing, NOT the fix round's regression; escalated to the gate, needs its own
+investigation. Also: tests/bench/results/ had been left root-owned by sudo bench runs.
