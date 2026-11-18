@@ -678,7 +678,7 @@ void foreign_cases() {
     auto* bi = static_cast<zxdg_importer_v2*>(bind_global(b, &zxdg_importer_v2_interface, 1));
     int unknown_destroyed = 0;
     auto* bogus = zxdg_importer_v2_import_toplevel(bi, "ffffffffffffffffffffffffffffffff");
-    a.created.push_back(reinterpret_cast<wl_proxy*>(bogus));
+    b.created.push_back(reinterpret_cast<wl_proxy*>(bogus)); // b's connection created it
     zxdg_imported_v2_add_listener(bogus, &imported_v2_listener, &unknown_destroyed);
     settle(b);
     check("foreign: an unknown handle is destroyed immediately", unknown_destroyed == 1, "");
