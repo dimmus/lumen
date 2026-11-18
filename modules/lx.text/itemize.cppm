@@ -308,8 +308,12 @@ lx::text::itemizer::itemizer(itemizer_config config) : config_{config} {
     if (config_.max_runs == 0)
         config_.max_runs = 1;
     const std::size_t n = config_.max_chars;
-    // Raw storage: pages become resident only as long paragraphs touch them.
-    const auto raw = [](std::size_t bytes) { return ::operator new(bytes, std::nothrow); };
+    // Raw storage: pages become resident only as long paragraphs touch them. malloc/free
+    // (not operator new/delete): under ASan the nothrow operator new is intercepted as a
+    // real "operator new" allocation while the matching delete lowers to plain free, an
+    // alloc-dealloc-mismatch — the malloc/free pair is identical semantics and one class
+    // of report fewer.
+    const auto raw = [](std::size_t bytes) { return std::malloc(bytes); };
     cps_ = static_cast<char32_t*>(raw(n * sizeof(char32_t)));
     offsets_ = static_cast<std::uint32_t*>(raw((n + 1) * sizeof(std::uint32_t)));
     flags_ = static_cast<std::uint8_t*>(raw(n));
@@ -330,15 +334,15 @@ lx::text::itemizer::itemizer(itemizer_config config) : config_{config} {
 lx::text::itemizer::~itemizer() { release(); }
 
 void lx::text::itemizer::release() {
-    ::operator delete(cps_);
-    ::operator delete(offsets_);
-    ::operator delete(flags_);
-    ::operator delete(levels_);
-    ::operator delete(scripts_);
-    ::operator delete(types_);
-    ::operator delete(btypes_);
-    ::operator delete(breaks_);
-    ::operator delete(runs_);
+    std::free(cps_);
+    std::free(offsets_);
+    std::free(flags_);
+    std::free(levels_);
+    std::free(scripts_);
+    std::free(types_);
+    std::free(btypes_);
+    std::free(breaks_);
+    std::free(runs_);
     cps_ = nullptr;
     offsets_ = nullptr;
     flags_ = levels_ = nullptr;

@@ -116,6 +116,10 @@ const char* const k_socket = "lumen-test-conformance";
 struct client {
     wl_display* display = nullptr;
     wl_registry* registry = nullptr;
+    /// Every proxy this connection created (registry binds, window roles, buffers);
+    /// finish destroys them (libwayland 1.26 frees no remaining proxy at
+    /// wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_compositor* compositor = nullptr;
     wl_subcompositor* subcompositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
@@ -173,56 +177,62 @@ uint32_t g_deco_version = 2;
 void on_global(void* data, wl_registry* registry, uint32_t name, const char* iface,
                uint32_t version) {
     auto* c = static_cast<client*>(data);
+    // Binds are tracked: they are proxies of this connection like any other, and
+    // finish()'s sweep owns what a case does not destroy.
+    const auto track = [c](auto* bound) {
+        c->created.push_back(reinterpret_cast<wl_proxy*>(bound));
+        return bound;
+    };
     if (std::strcmp(iface, wl_compositor_interface.name) == 0)
-        c->compositor = static_cast<wl_compositor*>(
-            wl_registry_bind(registry, name, &wl_compositor_interface, version < 6 ? version : 6));
+        c->compositor = track(static_cast<wl_compositor*>(
+            wl_registry_bind(registry, name, &wl_compositor_interface, version < 6 ? version : 6)));
     else if (std::strcmp(iface, wl_subcompositor_interface.name) == 0)
-        c->subcompositor = static_cast<wl_subcompositor*>(
-            wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+        c->subcompositor = track(static_cast<wl_subcompositor*>(
+            wl_registry_bind(registry, name, &wl_subcompositor_interface, 1)));
     else if (std::strcmp(iface, xdg_wm_base_interface.name) == 0)
-        c->wm_base = static_cast<xdg_wm_base*>(
-            wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
+        c->wm_base = track(static_cast<xdg_wm_base*>(
+            wl_registry_bind(registry, name, &xdg_wm_base_interface, 1)));
     else if (std::strcmp(iface, wl_shm_interface.name) == 0)
-        c->shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+        c->shm = track(static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1)));
     else if (std::strcmp(iface, wl_seat_interface.name) == 0)
-        c->seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 1));
+        c->seat = track(static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 1)));
     else if (std::strcmp(iface, zxdg_decoration_manager_v1_interface.name) == 0)
-        c->deco = static_cast<zxdg_decoration_manager_v1*>(wl_registry_bind(
+        c->deco = track(static_cast<zxdg_decoration_manager_v1*>(wl_registry_bind(
             registry, name, &zxdg_decoration_manager_v1_interface,
-            c->deco_version < version ? c->deco_version : version));
+            c->deco_version < version ? c->deco_version : version)));
     else if (std::strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0)
-        c->layer_shell = static_cast<zwlr_layer_shell_v1*>(wl_registry_bind(
+        c->layer_shell = track(static_cast<zwlr_layer_shell_v1*>(wl_registry_bind(
             registry, name, &zwlr_layer_shell_v1_interface,
-            c->layer_version < version ? c->layer_version : version));
+            c->layer_version < version ? c->layer_version : version)));
     else if (std::strcmp(iface, wl_data_device_manager_interface.name) == 0)
-        c->ddm = static_cast<wl_data_device_manager*>(
-            wl_registry_bind(registry, name, &wl_data_device_manager_interface, 3));
+        c->ddm = track(static_cast<wl_data_device_manager*>(
+            wl_registry_bind(registry, name, &wl_data_device_manager_interface, 3)));
     else if (std::strcmp(iface, wl_output_interface.name) == 0) {
         c->output_name = name;
         c->output_version = version;
     }
 #ifdef LUMEN_TEST_TOPLEVEL_DRAG
     else if (std::strcmp(iface, xdg_toplevel_drag_manager_v1_interface.name) == 0)
-        c->drag_manager = static_cast<xdg_toplevel_drag_manager_v1*>(
-            wl_registry_bind(registry, name, &xdg_toplevel_drag_manager_v1_interface, 1));
+        c->drag_manager = track(static_cast<xdg_toplevel_drag_manager_v1*>(
+            wl_registry_bind(registry, name, &xdg_toplevel_drag_manager_v1_interface, 1)));
 #endif
 #ifdef LUMEN_TEST_PRIMARY_SELECTION
     else if (std::strcmp(iface, zwp_primary_selection_device_manager_v1_interface.name) == 0)
-        c->psm = static_cast<zwp_primary_selection_device_manager_v1*>(wl_registry_bind(
-            registry, name, &zwp_primary_selection_device_manager_v1_interface, 1));
+        c->psm = track(static_cast<zwp_primary_selection_device_manager_v1*>(wl_registry_bind(
+            registry, name, &zwp_primary_selection_device_manager_v1_interface, 1)));
 #endif
 #ifdef LUMEN_TEST_ACTIVATION
     else if (std::strcmp(iface, xdg_activation_v1_interface.name) == 0)
-        c->activation = static_cast<xdg_activation_v1*>(
-            wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1));
+        c->activation = track(static_cast<xdg_activation_v1*>(
+            wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1)));
 #endif
 #ifdef LUMEN_TEST_VIEWPORTER
     else if (std::strcmp(iface, wp_viewporter_interface.name) == 0)
-        c->viewporter = static_cast<wp_viewporter*>(
-            wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
+        c->viewporter = track(static_cast<wp_viewporter*>(
+            wl_registry_bind(registry, name, &wp_viewporter_interface, 1)));
     else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0)
-        c->fractional = static_cast<wp_fractional_scale_manager_v1*>(
-            wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1));
+        c->fractional = track(static_cast<wp_fractional_scale_manager_v1*>(
+            wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1)));
 #endif
 #ifdef LUMEN_TEST_PRESENTATION
     else if (std::strcmp(iface, wp_presentation_interface.name) == 0) {
@@ -230,38 +240,38 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
             [](void* data, wp_presentation*, uint32_t clk) {
                 static_cast<client*>(data)->clock_id = clk;
             }};
-        c->presentation = static_cast<wp_presentation*>(
-            wl_registry_bind(registry, name, &wp_presentation_interface, version < 2 ? version : 2));
+        c->presentation = track(static_cast<wp_presentation*>(
+            wl_registry_bind(registry, name, &wp_presentation_interface, version < 2 ? version : 2)));
         wp_presentation_add_listener(c->presentation, &presentation_listener, c);
     }
 #endif
 #ifdef LUMEN_TEST_IDLE
     else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0)
-        c->idle_notifier = static_cast<ext_idle_notifier_v1*>(
-            wl_registry_bind(registry, name, &ext_idle_notifier_v1_interface, version < 2 ? version : 2));
+        c->idle_notifier = track(static_cast<ext_idle_notifier_v1*>(
+            wl_registry_bind(registry, name, &ext_idle_notifier_v1_interface, version < 2 ? version : 2)));
     else if (std::strcmp(iface, zwp_idle_inhibit_manager_v1_interface.name) == 0)
-        c->inhibit_manager = static_cast<zwp_idle_inhibit_manager_v1*>(
-            wl_registry_bind(registry, name, &zwp_idle_inhibit_manager_v1_interface, 1));
+        c->inhibit_manager = track(static_cast<zwp_idle_inhibit_manager_v1*>(
+            wl_registry_bind(registry, name, &zwp_idle_inhibit_manager_v1_interface, 1)));
     else if (std::strcmp(iface, zwlr_output_power_manager_v1_interface.name) == 0)
-        c->power_manager = static_cast<zwlr_output_power_manager_v1*>(
-            wl_registry_bind(registry, name, &zwlr_output_power_manager_v1_interface, 1));
+        c->power_manager = track(static_cast<zwlr_output_power_manager_v1*>(
+            wl_registry_bind(registry, name, &zwlr_output_power_manager_v1_interface, 1)));
 #endif
 #ifdef LUMEN_TEST_SESSION_LOCK
     else if (std::strcmp(iface, ext_session_lock_manager_v1_interface.name) == 0)
-        c->lock_manager = static_cast<ext_session_lock_manager_v1*>(
-            wl_registry_bind(registry, name, &ext_session_lock_manager_v1_interface, 1));
+        c->lock_manager = track(static_cast<ext_session_lock_manager_v1*>(
+            wl_registry_bind(registry, name, &ext_session_lock_manager_v1_interface, 1)));
 #endif
 #ifdef LUMEN_TEST_IME
     else if (std::strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
         c->ti_version = version < 2 ? version : 2;
-        c->ti_manager = static_cast<zwp_text_input_manager_v3*>(
-            wl_registry_bind(registry, name, &zwp_text_input_manager_v3_interface, c->ti_version));
+        c->ti_manager = track(static_cast<zwp_text_input_manager_v3*>(
+            wl_registry_bind(registry, name, &zwp_text_input_manager_v3_interface, c->ti_version)));
     } else if (std::strcmp(iface, zwp_input_method_manager_v2_interface.name) == 0)
-        c->im_manager = static_cast<zwp_input_method_manager_v2*>(
-            wl_registry_bind(registry, name, &zwp_input_method_manager_v2_interface, 1));
+        c->im_manager = track(static_cast<zwp_input_method_manager_v2*>(
+            wl_registry_bind(registry, name, &zwp_input_method_manager_v2_interface, 1)));
     else if (std::strcmp(iface, zwp_virtual_keyboard_manager_v1_interface.name) == 0)
-        c->vk_manager = static_cast<zwp_virtual_keyboard_manager_v1*>(
-            wl_registry_bind(registry, name, &zwp_virtual_keyboard_manager_v1_interface, 1));
+        c->vk_manager = track(static_cast<zwp_virtual_keyboard_manager_v1*>(
+            wl_registry_bind(registry, name, &zwp_virtual_keyboard_manager_v1_interface, 1)));
 #endif
 }
 void on_global_remove(void*, wl_registry*, uint32_t) {}
@@ -284,6 +294,27 @@ struct outcome {
     uint32_t code = 0;
 };
 
+/** The teardown half of `finish`, on its own for the main-scope clients (dnd peers,
+    probes, hoarders) that never go through an expect() case: deliver what a stopped
+    dispatch left queued, destroy every tracked proxy in reverse creation order, then the
+    registry and the display — libwayland 1.26 frees none of them at
+    wl_display_disconnect (LSan: one 96-byte proxy per object per client). */
+void teardown(client& c) {
+    if (!c.display)
+        return;
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its oldest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+    c.display = nullptr;
+}
+
 outcome finish(client& c) {
     (void)wl_display_roundtrip(c.display);
     outcome o{};
@@ -295,8 +326,16 @@ outcome finish(client& c) {
         // once, so libwayland-client reports no interface for an error on it.
         o.interface = iface ? iface->name : "[destroyed]";
     }
-    wl_display_disconnect(c.display);
+    teardown(c);
     return o;
+}
+
+/// Takes a proxy off the tracked list after its typed destroy request ran (the typed
+/// destroy already freed the client proxy; finish's sweep must not destroy it again).
+/// Every occurrence goes: the same proxy can be tracked twice (helper + case body).
+void untrack(client& c, wl_proxy* p) {
+    for (auto it = c.created.begin(); it != c.created.end();)
+        it = (*it == p) ? c.created.erase(it) : it + 1;
 }
 
 int g_failed = 0;
@@ -321,9 +360,14 @@ void* bind_global(client& c, const wl_interface* iface, uint32_t version) {
     wl_registry* r = wl_display_get_registry(c.display);
     wl_registry_add_listener(r, &listener, &f);
     (void)wl_display_roundtrip(c.display);
-    if (!f.name)
+    if (!f.name) {
+        wl_registry_destroy(r); // the helper's own registry leaks otherwise
         return nullptr;
-    return wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+    }
+    void* bound = wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+    c.created.push_back(static_cast<wl_proxy*>(bound));
+    wl_registry_destroy(r);
+    return bound;
 }
 
 /// Runs `body` on a fresh connection and checks the error it ends in.
@@ -365,6 +409,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -373,6 +418,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
 /// A complete positioner: 40x30 below a 10x10 anchor rect.
 xdg_positioner* good_positioner(client& c) {
     xdg_positioner* p = xdg_wm_base_create_positioner(c.wm_base);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(p));
     xdg_positioner_set_size(p, 40, 30);
     xdg_positioner_set_anchor_rect(p, 5, 5, 10, 10);
     xdg_positioner_set_anchor(p, XDG_POSITIONER_ANCHOR_BOTTOM_LEFT);
@@ -401,9 +447,12 @@ struct window {
 /// A mapped 200x150 toplevel.
 void map_window(client& c, window& w) {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
     configure_and_map(c, w.surface, w.xdg, w.cfg, 200, 150);
 }
 
@@ -417,11 +466,15 @@ struct popup {
 popup make_popup(client& c, xdg_surface* parent) {
     popup p{};
     p.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(p.surface));
     p.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, p.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(p.xdg));
     xdg_surface_add_listener(p.xdg, &xdg_listener, &p.cfg);
     xdg_positioner* pos = good_positioner(c);
     p.role = xdg_surface_get_popup(p.xdg, parent, pos);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(p.role));
     xdg_positioner_destroy(pos);
+    untrack(c, reinterpret_cast<wl_proxy*>(pos));
     return p;
 }
 
@@ -451,8 +504,10 @@ layer make_layer(client& c, uint32_t level = ZWLR_LAYER_SHELL_V1_LAYER_TOP) {
     l.cfg = &g_layer_cfg[g_layer_cfg_next++ % 256];
     *l.cfg = {};
     l.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(l.surface));
     l.role = zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, l.surface, nullptr, level,
                                                    "conformance");
+    c.created.push_back(reinterpret_cast<wl_proxy*>(l.role));
     zwlr_layer_surface_v1_add_listener(l.role, &layer_listener, l.cfg);
     return l;
 }
@@ -479,6 +534,9 @@ void map_layer(client& c, layer& l) {
 /// the current offers and the source's `send`/`cancelled`.
 struct clip {
     client c{};
+    /// Set when `c` is a copy of a case's client (own_offer): clip_set's pushes go to
+    /// the original, whose finish() sweeps them.
+    client* borrowed = nullptr;
     wl_keyboard* kb = nullptr;
     uint32_t enter_serial = 0;
     wl_data_device* dd = nullptr;
@@ -526,8 +584,12 @@ void offer_action(void*, wl_data_offer*, uint32_t) {}
 const wl_data_offer_listener offer_listener = {offer_offer, offer_source_actions, offer_action};
 
 void dd_data_offer(void* data, wl_data_device*, wl_data_offer* o) {
-    static_cast<clip*>(data)->events.push_back("data_offer");
+    auto* k = static_cast<clip*>(data);
+    k->events.push_back("data_offer");
     g_pending_mimes.clear();
+    // The offer is a server-pushed proxy of this connection: track it so finish() owns
+    // the one still current at teardown (a borrowed clip pushes to the case's client).
+    (k->borrowed ? *k->borrowed : k->c).created.push_back(reinterpret_cast<wl_proxy*>(o));
     wl_data_offer_add_listener(o, &offer_listener, data);
 }
 void dd_enter(void*, wl_data_device*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t,
@@ -538,8 +600,10 @@ void dd_drop(void*, wl_data_device*) {}
 void dd_selection(void* data, wl_data_device*, wl_data_offer* o) {
     auto* k = static_cast<clip*>(data);
     k->events.push_back(o ? "selection" : "selection:nil");
-    if (k->offer && k->offer != o)
+    if (k->offer && k->offer != o) {
+        untrack(k->c, reinterpret_cast<wl_proxy*>(k->offer));
         wl_data_offer_destroy(k->offer); // as every toolkit does: the old one is done
+    }
     k->offer = o;
     k->offer_mimes = o ? g_pending_mimes : std::vector<std::string>{};
 }
@@ -568,16 +632,20 @@ void poffer_offer(void* data, zwp_primary_selection_offer_v1*, const char* mime)
 const zwp_primary_selection_offer_v1_listener poffer_listener = {poffer_offer};
 void pd_data_offer(void* data, zwp_primary_selection_device_v1*,
                    zwp_primary_selection_offer_v1* o) {
-    static_cast<clip*>(data)->events.push_back("pdata_offer");
+    auto* k = static_cast<clip*>(data);
+    k->events.push_back("pdata_offer");
     g_pending_mimes.clear();
+    (k->borrowed ? *k->borrowed : k->c).created.push_back(reinterpret_cast<wl_proxy*>(o));
     zwp_primary_selection_offer_v1_add_listener(o, &poffer_listener, data);
 }
 void pd_selection(void* data, zwp_primary_selection_device_v1*,
                   zwp_primary_selection_offer_v1* o) {
     auto* k = static_cast<clip*>(data);
     k->events.push_back(o ? "pselection" : "pselection:nil");
-    if (k->poffer && k->poffer != o)
+    if (k->poffer && k->poffer != o) {
+        untrack(k->c, reinterpret_cast<wl_proxy*>(k->poffer));
         zwp_primary_selection_offer_v1_destroy(k->poffer);
+    }
     k->poffer = o;
     k->poffer_mimes = o ? g_pending_mimes : std::vector<std::string>{};
 }
@@ -599,12 +667,15 @@ bool clip_connect(clip& k) {
     if (!connect(k.c) || !k.c.seat || !k.c.ddm)
         return false;
     k.kb = wl_seat_get_keyboard(k.c.seat);
+    k.c.created.push_back(reinterpret_cast<wl_proxy*>(k.kb));
     wl_keyboard_add_listener(k.kb, &kb_listener, &k);
     k.dd = wl_data_device_manager_get_data_device(k.c.ddm, k.c.seat);
+    k.c.created.push_back(reinterpret_cast<wl_proxy*>(k.dd));
     wl_data_device_add_listener(k.dd, &dd_listener, &k);
 #ifdef LUMEN_TEST_PRIMARY_SELECTION
     if (k.c.psm) {
         k.pd = zwp_primary_selection_device_manager_v1_get_device(k.c.psm, k.c.seat);
+        k.c.created.push_back(reinterpret_cast<wl_proxy*>(k.pd));
         zwp_primary_selection_device_v1_add_listener(k.pd, &pd_listener, &k);
     }
 #endif
@@ -617,6 +688,7 @@ bool clip_connect(clip& k) {
 /// A clipboard source offering `mimes` (comma-free list), set as the selection.
 void clip_set(clip& k, std::initializer_list<const char*> mimes, uint32_t serial) {
     k.source = wl_data_device_manager_create_data_source(k.c.ddm);
+    (k.borrowed ? *k.borrowed : k.c).created.push_back(reinterpret_cast<wl_proxy*>(k.source));
     wl_data_source_add_listener(k.source, &src_listener, &k);
     for (const char* m : mimes)
         wl_data_source_offer(k.source, m);
@@ -667,9 +739,7 @@ void check(const char* name, bool ok, const std::string& detail) {
 }
 
 void clip_disconnect(clip& k) {
-    if (k.c.display)
-        wl_display_disconnect(k.c.display);
-    k.c.display = nullptr;
+    teardown(k.c);
 }
 
 // ── helpers for the drag-and-drop cases ──
@@ -748,6 +818,9 @@ lx::rect2i newest_window() {
 /// `enter` with accept(`accept`) and set_actions(`actions`, `preferred`) when `respond`.
 struct dnd_peer {
     client c{};
+    /// Set when `c` is a copy of a case's client (self_drag): pushes go to the original,
+    /// whose finish() sweeps them — the copy's list dies with the case and would leak.
+    client* borrowed = nullptr;
     window win{};
     lx::rect2i geometry{};
     wl_pointer* ptr = nullptr;
@@ -794,6 +867,8 @@ const wl_data_offer_listener dp_offer_listener = {dp_offer_offer, dp_offer_sourc
                                                   dp_offer_action};
 
 void dp_data_offer(void* d, wl_data_device*, wl_data_offer* o) {
+    auto* p = static_cast<dnd_peer*>(d);
+    (p->borrowed ? *p->borrowed : p->c).created.push_back(reinterpret_cast<wl_proxy*>(o));
     wl_data_offer_add_listener(o, &dp_offer_listener, d);
 }
 void dp_enter(void* d, wl_data_device*, uint32_t serial, wl_surface*, wl_fixed_t, wl_fixed_t,
@@ -815,8 +890,11 @@ void dp_motion(void* d, wl_data_device*, uint32_t, wl_fixed_t, wl_fixed_t) {
 void dp_drop(void* d, wl_data_device*) { static_cast<dnd_peer*>(d)->events.push_back("drop"); }
 void dp_selection(void* d, wl_data_device*, wl_data_offer* o) {
     // The clipboard's own offers: not this test's business.
-    if (o && o != static_cast<dnd_peer*>(d)->offer)
+    auto* p = static_cast<dnd_peer*>(d);
+    if (o && o != p->offer) {
+        untrack(p->c, reinterpret_cast<wl_proxy*>(o));
         wl_data_offer_destroy(o);
+    }
 }
 const wl_data_device_listener dp_dd_listener = {dp_data_offer, dp_enter, dp_leave,
                                                 dp_motion,     dp_drop,  dp_selection};
@@ -846,14 +924,23 @@ const wl_data_source_listener dp_src_listener = {dp_src_target,         dp_src_s
                                                  dp_src_cancelled,      dp_src_drop_performed,
                                                  dp_src_finished,       dp_src_action};
 
+/** The client whose `created` list owns this peer's proxies: the peer's own, or the
+    case's client it borrowed (self_drag copies the client struct, so pushes must reach
+    the original list — the one finish() sweeps). */
+client& proxies_of(dnd_peer& p) {
+    return p.borrowed ? *p.borrowed : p.c;
+}
+
 /// Pointer, data device and a mapped window on `p.c` (connected already).
 void dnd_setup(dnd_peer& p) {
     p.ptr = wl_seat_get_pointer(p.c.seat);
+    proxies_of(p).created.push_back(reinterpret_cast<wl_proxy*>(p.ptr));
     wl_pointer_add_listener(p.ptr, &dp_ptr_listener, &p);
     p.dd = wl_data_device_manager_get_data_device(p.c.ddm, p.c.seat);
+    proxies_of(p).created.push_back(reinterpret_cast<wl_proxy*>(p.dd));
     wl_data_device_add_listener(p.dd, &dp_dd_listener, &p);
     (void)wl_display_roundtrip(p.c.display);
-    map_window(p.c, p.win);
+    map_window(proxies_of(p), p.win);
     (void)wl_display_roundtrip(p.c.display);
     p.geometry = newest_window();
 }
@@ -869,6 +956,7 @@ void dnd_press(dnd_peer& p, int x, int y) {
 /// (+`serial_skew`), origin the window.
 void dnd_start(dnd_peer& p, uint32_t serial_skew = 0, wl_surface* icon = nullptr) {
     p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+    proxies_of(p).created.push_back(reinterpret_cast<wl_proxy*>(p.source));
     wl_data_source_add_listener(p.source, &dp_src_listener, &p);
     wl_data_source_offer(p.source, "text/plain");
     wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -883,6 +971,7 @@ void dnd_start(dnd_peer& p, uint32_t serial_skew = 0, wl_surface* icon = nullptr
 void self_drag(dnd_peer& p, client& c) {
     p = {};
     p.c = c;
+    p.borrowed = &c; // pushes below reach c.created, which finish(c) sweeps
     p.respond = false;
     dnd_setup(p);
     dnd_press(p, 20, 20);
@@ -921,6 +1010,7 @@ const xdg_activation_token_v1_listener act_listener = {act_done};
 std::string issue_token(client& c, uint32_t serial, wl_surface* surface = nullptr) {
     std::string text;
     xdg_activation_token_v1* t = xdg_activation_v1_get_activation_token(c.activation);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(t));
     xdg_activation_token_v1_add_listener(t, &act_listener, &text);
     if (serial)
         xdg_activation_token_v1_set_serial(t, serial, c.seat);
@@ -929,6 +1019,8 @@ std::string issue_token(client& c, uint32_t serial, wl_surface* surface = nullpt
     xdg_activation_token_v1_set_app_id(t, "lumen-conformance");
     xdg_activation_token_v1_commit(t);
     (void)wl_display_roundtrip(c.display);
+    untrack(c, reinterpret_cast<wl_proxy*>(t)); // its typed destroy frees the proxy
+    untrack(c, reinterpret_cast<wl_proxy*>(t));
     xdg_activation_token_v1_destroy(t);
     return text;
 }
@@ -1004,64 +1096,90 @@ int main() {
                wl_registry_add_listener(r, &find_shell, &f);
                (void)wl_display_roundtrip(c.display);
                if (f.name)
-                   (void)wl_registry_bind(r, f.name, &zlm_shell_v1_interface, 1);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(
+                       wl_registry_bind(r, f.name, &zlm_shell_v1_interface, 1)));
+               wl_registry_destroy(r);
            });
 
     // ── wl_subcompositor.get_subsurface ──
     expect("subsurface: second wl_subsurface for one surface", "wl_subcompositor",
            WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, [](client& c) {
                wl_surface* parent = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(parent));
                wl_surface* child = wl_compositor_create_surface(c.compositor);
-               wl_subcompositor_get_subsurface(c.subcompositor, child, parent);
-               wl_subcompositor_get_subsurface(c.subcompositor, child, parent);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(child));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, child, parent)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, child, parent)));
            });
     expect("subsurface: surface with another role (xdg_toplevel)", "wl_subcompositor",
            WL_SUBCOMPOSITOR_ERROR_BAD_SURFACE, [](client& c) {
                wl_surface* parent = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(parent));
                wl_surface* top = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(top));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, top);
-               (void)xdg_surface_get_toplevel(xs);
-               wl_subcompositor_get_subsurface(c.subcompositor, top, parent);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_toplevel(xs)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, top, parent)));
            });
     expect("subsurface: parent is the surface itself", "wl_subcompositor",
            WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               wl_subcompositor_get_subsurface(c.subcompositor, s, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, s, s)));
            });
     expect("subsurface: parent is a descendant", "wl_subcompositor",
            WL_SUBCOMPOSITOR_ERROR_BAD_PARENT, [](client& c) {
                wl_surface* a = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
                wl_surface* b = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(b));
                wl_surface* d = wl_compositor_create_surface(c.compositor);
-               wl_subcompositor_get_subsurface(c.subcompositor, b, a); // b under a
-               wl_subcompositor_get_subsurface(c.subcompositor, d, b); // d under b
-               wl_subcompositor_get_subsurface(c.subcompositor, a, d); // a under its grandchild
+               c.created.push_back(reinterpret_cast<wl_proxy*>(d));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, b, a))); // b under a
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, d, b))); // d under b
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, a, d))); // a under its grandchild
            });
 
     // ── wl_subsurface.place_above / place_below ──
     expect("subsurface: place_above a non-sibling", "wl_subsurface",
            WL_SUBSURFACE_ERROR_BAD_SURFACE, [](client& c) {
                wl_surface* p = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* q = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(q));
                wl_surface* a = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
                wl_surface* b = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(b));
                wl_subsurface* sa = wl_subcompositor_get_subsurface(c.subcompositor, a, p);
-               (void)wl_subcompositor_get_subsurface(c.subcompositor, b, q);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, b, q)));
                wl_subsurface_place_above(sa, b);
            });
     expect("subsurface: place_below itself", "wl_subsurface", WL_SUBSURFACE_ERROR_BAD_SURFACE,
            [](client& c) {
                wl_surface* p = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* a = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
                wl_subsurface* sa = wl_subcompositor_get_subsurface(c.subcompositor, a, p);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
                wl_subsurface_place_below(sa, a);
            });
     expect("subsurface: place relative to parent and sibling is fine", "none", 0, [](client& c) {
         wl_surface* p = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(p));
         wl_surface* a = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(a));
         wl_surface* b = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(b));
         wl_subsurface* sa = wl_subcompositor_get_subsurface(c.subcompositor, a, p);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
+        c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
         wl_subsurface* sb = wl_subcompositor_get_subsurface(c.subcompositor, b, p);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(sb));
+        c.created.push_back(reinterpret_cast<wl_proxy*>(sb));
         wl_subsurface_place_below(sa, p);
         wl_subsurface_place_above(sb, a);
         wl_subsurface_set_position(sb, -4, 7);
@@ -1075,25 +1193,31 @@ int main() {
     expect("surface: set_buffer_scale 0", "wl_surface", WL_SURFACE_ERROR_INVALID_SCALE,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wl_surface_set_buffer_scale(s, 0);
            });
     expect("surface: set_buffer_transform 8", "wl_surface", WL_SURFACE_ERROR_INVALID_TRANSFORM,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wl_surface_set_buffer_transform(s, 8);
            });
     expect("surface: v5+ attach with a non-zero offset", "wl_surface",
            WL_SURFACE_ERROR_INVALID_OFFSET, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wl_surface_attach(s, make_buffer(c, 10, 10), 3, 0);
            });
     expect("surface: toplevel buffer not divisible by its scale", "wl_surface",
            WL_SURFACE_ERROR_INVALID_SIZE, [](client& c) {
                window w{};
                w.surface = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
                w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
                xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
                w.toplevel = xdg_surface_get_toplevel(w.xdg);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
                wl_surface_commit(w.surface);
                (void)wl_display_roundtrip(c.display);
                xdg_surface_ack_configure(w.xdg, w.cfg.serial);
@@ -1104,6 +1228,7 @@ int main() {
     expect("surface: role-less buffer not divisible by its scale is tolerated", "none", 0,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wl_surface_set_buffer_scale(s, 2);
                wl_surface_attach(s, make_buffer(c, 33, 33), 0, 0);
                wl_surface_commit(s);
@@ -1112,6 +1237,7 @@ int main() {
            [](client& c) {
                for (int t = 0; t < 8; ++t) {
                    wl_surface* s = wl_compositor_create_surface(c.compositor);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                    wl_surface_set_buffer_scale(s, 2);
                    wl_surface_set_buffer_transform(s, t);
                    wl_surface_attach(s, make_buffer(c, 40, 20), 0, 0);
@@ -1128,38 +1254,49 @@ int main() {
     expect("viewporter: second viewport for a surface", "wp_viewporter",
            WP_VIEWPORTER_ERROR_VIEWPORT_EXISTS, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_viewporter_get_viewport(c.viewporter, s);
-               (void)wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_viewporter_get_viewport(c.viewporter, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_viewporter_get_viewport(c.viewporter, s)));
            });
     expect("viewport: source with a negative x", "wp_viewport", WP_VIEWPORT_ERROR_BAD_VALUE,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wp_viewport_set_source(v, wl_fixed_from_int(-1), 0, wl_fixed_from_int(10),
                                       wl_fixed_from_int(10));
            });
     expect("viewport: source with zero width", "wp_viewport", WP_VIEWPORT_ERROR_BAD_VALUE,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wp_viewport_set_source(v, 0, 0, 0, wl_fixed_from_int(10));
            });
     expect("viewport: destination 0x5", "wp_viewport", WP_VIEWPORT_ERROR_BAD_VALUE,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wp_viewport_set_destination(v, 0, 5);
            });
     expect("viewport: destination -1x5 (only -1x-1 unsets)", "wp_viewport",
            WP_VIEWPORT_ERROR_BAD_VALUE, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wp_viewport_set_destination(v, -1, 5);
            });
     expect("viewport: fractional source size without a destination", "wp_viewport",
            WP_VIEWPORT_ERROR_BAD_SIZE, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
                wp_viewport_set_source(v, 0, 0, wl_fixed_from_double(10.5),
                                       wl_fixed_from_int(10));
@@ -1168,7 +1305,9 @@ int main() {
     expect("viewport: source past the buffer", "wp_viewport", WP_VIEWPORT_ERROR_OUT_OF_BUFFER,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
                wp_viewport_set_source(v, wl_fixed_from_int(30), 0, wl_fixed_from_int(11),
                                       wl_fixed_from_int(10));
@@ -1178,7 +1317,9 @@ int main() {
            WP_VIEWPORT_ERROR_OUT_OF_BUFFER, [](client& c) {
                // 80x40 at scale 2 turned by 90 is 20x40 in surface units: 21 wide is out.
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wl_surface_set_buffer_scale(s, 2);
                wl_surface_set_buffer_transform(s, WL_OUTPUT_TRANSFORM_90);
                wl_surface_attach(s, make_buffer(c, 80, 40), 0, 0);
@@ -1188,7 +1329,9 @@ int main() {
     expect("viewport: exactly the scale-2, 90-degree buffer is inside", "none", 0,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wl_surface_set_buffer_scale(s, 2);
                wl_surface_set_buffer_transform(s, WL_OUTPUT_TRANSFORM_90);
                wl_surface_attach(s, make_buffer(c, 80, 40), 0, 0);
@@ -1199,25 +1342,35 @@ int main() {
     expect("viewport: request after its wl_surface is gone", "wp_viewport",
            WP_VIEWPORT_ERROR_NO_SURFACE, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
                wp_viewport_set_destination(v, 10, 10);
            });
     expect("viewport: destroyed before the commit — its state goes with it", "none", 0,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
                wp_viewport_set_source(v, 0, 0, wl_fixed_from_double(10.5),
                                       wl_fixed_from_int(10));
+               untrack(c, reinterpret_cast<wl_proxy*>(v));
+               untrack(c, reinterpret_cast<wl_proxy*>(v));
                wp_viewport_destroy(v);
                wl_surface_commit(s);
                // And a new one may be created.
-               (void)wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_viewporter_get_viewport(c.viewporter, s)));
            });
     expect("viewport: -1 everywhere unsets the source", "none", 0, [](client& c) {
         wl_surface* s = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(s));
         wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(v));
         wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
         wp_viewport_set_source(v, 0, 0, wl_fixed_from_int(99), wl_fixed_from_int(99));
         const wl_fixed_t unset = wl_fixed_from_int(-1);
@@ -1228,8 +1381,14 @@ int main() {
     expect("viewport: a viewport surviving its wl_surface may still be destroyed", "none", 0,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(v));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
+               untrack(c, reinterpret_cast<wl_proxy*>(v));
+               untrack(c, reinterpret_cast<wl_proxy*>(v));
                wp_viewport_destroy(v);
            });
     {
@@ -1241,10 +1400,15 @@ int main() {
                [&](client& c) {
                    window w{};
                    w.surface = wl_compositor_create_surface(c.compositor);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
                    wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, w.surface);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(v));
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(v));
                    w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
                    xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
                    w.toplevel = xdg_surface_get_toplevel(w.xdg);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
                    xdg_toplevel_set_app_id(w.toplevel, "conformance-viewport");
                    wl_surface_commit(w.surface);
                    (void)wl_display_roundtrip(c.display);
@@ -1273,8 +1437,9 @@ int main() {
     expect("fractional scale: second object for a surface", "wp_fractional_scale_manager_v1",
            WP_FRACTIONAL_SCALE_MANAGER_V1_ERROR_FRACTIONAL_SCALE_EXISTS, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
-               (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s)));
            });
     {
         // The first preferred_scale arrives with the object, before the first configure,
@@ -1297,16 +1462,19 @@ int main() {
             }};
         expect("fractional scale: destroy and recreate is fine", "none", 0, [&](client& c) {
             wl_surface* s = wl_compositor_create_surface(c.compositor);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(s));
             wp_fractional_scale_v1* f =
                 wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
             wp_fractional_scale_v1_add_listener(f, &frac_listener, &o);
             xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
             xdg_surface_add_listener(xs, &order_xdg, &o);
-            (void)xdg_surface_get_toplevel(xs);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_toplevel(xs)));
             wl_surface_commit(s);
             (void)wl_display_roundtrip(c.display);
+            untrack(c, reinterpret_cast<wl_proxy*>(f));
             wp_fractional_scale_v1_destroy(f);
-            (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s)));
         });
         unsigned want = 120;
         {
@@ -1332,20 +1500,27 @@ int main() {
     {
         struct fb_log {
             std::vector<std::string> events;
+            client* owner = nullptr; // to untrack the feedback before its typed destroy
         };
         static const wp_presentation_feedback_listener fb_listener = {
             [](void*, struct wp_presentation_feedback*, wl_output*) {},
             [](void* data, struct wp_presentation_feedback* f, uint32_t, uint32_t, uint32_t, uint32_t,
                uint32_t, uint32_t, uint32_t) {
-                static_cast<fb_log*>(data)->events.emplace_back("presented");
+                auto* l = static_cast<fb_log*>(data);
+                l->events.emplace_back("presented");
+                untrack(*l->owner, reinterpret_cast<wl_proxy*>(f));
                 wp_presentation_feedback_destroy(f);
             },
             [](void* data, struct wp_presentation_feedback* f) {
-                static_cast<fb_log*>(data)->events.emplace_back("discarded");
+                auto* l = static_cast<fb_log*>(data);
+                l->events.emplace_back("discarded");
+                untrack(*l->owner, reinterpret_cast<wl_proxy*>(f));
                 wp_presentation_feedback_destroy(f);
             }};
-        const auto watch = [](wp_presentation* p, wl_surface* s, fb_log& log) {
+        const auto watch = [](client& c, wp_presentation* p, wl_surface* s, fb_log& log) {
             struct wp_presentation_feedback* f = wp_presentation_feedback(p, s);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(f));
+            log.owner = &c; // its destroy arrives in the listener: untrack there
             wp_presentation_feedback_add_listener(f, &fb_listener, &log);
         };
 
@@ -1361,11 +1536,11 @@ int main() {
         expect("presentation: feedback on a superseded commit", "none", 0, [&](client& c) {
             window w{};
             map_window(c, w);
-            watch(c.presentation, w.surface, first);
+            watch(c, c.presentation, w.surface, first);
             wl_surface_attach(w.surface, make_buffer(c, 200, 150), 0, 0);
             wl_surface_damage(w.surface, 0, 0, 200, 150);
             wl_surface_commit(w.surface);
-            watch(c.presentation, w.surface, second);
+            watch(c, c.presentation, w.surface, second);
             wl_surface_attach(w.surface, make_buffer(c, 200, 150), 0, 0);
             wl_surface_damage(w.surface, 0, 0, 200, 150);
             wl_surface_commit(w.surface);
@@ -1380,7 +1555,10 @@ int main() {
         fb_log gone{};
         expect("presentation: feedback whose surface is destroyed", "none", 0, [&](client& c) {
             wl_surface* s = wl_compositor_create_surface(c.compositor);
-            watch(c.presentation, s, gone); // pending: before any commit
+            c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+            watch(c, c.presentation, s, gone); // pending: before any commit
+            untrack(c, reinterpret_cast<wl_proxy*>(s));
+            untrack(c, reinterpret_cast<wl_proxy*>(s));
             wl_surface_destroy(s);
             (void)wl_display_roundtrip(c.display);
         });
@@ -1394,11 +1572,12 @@ int main() {
                    window w{};
                    map_window(c, w);
                    wl_surface* a = wl_compositor_create_surface(c.compositor);
-                   (void)wl_subcompositor_get_subsurface(c.subcompositor, a, w.surface);
-                   watch(c.presentation, a, cached);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(a));
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, a, w.surface)));
+                   watch(c, c.presentation, a, cached);
                    wl_surface_attach(a, make_buffer(c, 20, 20), 0, 0);
                    wl_surface_commit(a); // cached, waiting for the parent
-                   watch(c.presentation, a, applied);
+                   watch(c, c.presentation, a, applied);
                    wl_surface_attach(a, make_buffer(c, 20, 20), 0, 0);
                    wl_surface_commit(a); // replaces the cached update
                    wl_surface_commit(w.surface);
@@ -1416,38 +1595,67 @@ int main() {
     expect("surface: destroyed before its wl_subsurface", "[destroyed]",
            WL_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, [](client& c) {
                wl_surface* p = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* a = wl_compositor_create_surface(c.compositor);
-               (void)wl_subcompositor_get_subsurface(c.subcompositor, a, p);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wl_subcompositor_get_subsurface(c.subcompositor, a, p)));
+               untrack(c, reinterpret_cast<wl_proxy*>(a));
+               untrack(c, reinterpret_cast<wl_proxy*>(a));
                wl_surface_destroy(a);
            });
     expect("surface: destroyed before its xdg_toplevel", "[destroyed]",
            WL_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
-               (void)xdg_surface_get_toplevel(xs);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_toplevel(xs)));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
            });
     expect("surface: parent destroyed before the child's wl_subsurface is fine", "none", 0,
            [](client& c) {
                wl_surface* p = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* a = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
                wl_subsurface* sa = wl_subcompositor_get_subsurface(c.subcompositor, a, p);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
                wl_surface_commit(a); // cached: synchronized to a parent about to vanish
+               untrack(c, reinterpret_cast<wl_proxy*>(p));
+               untrack(c, reinterpret_cast<wl_proxy*>(p));
                wl_surface_destroy(p);
                wl_subsurface_set_position(sa, 1, 1); // inert, not an error
+               untrack(c, reinterpret_cast<wl_proxy*>(sa));
+               untrack(c, reinterpret_cast<wl_proxy*>(sa));
                wl_subsurface_destroy(sa);
+               untrack(c, reinterpret_cast<wl_proxy*>(a));
+               untrack(c, reinterpret_cast<wl_proxy*>(a));
                wl_surface_destroy(a);
            });
     expect("surface: role object first, then surface, then re-link is fine", "none", 0,
            [](client& c) {
                wl_surface* p = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* a = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
                wl_subsurface* sa = wl_subcompositor_get_subsurface(c.subcompositor, a, p);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
+               untrack(c, reinterpret_cast<wl_proxy*>(sa));
+               untrack(c, reinterpret_cast<wl_proxy*>(sa));
                wl_subsurface_destroy(sa);
                // The role stays; a new wl_subsurface for the same surface is allowed.
                sa = wl_subcompositor_get_subsurface(c.subcompositor, a, p);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
+               untrack(c, reinterpret_cast<wl_proxy*>(sa));
+               untrack(c, reinterpret_cast<wl_proxy*>(sa));
                wl_subsurface_destroy(sa);
+               untrack(c, reinterpret_cast<wl_proxy*>(a));
+               untrack(c, reinterpret_cast<wl_proxy*>(a));
                wl_surface_destroy(a);
+               untrack(c, reinterpret_cast<wl_proxy*>(p));
+               untrack(c, reinterpret_cast<wl_proxy*>(p));
                wl_surface_destroy(p);
            });
 
@@ -1463,21 +1671,27 @@ int main() {
                    window w{};
                    map_window(c, w);
                    wl_surface* a = wl_compositor_create_surface(c.compositor);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(a));
                    wl_surface_attach(a, make_buffer(c, 50, 20), 0, 0);
                    wl_surface_commit(a); // no role yet
                    (void)wl_display_roundtrip(c.display);
                    const unsigned before = drawn_surfaces();
                    wl_subsurface* sa = wl_subcompositor_get_subsurface(c.subcompositor, a, w.surface);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
                    wl_surface_commit(w.surface);
                    (void)wl_display_roundtrip(c.display);
                    drawn_ok = drawn_surfaces() == before + 1;
                    // Unlinked, then new content, then linked again.
+                   untrack(c, reinterpret_cast<wl_proxy*>(sa));
+                   untrack(c, reinterpret_cast<wl_proxy*>(sa));
                    wl_subsurface_destroy(sa);
                    wl_surface_attach(a, make_buffer(c, 60, 20), 0, 0);
                    wl_surface_commit(a);
                    (void)wl_display_roundtrip(c.display);
                    drawn_ok = drawn_ok && drawn_surfaces() == before;
                    sa = wl_subcompositor_get_subsurface(c.subcompositor, a, w.surface);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(sa));
                    wl_surface_commit(w.surface);
                    (void)wl_display_roundtrip(c.display);
                    drawn_ok = drawn_ok && drawn_surfaces() == before + 1;
@@ -1492,17 +1706,31 @@ int main() {
 
     // ── xdg_positioner ──
     expect("positioner: set_size 0", "xdg_positioner", XDG_POSITIONER_ERROR_INVALID_INPUT,
-           [](client& c) { xdg_positioner_set_size(xdg_wm_base_create_positioner(c.wm_base), 0, 10); });
+           [](client& c) {
+               xdg_positioner* p = xdg_wm_base_create_positioner(c.wm_base);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
+               xdg_positioner_set_size(p, 0, 10);
+           });
     expect("positioner: set_anchor_rect with a negative width", "xdg_positioner",
            XDG_POSITIONER_ERROR_INVALID_INPUT, [](client& c) {
-               xdg_positioner_set_anchor_rect(xdg_wm_base_create_positioner(c.wm_base), 0, 0, -1, 5);
+               xdg_positioner* p = xdg_wm_base_create_positioner(c.wm_base);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
+               xdg_positioner_set_anchor_rect(p, 0, 0, -1, 5);
            });
     expect("positioner: set_anchor out of range", "xdg_positioner",
            XDG_POSITIONER_ERROR_INVALID_INPUT,
-           [](client& c) { xdg_positioner_set_anchor(xdg_wm_base_create_positioner(c.wm_base), 9); });
+           [](client& c) {
+               xdg_positioner* p = xdg_wm_base_create_positioner(c.wm_base);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
+               xdg_positioner_set_anchor(p, 9);
+           });
     expect("positioner: set_gravity out of range", "xdg_positioner",
            XDG_POSITIONER_ERROR_INVALID_INPUT,
-           [](client& c) { xdg_positioner_set_gravity(xdg_wm_base_create_positioner(c.wm_base), 9); });
+           [](client& c) {
+               xdg_positioner* p = xdg_wm_base_create_positioner(c.wm_base);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
+               xdg_positioner_set_gravity(p, 9);
+           });
 
     // ── xdg_surface.get_popup ──
     expect("popup: get_popup with an incomplete positioner", "xdg_wm_base",
@@ -1510,16 +1738,21 @@ int main() {
                window w{};
                map_window(c, w);
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
                xdg_positioner* p = xdg_wm_base_create_positioner(c.wm_base);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                xdg_positioner_set_size(p, 10, 10); // no anchor rect
-               (void)xdg_surface_get_popup(xs, w.xdg, p);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_popup(xs, w.xdg, p)));
            });
     expect("popup: parent is the popup's own xdg_surface", "xdg_wm_base",
            XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
-               (void)xdg_surface_get_popup(xs, xs, good_positioner(c));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_popup(xs, xs, good_positioner(c))));
            });
     expect("popup: buffer before the first ack", "xdg_surface",
            XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, [](client& c) {
@@ -1544,8 +1777,11 @@ int main() {
         map_window(c, w);
         popup p = make_popup(c, w.xdg);
         configure_and_map(c, p.surface, p.xdg, p.cfg, 40, 30);
+        untrack(c, reinterpret_cast<wl_proxy*>(p.role));
         xdg_popup_destroy(p.role);
+        untrack(c, reinterpret_cast<wl_proxy*>(p.xdg));
         xdg_surface_destroy(p.xdg);
+        untrack(c, reinterpret_cast<wl_proxy*>(p.surface));
         wl_surface_destroy(p.surface);
     });
     expect("popup: grab after map", "xdg_popup", XDG_POPUP_ERROR_INVALID_GRAB, [](client& c) {
@@ -1571,6 +1807,7 @@ int main() {
                popup a = make_popup(c, w.xdg);
                configure_and_map(c, a.surface, a.xdg, a.cfg, 40, 30);
                (void)make_popup(c, a.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(a.role));
                xdg_popup_destroy(a.role);
            });
     expect("popup: xdg_surface destroyed before its xdg_popup", "[destroyed]",
@@ -1578,6 +1815,7 @@ int main() {
                window w{};
                map_window(c, w);
                popup p = make_popup(c, w.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.xdg));
                xdg_surface_destroy(p.xdg);
            });
     expect("popup: wl_surface destroyed before its xdg_popup", "[destroyed]",
@@ -1585,6 +1823,7 @@ int main() {
                window w{};
                map_window(c, w);
                popup p = make_popup(c, w.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.surface));
                wl_surface_destroy(p.surface);
            });
     expect("popup: a denied grab (stale serial) is popup_done, not an error", "none", 0,
@@ -1595,8 +1834,11 @@ int main() {
                xdg_popup_grab(p.role, c.seat, 12345);
                wl_surface_commit(p.surface); // inert after popup_done; no configure owed
                (void)wl_display_roundtrip(c.display);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.role));
                xdg_popup_destroy(p.role);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.xdg));
                xdg_surface_destroy(p.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.surface));
                wl_surface_destroy(p.surface);
            });
 
@@ -1604,13 +1846,20 @@ int main() {
     expect("wm_base: destroyed with an xdg_surface alive", "[destroyed]",
            XDG_WM_BASE_ERROR_DEFUNCT_SURFACES, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)xdg_wm_base_get_xdg_surface(c.wm_base, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_wm_base_get_xdg_surface(c.wm_base, s)));
+               untrack(c, reinterpret_cast<wl_proxy*>(c.wm_base));
                xdg_wm_base_destroy(c.wm_base);
            });
     expect("wm_base: destroyed after its xdg_surfaces is fine", "none", 0, [](client& c) {
         wl_surface* s = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(s));
         xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
+        untrack(c, reinterpret_cast<wl_proxy*>(xs));
+        untrack(c, reinterpret_cast<wl_proxy*>(xs));
         xdg_surface_destroy(xs);
+        untrack(c, reinterpret_cast<wl_proxy*>(c.wm_base));
         xdg_wm_base_destroy(c.wm_base);
     });
 
@@ -1618,25 +1867,33 @@ int main() {
     expect("decoration: second decoration object for one toplevel", "zxdg_toplevel_decoration_v1",
            ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ALREADY_CONSTRUCTED, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
                xdg_toplevel* t = xdg_surface_get_toplevel(xs);
-               (void)zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t);
-               (void)zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t)));
            });
     expect("decoration: set_mode with an invalid mode", "zxdg_toplevel_decoration_v1",
            ZXDG_TOPLEVEL_DECORATION_V1_ERROR_INVALID_MODE, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
                xdg_toplevel* t = xdg_surface_get_toplevel(xs);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
                zxdg_toplevel_decoration_v1* d =
                    zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(d));
                zxdg_toplevel_decoration_v1_set_mode(d, 3);
            });
     expect("decoration: xdg_toplevel destroyed before its decoration", "zxdg_toplevel_decoration_v1",
            ZXDG_TOPLEVEL_DECORATION_V1_ERROR_ORPHANED, [](client& c) {
                window w{};
                map_window(c, w);
-               (void)zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel)));
+               untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
                xdg_toplevel_destroy(w.toplevel);
            });
     expect("decoration: v2 object on a mapped toplevel, mode changes, destroy order ok", "none", 0,
@@ -1645,14 +1902,20 @@ int main() {
                map_window(c, w);
                zxdg_toplevel_decoration_v1* d =
                    zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(d));
                zxdg_toplevel_decoration_v1_set_mode(d, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
                zxdg_toplevel_decoration_v1_unset_mode(d);
                zxdg_toplevel_decoration_v1_set_mode(d, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
                (void)wl_display_roundtrip(c.display);
+               untrack(c, reinterpret_cast<wl_proxy*>(d));
+               untrack(c, reinterpret_cast<wl_proxy*>(d));
                zxdg_toplevel_decoration_v1_destroy(d);
                wl_surface_commit(w.surface);
+               untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
                xdg_toplevel_destroy(w.toplevel);
+               untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
                xdg_surface_destroy(w.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
                wl_surface_destroy(w.surface);
            });
     {
@@ -1674,11 +1937,15 @@ int main() {
         bool ok = false;
         expect("decoration: configure carries the policy's mode", "none", 0, [&](client& c) {
             wl_surface* s = wl_compositor_create_surface(c.compositor);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(s));
             xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
             xdg_surface_add_listener(xs, &order_listener, nullptr);
             xdg_toplevel* t = xdg_surface_get_toplevel(xs);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(t));
             zxdg_toplevel_decoration_v1* d =
                 zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(d));
             zxdg_toplevel_decoration_v1_add_listener(d, &deco_listener, nullptr);
             zxdg_toplevel_decoration_v1_set_mode(d, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
             wl_surface_commit(s);
@@ -1696,9 +1963,17 @@ int main() {
             const bool client_side = got.mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE &&
                                      got.serial != 0;
             ok = server && client_side;
+            untrack(c, reinterpret_cast<wl_proxy*>(d));
+            untrack(c, reinterpret_cast<wl_proxy*>(d));
             zxdg_toplevel_decoration_v1_destroy(d);
+            untrack(c, reinterpret_cast<wl_proxy*>(t));
+            untrack(c, reinterpret_cast<wl_proxy*>(t));
             xdg_toplevel_destroy(t);
+            untrack(c, reinterpret_cast<wl_proxy*>(xs));
+            untrack(c, reinterpret_cast<wl_proxy*>(xs));
             xdg_surface_destroy(xs);
+            untrack(c, reinterpret_cast<wl_proxy*>(s));
+            untrack(c, reinterpret_cast<wl_proxy*>(s));
             wl_surface_destroy(s);
         });
         ++g_ran;
@@ -1719,8 +1994,11 @@ int main() {
                    map_window(c, w);
                    zxdg_toplevel_decoration_v1* d =
                        zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(d));
                    (void)wl_display_roundtrip(c.display); // server-side configure, in flight
                    const uint32_t in_flight = w.cfg.serial;
+                   untrack(c, reinterpret_cast<wl_proxy*>(d));
+                   untrack(c, reinterpret_cast<wl_proxy*>(d));
                    zxdg_toplevel_decoration_v1_destroy(d);
                    wl_surface_commit(w.surface);
                    xdg_surface_ack_configure(w.xdg, in_flight);
@@ -1730,6 +2008,7 @@ int main() {
                    const bool none_after_destroy = server_decorated() == 0;
                    // A new object is configured server-side again, and that does apply.
                    d = zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(d));
                    (void)wl_display_roundtrip(c.display);
                    xdg_surface_ack_configure(w.xdg, w.cfg.serial);
                    wl_surface_attach(w.surface, make_buffer(c, 200, 150), 0, 0);
@@ -1750,15 +2029,18 @@ int main() {
            ZXDG_TOPLEVEL_DECORATION_V1_ERROR_UNCONFIGURED_BUFFER, [](client& c) {
                window w{};
                map_window(c, w);
-               (void)zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel)));
            });
     expect("decoration v1: buffer attached before the decoration configure",
            "zxdg_toplevel_decoration_v1", ZXDG_TOPLEVEL_DECORATION_V1_ERROR_UNCONFIGURED_BUFFER,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
                xdg_toplevel* t = xdg_surface_get_toplevel(xs);
-               (void)zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, t)));
                wl_surface_attach(s, make_buffer(c, 50, 50), 0, 0);
            });
     g_deco_version = 2;
@@ -1766,7 +2048,7 @@ int main() {
            [](client& c) {
                window w{};
                map_window(c, w);
-               (void)zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zxdg_decoration_manager_v1_get_toplevel_decoration(c.deco, w.toplevel)));
                (void)wl_display_roundtrip(c.display);
            });
 
@@ -1774,33 +2056,39 @@ int main() {
     expect("layer: surface with another role (xdg_toplevel)", "zwlr_layer_shell_v1",
            ZWLR_LAYER_SHELL_V1_ERROR_ROLE, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
-               (void)xdg_surface_get_toplevel(xs);
-               (void)zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x");
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_toplevel(xs)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x")));
            });
     expect("layer: second layer surface for one wl_surface", "zwlr_layer_shell_v1",
            ZWLR_LAYER_SHELL_V1_ERROR_ROLE, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x");
-               (void)zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x");
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x")));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x")));
            });
     expect("layer: surface has a buffer attached", "zwlr_layer_shell_v1",
            ZWLR_LAYER_SHELL_V1_ERROR_ALREADY_CONSTRUCTED, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wl_surface_attach(s, make_buffer(c, 10, 10), 0, 0);
-               (void)zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x");
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x")));
            });
     expect("layer: surface has a buffer committed", "zwlr_layer_shell_v1",
            ZWLR_LAYER_SHELL_V1_ERROR_ALREADY_CONSTRUCTED, [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wl_surface_attach(s, make_buffer(c, 10, 10), 0, 0);
                wl_surface_commit(s);
-               (void)zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x");
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 2, "x")));
            });
     expect("layer: invalid layer", "zwlr_layer_shell_v1", ZWLR_LAYER_SHELL_V1_ERROR_INVALID_LAYER,
            [](client& c) {
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 4, "x");
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, s, nullptr, 4, "x")));
            });
     expect("layer: set_layer with an invalid layer", "zwlr_layer_surface_v1",
            ZWLR_LAYER_SHELL_V1_ERROR_INVALID_LAYER, [](client& c) {
@@ -1893,6 +2181,7 @@ int main() {
     expect("layer: wl_surface destroyed before its layer surface", "[destroyed]",
            WL_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, [](client& c) {
                layer l = make_layer(c);
+               untrack(c, reinterpret_cast<wl_proxy*>(l.surface));
                wl_surface_destroy(l.surface);
            });
     expect("layer: get_popup on a popup that made its initial commit", "xdg_wm_base",
@@ -1919,8 +2208,11 @@ int main() {
                popup p = make_popup(c, nullptr);
                zwlr_layer_surface_v1_get_popup(l.role, p.role);
                configure_and_map(c, p.surface, p.xdg, p.cfg, 40, 30);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.role));
                xdg_popup_destroy(p.role);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.xdg));
                xdg_surface_destroy(p.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(p.surface));
                wl_surface_destroy(p.surface);
                wl_surface_attach(l.surface, nullptr, 0, 0);
                wl_surface_commit(l.surface);
@@ -1932,7 +2224,9 @@ int main() {
                wl_surface_attach(l.surface, make_buffer(c, 100, 40), 0, 0);
                wl_surface_commit(l.surface);
                (void)wl_display_roundtrip(c.display);
+               untrack(c, reinterpret_cast<wl_proxy*>(l.role));
                zwlr_layer_surface_v1_destroy(l.role);
+               untrack(c, reinterpret_cast<wl_proxy*>(l.surface));
                wl_surface_destroy(l.surface);
            });
     expect("layer: disconnect with a mapped panel and its popup alive", "none", 0,
@@ -1948,7 +2242,9 @@ int main() {
     expect("data device: set_selection with a source already used", "wl_data_device",
            WL_DATA_DEVICE_ERROR_USED_SOURCE, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_offer(src, "text/plain");
                wl_data_device_set_selection(dd, src, 1); // refused (serial) but used
                wl_data_device_set_selection(dd, src, 1);
@@ -1956,25 +2252,31 @@ int main() {
     expect("data device: a drag-and-drop source used as the selection", "wl_data_source",
            WL_DATA_SOURCE_ERROR_INVALID_SOURCE, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
                wl_data_device_set_selection(dd, src, 1);
            });
     expect("data source: set_actions twice", "wl_data_source",
            WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK, [](client& c) {
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
                wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
            });
     expect("data source: set_actions with an undefined bit", "wl_data_source",
            WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK, [](client& c) {
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_set_actions(src, 8);
            });
     expect("data source: set_actions after set_selection", "wl_data_source",
            WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_device_set_selection(dd, src, 1);
                wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
            });
@@ -1984,9 +2286,12 @@ int main() {
         const auto own_offer = [](client& c) {
             k = {};
             k.c = c;
+            k.borrowed = &c; // pushes below reach c.created, which finish(c) sweeps
             k.kb = wl_seat_get_keyboard(c.seat);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(k.kb));
             wl_keyboard_add_listener(k.kb, &kb_listener, &k);
             k.dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(k.dd));
             wl_data_device_add_listener(k.dd, &dd_listener, &k);
             window w{};
             map_window(c, w);
@@ -2049,6 +2354,7 @@ int main() {
 
         // A serial b was never sent: refused, the source cancelled, the selection kept.
         wl_data_source* stale = wl_data_device_manager_create_data_source(b.c.ddm);
+        b.c.created.push_back(reinterpret_cast<wl_proxy*>(stale));
         static bool stale_cancelled;
         stale_cancelled = false;
         static const wl_data_source_listener stale_listener = {
@@ -2064,6 +2370,8 @@ int main() {
               stale_cancelled && kept,
               "stale source cancelled=" + std::to_string(stale_cancelled) +
                   ", owner kept the selection=" + std::to_string(kept));
+        untrack(b.c, reinterpret_cast<wl_proxy*>(stale));
+        untrack(b.c, reinterpret_cast<wl_proxy*>(stale));
         wl_data_source_destroy(stale);
 
         // Replacement: b takes the selection with its own enter serial; a is cancelled.
@@ -2076,6 +2384,7 @@ int main() {
                   std::to_string(b.offer_mimes.size()));
 
         // The owner destroys its source: the focused client is told there is none.
+        untrack(b.c, reinterpret_cast<wl_proxy*>(b.source));
         wl_data_source_destroy(b.source);
         b.source = nullptr;
         (void)wl_display_roundtrip(b.c.display);
@@ -2105,6 +2414,7 @@ int main() {
         };
         pl.axis = [](void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {};
         wl_pointer* ptr = wl_seat_get_pointer(k.c.seat);
+k.c.created.push_back(reinterpret_cast<wl_proxy*>(ptr));
         wl_pointer_add_listener(ptr, &pl, nullptr);
         (void)wl_display_roundtrip(k.c.display);
 
@@ -2113,8 +2423,10 @@ int main() {
         clip_set(k, {"text/plain"}, k.win.cfg.serial);
         (void)wl_display_roundtrip(k.c.display);
         const bool configure_refused = k.cancelled;
-        if (k.source)
+        if (k.source) {
+            untrack(k.c, reinterpret_cast<wl_proxy*>(k.source));
             wl_data_source_destroy(k.source);
+        }
         k.source = nullptr;
         k.cancelled = false;
 
@@ -2162,6 +2474,7 @@ int main() {
         a.payload = "lumen-primary-conformance";
         const bool up = clip_connect(a) && a.pd;
         a.psource = zwp_primary_selection_device_manager_v1_create_source(a.c.psm);
+        a.c.created.push_back(reinterpret_cast<wl_proxy*>(a.psource));
         zwp_primary_selection_source_v1_add_listener(a.psource, &psrc_listener, &a);
         zwp_primary_selection_source_v1_offer(a.psource, "text/plain;charset=utf-8");
         zwp_primary_selection_device_v1_set_selection(a.pd, a.psource, a.enter_serial);
@@ -2184,6 +2497,8 @@ int main() {
         check("primary: a reused source is refused and cancelled, not a protocol error",
               a.pcancelled && wl_display_get_error(a.c.display) == 0,
               "cancelled=" + std::to_string(a.pcancelled));
+        untrack(a.c, reinterpret_cast<wl_proxy*>(a.psource));
+        untrack(a.c, reinterpret_cast<wl_proxy*>(a.psource));
         zwp_primary_selection_source_v1_destroy(a.psource);
         (void)wl_display_roundtrip(a.c.display);
         (void)wl_display_roundtrip(b.c.display);
@@ -2201,6 +2516,7 @@ int main() {
     expect("dnd: start_drag with an icon that has another role", "wl_data_device",
            WL_DATA_DEVICE_ERROR_ROLE, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                window w{};
                map_window(c, w);
                wl_data_device_start_drag(dd, nullptr, w.surface, w.surface, 1);
@@ -2208,9 +2524,11 @@ int main() {
     expect("dnd: start_drag with a source already used", "wl_data_device",
            WL_DATA_DEVICE_ERROR_USED_SOURCE, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                window w{};
                map_window(c, w);
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_offer(src, "text/plain");
                wl_data_device_set_selection(dd, src, 1); // refused (serial) but used
                wl_data_device_start_drag(dd, src, w.surface, nullptr, 1);
@@ -2218,9 +2536,11 @@ int main() {
     expect("dnd: source set_actions after start_drag", "wl_data_source",
            WL_DATA_SOURCE_ERROR_INVALID_ACTION_MASK, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                window w{};
                map_window(c, w);
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_device_start_drag(dd, src, w.surface, nullptr, 1); // refused, used
                wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
            });
@@ -2338,6 +2658,7 @@ int main() {
         // A stale serial: refused, the source cancelled, pointer focus untouched.
         a.events.clear();
         b.events.clear();
+        untrack(a.c, reinterpret_cast<wl_proxy*>(a.source));
         wl_data_source_destroy(a.source);
         a.source = nullptr;
         dnd_press(a, 5, 5);
@@ -2351,6 +2672,7 @@ int main() {
               "origin events: " + joined(a.events));
 
         // Not accepted: b declines, the release over it cancels (leave, no drop).
+        untrack(a.c, reinterpret_cast<wl_proxy*>(a.source));
         wl_data_source_destroy(a.source);
         a.source = nullptr;
         a.events.clear();
@@ -2371,6 +2693,7 @@ int main() {
               "target " + joined(b.events) + " | source " + joined(a.events));
 
         // Escape: the target is left, the source cancelled, Escape reaches no client.
+        untrack(a.c, reinterpret_cast<wl_proxy*>(a.source));
         wl_data_source_destroy(a.source);
         a.source = nullptr;
         a.events.clear();
@@ -2401,6 +2724,7 @@ int main() {
               "target " + joined(b.events) + " | source " + joined(a.events));
 
         // The source's client goes mid-drag: the target is left, the compositor carries on.
+        untrack(a.c, reinterpret_cast<wl_proxy*>(a.source));
         wl_data_source_destroy(a.source);
         a.source = nullptr;
         a.events.clear();
@@ -2409,7 +2733,7 @@ int main() {
         dnd_start(a);
         inject_move(bx, by);
         (void)wl_display_roundtrip(b.c.display);
-        wl_display_disconnect(a.c.display);
+        teardown(a.c);
         a.c.display = nullptr;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         (void)wl_display_roundtrip(b.c.display);
@@ -2425,7 +2749,7 @@ int main() {
               "target " + joined(b.events) + ", drag active after=" +
                   std::to_string(active_after));
         if (b.c.display)
-            wl_display_disconnect(b.c.display);
+            teardown(b.c);
     }
 
 #ifdef LUMEN_TEST_TOPLEVEL_DRAG
@@ -2435,16 +2759,19 @@ int main() {
            "xdg_toplevel_drag_manager_v1", XDG_TOPLEVEL_DRAG_MANAGER_V1_ERROR_INVALID_SOURCE,
            [](client& c) {
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_offer(src, "text/plain");
-               (void)xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
-               (void)xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src)));
            });
     expect("toplevel-drag: a source marked for a toplevel drag is no selection",
            "wl_data_source", WL_DATA_SOURCE_ERROR_INVALID_SOURCE, [](client& c) {
                wl_data_device* dd = wl_data_device_manager_get_data_device(c.ddm, c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(dd));
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_offer(src, "text/plain");
-               (void)xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src)));
                wl_data_device_set_selection(dd, src, 1);
            });
     expect("toplevel-drag: attach while a toplevel is attached", "xdg_toplevel_drag_v1",
@@ -2452,9 +2779,11 @@ int main() {
                window w{};
                map_window(c, w);
                wl_data_source* src = wl_data_device_manager_create_data_source(c.ddm);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(src));
                wl_data_source_offer(src, "text/plain");
                xdg_toplevel_drag_v1* drag =
                    xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(c.drag_manager, src);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(drag));
                xdg_toplevel_drag_v1_attach(drag, w.toplevel, 0, 0);
                xdg_toplevel_drag_v1_attach(drag, w.toplevel, 4, 4);
            });
@@ -2466,10 +2795,12 @@ int main() {
                XDG_TOPLEVEL_DRAG_V1_ERROR_ONGOING_DRAG, [](client& c) {
                    p = {};
                    p.c = c;
+                   p.borrowed = &c; // pushes reach c.created, which finish(c) sweeps
                    p.respond = false;
                    dnd_setup(p);
                    dnd_press(p, 20, 20);
                    p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(p.source));
                    wl_data_source_add_listener(p.source, &dp_src_listener, &p);
                    wl_data_source_offer(p.source, "text/plain");
                    wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -2481,6 +2812,8 @@ int main() {
                    wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr,
                                              p.press_serial);
                    (void)wl_display_roundtrip(c.display);
+                   untrack(c, reinterpret_cast<wl_proxy*>(drag));
+                   untrack(c, reinterpret_cast<wl_proxy*>(drag));
                    xdg_toplevel_drag_v1_destroy(drag);
                });
         // The press outlived the connection: give the seat its release.
@@ -2497,12 +2830,16 @@ int main() {
             dnd_setup(p);
         dnd_press(p, 20, 20);
         p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(p.source));
         wl_data_source_add_listener(p.source, &dp_src_listener, &p);
         wl_data_source_offer(p.source, "text/plain");
         wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
                                                  WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
         xdg_toplevel_drag_v1* drag =
             xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(p.c.drag_manager, p.source);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(drag));
+        untrack(p.c, reinterpret_cast<wl_proxy*>(drag));
+        untrack(p.c, reinterpret_cast<wl_proxy*>(drag));
         xdg_toplevel_drag_v1_destroy(drag); // no drag began: allowed
         (void)wl_display_roundtrip(p.c.display);
         wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr, p.press_serial);
@@ -2518,7 +2855,7 @@ int main() {
               up && clean_start && dragging,
               "drag active=" + std::to_string(dragging) + " source " + joined(p.events));
         if (p.c.display)
-            wl_display_disconnect(p.c.display);
+            teardown(p.c);
     }
 
     // Behaviour, with input injected. Dragging an existing window (attach after start):
@@ -2536,6 +2873,7 @@ int main() {
         }
         dnd_press(a, 20, 20);
         a.source = wl_data_device_manager_create_data_source(a.c.ddm);
+a.c.created.push_back(reinterpret_cast<wl_proxy*>(a.source));
         wl_data_source_add_listener(a.source, &dp_src_listener, &a);
         wl_data_source_offer(a.source, "text/plain");
         wl_data_source_set_actions(a.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -2601,6 +2939,7 @@ int main() {
         pump_tick();
         const lx::rect2i g5 = newest_window();
         (void)wl_display_roundtrip(a.c.display);
+        untrack(a.c, reinterpret_cast<wl_proxy*>(drag));
         xdg_toplevel_drag_v1_destroy(drag);
         const bool clean = wl_display_roundtrip(a.c.display) >= 0 &&
                            wl_display_get_error(a.c.display) == 0 &&
@@ -2619,9 +2958,9 @@ int main() {
         check("toplevel-drag: destroy after the drag ended succeeds", up && clean,
               "source " + joined(a.events));
         if (b.c.display)
-            wl_display_disconnect(b.c.display);
+            teardown(b.c);
         if (a.c.display)
-            wl_display_disconnect(a.c.display);
+            teardown(a.c);
     }
 
     // A drop ends it the same way: destroy after dnd_drop_performed succeeds.
@@ -2637,6 +2976,7 @@ int main() {
         }
         dnd_press(a, 20, 20);
         a.source = wl_data_device_manager_create_data_source(a.c.ddm);
+        a.c.created.push_back(reinterpret_cast<wl_proxy*>(a.source));
         wl_data_source_add_listener(a.source, &dp_src_listener, &a);
         wl_data_source_offer(a.source, "text/plain");
         wl_data_source_set_actions(a.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -2671,6 +3011,7 @@ int main() {
         const bool dropped = in_order(b.events, {"enter", "drop", "leave"}) &&
                              in_order(a.events, {"drop_performed"}) &&
                              std::count(a.events.begin(), a.events.end(), "cancelled") == 0;
+        untrack(a.c, reinterpret_cast<wl_proxy*>(drag));
         xdg_toplevel_drag_v1_destroy(drag);
         const bool clean = wl_display_roundtrip(a.c.display) >= 0 &&
                            wl_display_get_error(a.c.display) == 0;
@@ -2680,9 +3021,9 @@ int main() {
                   std::to_string(g1.x) + "," + std::to_string(g1.y) + " source " +
                   joined(a.events));
         if (b.c.display)
-            wl_display_disconnect(b.c.display);
+            teardown(b.c);
         if (a.c.display)
-            wl_display_disconnect(a.c.display);
+            teardown(a.c);
     }
 
     // The detachable-window workflow: attach a toplevel that is not mapped yet, before
@@ -2695,6 +3036,7 @@ int main() {
             dnd_setup(p);
         dnd_press(p, 20, 20);
         p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(p.source));
         wl_data_source_add_listener(p.source, &dp_src_listener, &p);
         wl_data_source_offer(p.source, "text/plain");
         wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -2703,9 +3045,12 @@ int main() {
             xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(p.c.drag_manager, p.source);
         window w2{};
         w2.surface = wl_compositor_create_surface(p.c.compositor);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(w2.surface));
         w2.xdg = xdg_wm_base_get_xdg_surface(p.c.wm_base, w2.surface);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(w2.xdg));
         xdg_surface_add_listener(w2.xdg, &xdg_listener, &w2.cfg);
         w2.toplevel = xdg_surface_get_toplevel(w2.xdg);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(w2.toplevel));
         xdg_toplevel_drag_v1_attach(drag, w2.toplevel, 10, 7);
         wl_data_device_start_drag(p.dd, p.source, p.win.surface, nullptr, p.press_serial);
         (void)wl_display_roundtrip(p.c.display);
@@ -2722,6 +3067,8 @@ int main() {
         pump_tick();
         const lx::rect2i g3 = newest_window();
         (void)wl_display_roundtrip(p.c.display);
+        untrack(p.c, reinterpret_cast<wl_proxy*>(drag));
+        untrack(p.c, reinterpret_cast<wl_proxy*>(drag));
         xdg_toplevel_drag_v1_destroy(drag);
         const bool clean = wl_display_roundtrip(p.c.display) >= 0 &&
                            wl_display_get_error(p.c.display) == 0;
@@ -2733,7 +3080,7 @@ int main() {
                   std::to_string(g2.x) + "," + std::to_string(g2.y) + " ended=" +
                   std::to_string(g3.x) + "," + std::to_string(g3.y));
         if (p.c.display)
-            wl_display_disconnect(p.c.display);
+            teardown(p.c);
     }
 
     // An unmap auto-detaches: the drag goes on, the remapped window stays put until
@@ -2746,6 +3093,7 @@ int main() {
             dnd_setup(p);
         dnd_press(p, 20, 20);
         p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(p.source));
         wl_data_source_add_listener(p.source, &dp_src_listener, &p);
         wl_data_source_offer(p.source, "text/plain");
         wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -2781,6 +3129,7 @@ int main() {
         inject_left(false);
         pump_tick();
         (void)wl_display_roundtrip(p.c.display);
+        untrack(p.c, reinterpret_cast<wl_proxy*>(drag));
         xdg_toplevel_drag_v1_destroy(drag);
         const bool clean = wl_display_roundtrip(p.c.display) >= 0 &&
                            wl_display_get_error(p.c.display) == 0;
@@ -2792,7 +3141,7 @@ int main() {
                   std::to_string(g3.x) + "," + std::to_string(g3.y) + " reattached=" +
                   std::to_string(g4.x) + "," + std::to_string(g4.y));
         if (p.c.display)
-            wl_display_disconnect(p.c.display);
+            teardown(p.c);
     }
 
     // Destroying the data_source mid-attach is undefined per the XML — the compositor
@@ -2805,6 +3154,7 @@ int main() {
             dnd_setup(p);
         dnd_press(p, 20, 20);
         p.source = wl_data_device_manager_create_data_source(p.c.ddm);
+        p.c.created.push_back(reinterpret_cast<wl_proxy*>(p.source));
         wl_data_source_add_listener(p.source, &dp_src_listener, &p);
         wl_data_source_offer(p.source, "text/plain");
         wl_data_source_set_actions(p.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
@@ -2819,6 +3169,8 @@ int main() {
         inject_move(g0.x + 20 + 10, g0.y + 20 + 10);
         pump_tick();
         const lx::rect2i g1 = newest_window();
+        untrack(p.c, reinterpret_cast<wl_proxy*>(p.source));
+        untrack(p.c, reinterpret_cast<wl_proxy*>(p.source));
         wl_data_source_destroy(p.source);
         p.source = nullptr;
         (void)wl_display_roundtrip(p.c.display);
@@ -2826,6 +3178,7 @@ int main() {
         pump_tick();
         const lx::rect2i g2 = newest_window();
         inject_left(false); // the seat's held press: its release reached no client anyway
+        untrack(p.c, reinterpret_cast<wl_proxy*>(drag));
         xdg_toplevel_drag_v1_destroy(drag);
         const bool clean = wl_display_roundtrip(p.c.display) >= 0 &&
                            wl_display_get_error(p.c.display) == 0;
@@ -2836,7 +3189,7 @@ int main() {
                   std::to_string(g1.x) + "," + std::to_string(g1.y) + " after=" +
                   std::to_string(g2.x) + "," + std::to_string(g2.y));
         if (p.c.display)
-            wl_display_disconnect(p.c.display);
+            teardown(p.c);
     }
 #endif
 
@@ -2845,6 +3198,7 @@ int main() {
     expect("activation: xdg_activation_token_v1.commit twice", "xdg_activation_token_v1",
            XDG_ACTIVATION_TOKEN_V1_ERROR_ALREADY_USED, [](client& c) {
                xdg_activation_token_v1* t = xdg_activation_v1_get_activation_token(c.activation);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
                xdg_activation_token_v1_commit(t);
                xdg_activation_token_v1_commit(t);
            });
@@ -2858,11 +3212,14 @@ int main() {
            "none", 0, [](client& c) {
                std::string text;
                xdg_activation_token_v1* t = xdg_activation_v1_get_activation_token(c.activation);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
                xdg_activation_token_v1_add_listener(t, &act_listener, &text);
                xdg_activation_token_v1_commit(t);
                xdg_activation_token_v1_set_app_id(t, "late");
                xdg_activation_token_v1_set_serial(t, 1, c.seat);
                (void)wl_display_roundtrip(c.display);
+               untrack(c, reinterpret_cast<wl_proxy*>(t));
+               untrack(c, reinterpret_cast<wl_proxy*>(t));
                xdg_activation_token_v1_destroy(t);
                window w{};
                map_window(c, w);
@@ -2873,8 +3230,11 @@ int main() {
                window gone{};
                map_window(c, gone);
                const std::string text = issue_token(c, 0, gone.surface);
+               untrack(c, reinterpret_cast<wl_proxy*>(gone.toplevel));
                xdg_toplevel_destroy(gone.toplevel);
+               untrack(c, reinterpret_cast<wl_proxy*>(gone.xdg));
                xdg_surface_destroy(gone.xdg);
+               untrack(c, reinterpret_cast<wl_proxy*>(gone.surface));
                wl_surface_destroy(gone.surface);
                (void)wl_display_roundtrip(c.display);
                window w{};
@@ -2997,9 +3357,12 @@ int main() {
             const std::string t4 = issue_token(issuer.c, issuer.press_serial);
             window early{};
             early.surface = wl_compositor_create_surface(target.c.compositor);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(early.surface));
             early.xdg = xdg_wm_base_get_xdg_surface(target.c.wm_base, early.surface);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(early.xdg));
             xdg_surface_add_listener(early.xdg, &xdg_listener, &early.cfg);
             early.toplevel = xdg_surface_get_toplevel(early.xdg);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(early.toplevel));
             xdg_activation_v1_activate(target.c.activation, t4.c_str(), early.surface);
             configure_and_map(target.c, early.surface, early.xdg, early.cfg, 120, 90);
             (void)wl_display_roundtrip(target.c.display);
@@ -3014,9 +3377,12 @@ int main() {
             // every new window).
             window plain{};
             plain.surface = wl_compositor_create_surface(target.c.compositor);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(plain.surface));
             plain.xdg = xdg_wm_base_get_xdg_surface(target.c.wm_base, plain.surface);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(plain.xdg));
             xdg_surface_add_listener(plain.xdg, &xdg_listener, &plain.cfg);
             plain.toplevel = xdg_surface_get_toplevel(plain.xdg);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(plain.toplevel));
             xdg_activation_v1_activate(target.c.activation, "deadbeef", plain.surface);
             configure_and_map(target.c, plain.surface, plain.xdg, plain.cfg, 120, 90);
             (void)wl_display_roundtrip(target.c.display);
@@ -3045,9 +3411,12 @@ int main() {
             inject_left(false);
             window refused{};
             refused.surface = wl_compositor_create_surface(target.c.compositor);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(refused.surface));
             refused.xdg = xdg_wm_base_get_xdg_surface(target.c.wm_base, refused.surface);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(refused.xdg));
             xdg_surface_add_listener(refused.xdg, &xdg_listener, &refused.cfg);
             refused.toplevel = xdg_surface_get_toplevel(refused.xdg);
+        target.c.created.push_back(reinterpret_cast<wl_proxy*>(refused.toplevel));
             xdg_activation_v1_activate(target.c.activation, t5.c_str(), refused.surface);
             configure_and_map(target.c, refused.surface, refused.xdg, refused.cfg, 120, 90);
             (void)wl_display_roundtrip(target.c.display);
@@ -3067,7 +3436,7 @@ int main() {
         }
         for (dnd_peer* p : {&target, &issuer, &other})
             if (p->c.display)
-                wl_display_disconnect(p->c.display);
+                teardown(p->c);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 #endif
@@ -3085,13 +3454,18 @@ int main() {
 #ifdef LUMEN_TEST_ACTIVATION
             if (hoarder.activation)
                 for (int i = 0; i < 64; ++i)
-                    (void)xdg_activation_v1_get_activation_token(hoarder.activation);
+                    hoarder.created.push_back(reinterpret_cast<wl_proxy*>(
+                        xdg_activation_v1_get_activation_token(hoarder.activation)));
 #endif
             for (int i = 0; i < 128; ++i) {
-                (void)wl_data_device_manager_create_data_source(hoarder.ddm);
-                (void)wl_data_device_manager_get_data_device(hoarder.ddm, hoarder.seat);
-                (void)wl_registry_bind(hoarder.registry, hoarder.output_name,
-                                       &wl_output_interface, 1);
+                // Tracked, not destroyed mid-case: they all exist simultaneously, which is
+                // what the shared-table check exercises; teardown frees them afterwards.
+                hoarder.created.push_back(reinterpret_cast<wl_proxy*>(
+                    wl_data_device_manager_create_data_source(hoarder.ddm)));
+                hoarder.created.push_back(reinterpret_cast<wl_proxy*>(
+                    wl_data_device_manager_get_data_device(hoarder.ddm, hoarder.seat)));
+                hoarder.created.push_back(reinterpret_cast<wl_proxy*>(wl_registry_bind(
+                    hoarder.registry, hoarder.output_name, &wl_output_interface, 1)));
             }
             (void)wl_display_roundtrip(hoarder.display);
         }
@@ -3108,8 +3482,10 @@ int main() {
             if (victim.activation)
                 token = issue_token(victim, 0);
 #endif
-            (void)wl_data_device_manager_create_data_source(victim.ddm);
-            (void)wl_data_device_manager_get_data_device(victim.ddm, victim.seat);
+            victim.created.push_back(reinterpret_cast<wl_proxy*>(
+                wl_data_device_manager_create_data_source(victim.ddm)));
+            victim.created.push_back(reinterpret_cast<wl_proxy*>(
+                wl_data_device_manager_get_data_device(victim.ddm, victim.seat)));
             static const wl_output_listener count_done = {
                 [](void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*,
                    const char*, int32_t) {},
@@ -3121,6 +3497,7 @@ int main() {
             auto* out = static_cast<wl_output*>(
                 wl_registry_bind(victim.registry, victim.output_name, &wl_output_interface,
                                  victim.output_version < 4 ? victim.output_version : 4));
+            victim.created.push_back(reinterpret_cast<wl_proxy*>(out));
             wl_output_add_listener(out, &count_done, &od);
             (void)wl_display_roundtrip(victim.display);
         }
@@ -3132,9 +3509,9 @@ int main() {
                   std::to_string(victim_err) + ", token '" + token.substr(0, 8) +
                   "', wl_output.done " + std::to_string(od.dones));
         if (victim.display)
-            wl_display_disconnect(victim.display);
+            teardown(victim);
         if (hoarder.display)
-            wl_display_disconnect(hoarder.display);
+            teardown(hoarder);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
@@ -3158,9 +3535,13 @@ int main() {
                         comp.liveness().outstanding(lx::client_id{id}) != 0)
                         pinged = id;
             }
+            untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
             xdg_toplevel_destroy(w.toplevel);
+            untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
             xdg_surface_destroy(w.xdg);
+            untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
             wl_surface_destroy(w.surface);
+            untrack(c, reinterpret_cast<wl_proxy*>(c.wm_base));
             xdg_wm_base_destroy(c.wm_base);
             (void)wl_display_roundtrip(c.display);
             ok = wl_display_get_error(c.display) == 0;
@@ -3178,7 +3559,7 @@ int main() {
                            (marked ? ", not responding" : "")
                      : std::string("no ping went out on map"));
         if (c.display)
-            wl_display_disconnect(c.display);
+            teardown(c);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
@@ -3212,8 +3593,10 @@ int main() {
                 return;
             v2 = ext_idle_notifier_v1_get_version(c.idle_notifier) >= 2;
             auto* n = ext_idle_notifier_v1_get_idle_notification(c.idle_notifier, 0, c.seat);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(n));
             ext_idle_notification_v1_add_listener(n, &idle_listener, &zero);
             auto* l = ext_idle_notifier_v1_get_idle_notification(c.idle_notifier, 60000, c.seat);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(l));
             ext_idle_notification_v1_add_listener(l, &idle_listener, &long_timeout);
             ext_idle_notification_v1* i = nullptr;
             if (v2) {
@@ -3223,15 +3606,24 @@ int main() {
             // Notifications outlive their notifier ("All objects created via this interface
             // remain valid").
             auto* o = ext_idle_notifier_v1_get_idle_notification(c.idle_notifier, 0, c.seat);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(o));
             ext_idle_notification_v1_add_listener(o, &idle_listener, &orphan);
+            untrack(c, reinterpret_cast<wl_proxy*>(c.idle_notifier));
             ext_idle_notifier_v1_destroy(c.idle_notifier);
             (void)wl_display_roundtrip(c.display);
             inject_move(300, 200);
             (void)wl_display_roundtrip(c.display);
+            untrack(c, reinterpret_cast<wl_proxy*>(n));
+            untrack(c, reinterpret_cast<wl_proxy*>(n));
             ext_idle_notification_v1_destroy(n);
+            untrack(c, reinterpret_cast<wl_proxy*>(l));
+            untrack(c, reinterpret_cast<wl_proxy*>(l));
             ext_idle_notification_v1_destroy(l);
+            untrack(c, reinterpret_cast<wl_proxy*>(o));
+            untrack(c, reinterpret_cast<wl_proxy*>(o));
             ext_idle_notification_v1_destroy(o);
             if (i)
+                untrack(c, reinterpret_cast<wl_proxy*>(i));
                 ext_idle_notification_v1_destroy(i);
             inject_move(310, 210); // destroyed: nothing more may arrive
             (void)wl_display_roundtrip(c.display);
@@ -3251,9 +3643,15 @@ int main() {
                    if (!c.inhibit_manager)
                        return;
                    wl_surface* s = wl_compositor_create_surface(c.compositor);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                    auto* i = zwp_idle_inhibit_manager_v1_create_inhibitor(c.inhibit_manager, s);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(i));
+                   untrack(c, reinterpret_cast<wl_proxy*>(s));
+                   untrack(c, reinterpret_cast<wl_proxy*>(s));
                    wl_surface_destroy(s); // the inhibitor goes inert, not an error
                    (void)wl_display_roundtrip(c.display);
+                   untrack(c, reinterpret_cast<wl_proxy*>(i));
+                   untrack(c, reinterpret_cast<wl_proxy*>(i));
                    zwp_idle_inhibitor_v1_destroy(i);
                });
         expect("idle inhibitor: manager destroyed first, inhibitors live on", "none", 0,
@@ -3264,8 +3662,12 @@ int main() {
                    map_window(c, w);
                    auto* i =
                        zwp_idle_inhibit_manager_v1_create_inhibitor(c.inhibit_manager, w.surface);
+                   c.created.push_back(reinterpret_cast<wl_proxy*>(i));
+                   untrack(c, reinterpret_cast<wl_proxy*>(c.inhibit_manager));
                    zwp_idle_inhibit_manager_v1_destroy(c.inhibit_manager);
                    (void)wl_display_roundtrip(c.display);
+                   untrack(c, reinterpret_cast<wl_proxy*>(i));
+                   untrack(c, reinterpret_cast<wl_proxy*>(i));
                    zwp_idle_inhibitor_v1_destroy(i);
                });
 
@@ -3285,7 +3687,9 @@ int main() {
                 return nullptr;
             auto* out = static_cast<wl_output*>(
                 wl_registry_bind(c.registry, c.output_name, &wl_output_interface, 1));
+            c.created.push_back(reinterpret_cast<wl_proxy*>(out));
             auto* p = zwlr_output_power_manager_v1_get_output_power(c.power_manager, out);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(p));
             if (log)
                 zwlr_output_power_v1_add_listener(p, &power_listener, log);
             return p;
@@ -3357,8 +3761,10 @@ int main() {
             comp.wayland().flush();
         };
         const auto output = [](client& c) {
-            return static_cast<wl_output*>(
+            auto* out = static_cast<wl_output*>(
                 wl_registry_bind(c.registry, c.output_name, &wl_output_interface, 1));
+            c.created.push_back(reinterpret_cast<wl_proxy*>(out));
+            return out;
         };
         // A lock with one configured lock surface; `commit` maps it at the configured size.
         struct locker {
@@ -3369,11 +3775,14 @@ int main() {
         };
         const auto start_lock = [&](client& c, locker& l, bool with_surface) {
             l.lock = ext_session_lock_manager_v1_lock(c.lock_manager);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(l.lock));
             ext_session_lock_v1_add_listener(l.lock, &lock_listener, &l.log);
             if (!with_surface)
                 return;
             l.surface = wl_compositor_create_surface(c.compositor);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(l.surface));
             l.ls = ext_session_lock_v1_get_lock_surface(l.lock, l.surface, output(c));
+            c.created.push_back(reinterpret_cast<wl_proxy*>(l.ls));
             ext_session_lock_surface_v1_add_listener(l.ls, &lock_surface_listener, &l.log);
             (void)wl_display_roundtrip(c.display);
         };
@@ -3392,7 +3801,7 @@ int main() {
             client probe{};
             const bool ok = connect(probe) && probe.lock_manager && probe.output_name;
             if (probe.display)
-                wl_display_disconnect(probe.display);
+                teardown(probe);
             return ok;
         }();
         check("session lock: ext_session_lock_manager_v1 is advertised (with a wl_output)", up,
@@ -3405,7 +3814,8 @@ int main() {
                        map_window(c, w);
                        locker l{};
                        start_lock(c, l, false);
-                       (void)ext_session_lock_v1_get_lock_surface(l.lock, w.surface, output(c));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           ext_session_lock_v1_get_lock_surface(l.lock, w.surface, output(c))));
                    });
             // Each error kills its locker before `locked`: the session is abandoned (fails
             // closed, checked below) and logind's Unlock clears it for the next case.
@@ -3416,8 +3826,12 @@ int main() {
                        locker l{};
                        start_lock(c, l, true);
                        wl_output* o = output(c);
-                       (void)ext_session_lock_v1_get_lock_surface(
-                           l.lock, wl_compositor_create_surface(c.compositor), o);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           wl_compositor_create_surface(c.compositor)));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           ext_session_lock_v1_get_lock_surface(
+                               l.lock,
+                               reinterpret_cast<wl_surface*>(c.created.back()), o)));
                    });
             logind_unlock();
             expect("session lock: get_lock_surface on a surface with a buffer attached",
@@ -3426,14 +3840,18 @@ int main() {
                        locker l{};
                        start_lock(c, l, false);
                        wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        wl_surface_attach(s, make_buffer(c, 10, 10), 0, 0);
-                       (void)ext_session_lock_v1_get_lock_surface(l.lock, s, output(c));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           ext_session_lock_v1_get_lock_surface(l.lock, s, output(c))));
                    });
             logind_unlock();
             expect("session lock: unlock_and_destroy before locked", "[destroyed]",
                    EXT_SESSION_LOCK_V1_ERROR_INVALID_UNLOCK, [&](client& c) {
                        locker l{};
                        start_lock(c, l, false);
+                       untrack(c, reinterpret_cast<wl_proxy*>(l.lock));
+                       untrack(c, reinterpret_cast<wl_proxy*>(l.lock));
                        ext_session_lock_v1_unlock_and_destroy(l.lock);
                    });
             check("session lock: a locker dying of a protocol error before locked leaves the "
@@ -3501,6 +3919,8 @@ int main() {
                        start_lock(c, l, true);
                        map_lock(c, l);
                        life = l.log;
+                       untrack(c, reinterpret_cast<wl_proxy*>(l.lock));
+                       untrack(c, reinterpret_cast<wl_proxy*>(l.lock));
                        ext_session_lock_v1_destroy(l.lock);
                    });
             check("session lock: configure at the output's logical size, then locked",
@@ -3523,10 +3943,12 @@ int main() {
                        if (connect(other) && other.lock_manager) {
                            start_lock(other, second, false);
                            (void)wl_display_roundtrip(other.display);
+                           untrack(other, reinterpret_cast<wl_proxy*>(second.lock));
                            ext_session_lock_v1_destroy(second.lock); // finished: allowed
                            (void)wl_display_roundtrip(other.display);
-                           wl_display_disconnect(other.display);
+                           teardown(other);
                        }
+                       untrack(c, reinterpret_cast<wl_proxy*>(taker.lock));
                        ext_session_lock_v1_unlock_and_destroy(taker.lock);
                        (void)wl_display_roundtrip(c.display);
                    });
@@ -3549,6 +3971,7 @@ int main() {
                        map_lock(c, held);
                        logind_unlock();
                        (void)wl_display_roundtrip(c.display);
+                       untrack(c, reinterpret_cast<wl_proxy*>(held.lock));
                        ext_session_lock_v1_destroy(held.lock);
                        (void)wl_display_roundtrip(c.display);
                    });
@@ -3584,6 +4007,8 @@ int main() {
                 wl_keyboard* kb = nullptr;
                 if (ok) {
                     kb = wl_seat_get_keyboard(app.seat);
+                app.created.push_back(reinterpret_cast<wl_proxy*>(kb));
+                    app.created.push_back(reinterpret_cast<wl_proxy*>(kb));
                     wl_keyboard_add_listener(kb, &kl, nullptr);
                     map_window(app, w);
                     (void)wl_display_roundtrip(app.display);
@@ -3602,6 +4027,7 @@ int main() {
                     map_lock(app, l);
                 const bool lock_has_kb = lock_enters == 1;
                 if (ok) {
+                    untrack(app, reinterpret_cast<wl_proxy*>(l.lock));
                     ext_session_lock_v1_unlock_and_destroy(l.lock);
                     (void)wl_display_roundtrip(app.display);
                     (void)wl_display_roundtrip(app.display);
@@ -3614,10 +4040,13 @@ int main() {
                           std::to_string(app_enters) + ", leaves " +
                           std::to_string(leaves_at_request) + ", lock enters " +
                           std::to_string(lock_enters));
-                if (kb)
+                if (kb) {
+                    untrack(app, reinterpret_cast<wl_proxy*>(kb));
+                    untrack(app, reinterpret_cast<wl_proxy*>(kb));
                     wl_keyboard_destroy(kb);
+                }
                 if (app.display)
-                    wl_display_disconnect(app.display);
+                    teardown(app);
             }
             if (state() != lx::compositor::lock_state::unlocked)
                 logind_unlock();
@@ -3641,6 +4070,7 @@ int main() {
             }};
         const auto actions = [](client& c, std::initializer_list<uint32_t> list) {
             zwp_text_input_v3* ti = zwp_text_input_manager_v3_get_text_input(c.ti_manager, c.seat);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(ti));
             wl_array a{};
             wl_array_init(&a);
             for (uint32_t v : list)
@@ -3655,7 +4085,7 @@ int main() {
               "zwp_virtual_keyboard_manager_v1 are advertised",
               up, "text input v" + std::to_string(probe.ti_version));
         if (probe.display)
-            wl_display_disconnect(probe.display);
+            teardown(probe);
         if (up) {
             expect("text input: available actions holding none", "zwp_text_input_v3",
                    ZWP_TEXT_INPUT_V3_ERROR_INVALID_ACTION,
@@ -3674,33 +4104,50 @@ int main() {
                    "zwp_input_method_v2", ZWP_INPUT_METHOD_V2_ERROR_ROLE, [&](client& c) {
                        zwp_input_method_v2* im =
                            zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(im));
                        wl_surface* s = wl_compositor_create_surface(c.compositor);
-                       (void)xdg_surface_get_toplevel(xdg_wm_base_get_xdg_surface(c.wm_base, s));
-                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       xdg_surface* role = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(role));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(xdg_surface_get_toplevel(role)));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           zwp_input_method_v2_get_input_popup_surface(im, s)));
                    });
             expect("input method: a second popup object for one surface", "zwp_input_method_v2",
                    ZWP_INPUT_METHOD_V2_ERROR_ROLE, [&](client& c) {
                        zwp_input_method_v2* im =
                            zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(im));
                        wl_surface* s = wl_compositor_create_surface(c.compositor);
-                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
-                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           zwp_input_method_v2_get_input_popup_surface(im, s)));
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           zwp_input_method_v2_get_input_popup_surface(im, s)));
                    });
             expect("input method: the popup object goes, its surface may take a new one", "none",
                    0, [&](client& c) {
                        zwp_input_method_v2* im =
                            zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(im));
                        wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        zwp_input_popup_surface_v2_destroy(
                            zwp_input_method_v2_get_input_popup_surface(im, s));
-                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(
+                           zwp_input_method_v2_get_input_popup_surface(im, s)));
                    });
             expect("input method: wl_surface destroyed before its popup object", "[destroyed]",
                    WL_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, [&](client& c) {
                        zwp_input_method_v2* im =
                            zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(im));
                        wl_surface* s = wl_compositor_create_surface(c.compositor);
-                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       zwp_input_popup_surface_v2* pop = zwp_input_method_v2_get_input_popup_surface(im, s);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(pop));
+                       untrack(c, reinterpret_cast<wl_proxy*>(s));
+                       untrack(c, reinterpret_cast<wl_proxy*>(s));
                        wl_surface_destroy(s);
                    });
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -3709,6 +4156,7 @@ int main() {
                    [&](client& c) {
                        zwp_input_method_v2* first =
                            zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(first));
                        zwp_input_method_v2_add_listener(first, &quiet_im, &unavailable_first);
                        (void)wl_display_roundtrip(c.display);
                        client other{};
@@ -3716,13 +4164,14 @@ int main() {
                            zwp_input_method_v2* second =
                                zwp_input_method_manager_v2_get_input_method(other.im_manager,
                                                                             other.seat);
+                           other.created.push_back(reinterpret_cast<wl_proxy*>(second));
                            zwp_input_method_v2_add_listener(second, &quiet_im, &unavailable_second);
                            (void)wl_display_roundtrip(other.display);
                            // Inert: its requests are accepted and ignored.
                            zwp_input_method_v2_commit_string(second, "x");
                            zwp_input_method_v2_commit(second, 0);
                            (void)wl_display_roundtrip(other.display);
-                           wl_display_disconnect(other.display);
+                           teardown(other);
                        }
                    });
             check("input method: unavailable is the second one's only event, not the first's",
@@ -3731,24 +4180,25 @@ int main() {
                       std::to_string(unavailable_second));
             expect("virtual keyboard: key before a keymap", "zwp_virtual_keyboard_v1",
                    ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP, [&](client& c) {
-                       zwp_virtual_keyboard_v1_key(zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
-                                                       c.vk_manager, c.seat),
-                                                   0, 30, 1);
+                       zwp_virtual_keyboard_v1* vk =
+                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(vk));
+                       zwp_virtual_keyboard_v1_key(vk, 0, 30, 1);
                    });
             expect("virtual keyboard: modifiers before a keymap", "zwp_virtual_keyboard_v1",
                    ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP, [&](client& c) {
-                       zwp_virtual_keyboard_v1_modifiers(
-                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager,
-                                                                                   c.seat),
-                           1, 0, 0, 0);
+                       zwp_virtual_keyboard_v1* vk =
+                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(vk));
+                       zwp_virtual_keyboard_v1_modifiers(vk, 1, 0, 0, 0);
                    });
             expect("virtual keyboard: a keymap format that is not one", "zwp_virtual_keyboard_v1",
                    1 /* invalid_keymap_format */, [&](client& c) {
                        const int fd = memfd_create("lumen-vk", MFD_CLOEXEC);
-                       zwp_virtual_keyboard_v1_keymap(
-                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager,
-                                                                                   c.seat),
-                           5, fd, 0);
+                       zwp_virtual_keyboard_v1* vk =
+                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager, c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(vk));
+                       zwp_virtual_keyboard_v1_keymap(vk, 5, fd, 0);
                        close(fd);
                    });
             expect("virtual keyboard: a keymap that does not compile leaves it without one",
@@ -3760,6 +4210,7 @@ int main() {
                        zwp_virtual_keyboard_v1* vk =
                            zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager,
                                                                                    c.seat);
+                       c.created.push_back(reinterpret_cast<wl_proxy*>(vk));
                        zwp_virtual_keyboard_v1_keymap(vk, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                                       sizeof(junk));
                        close(fd);
@@ -3769,6 +4220,7 @@ int main() {
                 const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
                 zwp_virtual_keyboard_v1* vk =
                     zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager, c.seat);
+                c.created.push_back(reinterpret_cast<wl_proxy*>(vk));
                 zwp_virtual_keyboard_v1_keymap(vk, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, fd, 0);
                 close(fd);
                 zwp_virtual_keyboard_v1_key(vk, 0, 30, 1);
@@ -3889,9 +4341,11 @@ int main() {
             };
             if (ok) {
                 kb = wl_seat_get_keyboard(app.seat);
+                app.created.push_back(reinterpret_cast<wl_proxy*>(kb));
                 wl_keyboard_add_listener(kb, &app_kb, nullptr);
                 map_window(app, w);
                 ti = zwp_text_input_manager_v3_get_text_input(app.ti_manager, app.seat);
+                app.created.push_back(reinterpret_cast<wl_proxy*>(ti));
                 zwp_text_input_v3_add_listener(ti, &ti_l, nullptr);
                 both();
             }
@@ -3899,6 +4353,7 @@ int main() {
                   "enters " + std::to_string(al.enters));
             if (ok) {
                 im = zwp_input_method_manager_v2_get_input_method(ime.im_manager, ime.seat);
+ime.created.push_back(reinterpret_cast<wl_proxy*>(im));
                 zwp_input_method_v2_add_listener(im, &im_l, nullptr);
                 both();
             }
@@ -3923,6 +4378,7 @@ int main() {
                       std::to_string(il.dones) + ", surrounding '" + il.surrounding + "'");
             if (ok) {
                 grab = zwp_input_method_v2_grab_keyboard(im);
+ime.created.push_back(reinterpret_cast<wl_proxy*>(grab));
                 zwp_input_method_keyboard_grab_v2_add_listener(grab, &grab_l, nullptr);
                 both();
             }
@@ -3967,7 +4423,9 @@ int main() {
             zwp_input_popup_surface_v2* popup = nullptr;
             if (ok) {
                 ps = wl_compositor_create_surface(ime.compositor);
+ime.created.push_back(reinterpret_cast<wl_proxy*>(ps));
                 popup = zwp_input_method_v2_get_input_popup_surface(im, ps);
+ime.created.push_back(reinterpret_cast<wl_proxy*>(popup));
                 zwp_input_popup_surface_v2_add_listener(popup, &popup_l, nullptr);
                 wl_surface_attach(ps, make_buffer(ime, 120, 40), 0, 0);
                 wl_surface_commit(ps);
@@ -3989,6 +4447,8 @@ int main() {
             if (ok && il.keymap_fd >= 0) {
                 vk = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(ime.vk_manager,
                                                                              ime.seat);
+                ime.created.push_back(reinterpret_cast<wl_proxy*>(vk));
+                ime.created.push_back(reinterpret_cast<wl_proxy*>(vk));
                 zwp_virtual_keyboard_v1_keymap(vk, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, il.keymap_fd,
                                                il.keymap_size);
                 zwp_virtual_keyboard_v1_key(vk, 0, 48, WL_KEYBOARD_KEY_STATE_PRESSED); // KEY_B
@@ -4020,6 +4480,7 @@ int main() {
                         zwp_virtual_keyboard_v1* vk2 =
                             zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(ime.vk_manager,
                                                                                     ime.seat);
+                        ime.created.push_back(reinterpret_cast<wl_proxy*>(vk2));
                         zwp_virtual_keyboard_v1_keymap(vk2, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                                        static_cast<uint32_t>(len));
                         zwp_virtual_keyboard_v1_key(vk2, 0, 21, WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -4074,7 +4535,7 @@ int main() {
                 zwp_text_input_v3_commit(ti);
                 both();
                 // Its virtual keyboard and grab go with it.
-                wl_display_disconnect(ime.display);
+                teardown(ime);
                 ime.display = nullptr;
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 (void)wl_display_roundtrip(app.display);
@@ -4086,12 +4547,15 @@ int main() {
                 close(il.keymap_fd);
                 il.keymap_fd = -1;
             }
-            if (kb)
+            if (kb) {
+                untrack(app, reinterpret_cast<wl_proxy*>(kb));
+                untrack(app, reinterpret_cast<wl_proxy*>(kb));
                 wl_keyboard_destroy(kb);
+            }
             if (ime.display)
-                wl_display_disconnect(ime.display);
+                teardown(ime);
             if (app.display)
-                wl_display_disconnect(app.display);
+                teardown(app);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
@@ -4116,22 +4580,27 @@ int main() {
             }
         check("commit-path globals are advertised at version 1", all, missing);
         if (c.display)
-            wl_display_disconnect(c.display);
+            teardown(c);
     }
     expect("fifo: second wp_fifo_v1 for a surface", "wp_fifo_manager_v1",
            WP_FIFO_MANAGER_V1_ERROR_ALREADY_EXISTS, [](client& c) {
                auto* m = static_cast<wp_fifo_manager_v1*>(
                    bind_global(c, &wp_fifo_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_fifo_manager_v1_get_fifo(m, s);
-               (void)wp_fifo_manager_v1_get_fifo(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_fifo_manager_v1_get_fifo(m, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_fifo_manager_v1_get_fifo(m, s)));
            });
     expect("fifo: set_barrier after the surface is gone", "wp_fifo_v1",
            WP_FIFO_V1_ERROR_SURFACE_DESTROYED, [](client& c) {
                auto* m = static_cast<wp_fifo_manager_v1*>(
                    bind_global(c, &wp_fifo_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_fifo_v1* f = wp_fifo_manager_v1_get_fifo(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
                wp_fifo_v1_set_barrier(f);
            });
@@ -4140,7 +4609,11 @@ int main() {
                auto* m = static_cast<wp_fifo_manager_v1*>(
                    bind_global(c, &wp_fifo_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_fifo_v1* f = wp_fifo_manager_v1_get_fifo(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
                wp_fifo_v1_wait_barrier(f);
            });
@@ -4151,6 +4624,7 @@ int main() {
                window w{};
                map_window(c, w);
                wp_fifo_v1* f = wp_fifo_manager_v1_get_fifo(m, w.surface);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                for (int i = 0; i < 20; ++i) {
                    wp_fifo_v1_set_barrier(f);
                    wp_fifo_v1_wait_barrier(f);
@@ -4165,15 +4639,18 @@ int main() {
                auto* m = static_cast<wp_commit_timing_manager_v1*>(
                    bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_commit_timing_manager_v1_get_timer(m, s);
-               (void)wp_commit_timing_manager_v1_get_timer(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_commit_timing_manager_v1_get_timer(m, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_commit_timing_manager_v1_get_timer(m, s)));
            });
     expect("commit-timing: tv_nsec of a whole second", "wp_commit_timer_v1",
            WP_COMMIT_TIMER_V1_ERROR_INVALID_TIMESTAMP, [](client& c) {
                auto* m = static_cast<wp_commit_timing_manager_v1*>(
                    bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
                wp_commit_timer_v1_set_timestamp(t, 0, 5, 1'000'000'000u);
            });
     expect("commit-timing: two timestamps for one commit", "wp_commit_timer_v1",
@@ -4181,7 +4658,9 @@ int main() {
                auto* m = static_cast<wp_commit_timing_manager_v1*>(
                    bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
                wp_commit_timer_v1_set_timestamp(t, 0, 5, 0);
                wp_commit_timer_v1_set_timestamp(t, 0, 6, 0);
            });
@@ -4189,7 +4668,9 @@ int main() {
         auto* m = static_cast<wp_commit_timing_manager_v1*>(
             bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
         wl_surface* s = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(s));
         wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
         wp_commit_timer_v1_set_timestamp(t, 0, 5, 0);
         wl_surface_commit(s);
         wp_commit_timer_v1_set_timestamp(t, 0, 6, 0);
@@ -4200,7 +4681,11 @@ int main() {
                auto* m = static_cast<wp_commit_timing_manager_v1*>(
                    bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
                wp_commit_timer_v1_set_timestamp(t, 0, 5, 0);
            });
@@ -4209,20 +4694,26 @@ int main() {
                auto* m = static_cast<wp_tearing_control_manager_v1*>(
                    bind_global(c, &wp_tearing_control_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_tearing_control_manager_v1_get_tearing_control(m, s);
-               (void)wp_tearing_control_manager_v1_get_tearing_control(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_tearing_control_manager_v1_get_tearing_control(m, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_tearing_control_manager_v1_get_tearing_control(m, s)));
            });
     expect("tearing-control: an inert object takes requests", "none", 0, [](client& c) {
         auto* m = static_cast<wp_tearing_control_manager_v1*>(
             bind_global(c, &wp_tearing_control_manager_v1_interface, 1));
         wl_surface* s = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(s));
         wp_tearing_control_v1* t = wp_tearing_control_manager_v1_get_tearing_control(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
         wp_tearing_control_v1_set_presentation_hint(t,
                                                     WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
         wl_surface_commit(s);
+        untrack(c, reinterpret_cast<wl_proxy*>(s));
+        untrack(c, reinterpret_cast<wl_proxy*>(s));
         wl_surface_destroy(s);
         wp_tearing_control_v1_set_presentation_hint(t,
                                                     WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC);
+        untrack(c, reinterpret_cast<wl_proxy*>(t));
         wp_tearing_control_v1_destroy(t);
     });
     expect("content-type: second object for a surface", "wp_content_type_manager_v1",
@@ -4230,16 +4721,18 @@ int main() {
                auto* m = static_cast<wp_content_type_manager_v1*>(
                    bind_global(c, &wp_content_type_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_content_type_manager_v1_get_surface_content_type(m, s);
-               (void)wp_content_type_manager_v1_get_surface_content_type(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_content_type_manager_v1_get_surface_content_type(m, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_content_type_manager_v1_get_surface_content_type(m, s)));
            });
     expect("alpha-modifier: second object for a surface", "wp_alpha_modifier_v1",
            WP_ALPHA_MODIFIER_V1_ERROR_ALREADY_CONSTRUCTED, [](client& c) {
                auto* m = static_cast<wp_alpha_modifier_v1*>(
                    bind_global(c, &wp_alpha_modifier_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)wp_alpha_modifier_v1_get_surface(m, s);
-               (void)wp_alpha_modifier_v1_get_surface(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_alpha_modifier_v1_get_surface(m, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(wp_alpha_modifier_v1_get_surface(m, s)));
            });
     expect("alpha-modifier: set_multiplier after the surface is gone",
            "wp_alpha_modifier_surface_v1", WP_ALPHA_MODIFIER_SURFACE_V1_ERROR_NO_SURFACE,
@@ -4247,7 +4740,11 @@ int main() {
                auto* m = static_cast<wp_alpha_modifier_v1*>(
                    bind_global(c, &wp_alpha_modifier_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                wp_alpha_modifier_surface_v1* a = wp_alpha_modifier_v1_get_surface(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
                wp_alpha_modifier_surface_v1_set_multiplier(a, 7);
            });
@@ -4274,14 +4771,18 @@ int main() {
             window w{};
             map_window(c, w);
             wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, w.surface);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(v));
             wp_viewport_set_destination(v, 200, 150);
             wp_alpha_modifier_surface_v1* a = wp_alpha_modifier_v1_get_surface(am, w.surface);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(a));
             wp_alpha_modifier_surface_v1_set_multiplier(a, 0x80000000u);
             wp_content_type_v1* t = wp_content_type_manager_v1_get_surface_content_type(ct, w.surface);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(t));
             wp_content_type_v1_set_content_type(t, WP_CONTENT_TYPE_V1_TYPE_VIDEO);
             wl_buffer* px = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
                 spb, 0, 0xFFFFFFFFu, 0, 0xFFFFFFFFu);
             wl_surface_attach(w.surface, px, 0, 0);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(px));
             wl_surface_damage_buffer(w.surface, 0, 0, 1, 1);
             wl_surface_commit(w.surface);
             ok = wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0 &&
@@ -4315,7 +4816,7 @@ int main() {
 #endif
         check("single-pixel + viewport + alpha + content type reach the scene", ok, detail);
         if (c.display)
-            wl_display_disconnect(c.display);
+            teardown(c);
     }
 #endif
 
@@ -4326,8 +4827,9 @@ int main() {
                auto* m = static_cast<ext_background_effect_manager_v1*>(
                    bind_global(c, &ext_background_effect_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
-               (void)ext_background_effect_manager_v1_get_background_effect(m, s);
-               (void)ext_background_effect_manager_v1_get_background_effect(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ext_background_effect_manager_v1_get_background_effect(m, s)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ext_background_effect_manager_v1_get_background_effect(m, s)));
            });
     expect("background-effect: set_blur_region after the surface is gone",
            "ext_background_effect_surface_v1",
@@ -4335,8 +4837,12 @@ int main() {
                auto* m = static_cast<ext_background_effect_manager_v1*>(
                    bind_global(c, &ext_background_effect_manager_v1_interface, 1));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(s));
                ext_background_effect_surface_v1* e =
                    ext_background_effect_manager_v1_get_background_effect(m, s);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(e));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
+               untrack(c, reinterpret_cast<wl_proxy*>(s));
                wl_surface_destroy(s);
                ext_background_effect_surface_v1_set_blur_region(e, nullptr);
            });
@@ -4375,18 +4881,22 @@ int main() {
             window w{};
             map_window(c, w);
             wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, w.surface);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(v));
             wp_viewport_set_destination(v, 200, 150);
             ext_background_effect_surface_v1* e =
                 ext_background_effect_manager_v1_get_background_effect(m, w.surface);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(e));
             wl_region* r = wl_compositor_create_region(c.compositor);
             wl_region_add(r, 0, 0, 100, 50);
             wl_region_add(r, 50, 25, 100, 50);
             wl_region_add(r, 150, 140, 100, 100); // clipped to the surface: 50 x 10
             ext_background_effect_surface_v1_set_blur_region(e, r);
+            untrack(c, reinterpret_cast<wl_proxy*>(r));
             wl_region_destroy(r); // copy semantics
             wl_buffer* px = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
                 spb, 0x10000000u, 0x20000000u, 0x30000000u, 0x80000000u);
             wl_surface_attach(w.surface, px, 0, 0);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(px));
             wl_surface_damage_buffer(w.surface, 0, 0, 1, 1);
             wl_surface_commit(w.surface);
             ok = wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0 &&
@@ -4406,6 +4916,7 @@ int main() {
             const bool blur = (caps.flags & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR) != 0;
             ok = ok && count == (blur ? 4 : 0);
             detail += ", node rects " + std::to_string(count);
+            untrack(c, reinterpret_cast<wl_proxy*>(e));
             ext_background_effect_surface_v1_destroy(e);
             wl_surface_commit(w.surface);
             ok = ok && wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0;
@@ -4422,7 +4933,7 @@ int main() {
               "where the backend blurs",
               ok, detail);
         if (c.display)
-            wl_display_disconnect(c.display);
+            teardown(c);
     }
 #endif
 
@@ -4572,21 +5083,25 @@ int main() {
             check("color-management: version 1 gets srgb, not its version 2 successor", ok1,
                   "tfs " + std::to_string(s1.tfs.size()));
             if (c1.display)
-                wl_display_disconnect(c1.display);
+                teardown(c1);
         }
 
         // The output's description: ready with an identity, its information sRGB.
         if (ok && c.output_name) {
             auto* out = static_cast<wl_output*>(
                 wl_registry_bind(c.registry, c.output_name, &wl_output_interface, 1));
+            c.created.push_back(reinterpret_cast<wl_proxy*>(out));
             wp_color_management_output_v1* co = wp_color_manager_v1_get_output(m, out);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(co));
             wp_image_description_v1* od = wp_color_management_output_v1_get_image_description(co);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(od));
             desc_state ods{};
             wp_image_description_v1_add_listener(od, &desc_listener, &ods);
             (void)wl_display_roundtrip(c.display);
             info_state info{};
             if (ods.ready) {
                 wp_image_description_info_v1* i = wp_image_description_v1_get_information(od);
+                c.created.push_back(reinterpret_cast<wl_proxy*>(i));
                 wp_image_description_info_v1_add_listener(i, &info_listener, &info);
                 (void)wl_display_roundtrip(c.display);
             }
@@ -4602,7 +5117,9 @@ int main() {
             map_window(c, w);
             wp_color_management_surface_feedback_v1* fb =
                 wp_color_manager_v1_get_surface_feedback(m, w.surface);
+            c.created.push_back(reinterpret_cast<wl_proxy*>(fb));
             wp_image_description_v1* pd = wp_color_management_surface_feedback_v1_get_preferred(fb);
+                c.created.push_back(reinterpret_cast<wl_proxy*>(pd));
             desc_state pds{};
             wp_image_description_v1_add_listener(pd, &desc_listener, &pds);
             (void)wl_display_roundtrip(c.display);
@@ -4703,7 +5220,7 @@ int main() {
                   ok ? "no wl_output global" : "not bound");
         }
         if (c.display)
-            wl_display_disconnect(c.display);
+            teardown(c);
 
         if (parametric) {
             const auto creator = [](client& k) {
@@ -4716,6 +5233,9 @@ int main() {
                        auto* mm = static_cast<wp_color_manager_v1*>(
                            bind_global(k, &wp_color_manager_v1_interface, 3));
                        wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        (void)wp_color_manager_v1_get_surface(mm, s);
                        (void)wp_color_manager_v1_get_surface(mm, s);
                    });
@@ -4815,6 +5335,9 @@ int main() {
                        wp_image_description_v1* d = wp_image_description_creator_params_v1_create(p);
                        (void)wl_display_roundtrip(k.display);
                        wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(mm, s);
                        wp_color_management_surface_v1_set_image_description(
                            cs, d, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
@@ -4831,6 +5354,9 @@ int main() {
                        wp_image_description_v1* d = wp_image_description_creator_params_v1_create(p);
                        (void)wl_display_roundtrip(k.display);
                        wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(mm, s);
                        wp_color_management_surface_v1_set_image_description(
                            cs, d, WP_COLOR_MANAGER_V1_RENDER_INTENT_RELATIVE);
@@ -4841,7 +5367,12 @@ int main() {
                        auto* mm = static_cast<wp_color_manager_v1*>(
                            bind_global(k, &wp_color_manager_v1_interface, 3));
                        wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(mm, s);
+                       untrack(k, reinterpret_cast<wl_proxy*>(s));
+                       untrack(k, reinterpret_cast<wl_proxy*>(s));
                        wl_surface_destroy(s);
                        wp_color_management_surface_v1_unset_image_description(cs);
                    });
@@ -4851,8 +5382,14 @@ int main() {
                        auto* mm = static_cast<wp_color_manager_v1*>(
                            bind_global(k, &wp_color_manager_v1_interface, 3));
                        wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(s));
                        wp_color_management_surface_feedback_v1* f =
                            wp_color_manager_v1_get_surface_feedback(mm, s);
+                       k.created.push_back(reinterpret_cast<wl_proxy*>(f));
+                       untrack(k, reinterpret_cast<wl_proxy*>(s));
+                       untrack(k, reinterpret_cast<wl_proxy*>(s));
                        wl_surface_destroy(s);
                        (void)wp_color_management_surface_feedback_v1_get_preferred(f);
                    });
@@ -4876,13 +5413,13 @@ int main() {
         for (int i = 0; i < 3; ++i)
             churn_ok = connect(c[i]) && wl_display_roundtrip(c[i].display) >= 0 && churn_ok;
         if (c[0].display)
-            wl_display_disconnect(c[0].display); // a middle slot frees; the last moves into it
+            teardown(c[0]); // a middle slot frees; the last moves into it
         // The server must have seen that disconnect before the next client connects.
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         churn_ok = connect(c[3]) && wl_display_roundtrip(c[3].display) >= 0 && churn_ok;
         for (int i = 1; i < 4; ++i)
             if (c[i].display)
-                wl_display_disconnect(c[i].display);
+                teardown(c[i]);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 

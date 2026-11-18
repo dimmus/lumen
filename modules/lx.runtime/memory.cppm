@@ -92,7 +92,11 @@ private:
     unsigned char* storage_ = nullptr;
     unsigned capacity_ = 0;
     unsigned mapped_bytes_ = 0;
-    unsigned offset_ = 0;
+    // Relaxed-atomic statistic: the owning affinity thread allocates and resets, while
+    // the coordinator's tick (UI thread) samples every arena's used bytes for the
+    // pressure evaluation — a read across threads that is not synchronization (a plain
+    // unsigned here was a TSan reset-vs-used_bytes race between tick_render and tick_ui).
+    std::atomic<unsigned> offset_{0};
 };
 
 /// Zero-filled anonymous pages straight from the kernel, outside the malloc heap, in small
@@ -215,7 +219,7 @@ void lx::runtime::memory_arena::release() {
     storage_ = nullptr;
     capacity_ = 0;
     mapped_bytes_ = 0;
-    offset_ = 0;
+    offset_.store(0, std::memory_order_relaxed);
 }
 
 namespace {
@@ -286,11 +290,11 @@ lx::runtime::memory_arena::memory_arena(memory_arena&& other) noexcept
     : storage_{other.storage_},
       capacity_{other.capacity_},
       mapped_bytes_{other.mapped_bytes_},
-      offset_{other.offset_} {
+      offset_{other.offset_.load(std::memory_order_relaxed)} {
     other.storage_ = nullptr;
     other.capacity_ = 0;
     other.mapped_bytes_ = 0;
-    other.offset_ = 0;
+    other.offset_.store(0, std::memory_order_relaxed);
 }
 
 lx::runtime::memory_arena& lx::runtime::memory_arena::operator=(memory_arena&& other) noexcept {
@@ -300,11 +304,12 @@ lx::runtime::memory_arena& lx::runtime::memory_arena::operator=(memory_arena&& o
     storage_ = other.storage_;
     capacity_ = other.capacity_;
     mapped_bytes_ = other.mapped_bytes_;
-    offset_ = other.offset_;
+    offset_.store(other.offset_.load(std::memory_order_relaxed),
+                  std::memory_order_relaxed);
     other.storage_ = nullptr;
     other.capacity_ = 0;
     other.mapped_bytes_ = 0;
-    other.offset_ = 0;
+    other.offset_.store(0, std::memory_order_relaxed);
     return *this;
 }
 
@@ -313,23 +318,29 @@ void* lx::runtime::memory_arena::allocate(unsigned size, unsigned alignment) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
 
     // offset_ <= capacity_ always holds, so the round-up cannot wrap for sane alignments.
-    if (offset_ > 0xFFFFFFFFu - (alignment - 1)) return nullptr;
-    const unsigned aligned = (offset_ + alignment - 1) & ~(alignment - 1);
+    const unsigned base = offset_.load(std::memory_order_relaxed);
+    if (base > 0xFFFFFFFFu - (alignment - 1)) return nullptr;
+    const unsigned aligned = (base + alignment - 1) & ~(alignment - 1);
     if (aligned > capacity_ || size > capacity_ - aligned) return nullptr;
 
     void* ptr = storage_ + aligned;
-    offset_ = aligned + size;
+    offset_.store(aligned + size, std::memory_order_relaxed);
     return ptr;
 }
 
-void lx::runtime::memory_arena::reset() { offset_ = 0; }
+void lx::runtime::memory_arena::reset() {
+    offset_.store(0, std::memory_order_relaxed);
+}
 
-unsigned lx::runtime::memory_arena::used_bytes() const { return offset_; }
+unsigned lx::runtime::memory_arena::used_bytes() const {
+    return offset_.load(std::memory_order_relaxed);
+}
 unsigned lx::runtime::memory_arena::capacity_bytes() const { return capacity_; }
 bool lx::runtime::memory_arena::valid() const { return storage_ != nullptr; }
 
 bool lx::runtime::memory_arena::would_overflow(unsigned size) const {
-    return offset_ > capacity_ || size > capacity_ - offset_;
+    const unsigned used = offset_.load(std::memory_order_relaxed);
+    return used > capacity_ || size > capacity_ - used;
 }
 
 lx::runtime::memory_budget_coordinator::memory_budget_coordinator(memory_budget_config config)

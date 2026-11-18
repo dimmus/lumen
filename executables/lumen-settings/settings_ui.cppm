@@ -106,7 +106,8 @@ struct string_field {
     }
     void set(std::string_view text) {
         const std::size_t n = std::min(text.size(), sizeof(storage) - 1);
-        std::memcpy(storage, text.data(), n);
+        if (n > 0) // memcpy of an empty view would pass its null data(): UB, flagged by UBSan
+            std::memcpy(storage, text.data(), n);
         storage[n] = '\0';
         bind();
     }

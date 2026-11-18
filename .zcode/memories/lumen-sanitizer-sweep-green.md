@@ -116,3 +116,18 @@ predates the gate verdict). Related: [[lumen-snprintf-log-migration]] (base tree
 [[lumen-compositor-theme-env-export]] (the notification_view SEGV TODO row),
 [[lumen-app-smoke-known-noise]], [[lumen-host-build-run-env]], [[lumen-memory-pressure-green]]
 (PSI-row family), [[lumen-no-degradation-rule]].
+
+**Seat regression resolved 2026-11-18 late evening** (the open item above): A/B on one
+evening's seat — base 95372af 176/0/1 (only the environmental memory-pressure WARN row),
+0e0571c 71/101 SEGV, bisect leg 573d7f3 (= 655ae13^) 166/0/4 no SEGV — pinned the trigger
+to 655ae13 (itself a correct fix) flipping a pre-existing intermittent bug deterministic:
+**retained text blocks re-strlen pointers into dead build_ui() frames** (the TODO's
+notification_view SIGSEGV since 2026-11-16; notification_view was a downstream victim with
+zero stack text buffers of its own). ASan shell on the seat (the TODO's prescription)
+caught the origins one per launch: panel (655ae13), switcher letters (ecc162d), menu row
+labels' std::string SSO (0bf30d4), launcher status line (920899c). After the four fixes:
+ASan smoke SUAR=0; release app-smoke 176/0/1 (parity with the base in the same evening —
+N8 idle-row noise discounted by rerun); drag-smoke PASS at HEAD; ctest 136/136. Evidence:
+evidence/2026-11-18-sanitizer-sweep/seat-regression/. NEW pre-existing finding, recorded
+as a TODO row: heap-use-after-free READ of size 8 at tray-menu close (stack lost to abort
++ truncation; menu/tray untouched by this branch). DBG scaffolding dropped (2698a85).

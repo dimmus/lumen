@@ -551,6 +551,9 @@ void check(const char* name, bool ok, const std::string& detail = {}) {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     wl_subcompositor* subcompositor = nullptr;
@@ -573,6 +576,38 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
 }
 void on_global_remove(void*, wl_registry*, uint32_t) {}
 const wl_registry_listener registry_listener = {on_global, on_global_remove};
+
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.subcompositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.subcompositor));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 
 struct window {
     wl_surface* surface = nullptr;
@@ -604,6 +639,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -635,9 +671,12 @@ void answer(client& c, window& w) {
 /// Maps a window without ticking: its first frame is the next `tick`.
 void map_window(client& c, window& w, const char* app_id) {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_toplevel_add_listener(w.toplevel, &toplevel_listener, &w);
     xdg_toplevel_set_app_id(w.toplevel, app_id);
     wl_surface_commit(w.surface);
@@ -649,8 +688,11 @@ void map_window(client& c, window& w, const char* app_id) {
 
 void destroy_window(client& c, window& w) {
     xdg_toplevel_destroy(w.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     w = {};
     (void)wl_display_roundtrip(c.display);
     (void)wl_display_roundtrip(c.display);
@@ -1033,6 +1075,7 @@ void run_cases() {
         check("null close: then nothing of it is drawn and the desktop is quiet",
               quiet && !window_draw().found, why);
         wl_buffer_destroy(bw.buffer);
+        untrack(c, reinterpret_cast<wl_proxy*>(bw.buffer));
     }
 
     // The same unmapping close with a CSD shadow: a subsurface reaching 24 px past the
@@ -1051,7 +1094,9 @@ void run_cases() {
     const int sheight = s.height > 0 ? s.height : 150;
     constexpr int k_halo = 24;
     wl_surface* shadow = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(shadow));
     wl_subsurface* sub = wl_subcompositor_get_subsurface(c.subcompositor, shadow, s.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(sub));
     wl_subsurface_set_position(sub, -k_halo, -k_halo);
     wl_surface_attach(shadow, make_buffer(c, swidth + 2 * k_halo, sheight + 2 * k_halo), 0, 0);
     wl_surface_commit(shadow);
@@ -1116,7 +1161,9 @@ void run_cases() {
               quiet && !window_draw().found && !draw_wider_than(s1.geometry.width).found, why);
     }
     wl_subsurface_destroy(sub);
+    untrack(c, reinterpret_cast<wl_proxy*>(sub));
     wl_surface_destroy(shadow);
+    untrack(c, reinterpret_cast<wl_proxy*>(shadow));
     destroy_window(c, s);
     tick();
 
@@ -1365,7 +1412,7 @@ void run_cases() {
     check("off mid-motion: every motion ends at once", was && !animating());
     tick();
     check("off mid-motion: the ghost is gone", !window_draw().found);
-    wl_display_disconnect(c.display);
+    disconnect(c);
 }
 
 } // namespace

@@ -79,6 +79,9 @@ struct surface_info {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
@@ -169,6 +172,41 @@ bool connect(client& c) {
     return true;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.viewporter)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.viewporter));
+    if (c.fractional)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.fractional));
+    if (c.xom)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.xom));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 wl_buffer* make_buffer(client& c, int w, int h) {
     const int stride = w * 4;
     const int size = stride * h;
@@ -177,6 +215,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -189,15 +228,20 @@ constexpr int k_h = 200;
 /// the integer wl_surface v6 events). Mapped with a 1x buffer.
 void open_window(client& c, surface_info& s, bool fractional) {
     s.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(s.surface));
     wl_surface_add_listener(s.surface, &surface_listener, &s);
     if (fractional) {
         s.fs = wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s.surface);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(s.fs));
         wp_fractional_scale_v1_add_listener(s.fs, &fractional_listener, &s);
         s.viewport = wp_viewporter_get_viewport(c.viewporter, s.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(s.viewport));
     }
     s.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, s.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(s.xdg));
     xdg_surface_add_listener(s.xdg, &xdg_listener, &s);
     s.toplevel = xdg_surface_get_toplevel(s.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(s.toplevel));
     wl_surface_commit(s.surface);
     (void)wl_display_roundtrip(c.display);
     xdg_surface_ack_configure(s.xdg, s.serial);
@@ -294,8 +338,10 @@ int main() {
         o.output = static_cast<wl_output*>(wl_registry_bind(
             c.registry, c.output_name, &wl_output_interface,
             c.output_version < 4 ? c.output_version : 4));
+        c.created.push_back(reinterpret_cast<wl_proxy*>(o.output));
         wl_output_add_listener(o.output, &output_listener, &o);
         o.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(o.xo));
         zxdg_output_v1_add_listener(o.xo, &xdg_output_listener, &o);
         (void)wl_display_roundtrip(c.display);
 
@@ -385,7 +431,7 @@ int main() {
               "no wl_output event across every render scale change");
     }
     if (c.display)
-        wl_display_disconnect(c.display);
+        disconnect(c);
 
     pump.store(false, std::memory_order_release);
     pump_thread.join();

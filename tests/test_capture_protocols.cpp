@@ -90,6 +90,10 @@ void check(const char* name, bool ok, const std::string& detail) {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
+    wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
     wl_shm* shm = nullptr;
@@ -146,13 +150,56 @@ bool connect(client& c) {
     c.display = wl_display_connect(k_socket);
     if (!c.display)
         return false;
-    wl_registry* r = wl_display_get_registry(c.display);
-    wl_registry_add_listener(r, &registry_listener, &c);
+    c.registry = wl_display_get_registry(c.display);
+    wl_registry_add_listener(c.registry, &registry_listener, &c);
     if (wl_display_roundtrip(c.display) < 0 || wl_display_roundtrip(c.display) < 0)
         return false;
     if (c.wm_base)
         xdg_wm_base_add_listener(c.wm_base, &wm_listener, nullptr);
     return true;
+}
+
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its oldest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.lock_manager)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.lock_manager));
+    if (c.screencopy)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.screencopy));
+    if (c.copy)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.copy));
+    if (c.toplevel_sources)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.toplevel_sources));
+    if (c.output_sources)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.output_sources));
+    if (c.seat)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.seat));
+    if (c.output)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.output));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
 }
 
 struct outcome {
@@ -169,7 +216,7 @@ outcome finish(client& c) {
         o.code = wl_display_get_protocol_error(c.display, &iface, &id);
         o.interface = iface ? iface->name : "[destroyed]";
     }
-    wl_display_disconnect(c.display);
+    disconnect(c);
     c.display = nullptr;
     return o;
 }
@@ -233,6 +280,7 @@ shm_buffer make_buffer(client& c, int w, int h, uint32_t argb,
         b.pixels[i] = argb;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, static_cast<int32_t>(b.size));
     b.buffer = wl_shm_pool_create_buffer(pool, 0, w, h, stride, format);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b.buffer));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -252,7 +300,9 @@ const xdg_surface_listener xdg_listener = {
 void map_window(client& c, window& w, const char* app_id, int width, int height, uint32_t argb,
                 const char* title = "capture test") {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
     xdg_toplevel_set_app_id(w.toplevel, app_id);
@@ -342,12 +392,15 @@ const ext_image_copy_capture_frame_v1_listener frame_listener = {
 
 void open_session(client& c, session& s, ext_image_capture_source_v1* source, uint32_t options = 0) {
     s.session = ext_image_copy_capture_manager_v1_create_session(c.copy, source, options);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(s.session));
     ext_image_copy_capture_session_v1_add_listener(s.session, &session_listener, &s);
     (void)wl_display_roundtrip(c.display);
 }
 
 ext_image_capture_source_v1* output_source(client& c) {
-    return ext_output_image_capture_source_manager_v1_create_source(c.output_sources, c.output);
+    auto* src = ext_output_image_capture_source_manager_v1_create_source(c.output_sources, c.output);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(src));
+    return src;
 }
 
 /// Captures one frame of `s` into `b` with `damage` (x,y,w,h quads) and waits for the answer.
@@ -364,6 +417,7 @@ frame capture(client& c, session& s, shm_buffer& b, const std::vector<int>& dama
     (void)run_until(c, [&] { return f.ready || f.failed; }, ticks);
     // One frame object per session at a time: this one is done with.
     ext_image_copy_capture_frame_v1_destroy(f.frame);
+    untrack(c, reinterpret_cast<wl_proxy*>(f.frame));
     f.frame = nullptr;
     return f;
 }
@@ -393,6 +447,11 @@ struct list_state {
     ext_foreign_toplevel_list_v1* list = nullptr;
     std::vector<handle_info*> handles;
     bool finished = false;
+    client* owner = nullptr; // the handles are server-pushed proxies of this client
+    ~list_state() {
+        for (handle_info* h : handles)
+            delete h;
+    }
 };
 
 const ext_foreign_toplevel_handle_v1_listener handle_listener = {
@@ -412,17 +471,25 @@ const ext_foreign_toplevel_list_v1_listener list_listener = {
             auto* info = new handle_info{};
             info->handle = h;
             ext_foreign_toplevel_handle_v1_add_listener(h, &handle_listener, info);
-            static_cast<list_state*>(d)->handles.push_back(info);
+            auto* l = static_cast<list_state*>(d);
+            l->handles.push_back(info);
+            // The handle proxy is this client's to destroy once the toplevel is done
+            // with it; nothing here destroys it mid-case, so teardown owns it.
+            if (l->owner)
+                l->owner->created.push_back(reinterpret_cast<wl_proxy*>(h));
         },
     .finished = [](void* d, ext_foreign_toplevel_list_v1*) { static_cast<list_state*>(d)->finished = true; },
 };
 
 void bind_list(client& c, list_state& l) {
+    l.owner = &c;
     wl_registry* r = wl_display_get_registry(c.display);
     l.list = static_cast<ext_foreign_toplevel_list_v1*>(
         wl_registry_bind(r, c.list_name, &ext_foreign_toplevel_list_v1_interface, 1));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(l.list));
     ext_foreign_toplevel_list_v1_add_listener(l.list, &list_listener, &l);
     (void)wl_display_roundtrip(c.display);
+    wl_registry_destroy(r); // the helper's own registry is not freed at disconnect
 }
 
 handle_info* find_handle(list_state& l, const char* app_id) {
@@ -518,11 +585,17 @@ void list_cases() {
     check("list: stop is answered by finished, and no toplevel follows",
           l.finished && l.handles.size() == before, "handles=" + std::to_string(l.handles.size()));
     xdg_toplevel_destroy(w2.toplevel);
+    untrack(a, reinterpret_cast<wl_proxy*>(w2.toplevel));
     xdg_surface_destroy(w2.xdg);
+    untrack(a, reinterpret_cast<wl_proxy*>(w2.xdg));
     wl_surface_destroy(w2.surface);
+    untrack(a, reinterpret_cast<wl_proxy*>(w2.surface));
     xdg_toplevel_destroy(w.toplevel);
+    untrack(a, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(a, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(a, reinterpret_cast<wl_proxy*>(w.surface));
     (void)wl_display_roundtrip(a.display);
     tick();
     (void)finish(a);
@@ -589,6 +662,7 @@ void output_cases() {
           pixel(b, g.x + 40, g.y + 15) == 0xFF0000u && pixel(b, g.x + 10, g.y + 50) == 0x0000FFu,
           hex(pixel(b, g.x + 40, g.y + 15)));
     ext_image_copy_capture_frame_v1_destroy(f2.frame);
+    untrack(c, reinterpret_cast<wl_proxy*>(f2.frame));
 
     // A buffer of the wrong size: failed(buffer_constraints).
     shm_buffer small = make_buffer(c, 32, 32, 0);
@@ -597,8 +671,11 @@ void output_cases() {
           f3.failed && f3.reason == EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS,
           "reason=" + std::to_string(f3.reason));
     xdg_toplevel_destroy(w.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     tick();
     (void)finish(c);
 }
@@ -619,10 +696,12 @@ void toplevel_cases() {
     bind_list(c, l);
     handle_info* h = find_handle(l, "lumen-test-under");
     session s{};
-    if (h)
-        open_session(c, s,
-                     ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
-                         c.toplevel_sources, h->handle));
+    if (h) {
+        auto* src = ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
+            c.toplevel_sources, h->handle);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(src));
+        open_session(c, s, src);
+    }
     check("toplevel: constraints are the window's size",
           s.width == 200 && s.height == 150 && s.dones == 1,
           std::to_string(s.width) + "x" + std::to_string(s.height));
@@ -639,22 +718,29 @@ void toplevel_cases() {
     // Its window unmaps: stopped, and a frame waiting for it fails as stopped.
     frame f2{};
     f2.frame = ext_image_copy_capture_session_v1_create_frame(s.session);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(f2.frame));
     ext_image_copy_capture_frame_v1_add_listener(f2.frame, &frame_listener, &f2);
     ext_image_copy_capture_frame_v1_attach_buffer(f2.frame, b.buffer);
     ext_image_copy_capture_frame_v1_capture(f2.frame);
     tick();
     (void)wl_display_roundtrip(c.display);
     xdg_toplevel_destroy(under.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(under.toplevel));
     xdg_surface_destroy(under.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(under.xdg));
     wl_surface_destroy(under.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(under.surface));
     (void)run_until(c, [&] { return f2.failed || f2.ready; }, 5);
     check("toplevel: the window going stops the session and fails its frame as stopped",
           s.stopped && f2.failed &&
               f2.reason == EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED,
           "stopped=" + std::to_string(s.stopped) + " reason=" + std::to_string(f2.reason));
     xdg_toplevel_destroy(over.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(over.toplevel));
     xdg_surface_destroy(over.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(over.xdg));
     wl_surface_destroy(over.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(over.surface));
     tick();
     (void)finish(c);
 }
@@ -662,20 +748,23 @@ void toplevel_cases() {
 void error_cases() {
     expect("error: create_session with an unknown option", "ext_image_copy_capture_manager_v1",
            EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_ERROR_INVALID_OPTION, [](client& c) {
-               (void)ext_image_copy_capture_manager_v1_create_session(c.copy, output_source(c), 2);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(ext_image_copy_capture_manager_v1_create_session(c.copy, output_source(c), 2)));
            });
     expect("error: create_frame while a frame lives", "ext_image_copy_capture_session_v1",
            EXT_IMAGE_COPY_CAPTURE_SESSION_V1_ERROR_DUPLICATE_FRAME, [](client& c) {
                session s{};
                open_session(c, s, output_source(c));
-               (void)ext_image_copy_capture_session_v1_create_frame(s.session);
-               (void)ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   ext_image_copy_capture_session_v1_create_frame(s.session)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   ext_image_copy_capture_session_v1_create_frame(s.session)));
            });
     expect("error: capture without attach_buffer", "ext_image_copy_capture_frame_v1",
            EXT_IMAGE_COPY_CAPTURE_FRAME_V1_ERROR_NO_BUFFER, [](client& c) {
                session s{};
                open_session(c, s, output_source(c));
                auto* f = ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                ext_image_copy_capture_frame_v1_capture(f);
            });
     expect("error: damage_buffer with a negative x", "ext_image_copy_capture_frame_v1",
@@ -683,6 +772,7 @@ void error_cases() {
                session s{};
                open_session(c, s, output_source(c));
                auto* f = ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                ext_image_copy_capture_frame_v1_damage_buffer(f, -1, 0, 10, 10);
            });
     expect("error: damage_buffer with zero width", "ext_image_copy_capture_frame_v1",
@@ -690,6 +780,7 @@ void error_cases() {
                session s{};
                open_session(c, s, output_source(c));
                auto* f = ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                ext_image_copy_capture_frame_v1_damage_buffer(f, 0, 0, 0, 10);
            });
     expect("error: capture twice", "ext_image_copy_capture_frame_v1",
@@ -698,6 +789,7 @@ void error_cases() {
                open_session(c, s, output_source(c));
                shm_buffer b = make_buffer(c, s.width, s.height, 0);
                auto* f = ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                ext_image_copy_capture_frame_v1_attach_buffer(f, b.buffer);
                ext_image_copy_capture_frame_v1_capture(f);
                ext_image_copy_capture_frame_v1_capture(f);
@@ -708,6 +800,7 @@ void error_cases() {
                open_session(c, s, output_source(c));
                shm_buffer b = make_buffer(c, s.width, s.height, 0);
                auto* f = ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                ext_image_copy_capture_frame_v1_attach_buffer(f, b.buffer);
                ext_image_copy_capture_frame_v1_capture(f);
                ext_image_copy_capture_frame_v1_attach_buffer(f, b.buffer);
@@ -718,6 +811,7 @@ void error_cases() {
                open_session(c, s, output_source(c));
                shm_buffer b = make_buffer(c, s.width, s.height, 0);
                auto* f = ext_image_copy_capture_session_v1_create_frame(s.session);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                ext_image_copy_capture_frame_v1_attach_buffer(f, b.buffer);
                ext_image_copy_capture_frame_v1_capture(f);
                ext_image_copy_capture_frame_v1_damage_buffer(f, 0, 0, 4, 4);
@@ -726,20 +820,26 @@ void error_cases() {
            "ext_image_copy_capture_cursor_session_v1",
            EXT_IMAGE_COPY_CAPTURE_CURSOR_SESSION_V1_ERROR_DUPLICATE_SESSION, [](client& c) {
                wl_pointer* p = wl_seat_get_pointer(c.seat);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                auto* cs = ext_image_copy_capture_manager_v1_create_pointer_cursor_session(
                    c.copy, output_source(c), p);
-               (void)ext_image_copy_capture_cursor_session_v1_get_capture_session(cs);
-               (void)ext_image_copy_capture_cursor_session_v1_get_capture_session(cs);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(cs));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   ext_image_copy_capture_cursor_session_v1_get_capture_session(cs)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   ext_image_copy_capture_cursor_session_v1_get_capture_session(cs)));
            });
     expect("error: screencopy copy into a buffer of the wrong size", "zwlr_screencopy_frame_v1",
            ZWLR_SCREENCOPY_FRAME_V1_ERROR_INVALID_BUFFER, [](client& c) {
                auto* f = zwlr_screencopy_manager_v1_capture_output(c.screencopy, 0, c.output);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                shm_buffer b = make_buffer(c, 16, 16, 0);
                zwlr_screencopy_frame_v1_copy(f, b.buffer);
            });
     expect("error: screencopy copy twice", "zwlr_screencopy_frame_v1",
            ZWLR_SCREENCOPY_FRAME_V1_ERROR_ALREADY_USED, [](client& c) {
                auto* f = zwlr_screencopy_manager_v1_capture_output(c.screencopy, 0, c.output);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(f));
                shm_buffer b = make_buffer(c, k_out_w, k_out_h, 0);
                zwlr_screencopy_frame_v1_copy(f, b.buffer);
                zwlr_screencopy_frame_v1_copy(f, b.buffer);
@@ -795,6 +895,7 @@ void screencopy_cases() {
     const lx::rect2i g = geometry_of("lumen-test-sc");
     sc_frame f{};
     f.frame = zwlr_screencopy_manager_v1_capture_output(c.screencopy, 0, c.output);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(f.frame));
     zwlr_screencopy_frame_v1_add_listener(f.frame, &sc_listener, &f);
     (void)wl_display_roundtrip(c.display);
     check("screencopy: buffer (XRGB, the output's size, its stride) and buffer_done",
@@ -807,6 +908,7 @@ void screencopy_cases() {
     check("screencopy: copy is ready with the window's pixels",
           f.ready && pixel(b, g.x + 5, g.y + 5) == 0x00FFFFu, hex(pixel(b, g.x + 5, g.y + 5)));
     zwlr_screencopy_frame_v1_destroy(f.frame);
+    untrack(c, reinterpret_cast<wl_proxy*>(f.frame));
 
     // A region: the window's corner at the buffer's origin.
     sc_frame r{};
@@ -824,17 +926,21 @@ void screencopy_cases() {
               pixel(rb, 19, 14) == 0x00FFFFu,
           std::to_string(r.width) + "x" + std::to_string(r.height));
     zwlr_screencopy_frame_v1_destroy(r.frame);
+    untrack(c, reinterpret_cast<wl_proxy*>(r.frame));
 
     // copy_with_damage: the first copy at once (full), the second waits for a change.
     sc_frame d1{};
     d1.frame = zwlr_screencopy_manager_v1_capture_output(c.screencopy, 0, c.output);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(d1.frame));
     zwlr_screencopy_frame_v1_add_listener(d1.frame, &sc_listener, &d1);
     (void)wl_display_roundtrip(c.display);
     zwlr_screencopy_frame_v1_copy_with_damage(d1.frame, b.buffer);
     (void)run_until(c, [&] { return d1.ready || d1.failed; });
     zwlr_screencopy_frame_v1_destroy(d1.frame);
+    untrack(c, reinterpret_cast<wl_proxy*>(d1.frame));
     sc_frame d2{};
     d2.frame = zwlr_screencopy_manager_v1_capture_output(c.screencopy, 0, c.output);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(d2.frame));
     zwlr_screencopy_frame_v1_add_listener(d2.frame, &sc_listener, &d2);
     (void)wl_display_roundtrip(c.display);
     zwlr_screencopy_frame_v1_copy_with_damage(d2.frame, b.buffer);
@@ -858,9 +964,13 @@ void screencopy_cases() {
               area > 0 && area < 200,
           "waited=" + std::to_string(waited) + " area=" + std::to_string(area));
     zwlr_screencopy_frame_v1_destroy(d2.frame);
+    untrack(c, reinterpret_cast<wl_proxy*>(d2.frame));
     xdg_toplevel_destroy(w.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     tick();
     (void)finish(c);
 }
@@ -904,6 +1014,7 @@ void lock_cases() {
     // Then nothing until unlock.
     frame f3{};
     f3.frame = ext_image_copy_capture_session_v1_create_frame(s.session);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(f3.frame));
     ext_image_copy_capture_frame_v1_add_listener(f3.frame, &frame_listener, &f3);
     ext_image_copy_capture_frame_v1_attach_buffer(f3.frame, b.buffer);
     ext_image_copy_capture_frame_v1_capture(f3.frame);
@@ -921,8 +1032,11 @@ void lock_cases() {
               pixel(b, g.x + 5, g.y + 5) == 0xFFFF00u,
           "locked=" + std::to_string(ls.locked) + " px=" + hex(pixel(b, g.x + 5, g.y + 5)));
     xdg_toplevel_destroy(w.toplevel);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_surface_destroy(w.xdg);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.xdg));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     tick();
     (void)finish(c);
     (void)finish(locker);

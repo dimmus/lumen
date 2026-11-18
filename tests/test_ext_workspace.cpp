@@ -75,6 +75,9 @@ struct group_state {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
@@ -139,7 +142,10 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
     else if (std::strcmp(iface, wl_shm_interface.name) == 0)
         c->shm = static_cast<wl_shm*>(wl_registry_bind(r, name, &wl_shm_interface, 1));
     else if (std::strcmp(iface, wl_output_interface.name) == 0) {
-        c->outputs.push_back(static_cast<wl_output*>(wl_registry_bind(r, name, &wl_output_interface, 4)));
+        wl_output* o = static_cast<wl_output*>(wl_registry_bind(r, name, &wl_output_interface, 4));
+        c->outputs.push_back(o);
+        // Bound proxies are not freed by wl_display_disconnect; track for teardown.
+        c->created.push_back(reinterpret_cast<wl_proxy*>(o));
         c->output_names.push_back(name);
     } else if (std::strcmp(iface, ext_workspace_manager_v1_interface.name) == 0)
         c->ws_name = name;
@@ -226,6 +232,9 @@ const ext_workspace_manager_v1_listener manager_listener = {
         auto st = std::make_unique<group_state>();
         st->proxy = g;
         c->groups.push_back(std::move(st));
+        // Server-pushed proxies are this client's to destroy too; track them so
+        // disconnect owns whatever the case did not destroy.
+        c->created.push_back(reinterpret_cast<wl_proxy*>(g));
         ext_workspace_group_handle_v1_add_listener(g, &group_listener, c);
         c->log.push_back("group");
     },
@@ -234,6 +243,7 @@ const ext_workspace_manager_v1_listener manager_listener = {
         auto st = std::make_unique<ws_state>();
         st->proxy = w;
         c->workspaces.push_back(std::move(st));
+        c->created.push_back(reinterpret_cast<wl_proxy*>(w));
         ext_workspace_handle_v1_add_listener(w, &ws_listener, c);
         c->log.push_back("workspace");
     },
@@ -259,6 +269,37 @@ bool connect(client& c) {
     for (wl_output* o : c.outputs)
         wl_output_add_listener(o, &output_listener, nullptr);
     return wl_display_roundtrip(c.display) >= 0;
+}
+
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its oldest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.manager)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.manager));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
 }
 
 void bind_manager(client& c) {
@@ -308,6 +349,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -315,9 +357,12 @@ wl_buffer* make_buffer(client& c, int w, int h) {
 
 void map_window(client& c, window& w, const char* app_id) {
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_toplevel_add_listener(w.toplevel, &toplevel_listener, &w);
     xdg_toplevel_set_app_id(w.toplevel, app_id);
     wl_surface_commit(w.surface);
@@ -407,6 +452,7 @@ void run_cases() {
     {
         auto* late = static_cast<wl_output*>(
             wl_registry_bind(c.registry, c.output_names[0], &wl_output_interface, 4));
+        c.created.push_back(reinterpret_cast<wl_proxy*>(late));
         wl_output_add_listener(late, &output_listener, nullptr);
         settle(c);
         check("a wl_output bound later gets output_enter and done",
@@ -488,6 +534,7 @@ void run_cases() {
     settle(c);
     check("requests on an inert handle are ignored", protocol_ok(c) && c.names(ga) == "1* 2",
           c.names(ga));
+    untrack(c, reinterpret_cast<wl_proxy*>(w2->proxy)); // its typed destroy frees the proxy
     ext_workspace_handle_v1_destroy(w2->proxy);
     w2->proxy = nullptr;
 
@@ -559,7 +606,7 @@ void run_cases() {
     ext_workspace_manager_v1_stop(c.manager);
     settle(c);
     check("stop: finished", c.finished && protocol_ok(c));
-    wl_display_disconnect(c.display);
+    disconnect(c);
 
     // A second client binds after all that: it sees the same state.
     client d{};
@@ -569,7 +616,7 @@ void run_cases() {
         group_state* db = d.group_of(d.outputs[1]);
         check("a new client sees the same workspaces", db && d.names(db) == c.names(gb),
               (db ? d.names(db) : "-") + " vs " + c.names(gb));
-        wl_display_disconnect(d.display);
+        disconnect(d);
     } else {
         check("a second client connects", false);
     }

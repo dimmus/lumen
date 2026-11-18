@@ -72,6 +72,7 @@
 // was before Phase 3) — every node dirty (cold), the root alone dirty over warm caches, one
 // label dirty (a clock cell) — under "layout_solve" (`--no-layout-solve` skips it).
 
+#include "alloc_counting.hpp"
 #include "render_node.hpp"
 #include "lx.trace/scope.hpp" // LX_TRACE_SCOPE (a macro, so a header: modules export none)
 #include <errno.h>
@@ -109,14 +110,14 @@ std::atomic<std::uint64_t> g_new_bytes{0};
 /// the UI thread, not on the worker's icon rasters or a driver's threads.
 __attribute__((tls_model("initial-exec"))) thread_local std::uint64_t g_thread_new_calls = 0;
 
-void* counted_alloc(std::size_t n) noexcept {
+[[maybe_unused]] void* counted_alloc(std::size_t n) noexcept {
     g_new_calls.fetch_add(1, std::memory_order_relaxed);
     g_new_bytes.fetch_add(n, std::memory_order_relaxed);
     ++g_thread_new_calls;
     return std::malloc(n > 0 ? n : 1);
 }
 
-void* counted_aligned_alloc(std::size_t n, std::align_val_t align) noexcept {
+[[maybe_unused]] void* counted_aligned_alloc(std::size_t n, std::align_val_t align) noexcept {
     g_new_calls.fetch_add(1, std::memory_order_relaxed);
     g_new_bytes.fetch_add(n, std::memory_order_relaxed);
     ++g_thread_new_calls;
@@ -130,6 +131,9 @@ void* counted_aligned_alloc(std::size_t n, std::align_val_t align) noexcept {
 /// `operator new` calls made by the calling thread so far (bench_ui_client.cpp).
 std::uint64_t bench_thread_new_calls() noexcept { return g_thread_new_calls; }
 
+// See alloc_counting.hpp: not compiled under ThreadSanitizer (its runtime defines
+// the global operators; a replacement is a duplicate-symbol link error).
+#if LUMEN_TEST_ALLOC_COUNTING
 void* operator new(std::size_t n) {
     if (void* p = counted_alloc(n))
         return p;
@@ -170,6 +174,7 @@ void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
+#endif // LUMEN_TEST_ALLOC_COUNTING
 
 namespace {
 
@@ -2013,8 +2018,15 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             return "fail";
         return st.samples < k_min_gate_samples ? "insufficient" : verdict(p95_ok);
     };
-    // G5: no operator new and no net malloc growth over the steady window.
+    // G5: no operator new and no net malloc growth over the steady window. The
+    // new-call count exists only when the counting operators are compiled in
+    // (alloc_counting.hpp); under TSan the mallinfo2 delta alone judges, and the gate's
+    // detail says so instead of printing a vacuous zero count.
+#if LUMEN_TEST_ALLOC_COUNTING
     const bool no_allocs = mem.allocations == 0 && mem.mallinfo_delta == 0;
+#else
+    const bool no_allocs = mem.mallinfo_delta == 0;
+#endif
     if (std::strcmp(spec.id, "S1") == 0) {
         const bool idle = cnt.frames_produced == 0 && cnt.primitives_total == 0;
         add_gate("G1", verdict(idle), "%u frames produced, %llu primitives emitted over %u idle ticks",
@@ -2056,8 +2068,13 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
                                                           : ", more than 1 draw per page")
                      : "");
     }
+#if LUMEN_TEST_ALLOC_COUNTING
     add_gate("G5", verdict(no_allocs), "%llu heap allocations in %u steady frames, mallinfo2 delta %lld B",
              static_cast<unsigned long long>(mem.allocations), opt.frames, mem.mallinfo_delta);
+#else
+    add_gate("G5", verdict(no_allocs), "allocation count not built under TSan, mallinfo2 delta %lld B in %u steady frames",
+             mem.mallinfo_delta, opt.frames);
+#endif
     if (vk && vk_target)
         g_vk->renderer.wait_idle(); // the target goes with this frame
     return out;

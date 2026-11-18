@@ -74,8 +74,11 @@ struct mode_info {
     bool finished = false;
 };
 
+struct client;
+
 struct head_info {
     zwlr_output_head_v1* head = nullptr;
+    struct client* owner = nullptr; // head_mode tracks the mode proxy on it
     std::string name, description, make;
     std::vector<mode_info*> modes;
     bool enabled = false;
@@ -99,6 +102,9 @@ struct wl_out {
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     zwlr_output_manager_v1* manager = nullptr;
     zxdg_output_manager_v1* xom = nullptr;
@@ -106,6 +112,17 @@ struct client {
     uint32_t serial = 0;
     unsigned dones = 0;
     std::vector<wl_out*> outs;
+    // The listener state new'd as the manager announces heads/modes/outputs: this client
+    // owns it (nothing else frees it), so it goes with the client.
+    ~client() {
+        for (head_info* h : heads) {
+            for (mode_info* m : h->modes)
+                delete m;
+            delete h;
+        }
+        for (wl_out* o : outs)
+            delete o;
+    }
 };
 
 void mode_size(void* d, zwlr_output_mode_v1*, int32_t w, int32_t h) {
@@ -129,6 +146,7 @@ void head_mode(void* d, zwlr_output_head_v1*, zwlr_output_mode_v1* m) {
     mi->mode = m;
     zwlr_output_mode_v1_add_listener(m, &mode_listener, mi);
     static_cast<head_info*>(d)->modes.push_back(mi);
+    static_cast<head_info*>(d)->owner->created.push_back(reinterpret_cast<wl_proxy*>(m));
 }
 void head_enabled(void* d, zwlr_output_head_v1*, int32_t e) { static_cast<head_info*>(d)->enabled = e != 0; }
 void head_current_mode(void* d, zwlr_output_head_v1*, zwlr_output_mode_v1* m) {
@@ -161,8 +179,10 @@ const zwlr_output_head_v1_listener head_listener = {
 void mgr_head(void* d, zwlr_output_manager_v1*, zwlr_output_head_v1* h) {
     auto* hi = new head_info{};
     hi->head = h;
+    hi->owner = static_cast<client*>(d);
     zwlr_output_head_v1_add_listener(h, &head_listener, hi);
     static_cast<client*>(d)->heads.push_back(hi);
+    static_cast<client*>(d)->created.push_back(reinterpret_cast<wl_proxy*>(h));
 }
 void mgr_done(void* d, zwlr_output_manager_v1*, uint32_t serial) {
     auto* c = static_cast<client*>(d);
@@ -204,9 +224,11 @@ const zxdg_output_v1_listener xdg_output_listener = {xo_position, xo_size, xo_do
 
 void bind_out(client& c, wl_out& o) {
     o.output = static_cast<wl_output*>(wl_registry_bind(c.registry, o.global, &wl_output_interface, 4));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(o.output));
     wl_output_add_listener(o.output, &output_listener, &o);
     if (c.xom) {
         o.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(o.xo));
         zxdg_output_v1_add_listener(o.xo, &xdg_output_listener, &o);
     }
 }
@@ -247,6 +269,33 @@ bool connect(client& c) {
         if (!o->output)
             bind_out(c, *o);
     return wl_display_roundtrip(c.display) >= 0 && c.manager;
+}
+
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its oldest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.xom)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.xom));
+    if (c.manager)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.manager));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
 }
 
 head_info* head_named(client& c, const char* name) {
@@ -304,6 +353,7 @@ zwlr_output_configuration_v1* build(client& c, const std::vector<spec>& specs, u
             continue;
         }
         zwlr_output_configuration_head_v1* ch = zwlr_output_configuration_v1_enable_head(cfg, h->head);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(ch));
         if (s.mode_w > 0)
             if (mode_info* m = mode_of(h, s.mode_w, s.mode_h, s.mode_refresh))
                 zwlr_output_configuration_head_v1_set_mode(ch, m->mode);
@@ -364,14 +414,20 @@ int main() {
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
         });
+        // Returns fn()'s value so a poll can read UI state under the same lock.
         const auto ui = [&](auto fn) {
             std::lock_guard<std::mutex> hold(dispatch_lock);
             lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
-            fn();
+            return fn();
         };
         auto& outs = comp.outputs();
         ui([&] { comp.simulate_connector_scan(scan); });
-        for (int i = 0; i < 200 && outs.count() < 2; ++i) {
+        // `outs.count()` reads UI-affinity compositor state: it must share the dispatch
+        // lock with the pump thread that runs the posted add-output tasks (TSan flags the
+        // unsynchronized read otherwise), so poll it through `ui` like every other access.
+        for (int i = 0; i < 200; ++i) {
+            if (ui([&] { return outs.count() >= 2; }))
+                break;
             ui([&] { comp.run_posted_ui_tasks(); });
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -467,7 +523,8 @@ int main() {
             zwlr_output_configuration_v1_apply(cfg_obj);
             const int st = wait_result(r);
             zwlr_output_configuration_v1_destroy(cfg_obj);
-            check(st == 1 && outs.count() == 2, "every head disabled: failed, nothing changed");
+            const unsigned n_after_fail = ui([&] { return outs.count(); });
+            check(st == 1 && n_after_fail == 2, "every head disabled: failed, nothing changed");
             result r2{};
             auto* cfg2 = build(c, {{.name = "HEADLESS-1"}, {.name = "Virtual-1", .adaptive = 1}},
                                c.serial, r2);
@@ -493,10 +550,15 @@ int main() {
             zwlr_output_configuration_v1_apply(cfg_obj);
             const int st = wait_result(r);
             zwlr_output_configuration_v1_destroy(cfg_obj);
-            for (int i = 0; i < 100 && outs.count() != 1; ++i)
+            unsigned n_after_disable = 0;
+            for (int i = 0; i < 100; ++i) {
+                n_after_disable = ui([&] { return outs.count(); });
+                if (n_after_disable == 1)
+                    break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
             (void)wl_display_roundtrip(c.display);
-            check(st == 0 && outs.count() == 1 && !out_named(c, "Virtual-1") && v1 && !v1->finished &&
+            check(st == 0 && n_after_disable == 1 && !out_named(c, "Virtual-1") && v1 && !v1->finished &&
                       !v1->enabled,
                   "disabled: its wl_output goes, its head stays (enabled 0)");
             result r2{};
@@ -536,7 +598,7 @@ int main() {
             const uint32_t old = c.serial;
             connector(scan, 53, "Virtual-2", true, {mode(1280, 720)});
             ui([&] { comp.simulate_connector_scan(scan); });
-            for (int i = 0; i < 200 && outs.count() < 3; ++i) {
+            for (int i = 0; i < 200 && ui([&] { return outs.count(); }) < 3; ++i) {
                 ui([&] { comp.run_posted_ui_tasks(); });
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -552,7 +614,7 @@ int main() {
             zwlr_output_configuration_v1_destroy(cfg_obj);
             connector(scan, 53, "Virtual-2", false);
             ui([&] { comp.simulate_connector_scan(scan); });
-            for (int i = 0; i < 200 && outs.count() > 2; ++i) {
+            for (int i = 0; i < 200 && ui([&] { return outs.count(); }) > 2; ++i) {
                 ui([&] { comp.run_posted_ui_tasks(); });
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -605,26 +667,28 @@ int main() {
             head_info* b = head_named(e, "Virtual-1");
             result r{};
             auto* cfg_obj = zwlr_output_manager_v1_create_configuration(e.manager, e.serial);
+            e.created.push_back(reinterpret_cast<wl_proxy*>(cfg_obj));
             zwlr_output_configuration_v1_add_listener(cfg_obj, &cfg_listener, &r);
             if (a && b) {
                 switch (ec.kind) {
                 case 0:
-                    (void)zwlr_output_configuration_v1_enable_head(cfg_obj, a->head);
-                    (void)zwlr_output_configuration_v1_enable_head(cfg_obj, a->head);
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_output_configuration_v1_enable_head(cfg_obj, a->head)));
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_output_configuration_v1_enable_head(cfg_obj, a->head)));
                     break;
                 case 1:
-                    (void)zwlr_output_configuration_v1_enable_head(cfg_obj, a->head);
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_output_configuration_v1_enable_head(cfg_obj, a->head)));
                     zwlr_output_configuration_v1_apply(cfg_obj);
                     break;
                 case 2:
-                    (void)zwlr_output_configuration_v1_enable_head(cfg_obj, a->head);
-                    (void)zwlr_output_configuration_v1_enable_head(cfg_obj, b->head);
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_output_configuration_v1_enable_head(cfg_obj, a->head)));
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_output_configuration_v1_enable_head(cfg_obj, b->head)));
                     zwlr_output_configuration_v1_apply(cfg_obj);
                     zwlr_output_configuration_v1_apply(cfg_obj);
                     break;
                 default: {
-                    (void)zwlr_output_configuration_v1_enable_head(cfg_obj, a->head);
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(zwlr_output_configuration_v1_enable_head(cfg_obj, a->head)));
                     auto* ch = zwlr_output_configuration_v1_enable_head(cfg_obj, b->head);
+                    e.created.push_back(reinterpret_cast<wl_proxy*>(ch));
                     switch (ec.kind) {
                     case 3:
                         zwlr_output_configuration_head_v1_set_scale(ch, wl_fixed_from_double(1.0));
@@ -653,7 +717,7 @@ int main() {
             const uint32_t code = wl_display_get_protocol_error(e.display, &iface, &id);
             check(wl_display_get_error(e.display) == EPROTO && iface == ec.iface && code == ec.code,
                   ec.what);
-            wl_display_disconnect(e.display);
+            disconnect(e);
         }
         // The compositor survived every error.
         check(wl_display_roundtrip(c.display) >= 0, "the compositor and other clients are unaffected");
@@ -674,12 +738,7 @@ int main() {
                   saved.find("position = [0, 600]") != std::string::npos,
               "and the setup with its position");
 
-        for (auto* h : c.heads) {
-            for (auto* m : h->modes)
-                delete m;
-            delete h;
-        }
-        wl_display_disconnect(c.display);
+        disconnect(c); // c's destructor owns the head/mode/output records
         pump.store(false, std::memory_order_release);
         pump_thread.join();
     }

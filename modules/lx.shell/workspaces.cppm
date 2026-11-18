@@ -292,9 +292,14 @@ unsigned lx::shell::workspace_view::of_output(void* output, int* out, unsigned c
     for (unsigned i = 0; i < k_max_shell_workspaces && n < cap; ++i)
         if (ws_[i].used && ws_[i].group == group && !(ws_[i].state & shell_ws_hidden))
             out[n++] = static_cast<int>(i);
-    // By coordinate (their order), stable for equal ones.
-    std::stable_sort(out, out + n, [&](int a, int b) {
-        return ws_[a].coordinate < ws_[b].coordinate;
+    // By coordinate (their order), stable for equal ones: the fill above emitted
+    // increasing workspace indices, so the index itself is the tiebreak a stable sort
+    // would have kept — std::sort with that total order orders identically without
+    // stable_sort's heap-allocated temp buffer.
+    std::sort(out, out + n, [&](int a, int b) {
+        if (ws_[a].coordinate != ws_[b].coordinate)
+            return ws_[a].coordinate < ws_[b].coordinate;
+        return a < b;
     });
     return n;
 }

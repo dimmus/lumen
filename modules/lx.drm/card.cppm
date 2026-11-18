@@ -96,7 +96,10 @@ void lx::drm::rank_cards(card_list& list) {
         return c.connectors == 0;
     });
     list.count = static_cast<unsigned>(end - begin);
-    std::stable_sort(begin, end, [](const card_candidate& a, const card_candidate& b) {
+    // std::sort, not stable_sort: the comparator ends in the unique card index, a total
+    // order with no ties — identical ordering without stable_sort's heap-allocated temp
+    // buffer (which trips ASan's alloc-dealloc-mismatch inside libstdc++'s tempbuf).
+    std::sort(begin, end, [](const card_candidate& a, const card_candidate& b) {
         if ((a.connected > 0) != (b.connected > 0))
             return a.connected > 0;
         if (a.boot_vga != b.boot_vga)

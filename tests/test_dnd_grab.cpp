@@ -23,12 +23,14 @@ using lx::compositor::dnd_target;
 using lx::compositor::root_kind;
 
 // ── Allocation counter: every operator new in the process while `g_counting` is set ──
+#include "alloc_counting.hpp"
 
 namespace {
 std::atomic<bool> g_counting{false};
 std::atomic<unsigned> g_allocs{0};
 } // namespace
 
+#if LUMEN_TEST_ALLOC_COUNTING
 void* operator new(std::size_t n) {
     if (g_counting.load(std::memory_order_relaxed))
         g_allocs.fetch_add(1, std::memory_order_relaxed);
@@ -38,6 +40,7 @@ void* operator new(std::size_t n) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 namespace {
 
@@ -108,11 +111,22 @@ struct fixture {
         grab.set_ops(ops);
     }
 
+    /// What a client's wl_surface destroy does in production: drop every surface the
+    /// fixture made (make_root's container_node is freed only on remove_surface).
+    ~fixture() {
+        for (unsigned i = made_count_; i-- > 0;)
+            tree.remove_surface(made_[i]);
+    }
+
+    lx::surface_id made_[64]{};
+    unsigned made_count_ = 0;
+
     /// A root surface with w x h content, made a drag icon.
     lx::surface_id icon(unsigned n, int w, int h) {
         const lx::surface_id s = sid(n);
         LUMEN_CHECK(surfaces.register_surface(s, nullptr));
         LUMEN_CHECK(tree.add_surface(s));
+        made_[made_count_ < 64 ? made_count_++ : 63] = s;
         const lx::buffer_id b{next_buffer++};
         surfaces.register_shm(b, static_cast<unsigned>(w), static_cast<unsigned>(h),
                               static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));
@@ -173,6 +187,7 @@ struct wm_fixture : fixture {
         const lx::surface_id s = sid(n);
         LUMEN_CHECK(surfaces.register_surface(s, &res_a));
         LUMEN_CHECK(tree.add_surface(s));
+        made_[made_count_ < 64 ? made_count_++ : 63] = s;
         const lx::buffer_id b{next_buffer++};
         surfaces.register_shm(b, static_cast<unsigned>(w), static_cast<unsigned>(h),
                               static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));
@@ -418,7 +433,7 @@ LUMEN_TEST(dnd_dragged_toplevel_motion_and_tick_do_not_allocate) {
     for (int i = 0; i < 200; ++i) {
         f->seat.set_pointer_position(g0.x + 160.5 + i * 0.5, g0.y + 150.5 + i * 0.5);
         f->wm.on_pointer_motion(static_cast<unsigned>(i));
-        f->wm.on_tick(2'000'000'000 + i * 16'666'667);
+        f->wm.on_tick(2'000'000'000LL + i * 16'666'667LL);
     }
     g_counting.store(false);
     const unsigned tick_allocs = g_allocs.load();

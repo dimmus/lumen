@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "alloc_counting.hpp"
 #include "lumen_test.hpp"
 #include "render_node.hpp"
 
@@ -44,6 +45,9 @@ namespace {
 std::atomic<unsigned long long> g_allocations{0};
 } // namespace
 
+// See alloc_counting.hpp: not compiled under ThreadSanitizer (its runtime
+// defines the global operators; a replacement is a duplicate-symbol link error).
+#if LUMEN_TEST_ALLOC_COUNTING
 void* operator new(std::size_t n) {
     g_allocations.fetch_add(1, std::memory_order_relaxed);
     if (void* p = std::malloc(n ? n : 1))
@@ -60,6 +64,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif // LUMEN_TEST_ALLOC_COUNTING
 
 namespace {
 
@@ -935,7 +940,11 @@ LUMEN_TEST(steady_titled_frame_allocates_nothing) {
             during += g_allocations.load() - before;
     }
     std::printf("    allocations over 32 steady frames: %llu\n", during);
+    #if !LUMEN_TEST_ALLOC_COUNTING // counting not built under TSan (alloc_counting.hpp)
+        std::printf("    skip: allocation counting is not built under TSan\n");
+    #else
     LUMEN_CHECK(during == 0);
+    #endif
 }
 
 // ── GL ───────────────────────────────────────────────────────────────────────────────

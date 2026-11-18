@@ -80,6 +80,9 @@ constexpr unsigned k_outs = 8;
 
 struct client {
     wl_display* display = nullptr;
+    /// Proxies this client created beyond the globals; disconnect destroys them
+    /// (libwayland 1.26 frees no remaining proxy at wl_display_disconnect).
+    std::vector<wl_proxy*> created;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     xdg_wm_base* wm_base = nullptr;
@@ -155,9 +158,11 @@ const wl_surface_listener surface_listener = {surf_enter, surf_leave, surf_scale
 void bind_output(client& c, output_info& o, uint32_t name) {
     o.global = name;
     o.output = static_cast<wl_output*>(wl_registry_bind(c.registry, name, &wl_output_interface, 4));
+    c.created.push_back(reinterpret_cast<wl_proxy*>(o.output));
     wl_output_add_listener(o.output, &output_listener, &o);
     if (c.xom) {
         o.xo = zxdg_output_manager_v1_get_xdg_output(c.xom, o.output);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(o.xo));
         zxdg_output_v1_add_listener(o.xo, &xdg_output_listener, &o);
     }
 }
@@ -217,6 +222,39 @@ bool connect(client& c) {
     return wl_display_roundtrip(c.display) >= 0;
 }
 
+/// Full client teardown. `wl_display_disconnect` frees the bound proxies but leaks the
+/// registry proxy (libwayland 1.26 leaves the display's own map entry), so destroy the
+/// registry first — LSan found one 96-byte proxy per leaked client otherwise.
+/// Takes a proxy off the tracked list after its typed destroy request ran (a second
+/// wl_proxy_destroy would be UB).
+void untrack(client& c, wl_proxy* p) {
+    if (auto it = std::find(c.created.begin(), c.created.end(), p); it != c.created.end())
+        c.created.erase(it);
+}
+
+void disconnect(client& c) {
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its newest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.layer_shell)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.layer_shell));
+    if (c.xom)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.xom));
+    if (c.shm)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
+    if (c.wm_base)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.wm_base));
+    if (c.compositor)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
+    wl_display_disconnect(c.display);
+}
+
 wl_buffer* make_buffer(client& c, int w, int h) {
     const int stride = w * 4;
     const int size = stride * h;
@@ -225,6 +263,7 @@ wl_buffer* make_buffer(client& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -364,9 +403,11 @@ int main() {
     });
     surface_info w{};
     w.surface = wl_compositor_create_surface(c.compositor);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.surface));
     wl_surface_add_listener(w.surface, &surface_listener, &w);
     configured wcfg{};
     xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(xs));
     xdg_surface_add_listener(xs, &xdg_listener, &wcfg);
     xdg_toplevel* tl = xdg_surface_get_toplevel(xs);
     wl_surface_commit(w.surface);
@@ -389,6 +430,7 @@ int main() {
     surface_info ls{};
     if (v1 >= 0) {
         ls.surface = wl_compositor_create_surface(c.compositor);
+        c.created.push_back(reinterpret_cast<wl_proxy*>(ls.surface));
         layer = zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, ls.surface, c.outs[v1].output,
                                                       ZWLR_LAYER_SHELL_V1_LAYER_TOP, "panel");
         zwlr_layer_surface_v1_add_listener(layer, &layer_listener, &lcfg);
@@ -443,6 +485,7 @@ int main() {
             wl_registry_bind(c.registry, c.outs[v1].global, &wl_output_interface, 4));
         const int r = wl_display_roundtrip(c.display);
         wl_output_release(late);
+        untrack(c, reinterpret_cast<wl_proxy*>(late));
         check(r >= 0 && wl_display_get_error(c.display) == 0,
               "binding the removed wl_output global gives an inert object, no error");
     }
@@ -489,13 +532,18 @@ int main() {
 
     if (layer)
         zwlr_layer_surface_v1_destroy(layer);
+        untrack(c, reinterpret_cast<wl_proxy*>(layer));
     if (ls.surface)
         wl_surface_destroy(ls.surface);
+        untrack(c, reinterpret_cast<wl_proxy*>(ls.surface));
     xdg_toplevel_destroy(tl);
+    untrack(c, reinterpret_cast<wl_proxy*>(tl));
     xdg_surface_destroy(xs);
+    untrack(c, reinterpret_cast<wl_proxy*>(xs));
     wl_surface_destroy(w.surface);
+    untrack(c, reinterpret_cast<wl_proxy*>(w.surface));
     (void)wl_display_roundtrip(c.display);
-    wl_display_disconnect(c.display);
+    disconnect(c);
 
     pump.store(false, std::memory_order_release);
     pump_thread.join();

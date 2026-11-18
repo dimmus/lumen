@@ -130,6 +130,11 @@ private:
         menu_rows rows{};
         int selected = -1;
         bool dirty = false;
+        /// Stable storage for the rows' mnemonic-stripped labels: build_ui() must not
+        /// hand the text blocks a pointer into a frame-local std::string — the blocks
+        /// read their string at the NEXT tick's reconcile (ASan: stack-use-after-return
+        /// in strlen), the same class the panel tiles and switcher letters had.
+        std::string label[k_menu_max_rows]{};
     };
     /// A row's stable identity for the tree's callbacks.
     struct row_ref {

@@ -22,3 +22,26 @@ leak:libEGL_mesa.so
 leak:libgallium
 leak:libgbm.so
 leak:libglapi.so
+
+# ── libfontconfig ──────────────────────────────────────────────────────────────
+#
+# Parsing fontconfig's own system configuration (FcConfigParseAndLoadDir, run at
+# FcInit from lx.text's face_cache) allocates pattern state (FcPatternObjectInsertElt,
+# FcPatternAppend in fcpat.c / fcxml.c) that fontconfig keeps for the life of the
+# process and frees only at exit-by-os. LSan reports it at the test's exit. Every
+# frame of these leaks is fontconfig or expat parsing its XML — zero Lumen frames in
+# the allocation stacks (verified across 12 runs of test_font_matches: every leak
+# matched this entry, nothing remained). Reached from Lumen's faces.cppm, the same
+# way the Mesa EGL entries below are reached from compositor_impl::setup_gl_present.
+leak:libfontconfig.so
+
+# ── libsystemd (sd-varlink / sd-event) ─────────────────────────────────────────
+#
+# The control server's Varlink objects retain references past full teardown: a
+# standalone program with no Lumen code — sd_varlink_server + one connection +
+# an sd-event loop, everything shutdown/detach/unref'd in control_server's exact
+# order (/tmp/varlinkrepro) — leaks 1872 bytes in 18 allocations, the same
+# all-indirect shape test_control reports (634 allocations there, every one made
+# inside libsystemd code, none by Lumen). Reproduce either way:
+#   LSAN_OPTIONS= ./build/asan/test_control
+leak:libsystemd

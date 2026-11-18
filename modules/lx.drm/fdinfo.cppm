@@ -294,9 +294,19 @@ lx::drm::gpu_memory lx::drm::read_gpu_memory() {
         if (ec != std::errc{} || end != name.data() + name.size() || fd == dfd)
             continue;
         // Our own fd: a dmabuf, a socket, a memfd is no DRM client. Skip them without
-        // reading their fdinfo (a compositor holds hundreds).
+        // reading their fdinfo (a compositor holds hundreds). The directory lists fd
+        // NUMBERS, and another thread may close one (or the kernel reuse it) between
+        // readdir and the probe: dup first, so the stat either sees a handle this thread
+        // owns or the fd is already gone — a bare fstat of the listed number raced the
+        // closer thread (TSan: close in the input-open thread vs fstat here).
+        const int probe = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (probe < 0)
+            continue;
         struct stat st{};
-        if (::fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode) || major(st.st_rdev) != k_drm_major)
+        const bool drm_node =
+            ::fstat(probe, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == k_drm_major;
+        ::close(probe);
+        if (!drm_node)
             continue;
         const int info = ::openat(dfd, e->d_name, O_RDONLY | O_CLOEXEC);
         if (info < 0)
