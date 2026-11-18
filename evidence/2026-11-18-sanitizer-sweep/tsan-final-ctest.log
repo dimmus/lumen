@@ -1,0 +1,1343 @@
+Test project /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan
+        Start   1: scanner_golden
+  1/136 Test   #1: scanner_golden ........................   Passed    0.13 sec
+        Start   2: test_result
+  2/136 Test   #2: test_result ...........................   Passed    0.01 sec
+        Start   3: test_config
+  3/136 Test   #3: test_config ...........................   Passed    0.04 sec
+        Start   4: test_config_edit
+  4/136 Test   #4: test_config_edit ......................   Passed    0.02 sec
+        Start   5: test_input_config
+  5/136 Test   #5: test_input_config .....................   Passed    0.04 sec
+        Start   6: test_theme_env
+  6/136 Test   #6: test_theme_env ........................   Passed    0.03 sec
+        Start   7: test_health
+  7/136 Test   #7: test_health ...........................   Passed    0.01 sec
+        Start   8: test_session_discovery
+  8/136 Test   #8: test_session_discovery ................   Passed    0.02 sec
+        Start   9: test_peer_pidfd
+  9/136 Test   #9: test_peer_pidfd .......................   Passed    1.05 sec
+        Start  10: test_fd_limit
+ 10/136 Test  #10: test_fd_limit .........................   Passed    0.04 sec
+        Start  11: test_control
+ 11/136 Test  #11: test_control ..........................   Passed    0.69 sec
+        Start  12: test_lumen_session
+ 12/136 Test  #12: test_lumen_session ....................   Passed    5.30 sec
+        Start  13: test_logf
+ 13/136 Test  #13: test_logf .............................   Passed    0.01 sec
+        Start  14: test_snapshot
+ 14/136 Test  #14: test_snapshot .........................   Passed    0.57 sec
+        Start  15: test_primitives
+ 15/136 Test  #15: test_primitives .......................   Passed    0.21 sec
+        Start  16: test_atlas
+ 16/136 Test  #16: test_atlas ............................   Passed    1.36 sec
+        Start  17: test_ui_golden
+ 17/136 Test  #17: test_ui_golden ........................   Passed    8.93 sec
+        Start  18: ui_gallery
+ 18/136 Test  #18: ui_gallery ............................   Passed    2.29 sec
+        Start  19: test_shell_menu
+ 19/136 Test  #19: test_shell_menu .......................   Passed    0.10 sec
+        Start  20: test_ui_golden_vk_validation
+ 20/136 Test  #20: test_ui_golden_vk_validation ..........   Passed    3.41 sec
+        Start  21: test_scene_outputs
+ 21/136 Test  #21: test_scene_outputs ....................   Passed    0.03 sec
+        Start  22: test_damage_region
+ 22/136 Test  #22: test_damage_region ....................   Passed    0.02 sec
+        Start  23: test_window_rules
+ 23/136 Test  #23: test_window_rules .....................   Passed    0.05 sec
+        Start  24: test_wm_geometry
+ 24/136 Test  #24: test_wm_geometry ......................   Passed    0.03 sec
+        Start  25: test_shm_staging
+ 25/136 Test  #25: test_shm_staging ......................   Passed    0.04 sec
+        Start  26: test_positioner
+ 26/136 Test  #26: test_positioner .......................   Passed    0.06 sec
+        Start  27: test_data_transfer
+ 27/136 Test  #27: test_data_transfer ....................   Passed    0.05 sec
+        Start  28: test_session_pause
+ 28/136 Test  #28: test_session_pause ....................   Passed    0.04 sec
+        Start  29: test_viewport_geometry
+ 29/136 Test  #29: test_viewport_geometry ................   Passed    0.18 sec
+        Start  30: test_presentation_feedback
+ 30/136 Test  #30: test_presentation_feedback ............   Passed    0.04 sec
+        Start  31: test_display_power
+ 31/136 Test  #31: test_display_power ....................   Passed    0.03 sec
+        Start  32: test_session_lock
+ 32/136 Test  #32: test_session_lock .....................   Passed    0.03 sec
+        Start  33: test_text_input
+ 33/136 Test  #33: test_text_input .......................   Passed    0.03 sec
+        Start  34: test_capture
+ 34/136 Test  #34: test_capture ..........................   Passed    0.04 sec
+        Start  35: test_gl_capture
+ 35/136 Test  #35: test_gl_capture .......................   Passed    0.51 sec
+        Start  36: test_vk_capture
+ 36/136 Test  #36: test_vk_capture .......................***Failed    1.00 sec
+==================
+WARNING: ThreadSanitizer: data race (pid=4087367)
+  Write of size 8 at 0x72140002e5e0 by main thread:
+    #0 free <null> (test_vk_capture+0xac742) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #1 unsafe_free /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:319:7 (libgallium-26.2.7-arch1.1.so+0x5cfc0d) (BuildId: 8f8fcbbdd56b776996a59a4be286d8d00a5cdedc)
+    #2 ralloc_free /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:264:4 (libgallium-26.2.7-arch1.1.so+0x5cfc0d)
+    #3 ralloc_free /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:255:1 (libgallium-26.2.7-arch1.1.so+0x5cfc0d)
+    #4 os_get_option_cached /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/os_misc.c:316:7 (libgallium-26.2.7-arch1.1.so+0x5ced45) (BuildId: 8f8fcbbdd56b776996a59a4be286d8d00a5cdedc)
+
+  Previous write of size 8 at 0x72140002e5e0 by thread T4:
+    #0 malloc <null> (test_vk_capture+0xabbe5) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #1 ralloc_size /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:118:18 (libgallium-26.2.7-arch1.1.so+0x5cf89d) (BuildId: 8f8fcbbdd56b776996a59a4be286d8d00a5cdedc)
+
+  Thread T4 'test_vk:disk$0' (tid=4087372, running) created by main thread at:
+    #0 pthread_create <null> (test_vk_capture+0xadfee) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libgallium-26.2.7-arch1.1.so+0x626e33) (BuildId: 8f8fcbbdd56b776996a59a4be286d8d00a5cdedc)
+    #2 lumen_test_fn_vk_output_frame_is_read_back_into_shm_in_wl_shm_order() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_vk_capture.cpp:222:18 (test_vk_capture+0x13562e) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #3 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_vk_capture+0x13f6cf) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_vk_capture.cpp:826:42 (test_vk_capture+0x13d130) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_vk_capture+0xac742) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7) in free
+==================
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d010
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d030
+==================
+WARNING: ThreadSanitizer: data race (pid=4087367)
+  Write of size 8 at 0x721400030b10 by main thread:
+    #0 free <null> (test_vk_capture+0xac742) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #1 unsafe_free /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:319:7 (libvulkan_intel_hasvk.so+0x18c24d) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 ralloc_free /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:264:4 (libvulkan_intel_hasvk.so+0x18c24d)
+    #3 ralloc_free /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:255:1 (libvulkan_intel_hasvk.so+0x18c24d)
+    #4 os_get_option_cached /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/os_misc.c:316:7 (libvulkan_intel_hasvk.so+0x1892c5) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Previous write of size 8 at 0x721400030b10 by thread T2:
+    #0 malloc <null> (test_vk_capture+0xabbe5) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #1 ralloc_size /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/ralloc.c:118:18 (libvulkan_intel_hasvk.so+0x18bedd) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Thread T2 'test_vk:disk$0' (tid=4087370, running) created by main thread at:
+    #0 pthread_create <null> (test_vk_capture+0xadfee) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::gfx::device@lx.gfx::create(lx::gfx::device_info@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:507:9 (liblx.gfx.so.0.3+0xb1acf) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #3 lx::gfx::device_selector@lx.gfx::select_best(lx::gfx::drm_node@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:769:23 (liblx.gfx.so.0.3+0xb3c80) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #4 (anonymous namespace)::gpu() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_vk_capture.cpp:65:21 (test_vk_capture+0x13d2a0) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #5 lumen_test_fn_vk_output_frame_is_read_back_into_shm_in_wl_shm_order() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_vk_capture.cpp:222:18 (test_vk_capture+0x13562e) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #6 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_vk_capture+0x13f6cf) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+    #7 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_vk_capture.cpp:826:42 (test_vk_capture+0x13d130) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_vk_capture+0xac742) (BuildId: 28f9e4ca368edb7d51d90b1379c108a7ad05c6d7) in free
+==================
+  PASS  vk_output_frame_is_read_back_into_shm_in_wl_shm_order
+  PASS  vk_crop_lands_at_the_buffer_origin
+  PASS  vk_read_lands_on_a_worker_and_the_slot_is_reused
+  PASS  vk_read_back_async_copies_only_the_rects_asked_for
+  read-back 3200x1800: 3.30 ms median (min 3.25, max 30.41, 16 reads)
+  PASS  vk_read_back_latency_at_panel_resolution
+  PASS  vk_sync_read_back_reuses_its_buffer
+  PASS  vk_output_frame_is_copied_into_a_client_dmabuf
+  PASS  vk_dmabuf_copy_copies_only_the_rects_asked_for
+  PASS  vk_dmabuf_curtain_fills_opaque_black
+  PASS  vk_window_view_is_composited_and_read_back_into_shm
+  PASS  vk_window_view_is_copied_into_a_client_dmabuf
+  PASS  vk_take_sample_fence_never_hands_on_a_closed_fd
+  PASS  vk_engine_output_job_copies_into_a_client_dmabuf
+  PASS  vk_engine_dmabuf_job_with_cursor_lands
+14 tests, 0 failed
+ThreadSanitizer: reported 2 warnings
+
+        Start  37: test_portal_compose
+ 37/136 Test  #37: test_portal_compose ...................   Passed    0.07 sec
+        Start  38: test_portal_settings
+ 38/136 Test  #38: test_portal_settings ..................   Passed    0.04 sec
+        Start  39: test_content_update
+ 39/136 Test  #39: test_content_update ...................   Passed    0.03 sec
+        Start  40: test_idle_notify
+ 40/136 Test  #40: test_idle_notify ......................   Passed    0.03 sec
+        Start  41: test_keybindings
+ 41/136 Test  #41: test_keybindings ......................   Passed    0.04 sec
+        Start  42: test_workspaces
+ 42/136 Test  #42: test_workspaces .......................   Passed    0.03 sec
+        Start  43: test_toplevel_icon
+ 43/136 Test  #43: test_toplevel_icon ....................   Passed    0.08 sec
+        Start  44: test_pointer_constraints
+ 44/136 Test  #44: test_pointer_constraints ..............   Passed    0.02 sec
+        Start  45: test_input_serials
+ 45/136 Test  #45: test_input_serials ....................   Passed    0.03 sec
+        Start  46: test_dnd_grab
+ 46/136 Test  #46: test_dnd_grab .........................   Passed    0.04 sec
+        Start  47: test_output_membership
+ 47/136 Test  #47: test_output_membership ................   Passed    0.03 sec
+        Start  48: test_output_layout
+ 48/136 Test  #48: test_output_layout ....................   Passed    0.03 sec
+        Start  49: test_liveness
+ 49/136 Test  #49: test_liveness .........................   Passed    0.03 sec
+        Start  50: test_activation_policy
+ 50/136 Test  #50: test_activation_policy ................   Passed    0.06 sec
+        Start  51: test_decoration_geometry
+ 51/136 Test  #51: test_decoration_geometry ..............   Passed    0.20 sec
+        Start  52: test_ui_composite
+ 52/136 Test  #52: test_ui_composite .....................   Passed    0.25 sec
+        Start  53: test_deco_titles
+ 53/136 Test  #53: test_deco_titles ......................   Passed    1.65 sec
+        Start  54: test_deco_titles_vk_validation
+ 54/136 Test  #54: test_deco_titles_vk_validation ........   Passed    1.68 sec
+        Start  55: test_layer_arrange
+ 55/136 Test  #55: test_layer_arrange ....................   Passed    0.05 sec
+        Start  56: test_surface_tree
+ 56/136 Test  #56: test_surface_tree .....................   Passed    0.06 sec
+        Start  57: test_xcursor
+ 57/136 Test  #57: test_xcursor ..........................   Passed    0.55 sec
+        Start  58: test_runtime_memory
+ 58/136 Test  #58: test_runtime_memory ...................   Passed    0.21 sec
+        Start  59: test_runtime_psi
+ 59/136 Test  #59: test_runtime_psi ......................   Passed    0.03 sec
+        Start  60: test_input_keymap
+ 60/136 Test  #60: test_input_keymap .....................   Passed    0.20 sec
+        Start  61: test_repaint_schedule
+ 61/136 Test  #61: test_repaint_schedule .................   Passed    0.02 sec
+        Start  62: test_frame_clocks
+ 62/136 Test  #62: test_frame_clocks .....................   Passed    0.02 sec
+        Start  63: test_runtime_task
+ 63/136 Test  #63: test_runtime_task .....................   Passed    0.37 sec
+        Start  64: test_import_cache
+ 64/136 Test  #64: test_import_cache .....................   Passed    0.02 sec
+        Start  65: test_fence_deadline
+ 65/136 Test  #65: test_fence_deadline ...................   Passed    0.02 sec
+        Start  66: test_device_select
+ 66/136 Test  #66: test_device_select ....................   Passed    0.11 sec
+        Start  67: test_cpu_composite
+ 67/136 Test  #67: test_cpu_composite ....................   Passed    0.03 sec
+        Start  68: test_downsample
+ 68/136 Test  #68: test_downsample .......................   Passed    1.14 sec
+        Start  69: test_gl_composite
+ 69/136 Test  #69: test_gl_composite .....................   Passed    0.52 sec
+        Start  75: ui_bench_e2e_dry_run
+ 70/136 Test  #75: ui_bench_e2e_dry_run ..................   Passed    0.07 sec
+        Start  76: smoke_harness
+ 71/136 Test  #76: smoke_harness .........................   Passed    1.16 sec
+        Start  77: test_headless_golden
+ 72/136 Test  #77: test_headless_golden ..................   Passed    0.02 sec
+        Start  78: test_text_shaping
+ 73/136 Test  #78: test_text_shaping .....................   Passed    0.60 sec
+        Start  79: test_text_raster
+ 74/136 Test  #79: test_text_raster ......................   Passed    0.36 sec
+        Start  80: test_font_matches
+ 75/136 Test  #80: test_font_matches .....................   Passed    0.18 sec
+        Start  81: test_text_lines
+ 76/136 Test  #81: test_text_lines .......................   Passed    2.43 sec
+        Start  82: test_text_node
+ 77/136 Test  #82: test_text_node ........................   Passed    1.13 sec
+        Start  83: test_protocol_bind
+ 78/136 Test  #83: test_protocol_bind ....................   Passed    1.53 sec
+        Start  84: test_task_model
+ 79/136 Test  #84: test_task_model .......................   Passed    0.03 sec
+        Start  85: test_clock
+ 80/136 Test  #85: test_clock ............................   Passed    0.03 sec
+        Start  86: test_clock_popup
+ 81/136 Test  #86: test_clock_popup ......................   Passed    2.66 sec
+        Start  87: test_desktop_entry
+ 82/136 Test  #87: test_desktop_entry ....................   Passed    0.03 sec
+        Start  88: test_app_catalog
+ 83/136 Test  #88: test_app_catalog ......................   Passed    0.13 sec
+        Start  89: test_app_launch
+ 84/136 Test  #89: test_app_launch .......................   Passed    1.85 sec
+        Start  90: test_launcher_layout
+ 85/136 Test  #90: test_launcher_layout ..................   Passed    0.03 sec
+        Start  91: test_background
+ 86/136 Test  #91: test_background .......................   Passed    0.13 sec
+        Start  92: test_switcher
+ 87/136 Test  #92: test_switcher .........................   Passed    0.03 sec
+        Start  93: test_notifications
+ 88/136 Test  #93: test_notifications ....................   Passed    0.09 sec
+        Start  94: test_tray
+ 89/136 Test  #94: test_tray .............................   Passed    0.03 sec
+        Start  95: test_icon_theme
+ 90/136 Test  #95: test_icon_theme .......................   Passed    0.03 sec
+        Start  96: test_shell_bridge
+ 91/136 Test  #96: test_shell_bridge .....................Subprocess aborted***Exception:   1.21 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.drm: card /dev/dri/card1 (i915): 1 connected of 2 connectors, boot VGA
+[INFO] compositor.drm: KMS device open — page-flip present path
+[INFO] compositor.drm: framebuffer hand-over at exit: CLOSEFB (no black frame between masters)
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated) for card 226:1: matched by primary node
+[INFO] compositor.gfx: Vulkan composite path active
+[INFO] compositor.drm: output 0 pipeline crtc=53 (index 0) primary=35 connector=93 mode=3200x1800@59982 cursor_plane=47
+[INFO] compositor.drm: CRTC allocation: 1 output, 1 TEST_ONLY, 2 steps
+[INFO] compositor.output: output 0 mode=3200x1800 refresh_mhz=59982 scale=2 (240/120) logical=1600x900
+[INFO] compositor.output: output 0 name=eDP-1 mode=3200x1800 refresh_mhz=59982 scale=2 (240/120) logical=1600x900+0+0 render_scale=2 identifier="Sharp Corporation 0x141C Unknown"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=48 scale=240/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: hardware cursor planes=1 size=64x64 hotspot=0
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.gfx: explicit sync (linux-drm-syncobj-v1): offered; async page flips (tearing-control-v1): available
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (3 clients, 2 regions)
+[INFO] compositor.input: seat open took 83 ms: keymap 13 ms, libinput 70 ms of which 16 device opens 11 ms (slowest /dev/input/event5 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_shell_bridge
+[INFO] compositor.hotplug: hotplug: udev monitor on drm 226:1
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=226:1 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] compositor.wm: map id=1 app_id=test-app x=700 y=375 w=200 h=150
+[INFO] compositor.wm: map id=2 app_id=test-app x=732 y=407 w=200 h=150
+[INFO] shell.bridge: capabilities flags=0x0 version=7
+[INFO] compositor.shell: bridge bound client=2 snapshot=2 focus=2 pid=4088002 binds=1
+[INFO] shell.bridge: snapshot toplevels=2
+[INFO] wayland.client: connected: wl_compositor v6 xdg_wm_base v6 wl_seat×1 wl_output×0 linux-dmabuf v5 syncobj v1 fractional-scale v1 presentation v2 text-input v2; absent: none
+[INFO] gfx.swapchain: client tier vulkan: Intel(R) HD Graphics 5500 (BDW GT2) on /dev/dri/renderD128 (the device asked for) — vulkan: taken gl: not tried explicit sync: timeline syncobjs
+[INFO] shell.panel: configure w=1600 h=32
+[INFO] shell.panel: panel drawn 1600×32 output=?
+[INFO] wayland.client: connected: wl_compositor v6 xdg_wm_base v6 wl_seat×1 wl_output×0 linux-dmabuf v5 syncobj v1 fractional-scale v1 presentation v2 text-input v2; absent: none
+[INFO] gfx.swapchain: client tier vulkan: Intel(R) HD Graphics 5500 (BDW GT2) on /dev/dri/renderD128 (the device asked for) — vulkan: taken gl: not tried explicit sync: timeline syncobjs
+[INFO] shell.panel: configure w=1600 h=32
+[INFO] shell.panel: panel drawn 1600×32 output=?
+unknown object (26), message get_background_effect(no)
+error in client communication (pid 4088002)
+wl_display#1: error 1: invalid arguments for ext_background_effect_manager_v1#3.get_background_effect
+[INFO] shell.panel: panel drawn 1600×32 output=?
+[INFO] shell.panel: panel drawn 1600×32 output=?
+[INFO] compositor.wm: map id=3 app_id=test-app x=764 y=439 w=200 h=150
+[INFO] compositor.wm: unmap id=2 reason=destroyed
+[INFO] compositor.shell: bridge destroyed
+[INFO] shell.bridge: capabilities flags=0x0 version=7
+[INFO] compositor.shell: bridge bound client=7 snapshot=2 focus=1 pid=4088002 binds=2
+[INFO] shell.bridge: snapshot toplevels=2
+[INFO] shell.bridge: compositor has no key grabs (v2): no shell keybindings
+Proxy requested for unref has no references
+  PASS  applications connect
+  PASS  shell binds zlm_shell_v1 (exe matches the configured path)
+  PASS  capabilities arrive right after bind (the compositor implements version 7)
+  PASS  get_policy_bridge
+  PASS  snapshot: two toplevels, complete
+  PASS  snapshot carries app_id and title
+  PASS  focus_changed after snapshot_done names the focused one
+  PASS  snapshot carries the window geometry
+  PASS  the panel's lx.wayland.client connection connects
+  PASS  the panel's lx.ui.host context starts
+  PASS  panel layer surface created
+  PASS  panel committed a full-width 32 px row of two entries
+  PASS  the focused entry is highlighted
+  PASS  blur: the views' connection connects, its globals heard as announced
+  PASS  blur: the effect manager binds on the views' connection; capabilities arrive with the bind
+      (effect capabilities: 0x1)
+  PASS  blur: a ui host context starts on that connection
+  PASS  blur: a panel creates opaque (no manager)
+  PASS  blur: the opaque panel commits its row
+  PASS  blur: another connection connects
+  PASS  blur: the other connection finds the manager global
+  PASS  blur: a manager on another connection cannot name this surface — its connection is killed (the crash loop's marshal)
+  PASS  blur: the panel re-creates translucent over a blur (the manager of its own connection)
+  PASS  blur: the blurred panel commits its row, the connection healthy
+  PASS  blur: the panel re-creates opaque again (the toggle's other way)
+  PASS  blur: the opaque panel commits its row again
+  PASS  title delta
+  PASS  request_activate comes back as focus_changed
+  PASS  a second application connects
+  PASS  toplevel_created + state + focus for a new window
+  PASS  toplevel_destroyed removes the entry
+  PASS  a request on a stale handle is not sent
+  PASS  one toplevel marked not responding
+  PASS  toplevel_flags is not sent to a v1 bridge
+  PASS  a restarted shell binds again
+  PASS  re-snapshot: current windows and focus
+  PASS  re-snapshot lists creation order, each with its stacking index
+  PASS  v2 snapshot: toplevel_flags follows snapshot_toplevel for the flagged window only
+  PASS  the client answers again
+  PASS  toplevel_flags delta: not responding cleared
+  PASS  toplevel_flags delta: set on the right window
+  PASS  a shell bound at v2 cannot grab keys (not_implemented)
+
+        Start  97: test_protocol_conformance
+ 92/136 Test  #97: test_protocol_conformance .............   Passed    2.53 sec
+        Start  98: test_ext_workspace
+ 93/136 Test  #98: test_ext_workspace ....................***Failed    1.85 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated): no card to match
+[INFO] compositor.gfx: Vulkan composite path active (no scanout)
+[INFO] compositor.output: output 0 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720
+[INFO] compositor.output: output 0 name=HEADLESS-1 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720+0+0 render_scale=1 identifier="connector:HEADLESS-1"
+[INFO] compositor.output: output 1 name=HEADLESS-2 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720+1280+0 render_scale=1 identifier="connector:HEADLESS-2"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=24 scale=120/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: software cursor: no KMS scanout
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (2 clients, 2 regions)
+[INFO] compositor.input: seat open took 80 ms: keymap 13 ms, libinput 66 ms of which 16 device opens 9 ms (slowest /dev/input/event9 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=0:0 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] compositor.wm: map id=1 app_id=ws-a x=540 y=285 w=200 h=150
+[INFO] compositor.wm: map id=2 app_id=ws-b x=572 y=317 w=200 h=150
+[INFO] compositor.workspace: workspace activate output=HEADLESS-1 name=2 id=3 source=ext-workspace
+[INFO] compositor.workspace: workspace activate output=HEADLESS-1 name=1 id=1 source=ext-workspace
+[INFO] compositor.workspace: workspace move window id=2 to=2 id=3 follow=0 source=test
+[INFO] compositor.workspace: workspace move window id=2 to=1 id=1 follow=0 source=test
+[INFO] compositor.workspace: workspace activate output=HEADLESS-1 name=2 id=4 source=ext-workspace
+[INFO] compositor.workspace: workspace activate output=HEADLESS-1 name=1 id=1 source=ext-workspace
+[INFO] compositor.workspace: workspace assign id=1 output=1
+[INFO] compositor.workspace: workspace activate output=HEADLESS-2 name=2 id=1 source=ext-workspace
+[INFO] compositor.wm: unmap id=1 reason=destroyed
+[INFO] compositor.wm: unmap id=2 reason=destroyed
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d010
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d030
+==================
+WARNING: ThreadSanitizer: data race (pid=4088093)
+  Write of size 1 at 0x7ffece489500 by thread T5:
+    #0 pthread_barrier_destroy <null> (test_ext_workspace+0xb2b27) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d)
+    #1 util_queue_thread_func /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_queue.c:300:10 (libvulkan_intel_hasvk.so+0x1914f0) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Previous read of size 1 at 0x7ffece489500 by thread T12:
+    #0 pthread_barrier_wait <null> (test_ext_workspace+0xb2c6b) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d)
+    #1 util_barrier_wait /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_thread.c:213:11 (libvulkan_intel_hasvk.so+0x19244d) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Location is stack of main thread.
+
+  Thread T5 'test_ex:disk$0' (tid=4088099, running) created by main thread at:
+    #0 pthread_create <null> (test_ext_workspace+0xaeb9e) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::gfx::device@lx.gfx::create(lx::gfx::device_info@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:507:9 (liblx.gfx.so.0.3+0xb1acf) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #3 lx::gfx::device_selector@lx.gfx::select_best(lx::gfx::drm_node@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:769:23 (liblx.gfx.so.0.3+0xb3c80) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #4 lx::compositor::detail::compositor_impl@lx.compositor::ensure_graphics_device() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5116:20 (liblx.compositor.so.0.3+0x11b801) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #5 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9725:20 (liblx.compositor.so.0.3+0x1487e6) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #6 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_ext_workspace.cpp:624:29 (test_ext_workspace+0x1362c1) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d)
+
+  Thread T12 'test_ex:disk$3' (tid=4088106, running) created by main thread at:
+    #0 pthread_create <null> (test_ext_workspace+0xaeb9e) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::setup_vulkan_present() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5367:26 (liblx.compositor.so.0.3+0x11d880) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9819:30 (liblx.compositor.so.0.3+0x148cfd) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_ext_workspace.cpp:624:29 (test_ext_workspace+0x1362c1) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_ext_workspace+0xb2b27) (BuildId: 84b2f827836f12507e675fd27367b2c496df584d) in pthread_barrier_destroy
+==================
+  PASS  bind: a group per output, capabilities 0, output_enter for its wl_output — groups 2
+  PASS  bind: one active empty workspace per output (dynamic), activate|assign — 1* | 1*
+  PASS  bind: everything closed by one done — group, group-caps, output-enter, group, group-caps, output-enter, workspace, enter 1, workspace, enter 1, done
+  PASS  bind: groups announced before workspaces enter them
+  PASS  a wl_output bound later gets output_enter and done — output-enter, done
+  PASS  a window joins the active workspace; a new empty one appears after it — 1* 2 log: workspace, enter 2, done
+  PASS  the second window has the keyboard
+  PASS  activating the first gives it the keyboard
+  PASS  activate without commit changes nothing
+  PASS  activate + commit: workspace 2 is active — 1 2*
+  PASS  its windows are hidden, told they are suspended, and lose the keyboard — hidden 1 suspended 1
+  PASS  one done for the change — done
+  PASS  back on 1: the trailing empty workspace stays — 1* 2
+  PASS  the windows are shown again, not suspended, and the one focused there has the keyboard back (focus memory) — focus 1 a 1
+  PASS  b to 2 without following: 2 occupied, a new trailing 3, b hidden — 1* 2 3
+  PASS  removal order: workspace_leave, then removed, then done — leave 2, removed 2, done
+  PASS  b is back on 1, shown — 1* 2
+  PASS  requests on an inert handle are ignored — 1* 2
+  PASS  set_minimized: hidden, suspended, the other window has the keyboard
+  PASS  activate: unminimized and focused
+  PASS  a sticky window stays shown on another workspace — 1 2*
+  PASS  unsticking puts it on the active workspace — 1 2* 3
+  PASS  assign + activate in one commit: the workspace is on B and active there — 1* 2 | 1* 2 log: leave 1, leave 1, removed 1, enter 1, workspace, enter 2, done
+  PASS  the commit is one change: one done — leave 1, leave 1, removed 1, enter 1, workspace, enter 2, done
+  PASS  its window moved onto B's area and is shown — x 1820 B at 1280
+  PASS  A shows a workspace of its own — 1* 2
+  PASS  stop: finished
+  PASS  a new client sees the same workspaces — 1* 2 vs 1* 2
+28 cases, 0 failed
+ThreadSanitizer: reported 1 warnings
+
+        Start  99: test_tiling
+ 94/136 Test  #99: test_tiling ...........................***Failed    2.02 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated): no card to match
+[INFO] compositor.gfx: Vulkan composite path active (no scanout)
+[INFO] compositor.output: output 0 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720
+[INFO] compositor.output: output 0 name=HEADLESS-1 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720+0+0 render_scale=1 identifier="connector:HEADLESS-1"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=24 scale=120/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: software cursor: no KMS scanout
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (2 clients, 2 regions)
+[INFO] compositor.input: seat open took 80 ms: keymap 14 ms, libinput 66 ms of which 16 device opens 10 ms (slowest /dev/input/event2 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=0:0 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] compositor.wm: map id=1 app_id=a x=540 y=285 w=200 h=150
+[INFO] compositor.tile: layout workspace=1 output=0 layout=master-stack source=test
+[INFO] compositor.wm: map id=2 app_id=b x=707 y=8 w=565 h=704
+[INFO] compositor.wm: map id=3 app_id=c x=707 y=364 w=565 h=348
+[INFO] compositor.tile: float id=2 on=1
+[INFO] compositor.tile: float id=2 on=0
+[INFO] compositor.wm: map id=4 app_id=dialog x=253 y=285 w=200 h=150
+[INFO] compositor.wm: map id=5 app_id=fixed x=490 y=210 w=300 h=300
+[INFO] compositor.wm: unmap id=4 reason=destroyed
+[INFO] compositor.wm: unmap id=5 reason=destroyed
+[INFO] compositor.wm: tile swap id=3 with=1
+[INFO] compositor.wm: unmap id=2 reason=destroyed
+[INFO] compositor.tile: layout workspace=1 output=0 layout=floating source=test
+[INFO] compositor.wm: unmap id=1 reason=destroyed
+[INFO] compositor.wm: unmap id=3 reason=destroyed
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d010
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d030
+==================
+WARNING: ThreadSanitizer: data race (pid=4088134)
+  Write of size 1 at 0x7ffec012b470 by thread T10:
+    #0 pthread_barrier_destroy <null> (test_tiling+0xb1097) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923)
+    #1 util_queue_thread_func /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_queue.c:300:10 (libvulkan_intel_hasvk.so+0x1914f0) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Previous read of size 1 at 0x7ffec012b470 by thread T5:
+    #0 pthread_barrier_wait <null> (test_tiling+0xb11db) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923)
+    #1 util_barrier_wait /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_thread.c:213:11 (libvulkan_intel_hasvk.so+0x19244d) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Location is stack of main thread.
+
+  Thread T10 'test_ti:disk$1' (tid=4088145, running) created by main thread at:
+    #0 pthread_create <null> (test_tiling+0xad10e) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::setup_vulkan_present() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5367:26 (liblx.compositor.so.0.3+0x11d880) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9819:30 (liblx.compositor.so.0.3+0x148cfd) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_tiling.cpp:591:29 (test_tiling+0x134831) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923)
+
+  Thread T5 'test_ti:disk$0' (tid=4088140, running) created by main thread at:
+    #0 pthread_create <null> (test_tiling+0xad10e) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::gfx::device@lx.gfx::create(lx::gfx::device_info@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:507:9 (liblx.gfx.so.0.3+0xb1acf) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #3 lx::gfx::device_selector@lx.gfx::select_best(lx::gfx::drm_node@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:769:23 (liblx.gfx.so.0.3+0xb3c80) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #4 lx::compositor::detail::compositor_impl@lx.compositor::ensure_graphics_device() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5116:20 (liblx.compositor.so.0.3+0x11b801) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #5 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9725:20 (liblx.compositor.so.0.3+0x1487e6) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #6 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_tiling.cpp:591:29 (test_tiling+0x134831) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_tiling+0xb1097) (BuildId: a4c598d34fe7adb5d1b307de9a44b2aa553ab923) in pthread_barrier_destroy
+==================
+  PASS  floating (the default): a window maps at its own size, not tiled — 540,285 200x150
+  PASS  toggled to master-stack: one window takes the whole area, tiled_* states
+  PASS  a new window's initial configure is its tile; the master shrinks
+  PASS  a third window splits the stack (no pixel lost between the halves) —  order a b c
+  PASS  layout.promote: the window changes places with the master —  order c b a
+  PASS  layout.swap-previous: a changes places with its neighbour —  order c a b
+  PASS  layout.master-more: the first two split the master column
+  PASS  layout.master-grow: the master column widens by 0.05
+  PASS  window.float-toggle: the window leaves the layout, the rest reflow —  order c a
+  PASS  window.float-toggle again: it joins at the end of the order
+  PASS  a dialog and a fixed-size window float; the tiles stay —  dialog first configure 0
+  PASS  minimized: the window gives up its place —  order c b
+  PASS  restored: it comes back at the end of the order — c b a
+  PASS  maximized: it fills the area, the other tiles stay where they were
+  PASS  unmaximized: back in the tile it kept
+  PASS  a tile dropped on another swaps with it —  order a b c
+  PASS  a tile dropped where it was goes back to its tile
+  PASS  a closed window's place goes
+  PASS  toggled back to floating: the floating geometry returns, tiled states go
+  PASS  [tiling] layout = master-stack applies to the workspaces there are —  order a c
+  PASS  no protocol error
+21 cases, 0 failed
+ThreadSanitizer: reported 1 warnings
+
+        Start 100: test_window_animations
+ 95/136 Test #100: test_window_animations ................***Failed    1.37 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated): no card to match
+[INFO] compositor.gfx: Vulkan composite path active (no scanout)
+[INFO] compositor.output: output 0 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720
+[INFO] compositor.output: output 0 name=HEADLESS-1 mode=1280x720 refresh_mhz=60000 scale=1 (120/120) logical=1280x720+0+0 render_scale=1 identifier="connector:HEADLESS-1"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=24 scale=120/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: software cursor: no KMS scanout
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (2 clients, 2 regions)
+[INFO] compositor.input: seat open took 79 ms: keymap 14 ms, libinput 65 ms of which 16 device opens 10 ms (slowest /dev/input/event9 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=0:0 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] compositor.wm: map id=1 app_id=a x=540 y=285 w=200 h=150
+[INFO] compositor.wm: unmap id=1 reason=destroyed
+[INFO] compositor.wm: map id=2 app_id=b x=540 y=285 w=200 h=150
+[INFO] compositor.wm: unmap id=2 reason=destroyed
+[INFO] compositor.wm: map id=3 app_id=e x=540 y=285 w=200 h=150
+[INFO] compositor.wm: unmap id=3 reason=null-buffer
+[INFO] compositor.wm: map id=4 app_id=s x=540 y=285 w=200 h=150
+[INFO] compositor.wm: unmap id=4 reason=null-buffer
+[INFO] compositor.wm: map id=5 app_id=d x=540 y=285 w=200 h=150
+[INFO] compositor.workspace: workspace activate output=HEADLESS-1 name=2 id=2 source=binding
+[INFO] compositor.workspace: workspace activate output=HEADLESS-1 name=1 id=1 source=binding
+    critical: worst |x - x0(1+wt)e^-wt| 1.42e-14
+  PASS  spring_critically_damped_matches_the_closed_form
+  PASS  spring_critically_damped_never_overshoots_and_converges
+  PASS  spring_underdamped_bounces_and_its_reach_bounds_what_follows
+  PASS  spring_overdamped_creeps_without_overshoot
+    stops at frame 19 (316.7 ms), expected 19; worst value error 1.42e-14 px
+  PASS  spring_value_stops_at_the_first_frame_under_half_a_pixel
+  PASS  spring_value_retarget_is_continuous
+    settled at frame 17; after the shift worst value error 7.11e-15 px
+  PASS  spring_value_retarget_after_settling_starts_with_the_next_frame
+  PASS  scene_maps_and_fades_an_animated_window_and_restores_it_exactly
+  PASS  scene_confines_a_slide_to_its_output
+  PASS  scene_capture_views_draw_where_a_motion_ends
+    orders: animated 2, the window above 3
+  PASS  scene_scales_fades_and_reorders_animated_primitives
+  PASS  lifecycle_keeps_a_ghosts_dmabuf_until_it_lets_go
+12 tests, 0 failed
+  PASS  off: a mapped window's first frame is at rest, nothing animates — 540,285 200x150 rest 540,285 200x150
+  PASS  off: a closed window is gone in the next frame
+  PASS  open: every frame fades and grows as the critically damped spring says — 18 frames, worst edge 0 px, worst opacity 2.6e-08
+  PASS  open: a capture meanwhile shows it at rest — 540,285 200x150
+  PASS  open: it lands exactly at rest, then the desktop is quiet —  last 540,285 200x150
+  PASS  close: the ghost fades and shrinks frame by frame — 18 frames, worst edge 0 px, worst opacity 1.9e-08
+  PASS  close: a capture meanwhile shows nothing of the closed window — 0,0 0x0
+  PASS  close: then nothing of it is drawn and the desktop is quiet
+  PASS  null close: the commit copies the buffer, the client has it back at once
+  PASS  null close: the window is at rest, nothing animates — 540,285 200x150
+  PASS  null close: a ghost animates
+  PASS  null close: the ghost fades frame by frame at the rect it was last shown at — 18 frames, worst edge 0 px, worst opacity 1.9e-08; damage first 921600, least 25116 of 30000 px
+  PASS  null close: every frame of the fade repaints what the ghost draws — 18 frames, worst edge 0 px, worst opacity 1.9e-08; damage first 921600, least 25116 of 30000 px
+  PASS  null close: then nothing of it is drawn and the desktop is quiet
+  PASS  shadow close: the geometry stays at the window, the shadow is drawn past it — 540,285 200x150 shadow 516,261 248x198
+  PASS  shadow close: a ghost animates
+  PASS  shadow close: the shadow fades with the window, frame by frame — 18 frames, worst edge 0 px, worst opacity 1.9e-08; damage first 50000, least 41132 of 49104 px
+  PASS  shadow close: every frame of the fade repaints the shadow too — 18 frames, worst edge 0 px, worst opacity 1.9e-08; damage first 50000, least 41132 of 49104 px
+  PASS  shadow close: then nothing of it is drawn and the desktop is quiet
+  PASS  switch: the window slides out frame by frame, 1:1 — worst 0 px over 23 frames
+  PASS  switch: a capture meanwhile shows nothing of the workspace it leaves
+  PASS  switch: then it is hidden and the desktop is quiet
+  PASS  switch back: it slides in from the left and lands at rest — worst 0 px; 
+  PASS  minimize: fades out frame by frame, then hidden and quiet — 18 frames, worst edge 0 px, worst opacity 1.9e-08; 
+  PASS  minimize: a capture meanwhile shows nothing of it — 0,0 0x0
+  PASS  unminimize: fades back in frame by frame — 18 frames, worst edge 0 px, worst opacity 2.6e-08; 
+  PASS  maximize: nothing animates before it
+  PASS  maximize: the configure carries the final size at once — 1280x720
+  PASS  maximize: the first frame shows the new buffer where the window was — 540,285 200x150
+  PASS  maximize: every frame moves and resizes as the springs say (resampled) — worst 0 px over 23 frames
+  PASS  maximize: it lands on the output 1:1 and the desktop is quiet —  last 0,0 1280x720
+  PASS  maximize, then restore in its tail: the settled edge stays put, then springs — top edge settled at frame 19, size at 23; first frame y 0, worst 0 px over 19 fra[INFO] compositor.wm: unmap id=5 reason=destroyed
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d010
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d030
+==================
+WARNING: ThreadSanitizer: data race (pid=4088175)
+  Write of size 1 at 0x7ffc55c36ac0 by thread T11:
+    #0 pthread_barrier_destroy <null> (test_window_animations+0xb5e37) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+    #1 util_queue_thread_func /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_queue.c:300:10 (libvulkan_intel_hasvk.so+0x1914f0) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Previous read of size 1 at 0x7ffc55c36ac0 by thread T5:
+    #0 pthread_barrier_wait <null> (test_window_animations+0xb5f7b) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+    #1 util_barrier_wait /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_thread.c:213:11 (libvulkan_intel_hasvk.so+0x19244d) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Location is stack of main thread.
+
+  Thread T11 'test_wi:disk$2' (tid=4088187, running) created by main thread at:
+    #0 pthread_create <null> (test_window_animations+0xb1eae) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::setup_vulkan_present() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5367:26 (liblx.compositor.so.0.3+0x11d880) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9819:30 (liblx.compositor.so.0.3+0x148cfd) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 run_wm_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_window_animations.cpp:1426:29 (test_window_animations+0x13d0b1) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+    #5 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_window_animations.cpp:1463:20 (test_window_animations+0x148fa7) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+
+  Thread T5 'test_wi:disk$0' (tid=4088181, running) created by main thread at:
+    #0 pthread_create <null> (test_window_animations+0xb1eae) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::gfx::device@lx.gfx::create(lx::gfx::device_info@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:507:9 (liblx.gfx.so.0.3+0xb1acf) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #3 lx::gfx::device_selector@lx.gfx::select_best(lx::gfx::drm_node@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:769:23 (liblx.gfx.so.0.3+0xb3c80) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #4 lx::compositor::detail::compositor_impl@lx.compositor::ensure_graphics_device() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5116:20 (liblx.compositor.so.0.3+0x11b801) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #5 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9725:20 (liblx.compositor.so.0.3+0x1487e6) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #6 run_wm_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_window_animations.cpp:1426:29 (test_window_animations+0x13d0b1) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+    #7 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_window_animations.cpp:1463:20 (test_window_animations+0x148fa7) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_window_animations+0xb5e37) (BuildId: 306770f1d0bbe270db9855446e9bf67b8dacb284) in pthread_barrier_destroy
+==================
+mes
+  PASS  restore: it lands at rest 1:1 and the desktop is quiet —  last 540,285 200x150
+  PASS  off mid-motion: every motion ends at once
+  PASS  off mid-motion: the ghost is gone
+35 window-manager cases, 0 failed
+ThreadSanitizer: reported 1 warnings
+
+        Start 101: test_window_protocols
+ 96/136 Test #101: test_window_protocols .................***Failed    1.98 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.drm: card /dev/dri/card1 (i915): 1 connected of 2 connectors, boot VGA
+[INFO] compositor.drm: KMS device open — page-flip present path
+[INFO] compositor.drm: framebuffer hand-over at exit: CLOSEFB (no black frame between masters)
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated) for card 226:1: matched by primary node
+[INFO] compositor.gfx: Vulkan composite path active
+[INFO] compositor.drm: output 0 pipeline crtc=53 (index 0) primary=35 connector=93 mode=3200x1800@59982 cursor_plane=47
+[INFO] compositor.drm: CRTC allocation: 1 output, 1 TEST_ONLY, 2 steps
+[INFO] compositor.output: output 0 mode=3200x1800 refresh_mhz=59982 scale=2 (240/120) logical=1600x900
+[INFO] compositor.output: output 0 name=eDP-1 mode=3200x1800 refresh_mhz=59982 scale=2 (240/120) logical=1600x900+0+0 render_scale=2 identifier="Sharp Corporation 0x141C Unknown"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=48 scale=240/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: hardware cursor planes=1 size=64x64 hotspot=0
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.gfx: explicit sync (linux-drm-syncobj-v1): offered; async page flips (tearing-control-v1): available
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (3 clients, 2 regions)
+[INFO] compositor.input: seat open took 82 ms: keymap 12 ms, libinput 70 ms of which 16 device opens 11 ms (slowest /dev/input/event12 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] compositor.hotplug: hotplug: udev monitor on drm 226:1
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=226:1 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+error in client communication (pid 4088217)
+xdg_wm_dialog_v1#9: error 0: the xdg_toplevel already has an xdg_dialog_v1
+[INFO] compositor.wm: map id=3 app_id=modal-parent x=600 y=300 w=400 h=300
+[INFO] compositor.wm: map id=4 app_id=modal-dialog x=720 y=400 w=160 h=100
+[INFO] compositor.wm: unmap id=4 reason=null-buffer
+[INFO] compositor.wm: unmap id=3 reason=destroyed
+error in client communication (pid 4088217)
+xdg_toplevel_icon_v1#10: error 1: the buffer is not square
+error in client communication (pid 4088217)
+xdg_toplevel_icon_v1#13: error 2: the icon was already set on a toplevel
+error in client communication (pid 4088217)
+xdg_toplevel_icon_v1#13: error 2: the icon was already set on a toplevel
+error in client communication (pid 4088217)
+xdg_toplevel_icon_v1#10: error 3: a buffer of the icon was destroyed before the icon was set
+[INFO] compositor.wm: map id=8 app_id=icon-app x=700 y=375 w=200 h=150
+[INFO] compositor.wm: unmap id=8 reason=destroyed
+[INFO] compositor.wm: map id=9 app_id=bell-app x=700 y=375 w=200 h=150
+[INFO] compositor.bell: bell client=11 rate-limited (4 per second)
+[INFO] compositor.wm: unmap id=9 reason=destroyed
+error in client communication (pid 4088217)
+zxdg_exporter_v2#9: error 0: export_toplevel of a surface that is not an xdg_toplevel
+error in client communication (pid 4088217)
+zxdg_imported_v2#10: error 0: set_parent_of a surface that is not an xdg_toplevel
+[INFO] compositor.wm: map id=10 app_id=foreign-parent x=600 y=300 w=400 h=300
+[INFO] compositor.wm: map id=11 app_id=foreign-child x=720 y=400 w=160 h=100
+[INFO] compositor.wm: unmap id=10 reason=destroyed
+[INFO] compositor.wm: unmap id=11 reason=destroyed
+[INFO] compositor.inhibit: shortcuts inhibitor client=17 surface=15 created
+error in client communication (pid 4088217)
+zwp_keyboard_shortcuts_inhibit_manager_v1#9: error 0: shortcuts are already inhibited for this surface
+[INFO] compositor.wm: map id=12 app_id=inhibit-app x=700 y=375 w=200 h=150
+[INFO] compositor.inhibit: shortcuts inhibitor client=18 surface=16 created
+[INFO] compositor.inhibit: shortcuts inhibitor client=18 surface=16 turned off by the user (Super+Escape)
+[INFO] compositor.inhibit: shortcuts inhibitor client=18 surface=16 turned on by the user (Super+Escape)
+[INFO] compositor.wm: map id=13 app_id=inhibit-other x=732 y=407 w=200 h=150
+[INFO] compositor.wm: unmap id=12 reason=destroyed
+[INFO] compositor.wm: unmap id=13 reason=destroyed
+error in client communication (pid 4088217)
+ext_data_control_device_v1#10: error 1: the source has already been used
+error in client communication (pid 4088217)
+ext_data_control_source_v1#11: error 1: offer after the source was used
+error in client communication (pid 4088217)
+zwlr_data_control_device_v1#10: error 1: the source has already been used
+[INFO] compositor.wm: map id=14 app_id=dc-app x=700 y=375 w=200 h=150
+  PASS  every Part B global is advertised to an unsandboxed client — all 11
+  PASS  dialog: second xdg_dialog_v1 for one toplevel — got xdg_wm_dialog_v1/0, want xdg_wm_dialog_v1/0
+  PASS  dialog: a new xdg_dialog_v1 after the first was destroyed — got none/0, want none/0
+  PASS  dialog: a child maps centred on its parent — parent centre 800,450 dialog centre 800,450
+  PASS  dialog: the modal dialog has the keyboard and is above its parent — modal 1 focus on dialog 1
+  PASS  dialog: activating the parent focuses the dialog, the parent stays below it — focus on dialog 1
+  PASS  dialog: a click on the blocked parent is consumed and focuses the dialog — button events 0
+  PASS  dialog: lowering the dialog lowers the family, the dialog stays above — 
+  PASS  dialog: after unset_modal a click on the parent reaches it and focuses it — button events 2
+  PASS  dialog: set_modal again takes the keyboard from the focused parent — 
+  PASS  dialog: the dialog unmapped, the parent takes focus again — 
+  PASS  icon: a non-square buffer — got xdg_toplevel_icon_v1/1, want xdg_toplevel_icon_v1/1
+  PASS  icon: set_name after set_icon — got xdg_toplevel_icon_v1/2, want xdg_toplevel_icon_v1/2
+  PASS  icon: add_buffer after set_icon — got xdg_toplevel_icon_v1/2, want xdg_toplevel_icon_v1/2
+  PASS  icon: a buffer destroyed before the icon was set — got xdg_toplevel_icon_v1/3, want xdg_toplevel_icon_v1/3
+  PASS  icon: buffers destroyed after set_icon are no error (copied) — got none/0, want none/0
+  PASS  icon: set_icon snapshots name and buffers into sealed memfds, applied at commit — sizes 16 32 name utilities-terminal images 2 [32px sealed 1 px 1] [16px sealed 1 px 1]
+  PASS  icon: set_icon(null) resets to the default — 
+  PASS  bell: ring with and without a surface, faster than the rate limit — got none/0, want none/0
+  PASS  foreign v2: export of a surface that is not a toplevel — got zxdg_exporter_v2/0, want zxdg_exporter_v2/0
+  PASS  foreign v2: set_parent_of a surface that is not a toplevel — got zxdg_imported_v2/0, want zxdg_imported_v2/0
+  PASS  foreign v1: a non-toplevel export is no error (its handle imports as destroyed) — got none/0, want none/0
+  PASS  foreign: an unknown handle is destroyed immediately — 
+  PASS  foreign: the handle is 32 hex digits (128 random bits) — 877342026a12f180079669007b631e58
+  PASS  foreign: set_parent_of parents across clients; a modal child blocks the other client's window — parent 10 want 10
+  PASS  foreign: a v1 export imports over v2 — 75c4389b70e1332062db0792c234b08a
+  PASS  foreign: destroying the export sends destroyed and unparents the child — destroyed 1
+  PASS  foreign: destroying the exported window sends destroyed — 
+  PASS  inhibit: a second inhibitor for one surface — got zwp_keyboard_shortcuts_inhibit_manager_v1/0, want zwp_keyboard_shortcuts_inhibit_manager_v1/0
+  PASS  inhibit: the focused surface's inhibitor is active at once — active 1
+  PASS  inhibit: Super+Escape turns it off (inactive); Escape never reaches the client — inactive 1 esc seen 0
+  PASS  inhibit: Super+Escape again turns it back on (active) — active 2
+  PASS  inhibit: keys reach the inhibiting client — 
+  PASS  inhibit: focus away sends nothing, focus back sends active — active 3
+  PASS  inhibit: without an inhibitor Super+Escape reaches the client — 
+  PASS  data control: set_selection with a used source — got ext_data_control_device_v1/1, want ext_data_control_device_v1/1
+  PASS  data control: offer after the source was used — got ext_data_control_source_v1/1, want ext_data_control_source_v1/1
+  PASS  data control (wlr v2): set_primary_selection with a used source — got zwlr_data_control_device_v1/1, want zwlr_data_control_device_v1/1
+  PASS  data control: both selections are sent when the device is created — selection:nil
+  PASS  data control: a tool's selection reaches the focused application without a serial — read "from-wl-copy"
+  PASS  data control: an application's copy reaches the tool, whose source is cancelled — read "from-app"[INFO] compositor.wm: unmap id=14 reason=destroyed
+error in client communication (pid 4088217)
+wp_security_context_manager_v1#9: error 1: listen_fd is not a listening AF_UNIX stream socket
+error in client communication (pid 4088217)
+wp_security_context_v1#10: error 2: this metadata was already set
+error in client communication (pid 4088217)
+wp_security_context_v1#10: error 3: empty, overlong or non-printable metadata
+[INFO] wayland: security context listener: engine=- app_id=- instance=-
+error in client communication (pid 4088217)
+wp_security_context_v1#10: error 1: the security context was already committed
+[INFO] wayland: security context -/-: listener closed by the sandbox engine
+[INFO] wayland: security context listener: engine=org.flatpak app_id=org.example.Sandboxed instance=42
+[INFO] wayland: client 29 connected sandboxed (security context engine=org.flatpak app_id=org.example.Sandboxed): session-wide globals hidden
+[INFO] wayland: security context org.flatpak/org.example.Sandboxed: listener closed by the sandbox engine
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d010
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d030
+==================
+WARNING: ThreadSanitizer: data race (pid=4088217)
+  Write of size 1 at 0x7ffed8a447d0 by thread T10:
+    #0 pthread_barrier_destroy <null> (test_window_protocols+0xb7377) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc)
+    #1 util_queue_thread_func /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_queue.c:300:10 (libvulkan_intel_hasvk.so+0x1914f0) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Previous read of size 1 at 0x7ffed8a447d0 by thread T11:
+    #0 pthread_barrier_wait <null> (test_window_protocols+0xb74bb) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc)
+    #1 util_barrier_wait /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_thread.c:213:11 (libvulkan_intel_hasvk.so+0x19244d) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Location is stack of main thread.
+
+  Thread T10 'test_wi:disk$1' (tid=4088228, running) created by main thread at:
+    #0 pthread_create <null> (test_window_protocols+0xb33ee) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::setup_vulkan_present() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5367:26 (liblx.compositor.so.0.3+0x11d880) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9785:30 (liblx.compositor.so.0.3+0x1489f7) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_window_protocols.cpp:1350:29 (test_window_protocols+0x13ab09) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc)
+
+  Thread T11 'test_wi:disk$2' (tid=4088229, running) created by main thread at:
+    #0 pthread_create <null> (test_window_protocols+0xb33ee) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::setup_vulkan_present() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:5367:26 (liblx.compositor.so.0.3+0x11d880) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9785:30 (liblx.compositor.so.0.3+0x1489f7) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_window_protocols.cpp:1350:29 (test_window_protocols+0x13ab09) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_window_protocols+0xb7377) (BuildId: 9690e365e37809ab95e19c8a704068b9410439cc) in pthread_barrier_destroy
+==================
+ cancelled 1
+  PASS  data control (wlr v2): primary_selection at bind — 
+  PASS  data control: the owner's exit clears the selection for the tool — 
+  PASS  security context: a listen fd that is not a listening socket — got wp_security_context_manager_v1/1, want wp_security_context_manager_v1/1
+  PASS  security context: set_app_id twice — got wp_security_context_v1/2, want wp_security_context_v1/2
+  PASS  security context: empty metadata — got wp_security_context_v1/3, want wp_security_context_v1/3
+  PASS  security context: a request after commit — got wp_security_context_v1/1, want wp_security_context_v1/1
+  PASS  security context: a client on the listener is sandboxed and sees no session-wide global —  context 1
+  PASS  security context: after close_fd hangs up no client is accepted — 
+49 cases, 0 failed
+ThreadSanitizer: reported 1 warnings
+
+        Start 102: test_wayland_client
+ 97/136 Test #102: test_wayland_client ...................   Passed    3.95 sec
+        Start 103: test_wayland_client_nolayer
+ 98/136 Test #103: test_wayland_client_nolayer ...........   Passed    0.35 sec
+        Start 104: test_client_swapchain
+ 99/136 Test #104: test_client_swapchain .................   Passed   11.48 sec
+        Start 105: test_app_window
+100/136 Test #105: test_app_window .......................   Passed   15.84 sec
+        Start 106: test_ui_host
+101/136 Test #106: test_ui_host ..........................   Passed   15.57 sec
+        Start 107: test_pointer_protocols
+102/136 Test #107: test_pointer_protocols ................***Failed    1.23 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.drm: card /dev/dri/card1 (i915): 1 connected of 2 connectors, boot VGA
+[INFO] compositor.drm: KMS device open — page-flip present path
+[INFO] compositor.drm: framebuffer hand-over at exit: CLOSEFB (no black frame between masters)
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated) for card 226:1: matched by primary node
+[INFO] compositor.gfx: Vulkan composite path active
+[INFO] compositor.drm: output 0 pipeline crtc=53 (index 0) primary=35 connector=93 mode=3200x1800@59982 cursor_plane=47
+[INFO] compositor.drm: CRTC allocation: 1 output, 1 TEST_ONLY, 2 steps
+[INFO] compositor.output: output 0 mode=3200x1800 refresh_mhz=59982 scale=2 (240/120) logical=1600x900
+[INFO] compositor.output: output 0 name=eDP-1 mode=3200x1800 refresh_mhz=59982 scale=2 (240/120) logical=1600x900+0+0 render_scale=2 identifier="Sharp Corporation 0x141C Unknown"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=48 scale=240/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: hardware cursor planes=1 size=64x64 hotspot=0
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.gfx: explicit sync (linux-drm-syncobj-v1): offered; async page flips (tearing-control-v1): available
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (3 clients, 2 regions)
+[INFO] compositor.input: seat open took 117 ms: keymap 22 ms, libinput 95 ms of which 16 device opens 16 ms (slowest /dev/input/event11 2 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] compositor.hotplug: hotplug: udev monitor on drm 226:1
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=226:1 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] compositor.constraint: pointer lock client=2 surface=1 persistent created
+error in client communication (pid 4088624)
+zwp_pointer_constraints_v1#8: error 1: the surface already has a pointer constraint
+[INFO] compositor.constraint: pointer lock client=3 surface=2 oneshot created
+[INFO] compositor.constraint: pointer confine client=3 surface=2 persistent created
+[INFO] compositor.constraint: pointer lock client=3 surface=3 oneshot created
+[INFO] compositor.wm: map id=1 app_id=lock-app x=650 y=350 w=300 h=200
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent created
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent active
+[INFO] compositor.wm: map id=2 app_id=lock-other x=682 y=382 w=300 h=200
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent inactive (keyboard focus left)
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent active
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent released by the user (Super+Escape)
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent active
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent inactive (session locked)
+[INFO] compositor.lock: session lock: unlocked -> awaiting_surfaces
+[INFO] compositor.lock: logind Unlock: unlocking the session
+[INFO] compositor.lock: session lock: finished sent
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent active
+[INFO] compositor.lock: session lock: awaiting_surfaces -> unlocked
+[INFO] compositor.constraint: pointer lock client=4 surface=4 persistent destroyed
+[INFO] compositor.constraint: pointer lock client=4 surface=4 oneshot created
+[INFO] compositor.constraint: pointer lock client=4 surface=4 oneshot active
+[INFO] compositor.constraint: pointer lock client=4 surface=4 oneshot inactive (keyboard focus left)
+[INFO] compositor.constraint: pointer confine client=4 surface=4 oneshot created
+[INFO] compositor.constraint: pointer confine client=4 surface=4 oneshot active
+[INFO] compositor.constraint: pointer confine client=4 surface=4 oneshot destroyed
+[INFO] compositor.wm: unmap id=2 reason=destroyed
+[INFO] compositor.wm: unmap id=1 reason=destroyed
+==================
+WARNING: ThreadSanitizer: use of an invalid mutex (e.g. uninitialized or destroyed) (pid=4088624)
+    #0 pthread_mutex_lock <null> (test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2241:2 (libwayland-client.so.0+0x5a9a) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+  Mutex M0 (0x724c00001468) created at:
+    #0 pthread_mutex_lock <null> (test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2241:2 (libwayland-client.so.0+0x5a9a) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+SUMMARY: ThreadSanitizer: use of an invalid mutex (e.g. uninitialized or destroyed) (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad) in pthread_mutex_lock
+==================
+==================
+WARNING: ThreadSanitizer: heap-use-after-free (pid=4088624)
+  Atomic read of size 1 at 0x724c00001468 by main thread:
+    #0 pthread_mutex_unlock <null> (test_pointer_protocols+0xb390b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2245:2 (libwayland-client.so.0+0x5b0f) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+  Previous write of size 8 at 0x724c00001468 by main thread:
+    #0 free <null> (test_pointer_protocols+0xafd32) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:644:5 (test_pointer_protocols+0x14704c) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #2 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+SUMMARY: ThreadSanitizer: heap-use-after-free (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_pointer_protocols+0xb390b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad) in pthread_mutex_unlock
+==================
+==================
+WARNING: ThreadSanitizer: unlock of an unlocked mutex (or by a wrong thread) (pid=4088624)
+    #0 pthread_mutex_unlock <null> (test_pointer_protocols+0xb390b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2245:2 (libwayland-client.so.0+0x5b0f) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+  Mutex M0 (0x724c00001468) created at:
+    #0 pthread_mutex_lock <null> (test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2241:2 (libwayland-client.so.0+0x5a9a) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+SUMMARY: ThreadSanitizer: unlock of an unlocked mutex (or by a wrong thread) (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_pointer_protocols+0xb390b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad) in pthread_mutex_unlock
+==================
+==================
+WARNING: ThreadSanitizer: use of an invalid mutex (e.g. uninitialized or destroyed) (pid=4088624)
+    #0 pthread_mutex_unlock <null> (test_pointer_protocols+0xb390b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2245:2 (libwayland-client.so.0+0x5b0f) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+  Mutex M0 (0x724c00001468) created at:
+    #0 pthread_mutex_lock <null> (test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2241:2 (libwayland-client.so.0+0x5a9a) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+SUMMARY: ThreadSanitizer: use of an invalid mutex (e.g. uninitialized or destroyed) (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_pointer_protocols+0xb390b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad) in pthread_mutex_unlock
+==================
+==================
+WARNING: ThreadSanitizer: use of an invalid mutex (e.g. uninitialized or destroyed) (pid=4088624)
+    #0 pthread_mutex_lock <null> (test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_proxy_destroy /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:629:2 (libwayland-client.so.0+0x7561) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+  Mutex M0 (0x724c00001468) created at:
+    #0 pthread_mutex_lock <null> (test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #1 wl_display_dispatch_queue_pending /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:2241:2 (libwayland-client.so.0+0x5a9a) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #3 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+SUMMARY: ThreadSanitizer: use of an invalid mutex (e.g. uninitialized or destroyed) (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_pointer_protocols+0xb335b) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad) in pthread_mutex_lock
+==================
+ThreadSanitizer:DEADLYSIGNAL
+==4088624==ERROR: ThreadSanitizer: SEGV on unknown address 0x00000000008c (pc 0x7f904094b111 bp 0x7ffeb3d78190 sp 0x7ffeb3d78170 T4088624)
+==4088624==The signal is caused by a WRITE memory access.
+==4088624==HINT: address points to the zero page.
+    #0 wl_map_insert_at /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-util.c:293:16 (libwayland-client.so.0+0x6111) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #1 proxy_destroy /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:584:3 (libwayland-client.so.0+0x62ac) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #2 wl_proxy_destroy_caller_locks /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:608:2 (libwayland-client.so.0+0x7571) (BuildId: 811f309c6b797aa9eaec17093b01cd525c6f4679)
+    #3 wl_proxy_destroy /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-client.c:631:2 (libwayland-client.so.0+0x7571)
+    #4 (anonymous namespace)::disconnect((anonymous namespace)::client&) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:113:9 (test_pointer_protocols+0x148c68) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #5 (anonymous namespace)::pointer_client::~pointer_client() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:414:25 (test_pointer_protocols+0x13bd81) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #6 (anonymous namespace)::lock_cases() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:647:1 (test_pointer_protocols+0x147127) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #7 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_pointer_protocols.cpp:932:5 (test_pointer_protocols+0x13cfa1) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+    #8 __libc_start_call_main /usr/src/debug/glibc/glibc/csu/../sysdeps/nptl/libc_start_call_main.h:59:16 (libc.so.6+0x27780) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+    #9 __libc_start_main /usr/src/debug/glibc/glibc/csu/../csu/libc-start.c:372:3 (libc.so.6+0x278b8) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+    #10 _start <null> (test_pointer_protocols+0x7a3d4) (BuildId: f1709acb2e946aa2faa65defe248bfd5f64c96ad)
+
+==4088624==Register values:
+rax = 0x0000000000000004  rbx = 0x0000721800007920  rcx = 0x0000000000000002  rdx = 0x0000000000000011  
+rdi = 0x0000724c000013d0  rsi = 0x0000000000000002  rbp = 0x00007ffeb3d78190  rsp = 0x00007ffeb3d78170  
+ r8 = 0x0000000000000001   r9 = 0x0000000000000000  r10 = 0xafffff00000fffff  r11 = 0x4000000000000000  
+r12 = 0x0000721800007920  r13 = 0x0000000000000000  r14 = 0x00007ffeb3d784c0  r15 = 0x0000721000003570  
+ThreadSanitizer can not provide additional info.
+SUMMARY: ThreadSanitizer: SEGV /usr/src/debug/wayland/build/../wayland-1.26.0/src/wayland-util.c:293:16 in wl_map_insert_at
+==4088624==ABORTING
+
+        Start 108: test_capture_protocols
+103/136 Test #108: test_capture_protocols ................   Passed    0.96 sec
+        Start 109: test_output_contract
+104/136 Test #109: test_output_contract ..................   Passed    1.17 sec
+        Start 110: test_multi_output_contract
+105/136 Test #110: test_multi_output_contract ............   Passed    1.27 sec
+        Start 111: test_render_scale
+106/136 Test #111: test_render_scale .....................   Passed    1.30 sec
+        Start 112: test_hotplug_contract
+107/136 Test #112: test_hotplug_contract .................***Failed    1.36 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated): no card to match
+[INFO] compositor.gfx: Vulkan composite path active (no scanout)
+[INFO] compositor.output: output 0 mode=800x600 refresh_mhz=60000 scale=1 (120/120) logical=800x600
+[INFO] compositor.output: output 0 name=HEADLESS-1 mode=800x600 refresh_mhz=60000 scale=1 (120/120) logical=800x600+0+0 render_scale=1 identifier="connector:HEADLESS-1"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=24 scale=120/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: software cursor: no KMS scanout
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (2 clients, 2 regions)
+[INFO] compositor.input: seat open took 92 ms: keymap 15 ms, libinput 76 ms of which 16 device opens 11 ms (slowest /dev/input/event9 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=0:0 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] compositor.hotplug: output 1 connecting name=Virtual-1 preferred=1024x768@60000 modes=2
+[INFO] config: config: generation 1 from (none: LUMEN_CONFIG=0) (0 errors, 0 warnings; 57 bindings)
+==================
+WARNING: ThreadSanitizer: data race (pid=4088870)
+  Write of size 8 at 0x7f02329a9d78 by main thread (mutexes: write M0):
+    #0 lx::scene::scene_graph@lx.scene::ensure_view(unsigned int) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.scene/lx.scene.cppm:824:22 (liblx.scene.so.0.3+0xee5d) (BuildId: 13c7fa304739c8098f1121d469d8a605fba389ff)
+    #1 lx::scene::scene_graph@lx.scene::set_output_view(unsigned int, lx::scene::output_view_config@lx.scene const&) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.scene/lx.scene.cppm:854:15 (liblx.scene.so.0.3+0xee5d)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::sync_output_views() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:2098:19 (liblx.compositor.so.0.3+0x106624) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::detail::compositor_impl@lx.compositor::outputs_changed_now() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:8238:9 (liblx.compositor.so.0.3+0x1157b9) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 lx::compositor::detail::compositor_impl@lx.compositor::on_add_result(unsigned int, unsigned int, bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:7920:5 (liblx.compositor.so.0.3+0x135f8e) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #5 lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:7172:58 (liblx.compositor.so.0.3+0x1769ff) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #6 lx::runtime::task@lx.runtime::task<lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'(), lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()>(lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()&&)::'lambda'(void const*)::operator()(void const*) const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:59:41 (liblx.compositor.so.0.3+0x1769ff)
+    #7 lx::runtime::task@lx.runtime::task<lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'(), lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()>(lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()&&)::'lambda'(void const*)::__invoke(void const*) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:59:19 (liblx.compositor.so.0.3+0x1769ff)
+    #8 lx::runtime::task@lx.runtime::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:64:13 (liblx.runtime.so.0.3+0x160a0) (BuildId: 972a4701300d2103f7d3f9b56fffaf810376c307)
+    #9 lx::runtime::strand@lx.runtime::drain() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:217:17 (liblx.runtime.so.0.3+0x160a0)
+    #10 lx::runtime::executor@lx.runtime::drain(lx::runtime::affinity@lx.runtime) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:259:45 (liblx.runtime.so.0.3+0x160a0)
+    #11 lx::compositor::compositor@lx.compositor::run_posted_ui_tasks() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:10435:33 (liblx.compositor.so.0.3+0x14e06d) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #12 _ZZZ4mainENK3$_2clIZ4mainE3$_3EEDaT_ENKUlvE_clEv /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:344:22 (test_hotplug_contract+0x135832) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #13 _ZZ4mainENK3$_0clIZZ4mainENK3$_2clIZ4mainE3$_3EEDaT_EUlvE_EEDaS4_ /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:337:9 (test_hotplug_contract+0x135832)
+    #14 _ZZ4mainENK3$_2clIZ4mainE3$_3EEDaT_ /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:343:13 (test_hotplug_contract+0x135832)
+    #15 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:372:24 (test_hotplug_contract+0x135832)
+
+  Previous read of size 8 at 0x7f02329a9d78 by thread T13:
+    #0 lx::scene::scene_graph@lx.scene::snapshots(unsigned int) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.scene/lx.scene.cppm:1524:34 (liblx.scene.so.0.3+0x12ade) (BuildId: 13c7fa304739c8098f1121d469d8a605fba389ff)
+    #1 lx::compositor::detail::compositor_impl@lx.compositor::compute_low_water() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:11099:75 (liblx.compositor.so.0.3+0x14615b) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #2 lx::compositor::compositor@lx.compositor::tick_render() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:11045:39 (liblx.compositor.so.0.3+0x14615b)
+    #3 lx::compositor::detail::compositor_impl@lx.compositor::render_loop() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9484:27 (liblx.compositor.so.0.3+0x145129) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9335:42 (liblx.compositor.so.0.3+0x17b743) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #5 void std::__invoke_impl<void, lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()>(std::__invoke_other, lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:63:14 (liblx.compositor.so.0.3+0x17b743)
+    #6 std::__invoke_result<lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()>::type std::__invoke<lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()>(lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:98:14 (liblx.compositor.so.0.3+0x17b743)
+    #7 void std::thread::_Invoker<std::tuple<lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()>>::_M_invoke<0ul>(std::_Index_tuple<0ul>) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:303:13 (liblx.compositor.so.0.3+0x17b743)
+    #8 std::thread::_Invoker<std::tuple<lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()>>::operator()() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:310:11 (liblx.compositor.so.0.3+0x17b743)
+    #9 std::thread::_State_impl<std::thread::_Invoker<std::tuple<lx::compositor::detail::compositor_impl@lx.compositor::start_threads()::'lambda'()>>>::_M_run() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:255:13 (liblx.compositor.so.0.3+0x17b743)
+    #10 execute_native_thread_routine /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:105:18 (libstdc++.so.6+0xea858) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+
+  As if synchronized via sleep:
+    #0 nanosleep <null> (test_hotplug_contract+0xa95ae) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #1 void std::this_thread::sleep_for<long, std::ratio<1l, 1000l>>(std::chrono::duration<long, std::ratio<1l, 1000l>> const&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/this_thread_sleep.h:72:9 (test_hotplug_contract+0x13588a) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #2 _ZZ4mainENK3$_2clIZ4mainE3$_3EEDaT_ /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:349:13 (test_hotplug_contract+0x13588a)
+    #3 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:372:24 (test_hotplug_contract+0x13588a)
+
+  Location is heap block of size 1457728 at 0x7f023298b000 allocated by main thread:
+    #0 operator new(unsigned long, std::align_val_t) <null> (test_hotplug_contract+0x1333cc) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #1 lx::compositor::compositor@lx.compositor::compositor(lx::compositor::config@lx.compositor) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9539:13 (liblx.compositor.so.0.3+0x146847) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #2 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:300:32 (test_hotplug_contract+0x13437c) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+
+  Mutex M0 (0x7ffd98250f38) created at:
+    #0 pthread_mutex_lock <null> (test_hotplug_contract+0xae9db) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #1 __gthread_mutex_lock(pthread_mutex_t*) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/x86_64-pc-linux-gnu/bits/gthr-default.h:795:21 (test_hotplug_contract+0x13c07f) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #2 std::mutex::lock() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_mutex.h:116:17 (test_hotplug_contract+0x13c07f)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_mutex.h:276:19 (test_hotplug_contract+0x13c07f)
+    #4 main::$_22::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:313:45 (test_hotplug_contract+0x13c07f)
+    #5 void std::__invoke_impl<void, main::$_22>(std::__invoke_other, main::$_22&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:63:14 (test_hotplug_contract+0x13c07f)
+    #6 std::__invoke_result<main::$_22>::type std::__invoke<main::$_22>(main::$_22&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:98:14 (test_hotplug_contract+0x13c07f)
+    #7 void std::thread::_Invoker<std::tuple<main::$_22>>::_M_invoke<0ul>(std::_Index_tuple<0ul>) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:303:13 (test_hotplug_contract+0x13c07f)
+    #8 std::thread::_Invoker<std::tuple<main::$_22>>::operator()() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:310:11 (test_hotplug_contract+0x13c07f)
+    #9 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_22>>>::_M_run() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:255:13 (test_hotplug_contract+0x13c07f)
+    #10 execute_native_thread_routine /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:105:18 (libstdc++.so.6+0xea858) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+
+  Thread T13 'lx-render' (tid=4088890, running) created by main thread at:
+    #0 pthread_create <null> (test_hotplug_contract+0xacc5e) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+    #1 __gthread_create(unsigned long*, void* (*)(void*), void*) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/x86_64-pc-linux-gnu/bits/gthr-default.h:709:35 (libstdc++.so.6+0xea961) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+    #2 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State>>, void (*)()) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:173:37 (libstdc++.so.6+0xea961)
+    #3 lx::compositor::compositor@lx.compositor::start() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:10278:12 (liblx.compositor.so.0.3+0x14ca29) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_hotplug_contract.cpp:301:29 (test_hotplug_contract+0x13438f) (BuildId: de6e912b228e90de7699f6dea4856da9ea7bcf6b)
+
+SUMMARY: ThreadSanitizer: data race /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.scene/lx.scene.cppm:824:22 in lx::scene::scene_graph@lx.scene::ensure_view(unsigned int)
+==================
+
+        Start 113: test_output_management_contract
+108/136 Test #113: test_output_management_contract .......***Failed    1.17 sec
+[INFO] compositor.session: RLIMIT_NOFILE soft limit 524288 -> 524288
+[INFO] compositor.gfx: Vulkan device Intel(R) HD Graphics 5500 (BDW GT2) (integrated): no card to match
+[INFO] compositor.gfx: Vulkan composite path active (no scanout)
+[INFO] compositor.output: output 0 mode=800x600 refresh_mhz=60000 scale=1 (120/120) logical=800x600
+[INFO] compositor.output: output 0 name=HEADLESS-1 mode=800x600 refresh_mhz=60000 scale=1 (120/120) logical=800x600+0+0 render_scale=1 identifier="connector:HEADLESS-1"
+[INFO] wayland: client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free
+[INFO] compositor.cursor: cursor theme=default size=24 scale=120/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: software cursor: no KMS scanout
+[INFO] compositor.capture: capabilities read-back=1 window-capture=1 dmabuf=1
+[INFO] compositor.memory: GPU memory: DRM fdinfo of i915 (2 clients, 2 regions)
+[INFO] compositor.input: seat open took 80 ms: keymap 13 ms, libinput 67 ms of which 16 device opens 9 ms (slowest /dev/input/event9 1 ms)
+[INFO] compositor.input: libinput seat opened
+[INFO] compositor.input: input device "SynPS/2 Synaptics TouchPad" (touchpad): tap=on tap-button-map=lrm drag=on drag-lock=off disable-while-typing=on natural-scroll=on accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] compositor.input: input device "Lumen Inject Mouse" (mouse): natural-scroll=off accel-profile=default accel-speed=0.00 left-handed=off middle-emulation=off
+[INFO] wayland: shell binary /home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/lumen-shell
+[INFO] runtime.psi: kernel memory pressure: /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/com.zhipu.zcode.server.3b44f6b5.service/memory.pressure (some 150 ms → moderate, full 100 ms → critical, per 2 s)
+[INFO] compositor.session: session 1 vt=1 can_switch_vt=1 active=1 drm=0:0 found=XDG_SESSION_ID type=tty
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] config: config: generation 1 from (none: LUMEN_CONFIG=0) (0 errors, 0 warnings; 57 bindings)
+[INFO] compositor.hotplug: output 1 connecting name=Virtual-1 preferred=1024x768@60000 modes=3
+==================
+WARNING: ThreadSanitizer: data race (pid=4088907)
+  Write of size 4 at 0x7f3a71f7dcf0 by thread T15 (mutexes: write M0):
+    #0 lx::compositor::output_manager@lx.compositor::recount() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/output_manager.cppm:416:16 (liblx.compositor.so.0.3+0x24af2f) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #1 lx::compositor::output_manager@lx.compositor::add_output(lx::compositor::output_desc@lx.compositor const&, int) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/output_manager.cppm:813:9 (liblx.compositor.so.0.3+0x24af2f)
+    #2 lx::compositor::detail::compositor_impl@lx.compositor::on_add_result(unsigned int, unsigned int, bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:7898:17 (liblx.compositor.so.0.3+0x135ec1) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #3 lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:7172:58 (liblx.compositor.so.0.3+0x1769ff) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #4 lx::runtime::task@lx.runtime::task<lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'(), lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()>(lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()&&)::'lambda'(void const*)::operator()(void const*) const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:59:41 (liblx.compositor.so.0.3+0x1769ff)
+    #5 lx::runtime::task@lx.runtime::task<lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'(), lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()>(lx::compositor::detail::compositor_impl@lx.compositor::render_add_output(lx::compositor::detail::compositor_impl@lx.compositor::output_op const&)::'lambda'(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*)::operator()(bool, unsigned int, lx::compositor::detail::output_pipeline@lx.compositor*) const::'lambda'()&&)::'lambda'(void const*)::__invoke(void const*) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:59:19 (liblx.compositor.so.0.3+0x1769ff)
+    #6 lx::runtime::task@lx.runtime::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:64:13 (liblx.runtime.so.0.3+0x160a0) (BuildId: 972a4701300d2103f7d3f9b56fffaf810376c307)
+    #7 lx::runtime::strand@lx.runtime::drain() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:217:17 (liblx.runtime.so.0.3+0x160a0)
+    #8 lx::runtime::executor@lx.runtime::drain(lx::runtime::affinity@lx.runtime) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.runtime/executor.cppm:259:45 (liblx.runtime.so.0.3+0x160a0)
+    #9 lx::compositor::compositor@lx.compositor::run_posted_ui_tasks() /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:10435:33 (liblx.compositor.so.0.3+0x14e06d) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #10 main::$_8::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_output_management_contract.cpp:393:26 (test_output_management_contract+0x13bcb9) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+    #11 void std::__invoke_impl<void, main::$_8>(std::__invoke_other, main::$_8&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:63:14 (test_output_management_contract+0x13bcb9)
+    #12 std::__invoke_result<main::$_8>::type std::__invoke<main::$_8>(main::$_8&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:98:14 (test_output_management_contract+0x13bcb9)
+    #13 void std::thread::_Invoker<std::tuple<main::$_8>>::_M_invoke<0ul>(std::_Index_tuple<0ul>) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:303:13 (test_output_management_contract+0x13bcb9)
+    #14 std::thread::_Invoker<std::tuple<main::$_8>>::operator()() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:310:11 (test_output_management_contract+0x13bcb9)
+    #15 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_8>>>::_M_run() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:255:13 (test_output_management_contract+0x13bcb9)
+    #16 execute_native_thread_routine /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:105:18 (libstdc++.so.6+0xea858) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+
+  Previous read of size 4 at 0x7f3a71f7dcf0 by main thread:
+    #0 lx::compositor::output_manager@lx.compositor::count() const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/output_manager.cppm:419:65 (liblx.compositor.so.0.3+0x2456dd) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #1 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_output_management_contract.cpp:406:41 (test_output_management_contract+0x134fbb) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+
+  Location is heap block of size 1457728 at 0x7f3a71f0e000 allocated by main thread:
+    #0 operator new(unsigned long, std::align_val_t) <null> (test_output_management_contract+0x13300c) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+    #1 lx::compositor::compositor@lx.compositor::compositor(lx::compositor::config@lx.compositor) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/compositor_impl.cpp:9539:13 (liblx.compositor.so.0.3+0x146847) (BuildId: 2c1210856a90443c7e76dd3a932a74ca599cace4)
+    #2 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_output_management_contract.cpp:380:36 (test_output_management_contract+0x134e1b) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+
+  Mutex M0 (0x7ffe06da6090) created at:
+    #0 pthread_mutex_lock <null> (test_output_management_contract+0xae61b) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+    #1 __gthread_mutex_lock(pthread_mutex_t*) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/x86_64-pc-linux-gnu/bits/gthr-default.h:795:21 (test_output_management_contract+0x13bc7f) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+    #2 std::mutex::lock() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_mutex.h:116:17 (test_output_management_contract+0x13bc7f)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_mutex.h:276:19 (test_output_management_contract+0x13bc7f)
+    #4 main::$_8::operator()() const /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_output_management_contract.cpp:391:49 (test_output_management_contract+0x13bc7f)
+    #5 void std::__invoke_impl<void, main::$_8>(std::__invoke_other, main::$_8&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:63:14 (test_output_management_contract+0x13bc7f)
+    #6 std::__invoke_result<main::$_8>::type std::__invoke<main::$_8>(main::$_8&&) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/invoke.h:98:14 (test_output_management_contract+0x13bc7f)
+    #7 void std::thread::_Invoker<std::tuple<main::$_8>>::_M_invoke<0ul>(std::_Index_tuple<0ul>) /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:303:13 (test_output_management_contract+0x13bc7f)
+    #8 std::thread::_Invoker<std::tuple<main::$_8>>::operator()() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:310:11 (test_output_management_contract+0x13bc7f)
+    #9 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::$_8>>>::_M_run() /usr/bin/../lib64/gcc/x86_64-pc-linux-gnu/16/../../../../include/c++/16/bits/std_thread.h:255:13 (test_output_management_contract+0x13bc7f)
+    #10 execute_native_thread_routine /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:105:18 (libstdc++.so.6+0xea858) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+
+  Thread T15 (tid=4088935, running) created by main thread at:
+    #0 pthread_create <null> (test_output_management_contract+0xac89e) (BuildId: 8a13a6e801d43a17daee0aacd2689251ab3c7445)
+    #1 __gthread_create(unsigned long*, void* (*)(void*), void*) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/x86_64-pc-linux-gnu/bits/gthr-default.h:709:35 (libstdc++.so.6+0xea961) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+    #2 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State>>, void (*)()) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:173:37 (libstdc++.so.6+0xea961)
+    #3 __libc_start_call_main /usr/src/debug/glibc/glibc/csu/../sysdeps/nptl/libc_start_call_main.h:59:16 (libc.so.6+0x27780) (BuildId: 6961407ef2e7877eabf5ed8c5a39aea9de7194c1)
+
+SUMMARY: ThreadSanitizer: data race /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.compositor/output_manager.cppm:416:16 in lx::compositor::output_manager@lx.compositor::recount()
+==================
+
+        Start 114: test_kms_device
+109/136 Test #114: test_kms_device .......................   Passed    0.02 sec
+        Start 115: test_crtc_alloc
+110/136 Test #115: test_crtc_alloc .......................   Passed    0.02 sec
+        Start 116: test_cvt
+111/136 Test #116: test_cvt ..............................   Passed    0.02 sec
+        Start 117: test_uevent_parse
+112/136 Test #117: test_uevent_parse .....................   Passed    0.02 sec
+        Start 118: test_drm_fdinfo
+113/136 Test #118: test_drm_fdinfo .......................   Passed    0.05 sec
+        Start 119: test_card_select
+114/136 Test #119: test_card_select ......................   Passed    0.02 sec
+        Start 120: test_output_scan_diff
+115/136 Test #120: test_output_scan_diff .................   Passed    0.03 sec
+        Start 121: test_output_policy
+116/136 Test #121: test_output_policy ....................   Passed    0.03 sec
+        Start 122: test_window_migration
+117/136 Test #122: test_window_migration .................   Passed    0.03 sec
+        Start 123: test_output_management
+118/136 Test #123: test_output_management ................   Passed    0.03 sec
+        Start 124: test_output_config_store
+119/136 Test #124: test_output_config_store ..............   Passed    0.04 sec
+        Start 125: test_backdrop_blur
+120/136 Test #125: test_backdrop_blur ....................   Passed    1.24 sec
+        Start 126: test_backdrop_blur_vk_validation
+121/136 Test #126: test_backdrop_blur_vk_validation ......***Failed    1.29 sec
+==================
+WARNING: ThreadSanitizer: data race (pid=4088983)
+  Write of size 8 at 0x724c00002598 by main thread (mutexes: write M0):
+    #0 operator delete(void*, unsigned long) <null> (test_backdrop_blur+0x13606f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 vulkan_layer_chassis::DestroyFence(VkDevice_T*, VkFence_T*, VkAllocationCallbacks const*) /usr/src/debug/vulkan-validation-layers/Vulkan-ValidationLayers/layers/vulkan/generated/chassis.cpp:1367:42 (libVkLayer_khronos_validation.so+0x6c19e5) (BuildId: bf0c22058b08d3429bec2ab3f6c8921fbca18e65)
+    #2 lx::gfx::ui_vk_renderer@lx.gfx::initialize(lx::gfx::vk_context@lx.gfx const&, lx::gfx::ui_vk_options@lx.gfx const&) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/ui_vk.cppm:1156:19 (liblx.gfx.so.0.3+0xcec99) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #3 lumen_test_fn_vulkan_stream_frame_blurs_primitives_under_the_region() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1080:22 (test_backdrop_blur+0x1417c9) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #4 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_backdrop_blur+0x14aa7f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #5 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1167:24 (test_backdrop_blur+0x1434ea) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+
+  Previous atomic read of size 1 at 0x724c00002598 by thread T4 (mutexes: write M1):
+    #0 pthread_rwlock_unlock <null> (test_backdrop_blur+0xb2de7) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 std::__glibcxx_rwlock_unlock(pthread_rwlock_t*) /usr/include/c++/16/shared_mutex:90:3 (libVkLayer_khronos_validation.so+0xbaac57) (BuildId: bf0c22058b08d3429bec2ab3f6c8921fbca18e65)
+    #2 std::__shared_mutex_pthread::unlock() /usr/include/c++/16/shared_mutex:225:68 (libVkLayer_khronos_validation.so+0xbaac57)
+    #3 std::shared_mutex::unlock() /usr/include/c++/16/shared_mutex:434:35 (libVkLayer_khronos_validation.so+0xbaac57)
+    #4 std::unique_lock<std::shared_mutex>::unlock() /usr/include/c++/16/bits/unique_lock.h:203:23 (libVkLayer_khronos_validation.so+0xbaac57)
+    #5 std::unique_lock<std::shared_mutex>::~unique_lock() /usr/include/c++/16/bits/unique_lock.h:114:10 (libVkLayer_khronos_validation.so+0xbaac57)
+    #6 vvl::Fence::Retire() /usr/src/debug/vulkan-validation-layers/Vulkan-ValidationLayers/layers/state_tracker/fence_state.cpp:134:1 (libVkLayer_khronos_validation.so+0xbaac57)
+
+  Mutex M0 (0x72a4000052b0) created at:
+    #0 pthread_rwlock_wrlock <null> (test_backdrop_blur+0xb289b) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 std::__glibcxx_rwlock_wrlock(pthread_rwlock_t*) /usr/include/c++/16/shared_mutex:88:3 (libVkLayer_khronos_validation.so+0x6bcedb) (BuildId: bf0c22058b08d3429bec2ab3f6c8921fbca18e65)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/16/shared_mutex:201:42 (libVkLayer_khronos_validation.so+0x6bcedb)
+    #3 std::shared_mutex::lock() /usr/include/c++/16/shared_mutex:432:31 (libVkLayer_khronos_validation.so+0x6bcedb)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/16/bits/unique_lock.h:144:21 (libVkLayer_khronos_validation.so+0x6bcedb)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/16/bits/unique_lock.h:75:6 (libVkLayer_khronos_validation.so+0x6bcedb)
+    #6 vvl::BaseDevice::WriteLock() /usr/src/debug/vulkan-validation-layers/Vulkan-ValidationLayers/layers/./chassis/validation_object.h:216:87 (libVkLayer_khronos_validation.so+0x6bcedb)
+    #7 vulkan_layer_chassis::GetDeviceQueue(VkDevice_T*, unsigned int, unsigned int, VkQueue_T**) /usr/src/debug/vulkan-validation-layers/Vulkan-ValidationLayers/layers/vulkan/generated/chassis.cpp:450:39 (libVkLayer_khronos_validation.so+0x6bcedb)
+    #8 lx::gfx::device_selector@lx.gfx::select_best(lx::gfx::drm_node@lx.gfx) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/lx.gfx.cppm:769:23 (liblx.gfx.so.0.3+0xb3c80) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #9 (anonymous namespace)::vk() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:830:25 (test_backdrop_blur+0x1488d5) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #10 lumen_test_fn_vulkan_blur_matches_the_reference() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:873:21 (test_backdrop_blur+0x13e43e) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #11 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_backdrop_blur+0x14aa7f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #12 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1167:24 (test_backdrop_blur+0x1434ea) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+
+  Mutex M1 (0x724c00002598) created at:
+    #0 pthread_rwlock_wrlock <null> (test_backdrop_blur+0xb289b) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 std::__glibcxx_rwlock_wrlock(pthread_rwlock_t*) /usr/include/c++/16/shared_mutex:88:3 (libVkLayer_khronos_validation.so+0xbaca5e) (BuildId: bf0c22058b08d3429bec2ab3f6c8921fbca18e65)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/16/shared_mutex:201:42 (libVkLayer_khronos_validation.so+0xbaca5e)
+    #3 std::shared_mutex::lock() /usr/include/c++/16/shared_mutex:432:31 (libVkLayer_khronos_validation.so+0xbaca5e)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/16/bits/unique_lock.h:144:21 (libVkLayer_khronos_validation.so+0xbaca5e)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/16/bits/unique_lock.h:75:6 (libVkLayer_khronos_validation.so+0xbaca5e)
+    #6 vvl::Fence::WriteLock() /usr/src/debug/vulkan-validation-layers/Vulkan-ValidationLayers/layers/./state_tracker/fence_state.h:84:61 (libVkLayer_khronos_validation.so+0xbaca5e)
+    #7 vvl::Fence::EnqueueSignal(vvl::Queue*, unsigned long) /usr/src/debug/vulkan-validation-layers/Vulkan-ValidationLayers/layers/state_tracker/fence_state.cpp:58:28 (libVkLayer_khronos_validation.so+0xbaca5e)
+    #8 lx::gfx::ui_vk_renderer@lx.gfx::initialize(lx::gfx::vk_context@lx.gfx const&, lx::gfx::ui_vk_options@lx.gfx const&) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/ui_vk.cppm:1156:19 (liblx.gfx.so.0.3+0xcec99) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #9 lumen_test_fn_vulkan_stream_frame_blurs_primitives_under_the_region() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1080:22 (test_backdrop_blur+0x1417c9) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #10 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_backdrop_blur+0x14aa7f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #11 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1167:24 (test_backdrop_blur+0x1434ea) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+
+  Thread T4 (tid=4088988, running) created by main thread at:
+    #0 pthread_create <null> (test_backdrop_blur+0xaf12e) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 __gthread_create(unsigned long*, void* (*)(void*), void*) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/include/x86_64-pc-linux-gnu/bits/gthr-default.h:709:35 (libstdc++.so.6+0xea961) (BuildId: 5b8d3de442de987b24d0e3679533068f2ae62497)
+    #2 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State>>, void (*)()) /usr/src/debug/gcc/gcc-build/x86_64-pc-linux-gnu/libstdc++-v3/src/c++11/../../../../../gcc/libstdc++-v3/src/c++11/thread.cc:173:37 (libstdc++.so.6+0xea961)
+    #3 lx::gfx::vulkan_compositor@lx.gfx::upload_rgba(unsigned int, unsigned int, unsigned int, unsigned char const*, lx::rect2i@lx.foundation, std::span<lx::rect2i@lx.foundation const, 18446744073709551615ul>)::'lambda'(bool)::operator()(bool) const /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/vk_renderer.cppm:2450:30 (liblx.gfx.so.0.3+0xf3acc) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #4 lx::gfx::vulkan_compositor@lx.gfx::upload_rgba(unsigned int, unsigned int, unsigned int, unsigned char const*, lx::rect2i@lx.foundation, std::span<lx::rect2i@lx.foundation const, 18446744073709551615ul>) /home/dimmus/lumen-wt/sanitizer-sweep-green/modules/lx.gfx/vk_renderer.cppm:2499:26 (liblx.gfx.so.0.3+0xdee01) (BuildId: 82f2794bd9761fe5e271b120292a51bd7ebdb78a)
+    #5 lumen_test_fn_vulkan_blur_matches_the_reference() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:888:53 (test_backdrop_blur+0x13e618) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #6 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_backdrop_blur+0x14aa7f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #7 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1167:24 (test_backdrop_blur+0x1434ea) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_backdrop_blur+0x13606f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189) in operator delete(void*, unsigned long)
+==================
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d010
+warning: address range table at offset 0x2c8f0 has a premature terminator entry at offset 0x2d030
+==================
+WARNING: ThreadSanitizer: data race (pid=4088983)
+  Write of size 1 at 0x7ffd2f1f43f0 by thread T7:
+    #0 pthread_barrier_destroy <null> (test_backdrop_blur+0xb30b7) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 util_queue_thread_func /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_queue.c:300:10 (libvulkan_intel_hasvk.so+0x1914f0) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Previous read of size 1 at 0x7ffd2f1f43f0 by thread T5:
+    #0 pthread_barrier_wait <null> (test_backdrop_blur+0xb31fb) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 util_barrier_wait /usr/src/debug/mesa/build/../mesa-26.2.7/src/util/u_thread.c:213:11 (libvulkan_intel_hasvk.so+0x19244d) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+
+  Location is stack of main thread.
+
+  Thread T7 'test_ba:disk$3' (tid=4088996, running) created by main thread at:
+    #0 pthread_create <null> (test_backdrop_blur+0xaf12e) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lumen_test_fn_vulkan_stream_frame_blurs_primitives_under_the_region() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1080:22 (test_backdrop_blur+0x1417c9) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #3 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_backdrop_blur+0x14aa7f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1167:24 (test_backdrop_blur+0x1434ea) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+
+  Thread T5 'test_ba:disk$1' (tid=4088994, running) created by main thread at:
+    #0 pthread_create <null> (test_backdrop_blur+0xaf12e) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #1 thrd_create /usr/src/debug/mesa/build/../mesa-26.2.7/src/c11/impl/threads_posix.c:255:9 (libvulkan_intel_hasvk.so+0x1ab8c3) (BuildId: a8394109debaa01ce9904fe63113c443e7c155b3)
+    #2 lumen_test_fn_vulkan_stream_frame_blurs_primitives_under_the_region() /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1080:22 (test_backdrop_blur+0x1417c9) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #3 lumen_test::run_all(int, char**) /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/lumen_test.hpp:38:13 (test_backdrop_blur+0x14aa7f) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+    #4 main /home/dimmus/lumen-wt/sanitizer-sweep-green/tests/test_backdrop_blur.cpp:1167:24 (test_backdrop_blur+0x1434ea) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189)
+
+SUMMARY: ThreadSanitizer: data race (/home/dimmus/lumen-wt/sanitizer-sweep-green/build/tsan/test_backdrop_blur+0xb30b7) (BuildId: 7ff89f0d45eab42ce1f799763c982be6fd113189) in pthread_barrier_destroy
+==================
+Validation Layer Info - Logging validation error to /tmp/lumen-blur-vk-validation-4088983.log
+  Vulkan 320x200 region 96,40 128x72: 27648 values, worst 1 levels, outside differing 0
+  Vulkan 321x201 region 97,41 128x72: 27648 values, worst 1 levels, outside differing 0
+  Vulkan 400x300 region 200,120 120x80: 28800 values, worst 1 levels, outside differing 0
+  Vulkan 321x201 region 201,121 120x80: 28800 values, worst 1 levels, outside differing 0
+  PASS  vulkan_blur_matches_the_reference
+  Vulkan stream: worst 1 levels over 15360 values
+  PASS  vulkan_stream_frame_blurs_primitives_under_the_region
+    validation layer log: 0 lines
+  PASS  vulkan_validation_clean
+3 tests, 0 failed
+ThreadSanitizer: reported 2 warnings
+
+        Start 127: test_color_management
+122/136 Test #127: test_color_management .................   Passed    2.66 sec
+        Start 128: test_color_management_vk_validation
+123/136 Test #128: test_color_management_vk_validation ...   Passed    0.18 sec
+        Start 129: test_dmabuf_composite
+124/136 Test #129: test_dmabuf_composite .................   Passed    4.23 sec
+        Start 130: test_ui_theme
+125/136 Test #130: test_ui_theme .........................   Passed    0.21 sec
+        Start 131: test_ui_reconcile
+126/136 Test #131: test_ui_reconcile .....................   Passed    0.03 sec
+        Start 132: test_ui_multi_root
+127/136 Test #132: test_ui_multi_root ....................   Passed    0.14 sec
+        Start 133: test_ui_components
+128/136 Test #133: test_ui_components ....................   Passed    1.68 sec
+        Start 134: test_ui_inputs
+129/136 Test #134: test_ui_inputs ........................   Passed    0.14 sec
+        Start 135: test_settings_ui
+130/136 Test #135: test_settings_ui ......................   Passed    0.45 sec
+        Start 136: test_layout_flex
+131/136 Test #136: test_layout_flex ......................   Passed    0.14 sec
+        Start 137: test_layout_grid
+132/136 Test #137: test_layout_grid ......................   Passed    0.03 sec
+        Start 138: test_clipboard_payload
+133/136 Test #138: test_clipboard_payload ................   Passed    0.03 sec
+        Start 139: test_ui_chrome
+134/136 Test #139: test_ui_chrome ........................   Passed    0.03 sec
+        Start 140: test_kms_vkms
+135/136 Test #140: test_kms_vkms .........................   Passed    0.03 sec
+        Start 141: test_kms_vulkan_scanout
+136/136 Test #141: test_kms_vulkan_scanout ...............   Passed    0.02 sec
+
+93% tests passed, 10 tests failed out of 136
+
+Total Test time (real) = 126.13 sec
+
+The following tests FAILED:
+	 36 - test_vk_capture (Failed)
+	 96 - test_shell_bridge (Subprocess aborted)
+	 98 - test_ext_workspace (Failed)
+	 99 - test_tiling (Failed)
+	100 - test_window_animations (Failed)
+	101 - test_window_protocols (Failed)
+	107 - test_pointer_protocols (Failed)
+	112 - test_hotplug_contract (Failed)
+	113 - test_output_management_contract (Failed)
+	126 - test_backdrop_blur_vk_validation (Failed)
+Errors while running CTest

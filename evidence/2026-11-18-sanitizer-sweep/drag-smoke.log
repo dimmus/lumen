@@ -1,0 +1,30 @@
+     injection: pointer /dev/input/event16 ('Lumen Inject Mouse'), relative /dev/input/event16 (the same device), keyboard /dev/input/event3 ('AT Translated Set 2 keyboard')
+WARN: another session is running (WAYLAND_DISPLAY='lumen-0'
+      DISPLAY=''); the compositor needs DRM master and the console.
+┌──────────────────────────────────────────────────────────────────────────┐
+│ HANDS OFF for about 30 s: do not touch the mouse or keyboard, and keep   │
+│ the host pointer OUTSIDE the VM window. Real input mixes with injected   │
+│ input on the same device; if any is seen, the run is reported INVALID.   │
+└──────────────────────────────────────────────────────────────────────────┘
+     starting in 3 ...     starting in 2 ...     starting in 1 ...                              1/3  compositor on lumen-drag-smoke (LUMEN_LOG=debug) ...
+     output 3200x1800 @ 59 Hz; hardware cursor planes=1 size=64x64 hotspot=0
+2/3  lumen-square ...
+3/3  scenarios ...
+
+──────────────────────────────────────────────────────────────────────────────
+PASS  a client move                                    origin (1400, 750) -> (1600, 870) (delta +200,+120, want +200,+120), size 400x300 -> 400x300, grab=client/move
+PASS  b client resize bottom-right                     400x300@1600,870 -> 550x400@1600,870; size delta +150,+100 (want +150,+100), origin kept=True; edges=10 configures=32 (client saw 31 with resizing, last without it), client last commit (550, 400)
+PASS  c client resize top-left                         550x400@1600,870 -> 700x500@1450,770; bottom-right (2150,1270) max drift 0px over 31 geometry updates, size delta +150,+100; edges=5 configures=33 (client saw 32 with resizing, last without it), client last commit (700, 500)
+PASS  d min-size clamp                                 700x500@1450,770 -> 120x90@1450,770; final 120x90 (want 120x90), configures below the minimum: 0; edges=10 configures=24 (client saw 23 with resizing, last without it), client last commit (120, 90)
+PASS  e Super+left move                                delta -110,-74 (want -110,-74), grab=keybinding, button lines reaching the client: 0
+PASS  f click-to-focus/raise                           overlap (1430,768) under pointer: id=2 before, id=1 after the click; raise id=1: True, keyboard focus id=1: True; square1 activated: True, square2 deactivated: True; square1 enter: 1, square2 enter: 0
+PASS  g latency                                        cursor (hover): n=150/150 median=9.2ms p95=16.1ms max=25.7ms; median split queued=0.0 compositor=8.0 gpu=n/a(no fence) display=1.2ms; newest-input→flip median=5.7ms | window move: n=120/120 median=12.6ms p95=19.3ms max=19.5ms; median split queued=0.0 compositor=9.7 gpu=0.8 display=1.3ms; newest-input→flip median=6.3ms
+PASS  h frame-perfect resize                           89 configures for 160 pointer motions, 83 committed sizes, all matched, never more than one in flight
+PASS  i client killed mid-grab                         grab end reason=destroyed, unmapped=True, compositor alive=True
+PASS  j xdg-toplevel-drag move                         origin (1400, 750) -> (1640, 910) (delta +240,+160, want +240,+160), size 400x300 kept=True; 36 toplevel-drag geometry updates (monotone=True, after detach=False); dnd start=1 rejected=0 attach=1 detach=1 cancel(no_target)=1 wm-grabs=0; client: press->toplevel-drag 1, dnd cancelled 1, leaked releases 0
+PASS  run: no error/warning, clean exit, console text  errors+warnings=0 budget-summaries=0 compositor exit=0 lumen-square exit=0 console=text
+──────────────────────────────────────────────────────────────────────────────
+presents logged: {'content': 216, 'cursor': 133}; refresh period 16.67 ms
+logs: /home/dimmus/lumen-wt/sanitizer-sweep-green/drag-smoke-logs
+
+VERDICT: PASS
