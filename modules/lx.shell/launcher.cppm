@@ -316,6 +316,10 @@ private:
     row_ref row_refs_[k_launcher_max_rows]{};
     icon_slot icon_slots_[32]{};
     char notice_[192]{};
+    /// Stable storage for the status row's count line: build_ui()'s stack buffer would
+    /// dangle, the retained label re-reads its string at every tick's reconcile (ASan:
+    /// stack-use-after-return, the panel/switcher/menu class).
+    char status_line_[224]{};
     unsigned notice_rev_ = 0;
 };
 
@@ -810,13 +814,12 @@ lx::ui::child lx::shell::launcher::build_ui() {
 
     // The status row: the notice until the query changes, else the count.
     {
-        char line[224];
-        const char* text = line;
+        const char* text = status_line_;
         if (layout_.notice) {
             text = notice_;
         } else {
-            *std::format_to_n(line, sizeof(line) - 1, "{} application{}", layout_.total,
-                              layout_.total == 1 ? "" : "s").out = '\0';
+            *std::format_to_n(status_line_, sizeof(status_line_) - 1, "{} application{}",
+                              layout_.total, layout_.total == 1 ? "" : "s").out = '\0';
         }
         lx::ui::child status = lx::ui::label(text)
                                    .size(lx::ui::label_size::small)
