@@ -142,7 +142,10 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
     else if (std::strcmp(iface, wl_shm_interface.name) == 0)
         c->shm = static_cast<wl_shm*>(wl_registry_bind(r, name, &wl_shm_interface, 1));
     else if (std::strcmp(iface, wl_output_interface.name) == 0) {
-        c->outputs.push_back(static_cast<wl_output*>(wl_registry_bind(r, name, &wl_output_interface, 4)));
+        wl_output* o = static_cast<wl_output*>(wl_registry_bind(r, name, &wl_output_interface, 4));
+        c->outputs.push_back(o);
+        // Bound proxies are not freed by wl_display_disconnect; track for teardown.
+        c->created.push_back(reinterpret_cast<wl_proxy*>(o));
         c->output_names.push_back(name);
     } else if (std::strcmp(iface, ext_workspace_manager_v1_interface.name) == 0)
         c->ws_name = name;
@@ -229,6 +232,9 @@ const ext_workspace_manager_v1_listener manager_listener = {
         auto st = std::make_unique<group_state>();
         st->proxy = g;
         c->groups.push_back(std::move(st));
+        // Server-pushed proxies are this client's to destroy too; track them so
+        // disconnect owns whatever the case did not destroy.
+        c->created.push_back(reinterpret_cast<wl_proxy*>(g));
         ext_workspace_group_handle_v1_add_listener(g, &group_listener, c);
         c->log.push_back("group");
     },
@@ -237,6 +243,7 @@ const ext_workspace_manager_v1_listener manager_listener = {
         auto st = std::make_unique<ws_state>();
         st->proxy = w;
         c->workspaces.push_back(std::move(st));
+        c->created.push_back(reinterpret_cast<wl_proxy*>(w));
         ext_workspace_handle_v1_add_listener(w, &ws_listener, c);
         c->log.push_back("workspace");
     },
@@ -278,7 +285,7 @@ void disconnect(client& c) {
     (void)wl_display_dispatch_pending(c.display);
     for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
         if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
-            continue; // tracked twice: destroy once, at its newest position
+            continue; // tracked twice: destroy once, at its oldest position
         wl_proxy_destroy(*it);
     }
     c.created.clear();
@@ -445,6 +452,7 @@ void run_cases() {
     {
         auto* late = static_cast<wl_output*>(
             wl_registry_bind(c.registry, c.output_names[0], &wl_output_interface, 4));
+        c.created.push_back(reinterpret_cast<wl_proxy*>(late));
         wl_output_add_listener(late, &output_listener, nullptr);
         settle(c);
         check("a wl_output bound later gets output_enter and done",
@@ -526,6 +534,7 @@ void run_cases() {
     settle(c);
     check("requests on an inert handle are ignored", protocol_ok(c) && c.names(ga) == "1* 2",
           c.names(ga));
+    untrack(c, reinterpret_cast<wl_proxy*>(w2->proxy)); // its typed destroy frees the proxy
     ext_workspace_handle_v1_destroy(w2->proxy);
     w2->proxy = nullptr;
 

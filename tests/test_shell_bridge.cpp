@@ -92,6 +92,7 @@ struct conn {
     /// Proxies this connection created; disconnect destroys them (libwayland 1.26
     /// frees no remaining proxy at wl_display_disconnect).
     std::vector<wl_proxy*> created;
+    wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
     wl_shm* shm = nullptr;
     wl_seat* seat = nullptr;
@@ -175,8 +176,8 @@ bool connect(conn& c) {
     c.display = wl_display_connect(k_socket);
     if (!c.display)
         return false;
-    wl_registry* r = wl_display_get_registry(c.display);
-    wl_registry_add_listener(r, &registry_listener, &c);
+    c.registry = wl_display_get_registry(c.display);
+    wl_registry_add_listener(c.registry, &registry_listener, &c);
     return wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0;
 }
 
@@ -199,6 +200,7 @@ wl_buffer* make_buffer(conn& c, int w, int h) {
         return nullptr;
     wl_shm_pool* pool = wl_shm_create_pool(c.shm, fd, size);
     wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(b));
     wl_shm_pool_destroy(pool);
     close(fd);
     return b;
@@ -227,6 +229,16 @@ void map_window(conn& c, window& w, const char* title) {
 void disconnect(conn& c) {
     if (!c.display)
         return; // already torn down (cases that disconnect manually)
+    // Deliver what a stopped dispatch left queued, then destroy what stayed tracked.
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its oldest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
+    if (c.lock_manager)
+        wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.lock_manager));
     if (c.shell)
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shell));
     if (c.layer_shell)
@@ -239,6 +251,8 @@ void disconnect(conn& c) {
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.shm));
     if (c.compositor)
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.compositor));
+    if (c.registry)
+        wl_registry_destroy(c.registry);
     wl_display_disconnect(c.display);
     c.display = nullptr;
 }
@@ -467,12 +481,17 @@ int main() {
             check(fe.name != 0, "blur: the other connection finds the manager global");
             auto* mgr = static_cast<ext_background_effect_manager_v1*>(
                 wl_registry_bind(fr, fe.name, &ext_background_effect_manager_v1_interface, 1));
-            (void)ext_background_effect_manager_v1_get_background_effect(
+            auto* effect = ext_background_effect_manager_v1_get_background_effect(
                 mgr, static_cast<wl_surface*>(blur_panel.surface()));
             (void)wl_display_roundtrip(foreign);
             check(wl_display_get_error(foreign) != 0,
                   "blur: a manager on another connection cannot name this surface — its "
                   "connection is killed (the crash loop's marshal)");
+            // The effect and the manager are this connection's proxies; freeing them is
+            // safe whatever the connection died of (wl_proxy_destroy is client-side).
+            wl_proxy_destroy(reinterpret_cast<wl_proxy*>(effect));
+            wl_proxy_destroy(reinterpret_cast<wl_proxy*>(mgr));
+            wl_registry_destroy(fr);
             wl_display_disconnect(foreign);
         }
 
@@ -603,6 +622,7 @@ int main() {
     v4.request_activate(v_one);
     (void)wl_display_roundtrip(sh3.display);
     wl_keyboard* kb = wl_seat_get_keyboard(app.seat);
+    app.created.push_back(reinterpret_cast<wl_proxy*>(kb));
     wl_keyboard_add_listener(kb, &keyboard_listener, nullptr);
     (void)wl_display_roundtrip(app.display);
     check(g_kb.enters == 1 && g_kb.enter_key_count == 0, "the application's keyboard is entered");
@@ -757,7 +777,14 @@ int main() {
             wl_registry* r = wl_display_get_registry(c.display);
             wl_registry_add_listener(r, &l, &f);
             (void)wl_display_roundtrip(c.display);
-            return f.name ? wl_registry_bind(r, f.name, iface, 1) : nullptr;
+            if (!f.name) {
+                wl_registry_destroy(r); // the helper's own registry leaks otherwise
+                return nullptr;
+            }
+            void* bound = wl_registry_bind(r, f.name, iface, 1);
+            c.created.push_back(static_cast<wl_proxy*>(bound));
+            wl_registry_destroy(r);
+            return bound;
         };
         static lx::shell::policy_bridge v6;
         static lx::shell::task_handle bells[8];
@@ -800,6 +827,7 @@ int main() {
             munmap(px, 16 * 16 * 4);
             wl_shm_pool* pool = wl_shm_create_pool(app.shm, fd, 16 * 16 * 4);
             wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, 16, 16, 64, WL_SHM_FORMAT_ARGB8888);
+            app.created.push_back(reinterpret_cast<wl_proxy*>(b));
             wl_shm_pool_destroy(pool);
             close(fd);
             xdg_toplevel_icon_v1_add_buffer(icon, b, 1);
@@ -818,7 +846,9 @@ int main() {
         app.created.push_back(reinterpret_cast<wl_proxy*>(dlg.toplevel));
         xdg_toplevel_set_title(dlg.toplevel, "the-dialog");
         xdg_toplevel_set_parent(dlg.toplevel, main_w.toplevel);
-        xdg_dialog_v1_set_modal(xdg_wm_dialog_v1_get_xdg_dialog(dialogs, dlg.toplevel));
+        auto* xdg_dlg = xdg_wm_dialog_v1_get_xdg_dialog(dialogs, dlg.toplevel);
+        app.created.push_back(reinterpret_cast<wl_proxy*>(xdg_dlg));
+        xdg_dialog_v1_set_modal(xdg_dlg);
         wl_surface_commit(dlg.surface);
         (void)wl_display_roundtrip(app.display);
         xdg_surface_ack_configure(dlg.xdg, dlg.serial);
@@ -1260,6 +1290,7 @@ int main() {
     sh3.shell = nullptr;
     disconnect(sh3);
     wl_keyboard_destroy(kb);
+    untrack(app, reinterpret_cast<wl_proxy*>(kb));
     disconnect(app);
     disconnect(app2);
     pump.store(false, std::memory_order_release);

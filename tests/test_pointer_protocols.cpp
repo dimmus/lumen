@@ -108,6 +108,15 @@ void untrack(client& c, wl_proxy* p) {
 void disconnect(client& c) {
     if (!c.display)
         return; // already torn down (cases that disconnect manually)
+    // Deliver what the last roundtrip queued but never dispatched (a protocol error
+    // stops dispatch mid-buffer), then destroy what the case left tracked.
+    (void)wl_display_dispatch_pending(c.display);
+    for (auto it = c.created.rbegin(); it != c.created.rend(); ++it) {
+        if (std::find(it + 1, c.created.rend(), *it) != c.created.rend())
+            continue; // tracked twice: destroy once, at its oldest position
+        wl_proxy_destroy(*it);
+    }
+    c.created.clear();
     if (c.seat)
         wl_proxy_destroy(reinterpret_cast<wl_proxy*>(c.seat));
     if (c.shm)
@@ -241,6 +250,7 @@ void map_window(client& c, window& w, const char* app_id, int width = 300, int h
     c.created.push_back(reinterpret_cast<wl_proxy*>(w.xdg));
     xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
     w.toplevel = xdg_surface_get_toplevel(w.xdg);
+    c.created.push_back(reinterpret_cast<wl_proxy*>(w.toplevel));
     xdg_toplevel_set_app_id(w.toplevel, app_id);
     wl_surface_commit(w.surface);
     (void)wl_display_roundtrip(c.display);
@@ -467,10 +477,11 @@ void error_cases() {
                c.created.push_back(reinterpret_cast<wl_proxy*>(p));
                wl_surface* s = wl_compositor_create_surface(c.compositor);
                c.created.push_back(reinterpret_cast<wl_proxy*>(s));
-               (void)zwp_pointer_constraints_v1_lock_pointer(
-                   m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
-               (void)zwp_pointer_constraints_v1_confine_pointer(
-                   m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(zwp_pointer_constraints_v1_lock_pointer(
+                   m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT)));
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   zwp_pointer_constraints_v1_confine_pointer(
+                       m, s, p, nullptr, ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT)));
            });
     expect("constraints: a new one after the first was destroyed; the surface goes first",
            "none", 0, [](client& c) {
@@ -487,7 +498,8 @@ void error_cases() {
                // An unknown lifetime is taken as oneshot (no error defined for it).
                wl_surface* s2 = wl_compositor_create_surface(c.compositor);
                c.created.push_back(reinterpret_cast<wl_proxy*>(s2));
-               (void)zwp_pointer_constraints_v1_lock_pointer(m, s2, p, nullptr, 7);
+               c.created.push_back(reinterpret_cast<wl_proxy*>(
+                   zwp_pointer_constraints_v1_lock_pointer(m, s2, p, nullptr, 7)));
                wl_surface_destroy(s);
                untrack(c, reinterpret_cast<wl_proxy*>(s));
                // Inert after its surface went: requests are harmless.
@@ -566,7 +578,8 @@ void lock_cases() {
                                           bind_global(locker, &ext_session_lock_manager_v1_interface, 1))
                                     : nullptr;
         if (mgr) {
-            (void)ext_session_lock_manager_v1_lock(mgr);
+            locker.created.push_back(reinterpret_cast<wl_proxy*>(
+                ext_session_lock_manager_v1_lock(mgr)));
             (void)wl_display_roundtrip(locker.display);
             settle(p.c);
             check("lock: deactivated when the session locks", p.log.unlocked == 3,
@@ -784,12 +797,15 @@ void gesture_cases() {
         return;
     }
     gesture_log log{};
-    zwp_pointer_gesture_swipe_v1_add_listener(zwp_pointer_gestures_v1_get_swipe_gesture(g, p.pointer),
-                                              &swipe_listener, &log);
-    zwp_pointer_gesture_pinch_v1_add_listener(zwp_pointer_gestures_v1_get_pinch_gesture(g, p.pointer),
-                                              &pinch_listener, &log);
-    zwp_pointer_gesture_hold_v1_add_listener(zwp_pointer_gestures_v1_get_hold_gesture(g, p.pointer),
-                                             &hold_listener, &log);
+    auto* swipe = zwp_pointer_gestures_v1_get_swipe_gesture(g, p.pointer);
+    auto* pinch = zwp_pointer_gestures_v1_get_pinch_gesture(g, p.pointer);
+    auto* hold = zwp_pointer_gestures_v1_get_hold_gesture(g, p.pointer);
+    p.c.created.push_back(reinterpret_cast<wl_proxy*>(swipe));
+    p.c.created.push_back(reinterpret_cast<wl_proxy*>(pinch));
+    p.c.created.push_back(reinterpret_cast<wl_proxy*>(hold));
+    zwp_pointer_gesture_swipe_v1_add_listener(swipe, &swipe_listener, &log);
+    zwp_pointer_gesture_pinch_v1_add_listener(pinch, &pinch_listener, &log);
+    zwp_pointer_gesture_hold_v1_add_listener(hold, &hold_listener, &log);
     settle(p.c);
     // Pointer elsewhere: nothing.
     park_pointer();
@@ -822,6 +838,7 @@ void gesture_cases() {
     check("gestures: pinch (scale, rotation, cancelled) and hold (v3)",
           joined(log.events) == "pinch-begin 2; pinch-update 1.50 10.0; pinch-end 1; hold-begin 4; hold-end 1",
           joined(log.events));
+    untrack(p.c, reinterpret_cast<wl_proxy*>(g)); // release frees the proxy
     zwp_pointer_gestures_v1_release(g);
     settle(p.c);
     check("gestures: release (v2) destroys the manager cleanly", wl_display_get_error(p.c.display) == 0, "");
