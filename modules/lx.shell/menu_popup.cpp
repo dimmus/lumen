@@ -785,7 +785,8 @@ lx::ui::child lx::shell::menu_popup::build_ui(unsigned index) {
         }
         {
             int mn = -1;
-            const std::string label = menu_label(e.label, &mn);
+            std::string& label = l.label[i];
+            label = menu_label(e.label, &mn);
             parts[p++] = menu_text_at(
                 {k_menu_indicator, 0, right - k_menu_indicator, r.height}, label.c_str(), color,
                 e.header ? menu_header_font() : menu_font(),
