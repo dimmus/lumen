@@ -282,6 +282,10 @@ private:
     const task_model* tasks_ = nullptr;
     static constexpr unsigned k_icon_slots = 16;
     icon_slot icon_slots_[k_icon_slots]{};
+    /// Stable storage for the letter tiles: a build_ui() stack buffer would dangle,
+    /// because the retained text blocks read their string at the NEXT tick's reconcile
+    /// (ASan: stack-use-after-return in strlen, the same class the panel tiles had).
+    char letters_[k_switcher_max][2]{};
     cell_ref cell_refs_[k_switcher_max]{};
 };
 
@@ -697,9 +701,10 @@ lx::ui::child lx::shell::switcher_view::build_ui() {
                 const char* src = e->app_id[0] ? e->app_id : (e->title[0] ? e->title : "?");
                 if (const char* dot = std::strrchr(src, '.'); dot && dot[1])
                     src = dot + 1;
-                char letter[2] = {src[0] >= 'a' && src[0] <= 'z' ? static_cast<char>(src[0] - 32)
-                                                                : src[0],
-                                  0};
+                char* const letter = letters_[i];
+                letter[0] = src[0] >= 'a' && src[0] <= 'z' ? static_cast<char>(src[0] - 32)
+                                                           : src[0];
+                letter[1] = '\0';
                 const lx::ui::child glyph[1] = {switcher_text(letter[0] ? letter : "?", k_sw_text,
                                                               k_sw_letter_font, 0x5202'0000u + i)};
                 lx::ui::quad_style q{};
