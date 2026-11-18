@@ -166,11 +166,11 @@ void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-#endif // LUMEN_TEST_ALLOC_COUNTING
 void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
+#endif // LUMEN_TEST_ALLOC_COUNTING
 
 namespace {
 
