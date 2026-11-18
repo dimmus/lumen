@@ -1,0 +1,132 @@
+== quiet CPU: PM-QoS latency 10 us held, cpu3 governor schedutil -> performance
+== host warm-up: probe 1 S2 frame p50 29.341 us (settles at <= 31.38)
+== lumen-ui-bench: backend=none warmup=120 pin=3 -> tests/bench/results/iritur-08fd3c-none/20261118-dfe18cd-dirty-2.json
+lumen-ui-bench  backend=none  frames=600  warmup=120  period-us=1000  scale=1.00  pin=3  git=dfe18cd-dirty  preset=release
+host: 7.2.15-arch1-1 x86_64, 4 cpus, Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz
+
+S1  idle window  (15 nodes, 640x480, 600 frames after 120 warm-up)
+  stage                 samples     p50 us     p95 us     p99 us     max us
+  update                    600      0.023      0.026      0.062      0.092
+  tick_idle                 600      0.177      0.220      0.824      2.594
+  update_idle               600      0.200      0.245      0.850      2.654
+  counters   frames_produced=0 frames_idle=600 frames_described=0 primitives=0 (built 86) surfaces=0 refs=0 batches=0 instance_bytes=0 damage_rects=0 damage_px=0 (0.00%) overflow_drops=0 raster_px=0 draw_calls=0 gpu_disjoint=0
+  memory     allocations=0 (0.000/frame, 0 B)  mallinfo2.uordblks delta=0 B  RssAnon=6328 kB  steady: page faults 1 minor 0 major, 0 preemptions
+  gates      G1 pass (0 frames produced, 0 primitives emitted over 600 idle ticks) G5 pass (0 heap allocations in 600 steady frames, mallinfo2 delta 0 B)
+lumen-ui-bench  backend=none  frames=36000  warmup=120  period-us=1000  scale=1.00  pin=3  git=dfe18cd-dirty  preset=release
+host: 7.2.15-arch1-1 x86_64, 4 cpus, Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz
+S2: theme one-dark.lxtheme, icons Lucide (librsvg)
+
+S2  shell panel on components  (301 nodes, 1920x1080, 36000 frames after 120 warm-up)
+  stage                 samples     p50 us     p95 us     p99 us     max us
+  update                  36000      0.058      0.189      0.621     12.435
+  tick_idle               35400      0.165      0.247      1.155     11.525
+  tick                      600     27.542     70.809     79.796     95.627
+  reconcile                 600      3.755     12.629     13.642     15.793
+  layout                    600     18.460     45.777     51.681     66.270
+  emit                      600      3.986     10.240     15.161     29.263
+  order                     600      0.438      0.903      1.196      1.973
+  encode                    600      0.234      0.660      0.827      1.943
+  emit_order_encode         600      4.682     11.909     15.856     30.924
+  frame                     600     28.326     72.971     81.884     98.106
+  layout_emit_order_encode      600     23.571     57.522     67.609     80.399
+  update_frame              600     28.693     74.089     83.200    100.818
+  update_idle             35400      0.224      0.366      1.715     12.998
+  counters   frames_produced=600 frames_idle=35400 frames_described=0 primitives=10 (built 141) surfaces=0 refs=10 batches=2 instance_bytes=672 damage_rects=1 damage_px=1357 (0.07%) overflow_drops=0 raster_px=0 draw_calls=0 gpu_disjoint=0
+  layout     per produced frame: measures max 9 (9.0 avg), measure hits max 2, arranges max 5 (5.0 avg); nodes emitted 7; damage 1-1 rect(s), max 1357 px (0.065% of the surface)
+  memory     allocations=0 (0.000/frame, 0 B)  mallinfo2.uordblks delta=0 B  RssAnon=13676 kB  steady: page faults 240 minor 0 major, 15 preemptions
+  text       document 0 B, 0 lines, 0 glyphs, layout storage 0 KiB; first frame 25482.3 us (layout 19379.3 us, 26 shaping calls, 86 glyphs rasterised, 28152 B uploaded)
+  text       steady: shaping_calls=600 (max 1/frame) rasterized=13 (max 1/frame, 13 frames) upload_bytes=1024 (max 90/frame, 1 rects, 13 frames) sprites=8/frame (max) glyphs=0 lines_drawn=0 sprite_batches=1 per_page=1 pages=1 sprite_draws_per_page=0
+  gates      G2 pass (change frame p50 28.7 p95 74.1 us (<= 150) over 600 frames (>= 600); between p95 0.37 us; damage 1 rect(s), 0.07% of the surface (<= 2%)) G5 pass (0 heap allocations in 36000 steady frames, mallinfo2 delta 0 B)
+
+S2 flex solve cost, 301-node panel tree (sizeof(ui_node) 64 B; 0 allocations; us)
+  dirty         p50        p95        p99   measures       hits   arranges    skipped
+  cold       109.11     111.79     119.24       1170          0        301          0
+  warm         1.68       1.73       3.27          0         10          1         10
+  leaf        11.09      11.15      13.52          5        121          3         37
+lumen-ui-bench  backend=none  frames=1800  warmup=120  period-us=1000  scale=1.00  pin=3  git=dfe18cd-dirty  preset=release
+host: 7.2.15-arch1-1 x86_64, 4 cpus, Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz
+
+S3  drifting rounded quads  (10651 nodes, 1919x1080, 1800 frames after 120 warm-up)
+  stage                 samples     p50 us     p95 us     p99 us     max us
+  update                   1800     97.342    102.533    114.551    129.987
+  tick                     1800    386.431    403.326    612.223    673.130
+  layout                   1800     84.829     88.486    136.438    156.214
+  emit                     1800    301.034    313.048    480.181    515.069
+  order                    1800     27.536     29.070     32.433     41.329
+  encode                   1800     68.275     72.734     83.934    142.376
+  emit_order_encode        1800    397.352    414.145    590.670    642.380
+  frame                    1800    482.819    503.578    723.175    800.684
+  layout_emit_order_encode     1800    482.153    502.822    722.051    798.594
+  update_frame             1800    579.898    604.889    841.600    915.477
+  counters   frames_produced=1800 frames_idle=0 frames_described=0 primitives=10001 (built 10001) surfaces=0 refs=10001 batches=1 instance_bytes=800080 damage_rects=0 damage_px=0 (0.00%) overflow_drops=0 raster_px=0 draw_calls=0 gpu_disjoint=0
+  layout     per produced frame: measures max 0 (0.0 avg), measure hits max 0, arranges max 1 (1.0 avg); nodes emitted 10651; damage 0-0 rect(s), max 0 px (0.000% of the surface)
+  memory     allocations=0 (0.000/frame, 0 B)  mallinfo2.uordblks delta=0 B  RssAnon=7416 kB  steady: page faults 26 minor 0 major, 27 preemptions
+  gates      G3 pass (emit+order+encode p95 414.1 us (<= 1000) over 1800 frames, 1 batch(es) (<= 8), 800080 instance bytes (<= 819200)) G5 pass (0 heap allocations in 1800 steady frames, mallinfo2 delta 0 B)
+lumen-ui-bench  backend=none  frames=1800  warmup=120  period-us=1000  scale=1.00  pin=3  git=dfe18cd-dirty  preset=release
+host: 7.2.15-arch1-1 x86_64, 4 cpus, Intel(R) Core(TM) i7-5500U CPU @ 2.40GHz
+
+S4  scrolling text wall  (2 nodes, 1920x1080, 1800 frames after 120 warm-up)
+  stage                 samples     p50 us     p95 us     p99 us     max us
+  update                   1800      0.222      0.277      0.598      2.478
+  tick                     1800    119.062    124.621    141.689    218.866
+  layout                   1800      0.321      0.388      0.685      1.400
+  emit                     1800    118.319    123.863    140.946    215.808
+  order                    1800     20.018     20.447     20.547     38.979
+  encode                   1800     10.907     11.392     11.796     19.883
+  emit_order_encode        1800    149.182    155.414    173.089    270.717
+  frame                    1800    149.993    156.243    173.971    273.987
+  layout_emit_order_encode     1800    149.502    155.763    173.406    271.636
+  update_frame             1800    150.216    156.483    174.186    274.983
+  counters   frames_produced=1800 frames_idle=0 frames_described=0 primitives=2014 (built 1918) surfaces=0 refs=2014 batches=2 instance_bytes=128912 damage_rects=0 damage_px=0 (0.00%) overflow_drops=0 raster_px=0 draw_calls=0 gpu_disjoint=0
+  layout     per produced frame: measures max 0 (0.0 avg), measure hits max 0, arranges max 0 (0.0 avg); nodes emitted 2; damage 0-0 rect(s), max 0 px (0.000% of the surface)
+  memory     allocations=0 (0.000/frame, 0 B)  mallinfo2.uordblks delta=0 B  RssAnon=19028 kB  steady: page faults 32 minor 0 major, 0 preemptions
+  text       document 139375 B, 2000 lines, 99771 glyphs, layout storage 7904 KiB; first frame 63133.2 us (layout 59988.0 us, 3673 shaping calls, 402 glyphs rasterised, 39904 B uploaded)
+  text       steady: shaping_calls=0 (max 0/frame) rasterized=45 (max 4/frame, 33 frames) upload_bytes=3740 (max 318/frame, 2 rects, 33 frames) sprites=2096/frame (max) glyphs=2499 lines_drawn=50 sprite_batches=1 per_page=1 pages=1 sprite_draws_per_page=0
+  gates      G4 pass (layout+emit+order+encode p50 149.5 p95 155.8 us (<= 2000) over 1800 frames, 0 shaping calls (0), 1 sprite batch(es) per page (<= 1)) G5 pass (0 heap allocations in 1800 steady frames, mallinfo2 delta 0 B)
+
+S4 reshape cost by invalidation size (inline on this thread; us)
+  size          bytes  lines  glyphs  shapes  first p50   cold p50   cold p95   warm p50   warm p95 rewrap p50 rewrap p95
+  label            14      1      10       2       11.9       10.4       13.1        2.1        2.1        0.2        0.2
+  line             76      1      50       9      305.0       30.6       33.6        9.9       10.0        0.4        0.4
+  paragraph       669      2     507      46      516.1      220.2      233.1       85.6       90.8        2.9        3.0
+  page           6879    100    4990     320     2361.7     2062.0     2082.3      978.9      984.4       40.2       41.5
+  document     139375   2000   99771    3673    36071.0    35663.2    36385.4    21172.3    21509.4      910.7      926.4
+
+== compare against tests/bench/baseline/iritur-08fd3c-none.json
+  ok   S1  update             p50     0.023 ->     0.023 us   +0.0 %, p95     0.030 ->     0.026 us  -13.3 %
+  ok   S1  tick_idle          p50     0.179 ->     0.177 us   -1.1 %, p95     0.260 ->     0.220 us  -15.4 %
+  ok   S1  update_idle        p50     0.202 ->     0.200 us   -1.0 %, p95     0.297 ->     0.245 us  -17.5 %
+  ok   S2  update             p50     0.059 ->     0.058 us   -1.7 %, p95     0.147 ->     0.189 us  +28.6 %
+  ok   S2  tick_idle          p50     0.169 ->     0.165 us   -2.4 %, p95     0.267 ->     0.247 us   -7.5 %
+  ok   S2  tick               p50    26.385 ->    27.542 us   +4.4 %, p95    65.606 ->    70.809 us   +7.9 %
+  ok   S2  reconcile          p50     3.629 ->     3.755 us   +3.5 %, p95    11.652 ->    12.629 us   +8.4 %
+  ok   S2  layout             p50    18.057 ->    18.460 us   +2.2 %, p95    42.868 ->    45.777 us   +6.8 %
+  ok   S2  emit               p50     3.762 ->     3.986 us   +6.0 %, p95     9.268 ->    10.240 us  +10.5 %
+  ok   S2  order              p50     0.471 ->     0.438 us   -7.0 %, p95     0.942 ->     0.903 us   -4.1 %
+  ok   S2  encode             p50     0.291 ->     0.234 us  -19.6 %, p95     0.802 ->     0.660 us  -17.7 %
+  ok   S2  emit_order_encode  p50     4.544 ->     4.682 us   +3.0 %, p95    11.068 ->    11.909 us   +7.6 %
+  ok   S2  frame              p50    27.284 ->    28.326 us   +3.8 %, p95    67.727 ->    72.971 us   +7.7 %
+  ok   S2  layout_emit_order_encode p50    22.696 ->    23.571 us   +3.9 %, p95    52.937 ->    57.522 us   +8.7 %
+  ok   S2  update_frame       p50    27.620 ->    28.693 us   +3.9 %, p95    69.011 ->    74.089 us   +7.4 %
+  ok   S2  update_idle        p50     0.234 ->     0.224 us   -4.3 %, p95     0.368 ->     0.366 us   -0.5 %
+  ok   S3  update             p50    98.528 ->    97.342 us   -1.2 %, p95   104.909 ->   102.533 us   -2.3 %
+  ok   S3  tick               p50   399.791 ->   386.431 us   -3.3 %, p95   408.827 ->   403.326 us   -1.3 %
+  ok   S3  layout             p50    86.403 ->    84.829 us   -1.8 %, p95    91.901 ->    88.486 us   -3.7 %
+  ok   S3  emit               p50   311.953 ->   301.034 us   -3.5 %, p95   319.166 ->   313.048 us   -1.9 %
+  ok   S3  order              p50    31.497 ->    27.536 us  -12.6 %, p95    33.902 ->    29.070 us  -14.3 %
+  ok   S3  encode             p50    68.540 ->    68.275 us   -0.4 %, p95    71.460 ->    72.734 us   +1.8 %
+  ok   S3  emit_order_encode  p50   410.902 ->   397.352 us   -3.3 %, p95   420.303 ->   414.145 us   -1.5 %
+  ok   S3  frame              p50   499.542 ->   482.819 us   -3.3 %, p95   510.208 ->   503.578 us   -1.3 %
+  ok   S3  layout_emit_order_encode p50   498.782 ->   482.153 us   -3.3 %, p95   509.337 ->   502.822 us   -1.3 %
+  ok   S3  update_frame       p50   598.415 ->   579.898 us   -3.1 %, p95   611.029 ->   604.889 us   -1.0 %
+  ok   S4  update             p50     0.216 ->     0.222 us   +2.8 %, p95     0.260 ->     0.277 us   +6.5 %
+  ok   S4  tick               p50   121.903 ->   119.062 us   -2.3 %, p95   127.411 ->   124.621 us   -2.2 %
+  ok   S4  layout             p50     0.297 ->     0.321 us   +8.1 %, p95     0.383 ->     0.388 us   +1.3 %
+  ok   S4  emit               p50   120.954 ->   118.319 us   -2.2 %, p95   126.497 ->   123.863 us   -2.1 %
+  ok   S4  order              p50    20.119 ->    20.018 us   -0.5 %, p95    20.521 ->    20.447 us   -0.4 %
+  ok   S4  encode             p50    11.059 ->    10.907 us   -1.4 %, p95    11.528 ->    11.392 us   -1.2 %
+  ok   S4  emit_order_encode  p50   152.112 ->   149.182 us   -1.9 %, p95   158.447 ->   155.414 us   -1.9 %
+  ok   S4  frame              p50   153.121 ->   149.993 us   -2.0 %, p95   159.456 ->   156.243 us   -2.0 %
+  ok   S4  layout_emit_order_encode p50   152.426 ->   149.502 us   -1.9 %, p95   158.796 ->   155.763 us   -1.9 %
+  ok   S4  update_frame       p50   153.343 ->   150.216 us   -2.0 %, p95   159.663 ->   156.483 us   -2.0 %
+== 0 failure(s), 0 warning(s)
