@@ -24,6 +24,7 @@ args:
     type: json
     description: "Compositors to compare (json array); names: lumen, weston, sway, hyprland"
     default: '["lumen", "weston", "sway"]'
+  scope: current-project — harness paths, hosts and comparators are Lumen's.
 */
 interface CompRow {
   /** Compositor name as compare.sh reports it: lumen, weston, sway, hyprland. */

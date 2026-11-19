@@ -6,6 +6,18 @@ current when an item closes.
 
 ## Now
 
+- [ ] **Push/merge policy flipped — pre-2026-11-19 "never push" notes above are
+  historical** (owner standing rule, 2026-11-19): all positive work (gate-READY) now
+  ends committed, merged into main by the run (topological order, merged tree
+  re-gated; ff-only on the light path) and pushed to origin over SSH. Below-READY
+  outcomes still go to the owner. `gh` is not installed and HTTPS has no credential
+  helper, so the PR of record is the PR-text artifact + the merge commit — owner may
+  install `gh` if real PR objects are wanted (then the workflows gain a PR step).
+- [x] **Agent-level parallelism landed** (2026-11-19, this change): gated-change
+  confirmations now dispatch under `Promise.all` (studio already did), and
+  `lumen-studio` §Lead duties mandates parallel dispatch of independent role agents.
+  Engine-level parallel task LANES remain deferred (row below) — a 2-core host makes
+  parallel builds counterproductive; parallelism belongs to agents, not compiles.
 - [x] **Commit/PR the ADR-013 settings-app tree** — closed 2026-11-17: everything merged to
   main (`ebe7046` portal Settings, `eaaf7ba` LUMEN_THEME export, `9022e74` settings-startup
   apply); 136/136 ctest at merged main. Push/PR remains the owner's call (never pushed
