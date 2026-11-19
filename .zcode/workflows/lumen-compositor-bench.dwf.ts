@@ -120,13 +120,14 @@ for (const t of targets.filter((x) => x !== "lumen")) {
 }
 const quiet = await world.run(
   "bash",
-  ["-c", 'pgrep -ax lumen-compositor; pgrep -af "^bash .*-smoke\\.sh"; cat /proc/loadavg; true'],
+  // One implementation of the quiet-seat triple: the broker (lumen-seat skill).
+  ["-c", "exec ./scripts/seat-lock.sh status"],
   { output: { tail: 4096 } },
 );
-const busyLines = quiet.stdout.trim().split("\n").filter((l) => l.trim() !== "" && !/^\d+\.\d+ \d+\.\d+ \d+\.\d+/.test(l.trim()));
+const busyLines = quiet.stdout.trim().split("\n").filter((l) => l.startsWith("FAIL:"));
 if (missing.length > 0 || busyLines.length > 0) {
   const blocked: WorkflowReport = {
-    conclusion: `Preflight blocked: ${missing.length > 0 ? `not installed: ${missing.join(", ")}` : ""}${busyLines.length > 0 ? `${missing.length > 0 ? "; " : ""}seat not quiet (a compositor/smoke session is running)` : ""}.`,
+    conclusion: `Preflight blocked: ${missing.length > 0 ? `not installed: ${missing.join(", ")}` : ""}${busyLines.length > 0 ? `${missing.length > 0 ? "; " : ""}seat not quiet (${busyLines.join("; ")})` : ""}.`,
     findings: busyLines.length > 0
       ? [{ where: "seat", what: "another compositor or smoke session holds the seat", evidence: busyLines.join(" | "), status: "verified", severity: "medium" }]
       : [],
@@ -135,13 +136,15 @@ if (missing.length > 0 || busyLines.length > 0) {
   };
   return blocked;
 }
-const load1 = Number((quiet.stdout.trim().split("\n").pop() ?? "99").split(" ")[0]);
+const load1 = Number((quiet.stdout.trim().split("\n").find((l) => l.startsWith("loadavg:")) ?? "loadavg: 99").split(" ")[1]);
 log(`Preflight ok (load ${load1}); targets: ${targets.join(", ")}`);
 
 phase("Run the interleaved comparison rounds on the seat");
+// The whole comparison holds one broker ticket (class bench) — a smoke or
+// screenshot interleaving with it contaminates the measurements.
 const compare = await world.run(
   "bash",
-  ["-c", `ROUNDS=${rounds} NAMES=${targets.join(",")} exec ${CMP}/compare.sh`],
+  ["-c", `exec ./scripts/seat-lock.sh with bench compare --wait 1800 -- bash -c 'ROUNDS=${rounds} NAMES=${targets.join(",")} exec ${CMP}/compare.sh'`],
   { timeoutMs: 3_600_000, output: { tail: 65_536 } },
 );
 if (compare.exitCode !== 0) {
@@ -221,12 +224,12 @@ const conclusion = comps.length === 0
       : "");
 const memory = await agent("Memory writer", {
   system:
-    "You write Lumen's project memory records. Work in the MAIN checkout at /home/dimmus/lumen. " +
-    "Read .zcode/skills/lumen-memory-writer/SKILL.md if present and 2-3 files in .zcode/memories/ to match " +
-    "the archive's voice. Write .zcode/memories/lumen-<kebab-topic>.md: YAML frontmatter (name, dense " +
-    "description with dates/numbers), dated verified facts with inline evidence (commands, artifact paths, " +
-    "measured numbers), then **Why:** and **How to apply:**. Add the MEMORY.md row. Commit both files on the " +
-    "current branch with subject 'memory: <topic>' (git add the two files only; never push).",
+    "You write Lumen's project memory records. Your full contract is .zcode/agents/lumen-memory-writer.md " +
+    "and .zcode/skills/lumen-memory-writer/SKILL.md — read them first, they are binding. Work in the MAIN " +
+    "checkout (this workflow's cwd). Frontmatter summary/modules/topics; the index regenerated with " +
+    "scripts/gen-memory-index.py; the commit lands on main directly or is SPOOLED to " +
+    "refs/heads/zcode/memory-spool when the checkout sits on another branch — never committed onto a " +
+    "feature branch (lost on switch-back). Never push.",
   model: "GLM-5.3-Flash",
 }).ask<MemoryRecord>(
   `Record this cross-compositor comparison. Host: the vmware Arch VM (vmwgfx, GL path, no hardware Vulkan; ` +
