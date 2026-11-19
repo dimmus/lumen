@@ -75,6 +75,12 @@ runs with `AmendWorkflow` + `path` edits, never full re-submissions. Reuse the
 `lumen-decisions`/`lumen-build-run` skills instead of re-deriving their facts. Don't spawn
 a confirmer on a finding a command already decided.
 
+**Reading large files** (the repo's `.cppm`s run past 5,000 lines): grep for the symbol
+first, read ±40 lines around the hits, `git log -L <range>:<file>` when history decides
+the question; never `cat` a file over ~400 lines; never re-read a file after an edit —
+the edit tool already verified the change. Memory retrieval goes through the generated
+`.zcode/memories/INDEX.md` (grep the module slice) — never load the whole archive.
+
 **Bounded auditors** (learned from the xdg-toplevel-drag run, where one bare-ask
 confirmation of a heavy finding cost 3.9M tokens — the subagent bootstrapped its whole
 context from zero, overflowed, and re-read after compaction): confirmers and gatekeepers
