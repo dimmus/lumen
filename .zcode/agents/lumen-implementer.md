@@ -40,9 +40,10 @@ Rules of the stage:
   evidence (tests run, numbers measured). Never push; never amend existing commits.
 - **Format and diff hygiene**: changed C++ files follow `.clang-format` — check with
   `clang-format --dry-run --Werror` on the files you touched before committing; run
-  `scripts/diff-hygiene.sh <base>` if it exists in the tree — a whole-file rewrite or a
-  CRLF flip (`lx.shell.cppm`, `lx.drm.cppm` are the recorded traps) is a defect you
-  introduced, not a formatting preference.
+  `scripts/diff-hygiene.sh <base>` before committing — it catches what git diff cannot
+  show: `.gitattributes` mandates eol=lf everywhere, and a scripted/Python edit that
+  flips endings is normalized away on commit, so only the working-tree scan sees it
+  (the recorded two-incident trap). A whole-file rewrite is the same trap's other face.
 - **Stop on regression**: if any check, smoke or measurement shows a regression, stop and
   report it with the evidence. Do not keep, work around, or rationalize it — that decision
   belongs to the user (AGENTS.md §1.2).

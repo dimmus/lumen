@@ -35,8 +35,9 @@ eyes miss):
 - `ctest -R layer_graph` (or `python3 scripts/check-layer-graph.py`) — the layer-graph
   invariant is machine-checked; an upward edge it reports is a CRITICAL finding, not an
   opinion.
-- `scripts/diff-hygiene.sh <base>` — CRLF flips, whole-file rewrites (the `lx.shell.cppm`
-  / `lx.drm.cppm` CRLF trap has two recorded incidents), and `clang-format --dry-run
+- `scripts/diff-hygiene.sh <base>` — line-ending policy (.gitattributes says eol=lf; a
+  scripted edit flipping endings is invisible to git diff because commit normalizes it —
+  the recorded two-incident trap), whole-file rewrites, and `clang-format --dry-run
   --Werror` on the changed C++ files. Its findings are yours to report, with its output
   as evidence.
 
