@@ -4,6 +4,10 @@ description: "2026-11-13/14 notebook seat fix (worktree panel-blur-fix, b8d9277.
 metadata:
   node_type: memory
   type: project
+summary: "Blur manager rebinds per-connection via pre-connect global_handler; live blur rebuilds panels; first hasvk blur pixels; gates BLOCKED ×2 then closed by committed gate-time smokes"
+modules: lx.shell
+topics: blur, panel
+
 ---
 
 Verified 2026-11-13/14 on the **notebook** (card0 nouveau, card1 i915, hasvk Vulkan,

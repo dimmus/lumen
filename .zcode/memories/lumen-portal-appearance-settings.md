@@ -4,6 +4,10 @@ description: "2026-11-16 notebook task (worktree portal-appearance-settings, 90b
 metadata:
   node_type: memory
   type: project
+summary: "xdg-desktop-portal-lumen serves impl.portal.Settings v1 → org.freedesktop.appearance; Zed followed light/dark/live; Nov-16 seat reds were the concurrent-session family, closed by redo"
+modules: lx.portal
+topics: portal, settings, dark-mode
+
 ---
 
 Verified 2026-11-16 on the **notebook** (iritur i915+nouveau, [[lumen-notebook-hw]]; the

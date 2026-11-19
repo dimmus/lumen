@@ -4,6 +4,10 @@ description: "2026-11-18 notebook: first-ever sanitizer runs on this host — AS
 metadata:
   node_type: memory
   type: project
+summary: "First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions"
+modules: harness, modules
+topics: asan, tsan, sanitizers
+
 ---
 
 Verified 2026-11-18 on the notebook iritur (task `sanitizer-sweep-green`, worktree

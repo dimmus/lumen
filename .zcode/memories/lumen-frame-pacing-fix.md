@@ -3,6 +3,10 @@ name: lumen-frame-pacing-fix
 description: "The callback-driven client pacing bug (46–53 fps, a quarter of frames a period late) found on the notebook 2026-11-03 and fixed 2026-11-04: the aim pairing was blind to exactly the late frames and the repaint lead had no whole-path feedback; the fix, the disproven theories, and the measured after"
 metadata:
   type: project
+summary: "2026-11-04: four-entry aim ring + observe_commit_late whole-path lead fixed fast-client frame pacing (59.9 fps, 1 late/200); k_client_margin_ns must not absorb handoff costs"
+modules: lx.compositor
+topics: frame-clock, pacing
+
 ---
 
 A `wl_surface.frame`-driven wl_shm client answering in ~60 µs (pres-probe in

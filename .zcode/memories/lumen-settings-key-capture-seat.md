@@ -4,6 +4,10 @@ description: "ADR-013 key capture proven on the notebook seat 2026-11-17 (Super+
 metadata:
   node_type: memory
   type: project
+summary: "ADR-013 key capture proven live (Super+Shift+y, splice gen 57→58, reserved Super+Escape refuses); trap: injected Super-chords trip the tap grab mid-chord — open TODO row"
+modules: lx.ui, lx.config
+topics: bindings, capture, adr-013
+
 ---
 
 Verified 2026-11-17 on the notebook `iritur` (i915+nouveau), quiet serialized seat session

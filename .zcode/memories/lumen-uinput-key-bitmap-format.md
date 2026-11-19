@@ -4,6 +4,10 @@ description: "2026-11-17 notebook: /proc/bus/input/devices B: KEY bitmaps print 
 metadata:
   node_type: memory
   type: project
+summary: "/proc KEY bitmap is 64-bit words MSW-first: 70000 0 0 0 0 IS BTN_LEFT/RIGHT/MIDDLE — never read caps from /proc text, use EVIOCGBIT; two gate records' 'no BTN codes' were misreadings"
+modules: scripts
+topics: uinput, evdev
+
 ---
 
 Verified 2026-11-17 on the **notebook** (iritur, i915+nouveau), during the seat-gate redo

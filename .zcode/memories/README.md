@@ -1,7 +1,7 @@
 # Lumen agent memories (archived from Claude Code)
 
 Verbatim archive of the project memory directory `~/.claude/projects/-home-dimmus-lumen/memory/`
-(snapshot 2026-11-02; files dated 2026-10-14 … 2026-10-30). `MEMORY.md` is the original index.
+(snapshot 2026-11-02; files dated 2026-10-14 … 2026-10-30). `MEMORY.md` and `INDEX.md` are GENERATED indexes — regenerate with `scripts/gen-memory-index.py`, never hand-edit rows.
 
 These are the full-fidelity records behind two distilled, always-relevant resources:
 

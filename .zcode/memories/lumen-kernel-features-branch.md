@@ -6,6 +6,10 @@ metadata:
   type: project
   originSessionId: a6815e3f-842a-4d0e-ab37-0ebf35aad1d9
   modified: 2026-10-28T04:39:10.273Z
+summary: "PSI + fence deadlines + pidfd + fdinfo + CLOSEFB shipped b4550d3; EEVDF/RT scheduling REVERTED (cursor p95 25.5→35.2 ms); expect drm_timeline_ops::query caller updates on merge"
+modules: lx.runtime, lx.drm
+topics: kernel, psi
+
 ---
 
 On 2026-10-28 the user asked to implement six newer-kernel items with workflows. Branch `claude/kernel-features`, worktree `.claude/worktrees/kernel-features`; commits 31d3e57..cf7b8ad, main (812ad52, PR #54) merged in. 116/116 tests and tty-smoke pass. Merged to main 2026-10-28 as b4550d3 (pushed directly at the user's request, no PR; main from PR #55 merged in first, that last merge not built or tested at the user's request).

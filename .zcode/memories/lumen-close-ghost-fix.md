@@ -4,6 +4,10 @@ description: "2026-11-14 notebook seat fix (worktree close-ghost-fix, f1391e2..e
 metadata:
   node_type: memory
   type: project
+summary: "Ghost freeze root-caused to the null-buffer commit collapsing geometry before on_unmap sized the ghost — fix = unmap branch first + make_ghost widens bounds; unit cases 35/35, app-smoke FAIL set 32→31"
+modules: lx.compositor
+topics: damage, unmap, ghost
+
 ---
 
 Verified 2026-11-14 on the **notebook** (nouveau card0 + i915 card1 per each session's
