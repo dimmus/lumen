@@ -98,6 +98,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Seat serialization (scripts/seat-lock.sh — the broker contract): a seat job
+# holds a broker ticket for its whole run; two seat jobs on one host
+# contaminate each other's evidence, so evidence without a ticket is INVALID.
+# Re-exec under the broker — the env var breaks the recursion, --help stays
+# lock-free — and a failed acquire is COULD NOT RUN (exit 2), never a quiet pass.
+if [[ -z "${LUMEN_SEAT_LOCKED:-}" && "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
+  exec "$ROOT/scripts/seat-lock.sh" with bench "$(basename "$0")" -- \
+    env LUMEN_SEAT_LOCKED=1 bash "$0" "$@"
+fi
+
 BUILD="${LUMEN_BUILD_DIR:-${ROOT}/build/release}"
 BENCH="${BUILD}/lumen-ui-bench"
 ABS_FLOOR_US=1.0
