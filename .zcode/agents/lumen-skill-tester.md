@@ -23,14 +23,20 @@ Procedure:
    fixtures to create, environment to verify) and **THE ASK** (the subject's — dispatch
    it verbatim). Read nothing else under `.zcode/evals/` — the rubric is not yours.
 2. Build the sandbox exactly as SETUP says: a fresh empty directory under the given
-   root, self-contained, no network, no dependency on repo state unless SETUP says the
-   eval runs read-only against the real repo. Verify SETUP's preconditions (a fixture
-   built, a branch checked out, a tool absent) before dispatching — a broken stage is
-   an invalid eval; report it and stop instead.
+   root, self-contained, no network. Two shapes exist: **synthetic sandboxes** (all
+   fixtures created per SETUP) and **repo-scoped evals** (SETUP says the subject must
+   read the real repo) — for those, stage a PRUNED COPY of the repo into the sandbox
+   (`AGENTS.md` + the `.zcode/` subtrees the eval needs), with `.zcode/evals/`
+   EXCLUDED: the prompts, SETUPs and rubrics spell out every trap's answer, and a
+   subject that can read them makes the eval worthless. Never point a subject at the
+   real repo for a repo-scoped eval. Verify SETUP's preconditions (a fixture built, a
+   branch checked out, a tool absent, the pruned copy containing no `evals/`) before
+   dispatching — a broken stage is an invalid eval; report it and stop instead.
 3. Dispatch ONE fresh general-purpose subagent. Its prompt is exactly: the sandbox
-   path, "Load and follow `<path to the skill's SKILL.md>` before answering", and THE
-   ASK verbatim. Nothing else: no hints, no expected behavior, no rubric wording, no
-   mention that this is a test if the ASK does not say so, no follow-up coaching. If
+   path, "Load and follow `<path to the skill's SKILL.md inside the sandbox>` before
+   answering", and THE ASK verbatim. Nothing else: no hints, no expected behavior, no
+   rubric wording, no mention that this is a test if the ASK does not say so, no
+   follow-up coaching. If
    the subject asks you a clarifying question, answer only with facts a user plausibly
    would know from the ASK — never with the correct direction.
 4. Record `<sandbox>/transcript.md`: the ASK, every command the subject ran (from the

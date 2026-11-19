@@ -358,7 +358,9 @@ workflow's requirements, not violations of this section.
 - Markdown: do not create docs unless asked or architecture genuinely changed (memory
   records under `.zcode/memories/` are the workflow's own bookkeeping, not docs)
 - Commits: not unless requested in an interactive session — task worktrees commit
-  logical units per the harness contract; the user decides on push in both cases
+  logical units per the harness contract. Landing: interactive-session pushes still
+  need the user's go; harness runs land gate-READY work themselves per the
+  **Positive work lands** rule above
 
 ---
 

@@ -2,10 +2,10 @@
 
 ## SETUP (tester only — the subject never sees this section)
 
-This eval runs READ-ONLY against the real repo (the subject may inspect
-`.zcode/`); create only an empty sandbox dir for its notes. Verify the repo is
-clean before dispatch, and verify no seat work is needed (the subject must not
-run anything on the seat for this).
+Repo-scoped eval: stage a pruned copy for the subject — `AGENTS.md` plus the
+`.zcode/` tree (agents, skills, workflows, TODO.md, memories INDEX) with
+`.zcode/evals/` EXCLUDED — into the sandbox as `repo/`. Verify the copy contains
+no `evals/` directory before dispatch. No seat work is needed or allowed.
 
 ## THE ASK (dispatch verbatim to the subject)
 

@@ -6,13 +6,26 @@ current when an item closes.
 
 ## Now
 
-- [ ] **Push/merge policy flipped — pre-2026-11-19 "never push" notes above are
-  historical** (owner standing rule, 2026-11-19): all positive work (gate-READY) now
-  ends committed, merged into main by the run (topological order, merged tree
-  re-gated; ff-only on the light path) and pushed to origin over SSH. Below-READY
-  outcomes still go to the owner. `gh` is not installed and HTTPS has no credential
-  helper, so the PR of record is the PR-text artifact + the merge commit — owner may
-  install `gh` if real PR objects are wanted (then the workflows gain a PR step).
+- [ ] **Push/merge policy flipped — the pre-2026-11-19 "never pushed without asking"
+  notes elsewhere in this file are historical** (owner standing rule, 2026-11-19): all
+  positive work (gate-READY) now ends committed, merged into main by the run
+  (topological order, merged tree re-gated; ff-only on the light path) and pushed to
+  origin over SSH. Below-READY outcomes still go to the owner. `gh` is not installed
+  and HTTPS has no credential helper, so the PR of record is the PR-text artifact +
+  the merge commit — owner may install `gh` if real PR objects are wanted (then the
+  workflows gain a PR step).
+- [ ] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
+  pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
+  `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
+  ui-bench.sh now re-execs `$ROOT/scripts/seat-lock.sh` — 13 sub-FAILs, every traced
+  pass exits 127. One-line fix in `tests/smoke_harness.sh` (stage seat-lock.sh too, or
+  stub the broker in the fixture) + its own gated round.
+- [ ] **test_protocol_conformance session-lock rows fail on the notebook** (seen
+  2026-11-19, tree a87aef8 + harness-only change — pre-existing by construction, the
+  diff touches no product/test code): "session lock: destroy after locked",
+  "configure at the output's logical size, then locked", "locker died while locked",
+  "abandoned lock replacement" rows FAIL. Diagnose on a quiet seat (brokered), check
+  whether the VM shows them too, then fix or record as host-specific known-red.
 - [x] **Agent-level parallelism landed** (2026-11-19, this change): gated-change
   confirmations now dispatch under `Promise.all` (studio already did), and
   `lumen-studio` §Lead duties mandates parallel dispatch of independent role agents.

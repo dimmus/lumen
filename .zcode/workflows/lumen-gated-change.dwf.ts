@@ -13,6 +13,7 @@ whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
   workflow for one Lumen change. For multi-task requests or full studio delivery
   (worktrees, commits, PR text, memory records) use lumen-development-studio
   instead. Not for small fixes or doc-only edits."
+  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 args:
   branch:
     type: string
@@ -34,7 +35,6 @@ args:
     type: string
     description: The change to implement (what you would tell the implementer)
     required: true
-  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 */
 interface ImplResult {
   /** 2-4 sentences: what was implemented and the shape of the solution. */
@@ -491,6 +491,7 @@ if (blockedOnHost) {
 // owner), and pushed. No gh CLI on this host: the report artifact plus the
 // merge commit is the PR of record.
 let mergedAndPushed = false;
+let mergedNotPushed = false;
 if (!gateFailed && !blockedOnHost) {
   phase("Commit, merge into main (ff-only) and push — positive work lands");
   const commitAsk = await implementer.ask(
@@ -498,26 +499,39 @@ if (!gateFailed && !blockedOnHost) {
       `messages (you wrote it — you know the units; summary line, what/why, evidence). Reply with the ` +
       `commit list only.`,
   );
-  const commits = await world.run("git", ["-C", wt, "log", "--oneline", `${branchPoint}..HEAD`], { output: { tail: 4096 } });
-  verified.push(`committed on ${branch}: ${commits.stdout.trim().split("\n").length} commit(s)\n${commitAsk}`);
-  const onMain = await world.run("git", ["-C", MAIN_WS, "branch", "--show-current"], { output: { tail: 512 } });
-  const mainClean = await world.run("git", ["-C", MAIN_WS, "status", "--porcelain"], { output: { tail: 2048 } });
-  if (onMain.exitCode !== 0 || onMain.stdout.trim() !== "main" || mainClean.stdout.trim() !== "") {
-    verified.push(`NOT merged: the main checkout at ${MAIN_WS} is not a clean main — the branch ${branch} is ready for a manual merge`);
+  // The gate tested the WORKING TREE (untracked files included); the merge lands
+  // commits. A partial commit would ff-merge a tree that was never gated — verify
+  // the commits captured everything before anything lands.
+  const leftover = await world.run("git", ["-C", wt, "status", "--porcelain"], { output: { tail: 2048 } });
+  const countRun = await world.run("git", ["-C", wt, "rev-list", "--count", `${branchPoint}..HEAD`], { output: { tail: 512 } });
+  const commitCount = countRun.exitCode === 0 ? Number(countRun.stdout.trim()) : Number.NaN;
+  if (leftover.exitCode !== 0 || leftover.stdout.trim() !== "" || !(commitCount >= 1)) {
+    verified.push(
+      `NOT landed: the commit handoff is incomplete in ${wt} (${leftover.stdout.trim() !== "" ? "uncommitted/untracked changes remain" : "zero commits on the branch"}) — ` +
+        `the merge would land a tree that was never gated; the branch holds the gated working tree for a manual commit+merge`,
+    );
   } else {
-    const merge = await world.run("git", ["-C", MAIN_WS, "merge", "--ff-only", branch], { output: { tail: 4096 } });
-    if (merge.exitCode !== 0) {
-      verified.push(
-        `NOT merged: main moved since ${branchPoint} — a fast-forward is impossible and the light path does ` +
-          `not merge untested combinations; merge ${branch} by hand (it was gated green on its own tree)`,
-      );
+    verified.push(`committed on ${branch}: ${commitCount} commit(s) — ${commitAsk}`);
+    const onMain = await world.run("git", ["-C", MAIN_WS, "branch", "--show-current"], { output: { tail: 512 } });
+    const mainClean = await world.run("git", ["-C", MAIN_WS, "status", "--porcelain"], { output: { tail: 2048 } });
+    if (onMain.exitCode !== 0 || onMain.stdout.trim() !== "main" || mainClean.stdout.trim() !== "") {
+      verified.push(`NOT merged: the main checkout at ${MAIN_WS} is not a clean main — the branch ${branch} is ready for a manual merge`);
     } else {
-      const push = await world.run("git", ["-C", MAIN_WS, "push", "origin", "main", branch], { timeoutMs: 300_000, output: { tail: 4096 } });
-      if (push.exitCode === 0) {
-        mergedAndPushed = true;
-        verified.push(`merged ${branch} into main (ff) and pushed origin main+branch (owner standing rule 2026-11-19)`);
+      const merge = await world.run("git", ["-C", MAIN_WS, "merge", "--ff-only", branch], { output: { tail: 4096 } });
+      if (merge.exitCode !== 0) {
+        verified.push(
+          `NOT merged: main moved since ${branchPoint} — a fast-forward is impossible and the light path does ` +
+            `not merge untested combinations; merge ${branch} by hand (it was gated green on its own tree)`,
+        );
       } else {
-        verified.push(`merged ${branch} into main (ff) but the PUSH failed — nothing lost locally; the owner pushes (SSH remote required): ${(push.stderr + push.stdout).trim().split("\n").slice(-2).join(" | ")}`);
+        const push = await world.run("git", ["-C", MAIN_WS, "push", "origin", "main", branch], { timeoutMs: 300_000, output: { tail: 4096 } });
+        if (push.exitCode === 0) {
+          mergedAndPushed = true;
+          verified.push(`merged ${branch} into main (ff) and pushed origin main+branch (owner standing rule 2026-11-19)`);
+        } else {
+          mergedNotPushed = true;
+          verified.push(`merged ${branch} into main (ff) but the PUSH failed — the merge is local and complete; the owner pushes (SSH remote required): ${(push.stderr + push.stdout).trim().split("\n").slice(-2).join(" | ")}`);
+        }
       }
     }
   }
@@ -526,7 +540,7 @@ if (!gateFailed && !blockedOnHost) {
 const markdown = [
   `# Gated change: ${task.split("\n")[0]}`,
   "",
-  `Worktree \`${wt}\`, branch \`${branch}\`${mergedAndPushed ? " — merged into main (ff) and pushed" : ", ready to review"}. The main checkout was never switched.`,
+  `Worktree \`${wt}\`, branch \`${branch}\`${mergedAndPushed ? " — merged into main (ff) and pushed" : mergedNotPushed ? " — merged into main (ff), push pending (see Gate)" : ", ready to review"}. The main checkout was never switched.`,
   "",
   "## Implementation",
   "",
@@ -571,7 +585,9 @@ const done: WorkflowReport = {
       ? `The change is implemented, reviewed and suite-green on branch ${branch} in worktree ${wt} — but this host cannot certify the decisive backend (BLOCKED-ON-HOST); a notebook ticket is required before merge.`
       : mergedAndPushed
         ? `The change is gate-green, committed on ${branch}, merged into main (fast-forward) and pushed — positive work lands (owner standing rule 2026-11-19).`
-        : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt}, committed and ready — the merge into main needs the owner (main not on a clean main, or moved).`,
+        : mergedNotPushed
+          ? `The change is gate-green, committed on ${branch} and merged into main (fast-forward) — the PUSH failed (SSH remote); the owner pushes, nothing is lost locally.`
+          : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt} — landing needs the owner (commit handoff incomplete, main not on a clean main, or main moved past a fast-forward).`,
   findings: reportFindings,
   verified,
   notCovered,

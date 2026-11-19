@@ -15,6 +15,11 @@ Three parties, three information partitions — enforced structurally, not by po
 | **Tester** (`lumen-skill-tester`) | `prompt-<N>.md` (SETUP + ASK) | `rubric.md` |
 | **Evaluator** (`lumen-skill-evaluator`) | `rubric.md` + the transcript (+ sandbox verification reads) | the SKILL.md under test, the run itself |
 
+Structurally: the subject works in a sandbox — synthetic fixtures, or for repo-scoped
+evals a **pruned copy** of the repo with `.zcode/evals/` excluded (the prompts and
+rubrics spell out every trap's answer; a subject that can read them makes the eval
+worthless). No eval ever points a subject at the real repo.
+
 The ASK is written like a real user message: the trap lives in the scenario, never in
 a hint. No prompt says what the correct approach is — if the skill does not teach it,
 the eval must be able to fail.
@@ -30,9 +35,11 @@ the eval must be able to fail.
   <skill>/rubric.md          criteria + red flags + improvement hooks (evaluator-only)
 ```
 
-Two prompts per skill (the standard round); one prompt is the fast lane. Sandboxes are
-built fresh under `/tmp/lumen-evals/<skill>-<N>-<ts>/` and never touch the repo unless
-the SETUP says the eval is read-only against it.
+Two prompts per skill (the standard round); **prompt-1 is the fast lane** for every
+skill (each rubric's first prompt is the core-discipline test — run it alone when
+time is short, both for a full round). Sandboxes are built fresh under
+`/tmp/lumen-evals/<skill>-<N>-<ts>/` and never touch the real repo: synthetic
+fixtures, or a pruned repo copy for repo-scoped evals.
 
 ## Scoring
 

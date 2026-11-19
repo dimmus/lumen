@@ -21,16 +21,14 @@ Execution status: completed, timed_out, interrupted, could_not_run. Assessment: 
 
 ## Bounded non-seat capture
 
-```bash
-python3 .agents/skills/lumen-test-agent/scripts/capture_run.py \
-  --output /tmp/lumen-evidence/<unique-attempt> \
-  --cwd "$PWD" --timeout 60 --kind helper \
-  --revision '<sha> plus described working-tree state' \
-  --question 'Does the protocol manifest emit successfully?' -- \
-  python3 -I scripts/protocol_manifest.py --fetch-out /tmp/lumen-evidence/<unique-fetch-file>
-```
-
-No shell is used: redirection/pipelines are literal arguments unless you explicitly invoke a reviewed shell command. Prefer argv. The helper redirects both logs to files, returns the child's nonnegative exit status (signals normalize to failure), returns 124 on timeout and 130 on interruption, refuses existing evidence directories, and starts a separate POSIX process group. On timeout/interrupt it TERM/KILLs that owned group. Windows only terminates the direct child and cannot guarantee descendant cleanup: use Linux/Docker for child-spawning commands. Successful commands must own and clean their own descendants; the helper does not supervise detached services. SIGTERM of the helper/container or host failure can leave a `running` manifest: treat it as incomplete, reconcile owned processes and never pass it.
+The DSH `capture_run.py` helper was removed with the archive and was not ported —
+its invocation block is gone. The discipline it enforced still applies to whatever
+bounded command you run instead: prefer argv over a shell (redirection/pipelines
+only when explicitly reviewed); redirect both logs to files under the evidence
+dir; record the child's exit status (signals normalize to failure), a timeout and
+an interruption as distinct outcomes; never reuse an existing evidence directory;
+own and clean descendant processes; and treat a torn-down run's manifest as
+incomplete — reconcile owned processes and never pass it.
 
 This helper is for noninteractive bounded checks, not seat-owning smoke/service lifecycle scripts. For those, record the same fields around the scripts' own cleanup, preserve their dedicated logs and validate console/layout/service/env restoration. A wrapper timeout that kills cleanup is not acceptable recovery.
 

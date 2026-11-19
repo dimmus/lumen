@@ -12,6 +12,7 @@ whenToUse: A non-trivial Lumen change or multi-task request that must go through
   when the user asks for the studio or coordinated delivery on Lumen. One
   bounded task → lumen-gated-change instead; cross-compositor benchmarking →
   lumen-compositor-bench.
+  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 args:
   app_smoke_tolerated_failset:
     type: json
@@ -69,7 +70,6 @@ args:
     description: "The request to deliver: what you would tell the studio (feature,
       protocol, fix, optimization)"
     required: true
-  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 */
 interface TaskCard {
   /** Short kebab-case id, unique across this plan, e.g. "toplevel-drag-protocol". */
@@ -1112,6 +1112,11 @@ for (const f of allFindings) if (f.disposition === undefined) f.disposition = "d
 // BLOCKED-ON-HOST), NOT_READY, NEEDS_REDESIGN — never merges here; its branch and
 // evidence go to the owner. No gh CLI / HTTPS credentials on this host: the PR-text
 // artifact plus the merge commit is the PR of record, pushed over SSH.
+// The headline states what actually landed, not what was attempted: landingLanded
+// is set only when the merges survived the merged-tree re-gate, landingPushed only
+// when origin took them.
+let landingLanded = false;
+let landingPushed = false;
 if (readyBranches.length > 0) {
   phase("Merge READY branches into main, re-gate the merged tree, push");
   const onMain = await world.run("git", ["-C", MAIN_WS, "branch", "--show-current"], { output: { tail: 512 } });
@@ -1128,6 +1133,9 @@ if (readyBranches.length > 0) {
   } else {
     const preMerge = (await world.run("git", ["-C", MAIN_WS, "rev-parse", "HEAD"], { output: { tail: 512 } })).stdout.trim().split("\n").pop() ?? "";
     let mergeOk = true;
+    // Merge notices are held back from `verified` until the landing survives the
+    // re-gate — a rolled-back merge must not live on as a "merged" evidence row.
+    const mergedNow: string[] = [];
     for (const card of tasks) {
       if (verdictOf.get(card.id) !== "READY") continue;
       const branch = branchOf.get(card.id);
@@ -1147,7 +1155,7 @@ if (readyBranches.length > 0) {
         });
         break;
       }
-      verified.push(`merged ${branch} into main (${card.title})`);
+      mergedNow.push(`merged ${branch} into main (${card.title})`);
     }
     if (mergeOk) {
       const cfg = await world.run(
@@ -1168,12 +1176,16 @@ if (readyBranches.length > 0) {
           ["-C", MAIN_WS, "push", "origin", "main", ...readyBranches],
           { timeoutMs: 300_000, output: { tail: 4096 } },
         );
+        verified.push(...mergedNow);
         if (push.exitCode === 0) {
+          landingLanded = true;
+          landingPushed = true;
           verified.push(`pushed main + ${readyBranches.length} READY branch(es) to origin (owner standing rule 2026-11-19)`);
         } else {
+          landingLanded = true;
           allFindings.push({
             where: "push",
-            what: `merged main is green but the push failed — nothing lost locally (main at the merge, branches kept); the owner pushes (SSH remote required)`,
+            what: `merged main is green but the push failed — the merges are local and complete; nothing is lost (main at the merge, branches kept); the owner pushes (SSH remote required)`,
             evidence: (push.stderr + push.stdout).trim().split("\n").slice(-3).join(" | "),
             status: "verified",
             severity: "medium",
@@ -1189,16 +1201,27 @@ if (readyBranches.length > 0) {
           status: "verified",
           severity: "high",
         });
+        verified.push(`merge attempt rolled back: main reset to ${preMerge} after the merged-tree re-gate failed — nothing landed, branches and worktrees kept`);
         notCovered.push("push — the merged tree is not green");
       }
     }
   }
 }
 
+// The headline states what actually landed, not what was attempted:
+// landingLanded is set only when the merges survived the merged-tree re-gate,
+// landingPushed only when origin took them.
+const landingNote = readyBranches.length === 0
+  ? "Nothing is merged or pushed."
+  : landingPushed
+    ? "All READY branches were merged into main (merged tree re-gated) and pushed; PR text per task is in the artifact (the PR of record on this gh-less host)."
+    : landingLanded
+      ? "READY branches were merged into main locally, but the PUSH failed — the owner pushes over SSH; nothing is lost."
+      : "Landing held: the merge phase did not complete (see findings/notCovered) — branches and worktrees are kept for the owner.";
 const conclusion = readyBranches.length === tasks.length && tasks.length > 0
-  ? `All ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}), merged into main, merged-tree re-gated and pushed; PR text per task is in the artifact (the PR of record on this gh-less host).`
+  ? `All ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}). ${landingNote}`
   : readyBranches.length > 0
-    ? `${readyBranches.length} of ${tasks.length} task(s) gate-READY and merged/pushed (${readyBranches.join(", ")}); the rest are blocked or need redesign with recorded evidence — see findings.`
+    ? `${readyBranches.length} of ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}); the rest are blocked or need redesign with recorded evidence — see findings. ${landingNote}`
     : `No task reached READY: ${tasks.length === 0 ? "the plan produced no tasks" : "every task blocked, conflicted or needing redesign with recorded evidence"}. Nothing is merged or pushed.`;
 const done: WorkflowReport = {
   conclusion,
