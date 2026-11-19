@@ -1,3 +1,4 @@
+<!-- Ported 2026-11-19 from the removed DSH archive (.agents/skills/lumen-script-runner/references/) — the script catalog still applies; environment text is superseded by .zcode/skills/lumen-testing/SKILL.md and lumen-build-run. -->
 # Lumen script catalog and execution playbook
 
 Inventory: all 20 files directly under `scripts/` in this checkout. This is an execution map; inspect current source before each selected run. Paths are repository-relative. `ART` is a newly created unique absolute evidence directory. Do not invoke `--help` on a file unless its parser supports it: tty/input smoke treat their first argument as a socket/duration, not help.

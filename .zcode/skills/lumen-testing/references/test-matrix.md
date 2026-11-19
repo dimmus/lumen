@@ -1,3 +1,4 @@
+<!-- Ported 2026-11-19 from the removed DSH archive (.agents/skills/lumen-test-agent/references/) — the deep catalog still applies; environment text (hosts, Docker mentions, script paths) is superseded by .zcode/skills/lumen-testing/SKILL.md and lumen-build-run, and the DSH helper scripts it names (test_tools.py, capture_run.py, validate_helpers.py) were removed with the archive — their command lines are historical. -->
 # Test selection and executable recipes
 
 Read current TEST.md in full first. It includes detailed per-row assertions and host exceptions that this index does not duplicate. Read scripts' help/source before invocation: defaults, durations and group lists evolve. Paths in commands below assume repository root in Linux. Use a unique absolute artifact directory (`ART`) you created for this run.

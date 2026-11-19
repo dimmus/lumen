@@ -1,3 +1,4 @@
+<!-- Ported 2026-11-19 from the removed DSH archive (.agents/skills/lumen-test-agent/references/) — the deep catalog still applies; environment text (hosts, Docker mentions, script paths) is superseded by .zcode/skills/lumen-testing/SKILL.md and lumen-build-run, and the DSH helper scripts it names (test_tools.py, capture_run.py, validate_helpers.py) were removed with the archive — their command lines are historical. -->
 # Targeted diagnostics catalog
 
 This is a broad selection guide for Lumen's Linux/C++26/Wayland/Vulkan stack, not a claim that every tool is installed or every conceivable tool is enumerated. Prefer repository tests and low-overhead observations, then one tool that answers the question. Confirm installed-version CLI with `--help`. Preserve raw output, symbols/build IDs and overhead metadata. Installing tools does not grant kernel, GPU or seat access.

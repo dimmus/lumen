@@ -1,3 +1,4 @@
+<!-- Ported 2026-11-19 from the removed DSH archive (.agents/skills/lumen-test-agent/references/) — the deep catalog still applies; environment text (hosts, Docker mentions, script paths) is superseded by .zcode/skills/lumen-testing/SKILL.md and lumen-build-run, and the DSH helper scripts it names (test_tools.py, capture_run.py, validate_helpers.py) were removed with the archive — their command lines are historical. -->
 # Development tool setup
 
 Use the existing `scripts/install-deps.sh` for Lumen's toolchain, libraries, sanitizer runtimes, smoke clients, Vulkan layers and common development tools. Do not duplicate its distribution/toolchain logic. It supports Arch, Debian/Ubuntu, Fedora and openSUSE; older releases may lack the required C++26 standard library. Inspect its current plan and checks:

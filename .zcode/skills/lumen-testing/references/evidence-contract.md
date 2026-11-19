@@ -1,3 +1,4 @@
+<!-- Ported 2026-11-19 from the removed DSH archive (.agents/skills/lumen-test-agent/references/) — the deep catalog still applies; environment text (hosts, Docker mentions, script paths) is superseded by .zcode/skills/lumen-testing/SKILL.md and lumen-build-run, and the DSH helper scripts it names (test_tools.py, capture_run.py, validate_helpers.py) were removed with the archive — their command lines are historical. -->
 # Execution evidence and analyst handoff
 
 An execution bundle belongs to one identified candidate and attempt. Use a new directory per command/round; never merge stdout from different binaries or overwrite an earlier failure. Store artifacts outside tracked source paths (or an explicitly ignored task directory). Record host and container paths so another agent can retrieve files.
