@@ -26,6 +26,9 @@ per run.
 | Invariant | Evidence | Gate |
 | --- | --- | --- |
 | `snapshot_buffer` v2: `try_publish()` swaps index only; `acquire()` returns `const&` | `test_snapshot` (publish/acquire semantics, back-pressure rows) | ctest |
+| `build_draw_list_into` writes into the write slot directly — no interim copy (R1) | `test_snapshot` (write-slot publish semantics) + `bench_ui` G5 (a steady frame allocates nothing — an interim copy shows up there) | ctest + bench |
+| Memory-pressure cascade: `memory_budget_coordinator` → evict import cache, flush buffer lifecycle, evict surface pool | `test_runtime_memory` (coordinator pressure levels, staging-over-budget), `test_runtime_psi` (PSI feed) — the downstream evict-on-pressure wiring as one cascade: **GAP** (consumers' eviction is tested for its own triggers, not driven by the coordinator's pressure signal) | ctest (+ GAP) |
+| Overflow caps: fixed-capacity structures use `overflow_action`, never silent unbounded growth | **GAP** (no designated test asserts overflow behavior across the engine's fixed-capacity structures; coverage is scattered per-structure at best) | — |
 | Back-pressure respected (drop/stall/triple-buffer) | `test_snapshot` (backpressure cases) | ctest |
 | Import cache keyed `(client_id, buffer_id, modifier)`, LRU + per-client cap + evict on disconnect | `test_import_cache` | ctest |
 | dmabuf-first commit path, explicit sync | `test_dmabuf_composite`, `test_client_swapchain` | ctest |
