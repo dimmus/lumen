@@ -4,6 +4,10 @@ description: "2026-11-12: staging xdg-toplevel-drag-v1 (wayland-protocols 1.49) 
 metadata:
   node_type: memory
   type: project
+summary: "xdg-toplevel-drag-v1 manifest block (glue only); suite 133-era known-red tolerated; smoke trap LUMEN_BUILD_DIR; review dedup 578e08c≡d4e96d5"
+modules: protocols, lx.wayland.protocols
+topics: protocol, manifest
+
 ---
 
 Verified 2026-11-12 on the vmware VM, worktree

@@ -5,7 +5,12 @@ description: Lumen's settled technical decisions and measured outcomes that must
 
 # Settled decisions & measured outcomes (do not re-litigate without new evidence)
 
-Full-fidelity records: `.zcode/memories/lumen-*.md` (one file per item below, with numbers).
+Full-fidelity records: `.zcode/memories/lumen-*.md` (one file per item below, with
+numbers). Retrieval goes through the generated `.zcode/memories/INDEX.md`
+(`scripts/gen-memory-index.py` — grouped by module with topics); this file is the
+curated distillation, and when a decision lands its record's `modules:`/`topics:`
+must make it findable there. The two disagreeing is drift: fix the distillation or
+the frontmatter, then regenerate.
 The user's standing rules behind all of these: **best-in-class bar** (compare wlroots/sway,
 KWin, Mutter, Smithay/niri, Hyprland; measure, don't assert) and **no degradation**
 (every change earns its place by measurement; the Vulkan backend is the gate).
@@ -85,7 +90,9 @@ G11 frame rule open as host-limited.
 
 ## Gotchas
 
-- `lx.shell.cppm` uses **CRLF** line endings — restore CRLF after any scripted/Python edit.
+- Line endings are LF repo-wide per `.gitattributes` (the old "lx.shell.cppm is CRLF"
+  premise is retired — both files are LF at HEAD); check flips with
+  `scripts/diff-hygiene.sh <base>` (a CRLF flip is invisible to `git diff`).
 - Pushing needs SSH (`git push git@github.com:dimmus/lumen.git <branch>`); the https origin
   has no credential helper.
 - `app-smoke` Z-groups fail if xdg-desktop-portal's frontend is broken — environmental,

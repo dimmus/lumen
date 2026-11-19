@@ -1,11 +1,13 @@
 /* zcode-workflow
 description: "The gated change workflow for Lumen: baseline build+ctest on the
-  clean tree, implement on a fresh branch, build+test fix loop, fresh-eyes
-  review of the diff, independent confirmation of every finding (pre-existing
-  defects confirmed but recorded, not fixed), apply confirmed findings, then
-  the final full-suite gate (optionally drag-smoke/app-smoke and ui-bench).
-  Ports the multi-agent pattern the Claude sessions used for every significant
-  Lumen change."
+  clean tree, implement in a DEDICATED WORKTREE on a fresh branch (the main
+  checkout stays on main, untouched), build+test fix loop, fresh-eyes review
+  of the diff, independent confirmation of every finding (pre-existing defects
+  confirmed but recorded, not fixed), apply confirmed findings, then the final
+  full-suite gate plus the seat/bench evidence the diff itself requires
+  (scripts/classify-change.py derives it — operator knobs can add evidence,
+  never waive it). Ports the multi-agent pattern the Claude sessions used for
+  every significant Lumen change."
 whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
   that must pass the no-degradation rule: run when the user asks for a gated
   workflow for one Lumen change. For multi-task requests or full studio delivery
@@ -18,13 +20,15 @@ args:
     default: zcode/gated-change
   run_bench:
     type: boolean
-    description: Also run scripts/ui-bench.sh (engine bench p50/p95 gate against the
-      stored baseline) in the final gate
+    description: "Also run scripts/ui-bench.sh even when the change classifier
+      does not require a bench. Additive only: a render-path change gets its
+      A/B bench whether or not this is set, and cannot be waived by it."
     default: false
   run_smokes:
     type: boolean
-    description: "Also run drag-smoke and app-smoke with --join-seat-session in the
-      final gate (needs a quiet host: no other compositor or smoke session)"
+    description: "Also run drag-smoke and app-smoke with --join-seat-session
+      even when the classifier does not require them. Additive only: required
+      seat evidence cannot be waived by this knob."
     default: false
   task:
     type: string
@@ -75,6 +79,15 @@ interface Confirmation {
   reason: string;
 }
 
+/** What scripts/classify-change.py derives from the diff. */
+interface RequiredEvidence {
+  classes: string[];
+  required: { ctest: boolean; smokes: boolean; bench_ab: boolean; goldens: boolean };
+  render_path: boolean;
+  decisive_backend_blocked_on_host: boolean;
+  host: string;
+}
+
 interface WorkflowReport {
   /** Two or three sentences answering what the user asked for. */
   conclusion: string;
@@ -100,61 +113,53 @@ if (task === "") {
   return empty;
 }
 
+// The main checkout is where this workflow runs; its path is where world.run's
+// cwd is. The worktree root is a sibling 'lumen-wt' directory (overridable with
+// LUMEN_WT_ROOT) — derived, never hardcoded to one machine's home.
+const pwdRun = await world.run("pwd", [], { output: { tail: 512 } });
+const MAIN_WS = pwdRun.stdout.trim().split("\n").pop() ?? ".";
+const WT_ROOT = (await world.run("bash", ["-c", `echo "\${LUMEN_WT_ROOT:-$(dirname '${MAIN_WS}')/lumen-wt}"`], { output: { tail: 512 } }))
+  .stdout.trim().split("\n").pop() ?? "../lumen-wt";
+const slug = branch.replace(/[^a-zA-Z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "gated";
+const wt = `${WT_ROOT}/gated-${slug}`;
+
+// The role contracts live in .zcode/agents/*.md — the single source of truth.
+// The personas below only orient and point there; the files are binding.
 const implementerPersona =
-  "You are the implement stage of Lumen's gated change workflow. " +
-  "Read the repository root/AGENTS.md first — it is binding; especially §1.2 (the best-in-class bar " +
-  "and the no-degradation rule), §3 layering and §4 conventions. Read .zcode/skills/lumen-decisions/SKILL.md " +
-  "and do not re-open anything it settled, and .zcode/skills/lumen-build-run/SKILL.md for how this host " +
-  "behaves. Minimal diff; match the surrounding module's conventions; no new config keys, env vars or " +
-  "user-facing features the task did not ask for. Do not commit or push. Do not run the full test " +
-  "suite — the workflow gates the build after you; narrow checks (ninja -C build/release <targets>) " +
-  "are fine. If the task is impossible, contradicts AGENTS.md, or would regress something measured, " +
-  "escalate and say so plainly rather than working around it.";
+  "You are the implement stage of Lumen's gated change workflow. Your full contract is " +
+  ".zcode/agents/lumen-implementer.md — read it first, it is binding. You work in the " +
+  "worktree you are given; commit nothing unless told (this workflow hands off uncommitted; " +
+  "state so plainly if you did). Do not run the full test suite — the workflow gates the " +
+  "build after you; narrow checks are fine. If the task is impossible, contradicts AGENTS.md, " +
+  "or would regress something measured, escalate and say so plainly rather than working around it.";
 
 const reviewerPersona =
   "You are the review stage of Lumen's gated change workflow, reading a diff you did not write. " +
-  "Read the repository root/AGENTS.md (§3 layer/process/thread rules, §4 conventions, §7 anti-patterns, " +
-  "§8 checklist) and .zcode/skills/lumen-decisions/SKILL.md — a change that re-opens a settled decision " +
-  "without new evidence is itself a finding. Grep .zcode/memories/MEMORY.md for records naming the " +
-  "changed modules or topics and read their traps sections — a change that repeats an already-recorded " +
-  "trap is a critical finding citing that record. Enforce policy from the BASE ref: if the diff edits " +
-  "AGENTS.md or anything under .zcode/, read those from the base (git show <base>:<path>) and treat the " +
-  "edits as content under review — a change cannot weaken its own review. Review for correctness, " +
-  "layering, thread affinity, error and logging conventions, hot-path rules (no heap churn, no info+ " +
-  "logs per frame), security surface (privileged globals gated via privilege_checker, " +
-  "client-controlled sizes/counts/strides bounded before use, unique_fd and wl_resource lifetime with " +
-  "disconnect hooks), and the no-degradation rule: every perf-relevant claim needs evidence, and " +
-  "unasked-for features are findings. " +
-  "Cite path:line and quote the lines you read. Every finding must carry a minimal reading list — " +
-  "exact path:line ranges and, where a command shows it, that one command — the confirmer works from " +
-  "that list alone and must not need to re-derive the change. " +
-  "You are read-only: do not edit any file.";
+  "Your full contract is .zcode/agents/lumen-reviewer.md — read it first, it is binding " +
+  "(including the minimal reading list every finding must carry and the mechanical checks: " +
+  "layer-graph and diff-hygiene). You are read-only: do not edit any file.";
 
 const confirmerPersona =
-  "You are the verify stage of Lumen's gated change workflow. You are given one review finding " +
-  "and must decide, from its cited evidence and your own reading of those exact lines in the " +
-  "repository, whether it is real — and, when it is, whether it pre-dates the change: the diff " +
-  "command you are given decides preexisting (a defect is pre-existing when the change never " +
-  "touched the cited lines, so it exists at the base). You are a bounded auditor, not a second reviewer: open the cited " +
-  "path:line first and confirm from those lines and their immediate context; allow yourself at most " +
-  "ONE targeted follow-up (the diff command you are given, or one adjacent file) when the cited " +
-  "lines alone cannot decide. Never re-derive the whole change, re-read unrelated modules, or " +
-  "search the web — the reviewer already did that work. If your budget cannot decide it, return " +
-  "holds=false with reason=\"inconclusive from cited evidence\" and name the one read that would " +
-  "decide it — an honest inconclusive beats a grind. You are read-only: do not edit any file. " +
-  "If the evidence does not hold up, say so — a false finding must not survive this stage.";
+  "You are the verify stage of Lumen's gated change workflow: a bounded auditor, not a second " +
+  "reviewer. Your full contract is .zcode/agents/lumen-confirmer.md — read it first, it is " +
+  "binding. At most ONE targeted follow-up beyond the cited lines; an honest inconclusive " +
+  "beats a grind. You are read-only: do not edit any file.";
 
 const fixerPersona =
-  "You fix build failures, test failures and confirmed review findings in the Lumen repository. " +
-  "Read the repository root/AGENTS.md §4 conventions before editing; minimal diffs only, no refactors " +
-  "beyond what the failure forces, no new features. Do not commit or push. Do not run the full test " +
-  "suite — the workflow re-gates after you; narrow checks are fine. If a failure looks environmental " +
-  "(host noise, DRM master, missing protocol stamp) rather than caused by the change, escalate and " +
-  "say so plainly rather than papering over it.";
+  "You fix build failures, test failures and confirmed review findings in the Lumen worktree " +
+  "you are given. Your full contract is .zcode/agents/lumen-fixer.md — read it first, it is " +
+  "binding. Minimal diffs only; never weaken a test to pass; say 'design-level' when a failure " +
+  "is not patchable so the task routes back to planning instead of burning another round.";
 
 const verified: string[] = [];
 
-phase("Baseline: build and test the tree as it stands");
+/** "Total Tests: N" from ctest -N — the tree's own computed count, never quoted from memory. */
+function ctestTotal(out: string): number {
+  const m = /Total Tests: (\d+)/.exec(out);
+  return m !== null && m[1] !== undefined ? Number(m[1]) : -1;
+}
+
+phase("Baseline: build and test the tree as it stands (main checkout, untouched)");
 const stamp = await world.run("test", ["-f", "protocols/upstream/.fetch-stamp"]);
 if (stamp.exitCode !== 0) {
   log("Protocols not fetched yet; fetching (needs network)");
@@ -202,39 +207,97 @@ if (baselineBuild.exitCode !== 0 || baselineTests === undefined || baselineTests
   };
   return red;
 }
-verified.push("baseline green before any change: cmake --build build/test (tests-enabled) + ctest --test-dir build/test -LE bench");
-log("Baseline is green; creating the working branch");
+const baselineCountRun = await world.run("ctest", ["--test-dir", "build/test", "-N"], { output: { tail: 2048 } });
+const baselineCount = ctestTotal(baselineCountRun.stdout + baselineCountRun.stderr);
+verified.push(
+  "baseline green before any change: cmake --build build/test (tests-enabled) + ctest --test-dir build/test -LE bench " +
+    `(computed count: ${baselineCount >= 0 ? String(baselineCount) + " tests via ctest -N" : "ctest -N unreadable — counts below are unverified"})`,
+);
+log("Baseline is green; creating the worktree (the main checkout stays on its branch)");
 
-phase("Create the working branch");
+phase("Create the dedicated worktree — never a branch switch in the main checkout");
 const status = await git.status();
 if (!status.clean) {
   const dirty: WorkflowReport = {
-    conclusion: "The working tree is not clean; the gated change refuses to start on top of unknown edits.",
+    conclusion: "The main working tree is not clean; the gated change refuses to start on top of unknown edits.",
     findings: [],
     verified: [],
     notCovered: ["the requested change — commit or stash the existing edits first"],
   };
   return dirty;
 }
-const sw = await world.run("git", ["switch", "-c", branch], { output: { tail: 4096 } });
-if (sw.exitCode !== 0) {
+// The branch point as a CONCRETE SHA: the classifier diffs the worktree's
+// working tree against it (the new branch has no commits of its own yet —
+// 'branch~1' would be main's last commit, the wrong diff entirely).
+const branchPoint = (await world.run("git", ["rev-parse", "HEAD"], { output: { tail: 512 } }))
+  .stdout.trim().split("\n").pop() ?? "HEAD";
+const add = await world.run("git", ["worktree", "add", wt, "-b", branch], { output: { tail: 4096 } });
+if (add.exitCode !== 0) {
   const taken: WorkflowReport = {
-    conclusion: `Could not create branch ${branch} (it probably exists); pass a fresh 'branch' argument.`,
+    conclusion:
+      `Could not create worktree ${wt} / branch ${branch} (one of them probably exists from an earlier run). ` +
+      `Inspect it, remove it (git worktree remove ${wt} && git branch -D ${branch}) or pass a fresh 'branch' argument.`,
     findings: [],
     verified: [],
-    notCovered: ["the requested change — branch creation failed"],
+    notCovered: ["the requested change — worktree/branch creation failed"],
   };
   return taken;
 }
+await world.run("bash", ["-c", `test -d '${wt}/protocols/upstream' || cp -r protocols/upstream '${wt}/protocols/'`], { output: { tail: 1024 } });
+const wtConfigure = await world.run(
+  "cmake",
+  ["--preset", "release", "-S", wt, "-B", `${wt}/build/test`, "-DLUMEN_BUILD_TESTS=ON"],
+  { timeoutMs: 600_000, output: { tail: 4096 } },
+);
+if (wtConfigure.exitCode !== 0) {
+  const blockedWt: WorkflowReport = {
+    conclusion: `CMake configure failed in the fresh worktree at ${wt}; nothing else ran.`,
+    findings: [],
+    verified: verified.concat([`worktree ${wt} created on branch ${branch} (left in place)`]),
+    notCovered: ["everything after worktree configure"],
+  };
+  return blockedWt;
+}
+verified.push(`implementation worktree ${wt} on branch ${branch} — the main checkout stayed on its branch, untouched`);
 
-phase("Implement the change");
+phase("Implement the change in the worktree");
 const implementer = agent("implementer", { system: implementerPersona });
 const impl = await implementer.ask<ImplResult>(
-  `Implement this task in the Lumen repository:\n\n${task}\n\nThe baseline build and the full test ` +
-    `suite pass on this tree. Keep the diff minimal. Answer with your summary, the changed files, ` +
-    `and what the reviewer should look at hardest.`,
+  `Implement this task in the Lumen worktree at ${wt} (branch ${branch}, uncommitted handoff; ` +
+    `build directory ${wt}/build/test, tests-enabled):\n\n${task}\n\nKeep the diff minimal. ` +
+    `Answer with your summary, the changed files, and what the reviewer should look at hardest.`,
 );
 log(`Implemented; ${impl.changedFiles.length} files touched`);
+
+// The diff itself decides what evidence the gate must see — an operator knob
+// can add evidence, never waive it.
+phase("Derive the required evidence from the diff");
+const classifyRun = await world.run(
+  "python3",
+  ["scripts/classify-change.py", "--repo", wt, "--base", branchPoint],
+  { output: { tail: 8192 }, },
+);
+let required: RequiredEvidence = {
+  classes: [],
+  required: { ctest: true, smokes: false, bench_ab: false, goldens: false },
+  render_path: false,
+  decisive_backend_blocked_on_host: false,
+  host: "unknown",
+};
+if (classifyRun.exitCode === 0) {
+  try {
+    required = JSON.parse(classifyRun.stdout) as RequiredEvidence;
+  } catch {
+    log("classifier output unparseable — falling back to ctest-only required evidence");
+  }
+} else {
+  log("classifier failed — falling back to ctest-only required evidence");
+}
+verified.push(
+  `required evidence derived from the diff: classes [${required.classes.join(", ")}] → ` +
+    `ctest=${required.required.ctest} smokes=${required.required.smokes} bench=${required.required.bench_ab} ` +
+    `goldens=${required.required.goldens} (host ${required.host})`,
+);
 
 const fixer = agent("fixer", { system: fixerPersona, budget: { webSearch: 0 } });
 let gateGreen = false;
@@ -243,17 +306,17 @@ let gateRounds = 0;
 phase("Build and test the change");
 for (let round = 1; round <= 3 && !gateGreen; round++) {
   gateRounds = round;
-  const build = await world.run("cmake", ["--build", "build/test", "-j2"], {
+  const build = await world.run("cmake", ["--build", `${wt}/build/test`, "-j2"], {
     timeoutMs: 1_200_000,
     output: { tail: 32_768 },
   });
   if (build.exitCode !== 0) {
-    await fixer.ask(`The build failed (round ${round}). Fix it with minimal changes. Tail of the output:\n${(build.stderr + build.stdout).slice(-4000)}`);
+    await fixer.ask(`The build failed (round ${round}) in ${wt}. Fix it with minimal changes. Tail of the output:\n${(build.stderr + build.stdout).slice(-4000)}`);
     continue;
   }
-  const tests = await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
+  const tests = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
   if (tests.exitCode !== 0) {
-    await fixer.ask(`The tests failed (round ${round}). Fix them with minimal changes. Tail of the output:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
+    await fixer.ask(`The tests failed (round ${round}) in ${wt}. Fix them with minimal changes. Tail of the output:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
     continue;
   }
   gateGreen = true;
@@ -267,13 +330,13 @@ if (!gateGreen) {
   };
   return red;
 }
-verified.push(`change green after ${gateRounds} fix round(s): tests-enabled build+ctest in build/test`);
+verified.push(`change green after ${gateRounds} fix round(s): tests-enabled build+ctest in ${wt}/build/test`);
 
 phase("Review the diff");
 const reviewer = agent("reviewer", { system: reviewerPersona, budget: { webSearch: 0 } });
 const review = await reviewer.ask<Review>(
-  `Review the uncommitted change on branch ${branch} (git diff HEAD plus untracked files) against ` +
-    `this task:\n\n${task}\n\nThe author's notes:\n${impl.notesForReviewer}\n\nReport every real ` +
+  `Review the uncommitted change in the worktree ${wt} on branch ${branch} (git -C ${wt} diff HEAD plus ` +
+    `untracked files) against this task:\n\n${task}\n\nThe author's notes:\n${impl.notesForReviewer}\n\nReport every real ` +
     `finding with evidence. An empty findings list must mean you found nothing — not that you ` +
     `looked nowhere — and approving takes evidence, objecting is the useful move.`,
 );
@@ -287,10 +350,10 @@ for (let i = 0; i < review.findings.length; i++) {
   if (finding === undefined) continue;
   const confirmation = await agent(`confirmer-${i + 1}`, { system: confirmerPersona, budget: { webSearch: 0 } }).ask<Confirmation>(
     `Decide whether this finding is real — from its cited evidence, by reading those exact lines.\n\n` +
-      `Change under review: the uncommitted diff on branch ${branch} (git diff HEAD plus untracked files).\n\n` +
+      `Change under review: the uncommitted diff in worktree ${wt} on branch ${branch} (git -C ${wt} diff HEAD plus untracked files).\n\n` +
       `Finding:\n${JSON.stringify(finding, null, 2)}\n\n` +
       `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
-      `(e.g. git diff HEAD -- <the cited path> — it also decides preexisting: cited lines untouched ` +
+      `(e.g. git -C ${wt} diff HEAD -- <the cited path> — it also decides preexisting: cited lines untouched ` +
       `by the diff mean the defect exists at the base); do not re-derive the change. If that budget cannot ` +
       `decide it, return holds=false with reason "inconclusive from cited evidence" and the one read ` +
       `that would decide it. Report exactly what you read.`,
@@ -322,11 +385,11 @@ if (preexistingFindings.length > 0) {
 phase("Apply the confirmed findings");
 if (toFix.length > 0) {
   await fixer.ask(
-    `These findings were each independently confirmed on code this change introduced. Fix every one, minimal diffs:\n${JSON.stringify(toFix)}`,
+    `These findings were each independently confirmed on code this change introduced. Fix every one in ${wt}, minimal diffs:\n${JSON.stringify(toFix)}`,
   );
   gateGreen = false;
   for (let round = 1; round <= 2 && !gateGreen; round++) {
-    const build = await world.run("cmake", ["--build", "build/test", "-j2"], {
+    const build = await world.run("cmake", ["--build", `${wt}/build/test`, "-j2"], {
       timeoutMs: 1_200_000,
       output: { tail: 32_768 },
     });
@@ -334,7 +397,7 @@ if (toFix.length > 0) {
       await fixer.ask(`After applying review fixes the build failed (round ${round}). Tail:\n${(build.stderr + build.stdout).slice(-4000)}`);
       continue;
     }
-    const tests = await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
+    const tests = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
     if (tests.exitCode !== 0) {
       await fixer.ask(`After applying review fixes the tests failed (round ${round}). Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`);
       continue;
@@ -355,35 +418,67 @@ if (toFix.length > 0) {
   verified.push("confirmed findings applied, then build+ctest green again");
 }
 
-phase("Final gate: the full suite, and hand over the report");
-const finalTests = await world.run("ctest", ["--test-dir", "build/test", "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
-verified.push("final gate: tests-enabled ctest green on the finished change (build/test, bench label excluded)");
-let smokeNote = "drag-smoke and app-smoke not run (run_smokes was not set)";
-let benchNote = "ui-bench not run (run_bench was not set)";
-if (finalTests.exitCode === 0 && runSmokes) {
-  const drag = await world.run("./scripts/drag-smoke.sh", ["--join-seat-session"], { timeoutMs: 300_000, output: { tail: 16_384 } });
-  const app = await world.run("./scripts/app-smoke.sh", ["--join-seat-session"], { timeoutMs: 600_000, output: { tail: 16_384 } });
-  verified.push(`drag-smoke ${drag.exitCode === 0 ? "pass" : "FAIL"}, app-smoke ${app.exitCode === 0 ? "pass (177/177 expected)" : "FAIL"}`);
-  smokeNote = `drag-smoke ${drag.exitCode === 0 ? "passed" : "FAILED"}, app-smoke ${app.exitCode === 0 ? "passed" : "FAILED"} (with --join-seat-session)`;
+phase("Final gate: the full suite and the evidence the diff requires");
+const finalTests = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 900_000, output: { tail: 32_768 } });
+const finalCountRun = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "-N"], { output: { tail: 2048 } });
+const finalCount = ctestTotal(finalCountRun.stdout + finalCountRun.stderr);
+const countNote =
+  baselineCount >= 0 && finalCount >= 0
+    ? finalCount >= baselineCount
+      ? `suite count computed at the gate: ${finalCount} (baseline ${baselineCount})`
+      : `INVALID as a suite run: the tree registered ${finalCount} tests against the baseline's ${baselineCount} — tests were dropped`
+    : "suite count not computable (ctest -N unreadable on one side)";
+verified.push(`final gate: tests-enabled ctest on the finished change (${wt}/build/test, bench label excluded); ${countNote}`);
+
+// Seat smokes: required by the classifier for seat-surface changes, addable by
+// the operator for anything. The scripts are brokered (scripts/seat-lock.sh).
+const needSmokes = required.required.smokes || runSmokes;
+const needBench = required.required.bench_ab || runBench;
+let smokeNote = needSmokes ? "" : "drag-smoke and app-smoke not required by the diff and run_smokes was not set";
+let benchNote = needBench ? "" : "ui-bench not required by the diff and run_bench was not set";
+const failRows = (out: string): string[] =>
+  out.split("\n").filter((l) => /^FAIL\s+\S+/.test(l)).map((l) => ( /^FAIL\s+(\S+)/.exec(l) ?? [l, l] )[1] ?? l);
+if (finalTests.exitCode === 0 && needSmokes) {
+  const drag = await world.run("bash", ["-c", `cd '${wt}' && exec ./scripts/drag-smoke.sh --join-seat-session`], { timeoutMs: 420_000, output: { tail: 16_384 } });
+  const app = await world.run("bash", ["-c", `cd '${wt}' && exec ./scripts/app-smoke.sh --join-seat-session`], { timeoutMs: 900_000, output: { tail: 16_384 } });
+  const appOut = app.stderr + app.stdout;
+  const appFails = failRows(appOut);
+  verified.push(
+    `drag-smoke ${drag.exitCode === 0 ? "PASS" : `FAIL (exit ${drag.exitCode})`}; ` +
+      `app-smoke ${app.exitCode === 0 ? "PASS" : `FAIL (exit ${app.exitCode}; failing rows: ${appFails.join(", ") || "see log"})`}`,
+  );
+  smokeNote =
+    (drag.exitCode === 0 ? "drag-smoke passed; " : `drag-smoke FAILED (exit ${drag.exitCode}); `) +
+    (app.exitCode === 0 ? "app-smoke passed; " : `app-smoke FAILED (exit ${app.exitCode}, failing rows: ${appFails.join(", ") || "see log"}); `) +
+    (required.required.smokes ? "required by the diff (seat-surface change)" : "operator-requested (run_smokes)");
 }
-if (finalTests.exitCode === 0 && runBench) {
+if (finalTests.exitCode === 0 && needBench) {
   const bench = await world.run(
     "bash",
-    ["-c", "LUMEN_BUILD_DIR=build/test exec ./scripts/ui-bench.sh"],
+    ["-c", `cd '${wt}' && LUMEN_BUILD_DIR=build/test exec ./scripts/ui-bench.sh`],
     { timeoutMs: 1_800_000, output: { tail: 32_768 } },
   );
   benchNote =
     bench.exitCode === 0
       ? "ui-bench gate passed (FAIL on p50 +25%, WARN on p50 +10% or p95 +25% against the stored baseline)"
       : "ui-bench gate FAILED — per the no-degradation rule this goes to the user with the evidence, not auto-accepted";
+  benchNote += required.required.bench_ab ? "; required by the diff (render-path change)" : "; operator-requested (run_bench)";
   verified.push(`ui-bench ${bench.exitCode === 0 ? "gate pass" : "gate FAIL"}`);
 }
-const gateFailed = finalTests.exitCode !== 0 || smokeNote.includes("FAILED") || benchNote.includes("FAILED");
+const countInvalid = countNote.startsWith("INVALID");
+const gateFailed = finalTests.exitCode !== 0 || countInvalid || smokeNote.includes("FAILED") || benchNote.includes("FAILED");
+const blockedOnHost = required.decisive_backend_blocked_on_host;
+if (blockedOnHost) {
+  verified.push(
+    "BLOCKED-ON-HOST: this is a render-path change and this host has no hardware Vulkan — the decisive " +
+      "present backend cannot be certified here (AGENTS.md §1.2); a notebook verification ticket is required before merge",
+  );
+}
 
 const markdown = [
   `# Gated change: ${task.split("\n")[0]}`,
   "",
-  `Branch \`${branch}\`, uncommitted, ready to review and commit.`,
+  `Worktree \`${wt}\`, branch \`${branch}\`, uncommitted there, ready to review and commit. The main checkout was never switched.`,
   "",
   "## Implementation",
   "",
@@ -401,9 +496,11 @@ const markdown = [
   "",
   "## Gate",
   "",
+  `- Required evidence (derived from the diff): classes [${required.classes.join(", ")}] → ctest=${required.required.ctest}, smokes=${required.required.smokes}, bench=${required.required.bench_ab}, goldens=${required.required.goldens} on host ${required.host}`,
   `- ${verified.map((v) => v.replace(/^./, (c) => c.toUpperCase())).join("\n- ")}`,
   "",
-  `Not covered: ${smokeNote}; ${benchNote}.`,
+  `Not covered: ${smokeNote || "seat smokes ran (see above)"}; ${benchNote || "bench ran (see above)"}.`,
+  blockedOnHost ? "\n**BLOCKED-ON-HOST**: render-path change on a host without hardware Vulkan — notebook ticket required before merge." : "",
   "",
 ].join("\n");
 await artifact.markdown("change-report", markdown, {
@@ -412,11 +509,19 @@ await artifact.markdown("change-report", markdown, {
   primary: true,
 });
 
-const notCovered = [smokeNote, benchNote, "the KMS/Vulkan present path cannot be exercised on this VM (no hardware Vulkan)"];
+const notCovered = [
+  smokeNote || "seat smokes ran",
+  benchNote || "bench ran",
+  blockedOnHost
+    ? "the decisive Vulkan present path cannot be certified on this host (no hardware Vulkan) — BLOCKED-ON-HOST, notebook ticket required"
+    : "the KMS/Vulkan present path cannot be exercised on this VM (no hardware Vulkan)",
+];
 const done: WorkflowReport = {
   conclusion: gateFailed
     ? "The change is implemented and reviewed, but a final gate FAILED — per the no-degradation rule this needs the user's decision before commit."
-    : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch}, uncommitted and ready.`,
+    : blockedOnHost
+      ? `The change is implemented, reviewed and suite-green on branch ${branch} in worktree ${wt} — but this host cannot certify the decisive backend (BLOCKED-ON-HOST); a notebook ticket is required before merge.`
+      : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt}, uncommitted and ready.`,
   findings: reportFindings,
   verified,
   notCovered,

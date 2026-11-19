@@ -4,6 +4,10 @@ description: "2026-11-14 notebook seat (worktree animations-post-blur-verify, ev
 metadata:
   node_type: memory
   type: project
+summary: "Notebook re-verify: blur-toggle damage non-reproducible; NEW pre-existing bug — closing a FLOATING window with animations on freezes a full-opacity ghost (fade stalls with no other animation)"
+modules: lx.compositor, lx.shell
+topics: animations, ghost, bugs
+
 ---
 
 Verified 2026-11-14 02:20–03:37 on the **notebook** (nouveau card0 + i915 card1, hasvk,

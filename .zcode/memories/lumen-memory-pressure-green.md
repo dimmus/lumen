@@ -4,6 +4,10 @@ description: "2026-11-15 notebook task (worktree memory-pressure-green, d24e1f3.
 metadata:
   node_type: memory
   type: project
+summary: "Spurious critical-pressure WARN fixed by fixing the measurement: staging judges bytes_in_flight (backlog), not bytes_mapped (rounding read 64 MiB as 100%); thresholds unchanged; final 177/0/0"
+modules: lx.compositor, lx.runtime
+topics: memory, pressure
+
 ---
 
 Verified 2026-11-15 on the **notebook** (iritur i915/hasvk, [[lumen-notebook-hw]]).

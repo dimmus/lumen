@@ -33,7 +33,10 @@ Procedure:
    ctest build (`-DLUMEN_BUILD_TESTS=ON` — the plain `release` preset builds NO tests),
    plus real-seat smokes (`--join-seat-session`) for anything touching compositor,
    display, input or shell behavior. Headless `--virtual-outputs` runs are not evidence
-   for that surface. New functionality gets new tests.
+   for that surface. New functionality gets new tests. Cross-check the evidence you
+   require per task against `scripts/classify-change.py` run on the task's expected
+   surface — the gate derives its requirements from the diff, and a plan that asks for
+   less than the classifier will is a plan the gate rejects.
 6. Name the risks, the regression stop points (any measured regression stops the task and
    goes to the user with A/B evidence), and anything that needs a user decision.
 

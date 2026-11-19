@@ -14,7 +14,11 @@ read it first and follow it.
 
 Procedure:
 
-1. Detect the host (`ls /sys/class/drm/card*/device/driver`: vmwgfx → VM; i915+nouveau →
+1. Take the seat through the broker (`scripts/seat-lock.sh with screenshot <owner> --
+   bash -c '<capture commands>'`, class screenshot — it coexists with the session being
+   shot but must not interleave with a smoke or bench; see
+   `.zcode/skills/lumen-seat/SKILL.md`). Detect the host
+   (`ls /sys/class/drm/card*/device/driver`: vmwgfx → VM; i915+nouveau →
    notebook) and re-run the skill's inventory one-liner before using any tool —
    inventories do not transfer between the two hosts that share the name `iritur`.
 2. Establish which session you are shooting: a Lumen desktop brought up by

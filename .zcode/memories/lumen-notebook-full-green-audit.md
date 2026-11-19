@@ -4,6 +4,10 @@ description: "2026-11-15/16 notebook task (worktree notebook-full-green-audit, m
 metadata:
   node_type: memory
   type: project
+summary: "All five legs PASS on one session set at merged tree c316906: ctest 134/134 ×2, drag PASS, app-smoke 177/0/0, both benches green; the 6bc4820 evidence force-add reverted (0 tracked files)"
+modules: harness
+topics: audit, evidence
+
 ---
 
 Verified 2026-11-15/16 on the **notebook** (i915 + nouveau re-read from

@@ -4,6 +4,10 @@ description: "2026-11-13 notebook seat diagnosis (main 0394e7c, evidence-only br
 metadata:
   node_type: memory
   type: project
+summary: "[panel] blur=true at start crash-loops lumen-shell (cross-connection get_background_effect) and IS the black-screen symptom; animations alone byte-clean; 3 seeded causes refuted"
+modules: lx.shell
+topics: blur, crash, diagnosis
+
 ---
 
 Verified 2026-11-13 on the **notebook** (card0 nouveau, card1 i915 — drivers re-checked

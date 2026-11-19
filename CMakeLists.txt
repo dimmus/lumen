@@ -650,6 +650,19 @@ set_tests_properties(scanner_golden PROPERTIES
     DEPENDS wl-scanner-cpp
 )
 
+# Layer-graph invariant (AGENTS.md §3.1 / docs/uml/01-package-layers.mmd):
+# dependencies flow downward only. Mechanical enforcement — the one tired
+# reviewer was the entire enforcement of the project's central invariant
+# before this. A new module must join LAYERS in the script in the same change
+# that adds it (a missing entry is an error, not a default).
+add_test(
+    NAME layer_graph
+    COMMAND python3 "${CMAKE_SOURCE_DIR}/scripts/check-layer-graph.py" --root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties(layer_graph PROPERTIES
+    TIMEOUT 60
+)
+
 if(LUMEN_BUILD_TESTS)
     add_executable(test_result tests/test_result.cpp)
     target_link_libraries(test_result PRIVATE lx.foundation)

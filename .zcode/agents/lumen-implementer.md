@@ -38,6 +38,12 @@ Rules of the stage:
 - **Commits**: commit each logically complete unit in the worktree with a detailed
   conventional message — summary line, then what/why, the design decision, and the
   evidence (tests run, numbers measured). Never push; never amend existing commits.
+- **Format and diff hygiene**: changed C++ files follow `.clang-format` — check with
+  `clang-format --dry-run --Werror` on the files you touched before committing; run
+  `scripts/diff-hygiene.sh <base>` before committing — it catches what git diff cannot
+  show: `.gitattributes` mandates eol=lf everywhere, and a scripted/Python edit that
+  flips endings is normalized away on commit, so only the working-tree scan sees it
+  (the recorded two-incident trap). A whole-file rewrite is the same trap's other face.
 - **Stop on regression**: if any check, smoke or measurement shows a regression, stop and
   report it with the evidence. Do not keep, work around, or rationalize it — that decision
   belongs to the user (AGENTS.md §1.2).

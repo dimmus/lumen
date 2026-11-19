@@ -121,6 +121,34 @@ current when an item closes.
   notes forbade a helper) — ratify the amended acceptance or direct another resolution
   (see `.zcode/memories/lumen-snprintf-log-migration.md`).
 
+- [ ] **Tracked CRLF files on main past .gitattributes** (found 2026-11-19 by
+  scripts/diff-hygiene.sh): 12 blobs under `evidence/2026-11-18-sanitizer-sweep/`
+  (app-smoke/drag-smoke/asan logs) were force-added with CRLF bytes and sit in the tree
+  against the `eol=lf` policy — and `evidence/` is supposed to never merge at all (37
+  files tracked there total). Owner decision: `git rm -r --cached evidence/` on main
+  (history keeps them) or accept as-is; diff-hygiene reports them as baseline debt until
+  then.
+- [ ] **Studio parallel task lanes** (deferred 2026-11-19 from the harness review): the
+  engine supports concurrency (confirmers already run under Promise.all) but the task
+  loop is strictly sequential with shared mutable state (knownRed, branchOf, the board).
+  Design sketch: max_parallel lanes over tasks with disjoint scopes and no dependency
+  edges between them, seat steps already serialize through the broker, run lock already
+  prevents run collisions. Needs a live workflow run to validate engine semantics
+  (report/board interleaving, world.run isolation) before shipping — do not land it
+  unexercised.
+- [ ] **compare.sh broker wiring** (2026-11-19): ~/lumen-compare's compare.sh lives
+  outside the repo; the lumen-compositor-bench workflow now wraps its invocation with
+  scripts/seat-lock.sh (class bench), but direct manual runs of compare.sh are still
+  unbrokered — wrap or document at the next notebook session.
+- [ ] **Invariant GAPs** (docs/invariants.md, 2026-11-19): four §5 invariants have no
+  designated test — content-hint scanout priority policy, GPU pool reuse across frames,
+  present-mode policy (discrete→mailbox / integrated→fifo_relaxed), and the kms_damage
+  contract in kms_atomic_commit/presentation_feedback. Close each by adding the check
+  named in the row; never by weakening the row.
+- [ ] **Remaining LONG memory records** (2026-11-19): 19 records are 121–300 lines —
+  split candidates listed in the generated `.zcode/memories/INDEX.md` ("LONG" markers);
+  the ≤120-line rule applies at next touch, split all of them eventually.
+
 ## Host-limited gates (ADR-010; VM cannot close these)
 
 - [ ] **Vulkan capture green** (replaces the portal task, owner decision 2026-11-14): make

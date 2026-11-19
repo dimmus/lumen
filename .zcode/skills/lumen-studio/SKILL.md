@@ -13,8 +13,8 @@ anywhere, and no headless compositor verification).
 
 | Layer | Location | Contents |
 | --- | --- | --- |
-| Role agents (Agent tool / workflow personas) | `.zcode/agents/*.md` | planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher, architect, doc-writer, screenshoter (`agent-screenshoter`) |
-| Knowledge skills | `.zcode/skills/` | `lumen-build-run` (hosts/commands/measurement), `lumen-testing` (matrices/evidence/statuses), `lumen-decisions` (settled), `lumen-adr` (when a decision needs `docs/adr/NNN-*.md` and how to write it), `lumen-memory-writer` (archive format), `agent-screenshoter` (seat screenshots), this skill |
+| Role agents (Agent tool / workflow personas) — the `.md` files are the single source of truth; workflow personas point at them | `.zcode/agents/*.md` | planner, implementer, reviewer, tester, test-analyst, gatekeeper, researcher, architect, doc-writer, screenshoter (`agent-screenshoter`) + the workflow-stage roles fixer, confirmer, memory-writer |
+| Knowledge skills | `.zcode/skills/` | `lumen-build-run` (hosts/commands/measurement), `lumen-testing` (matrices/evidence/statuses), `lumen-decisions` (settled; generated INDEX.md beside it), `lumen-adr` (when a decision needs `docs/adr/NNN-*.md` and how to write it), `lumen-memory-writer` (archive format), `lumen-seat` (the seat broker — every seat job holds a ticket), `agent-screenshoter` (seat screenshots), this skill |
 | Workflows | `.zcode/workflows/*.dwf.ts` | `lumen-development-studio`, `lumen-gated-change`, `lumen-compositor-bench` |
 
 ## Choosing the orchestration
@@ -36,13 +36,19 @@ park on you — answer them, relaying user decisions when needed; never leave th
 
 ## What the studio workflow does (per task)
 
-plan → worktree (`../lumen-wt/<id>`, branch from the agreed base) → tests-enabled
-baseline build+ctest → implement (one implementer; commits each logically complete unit
-with a detailed message) → build+test fix loop (≤3) → independent read-only review →
-per-finding independent confirmation (confirmed pre-existing defects are recorded to
-`.zcode/TODO.md`, not fixed) → confirmed fixes + re-gate (≤2) → **seat
-verification** (drag/app smokes `--join-seat-session`; optional `ui-bench` A/B) →
-read-only gate verdict (READY/BLOCKED/NOT READY) → memory record in `.zcode/memories/` →
+run lock (`scripts/run-lock.sh` — one studio run per worktree root, heartbeat per
+task) → plan → worktree (`../lumen-wt/<id>` — or `$LUMEN_WT_ROOT` — branch from the
+agreed base; ALL predecessor branches integrated for diamond deps) → tests-enabled
+baseline build+ctest (computed `ctest -N` counts) → implement (one implementer; commits
+each logically complete unit with a detailed message) → required evidence derived from
+the diff (`scripts/classify-change.py` — knobs add, never waive) → build+test fix loop
+(≤3; two design-level escalations park the task NEEDS_REDESIGN) → independent read-only
+review → per-finding independent confirmation (confirmed pre-existing defects are
+recorded to `.zcode/TODO.md`, not fixed) → confirmed fixes + re-gate (≤2) → **seat
+verification** (brokered drag/app smokes `--join-seat-session`, tolerance by exact
+failing-row set; `ui-bench` when the diff is render-path) → read-only gate verdict
+(READY/BLOCKED/NOT READY/NEEDS_REDESIGN; BLOCKED-ON-HOST for render-path on the VM) →
+memory record in `.zcode/memories/` (on main or spooled to `zcode/memory-spool`) →
 PR description artifact. Worktrees and branches survive the run for inspection.
 
 ## Binding rules (from the project owner)
@@ -68,6 +74,12 @@ ad-hoc multi-agent chats. Pass paths, not file contents, across agent boundaries
 runs with `AmendWorkflow` + `path` edits, never full re-submissions. Reuse the
 `lumen-decisions`/`lumen-build-run` skills instead of re-deriving their facts. Don't spawn
 a confirmer on a finding a command already decided.
+
+**Reading large files** (the repo's `.cppm`s run past 5,000 lines): grep for the symbol
+first, read ±40 lines around the hits, `git log -L <range>:<file>` when history decides
+the question; never `cat` a file over ~400 lines; never re-read a file after an edit —
+the edit tool already verified the change. Memory retrieval goes through the generated
+`.zcode/memories/INDEX.md` (grep the module slice) — never load the whole archive.
 
 **Bounded auditors** (learned from the xdg-toplevel-drag run, where one bare-ask
 confirmation of a heavy finding cost 3.9M tokens — the subagent bootstrapped its whole

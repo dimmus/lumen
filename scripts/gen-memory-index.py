@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Generate the Lumen memory indexes from record frontmatter.
+
+MEMORY.md grew to 28 KB with rows up to 3,193 chars — an "index" meant to be
+loaded every session. Rows are now capped at 200 chars (detail lives in the
+record, not the row), and a second index (INDEX.md) groups records by module
+for retrieval: grep a module slice, not the whole archive.
+
+  python3 scripts/gen-memory-index.py [REPO]      # default: cwd
+
+Reads .zcode/memories/lumen-*.md frontmatter:
+  name, description        (existing archive format — both required)
+  summary                  (optional; the MEMORY.md row — MUST be ≤200 chars,
+                            enforced; when absent the row is derived from the
+                            first clause of description and auto-shortened,
+                            with the file listed for an explicit summary)
+  modules, topics          (optional lists; modules inferred from lx.* tokens
+                            in the body when absent)
+  supersedes               (optional; shown in INDEX.md)
+
+Writes:
+  .zcode/memories/MEMORY.md   flat index, one ≤200-char row per record
+  .zcode/memories/INDEX.md    grouped by module, with topics and dates
+
+Exit 1 when a present `summary:` exceeds 200 chars (fix the record, not the
+index) or frontmatter is malformed; auto-shortened derived rows are a warning.
+"""
+import datetime
+import os
+import re
+import sys
+
+ROW_CAP = 200
+
+
+def parse_frontmatter(path):
+    text = open(path, encoding="utf-8").read()
+    if not text.startswith("---"):
+        return None, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return None, text
+    fm_text = text[4:end]
+    body = text[end + 4:]
+    fm = {}
+    key = None
+    for line in fm_text.splitlines():
+        m = re.match(r"^(\w[\w-]*):\s*(.*)$", line)
+        if m and not line.startswith((" ", "-", "\t")):
+            key = m.group(1)
+            fm[key] = m.group(2).strip().strip('"')
+        elif key is not None and line.startswith(("  ", "\t", "- ")):
+            fm[key] += " " + line.strip().lstrip("-").strip()
+    return fm, body
+
+
+def first_clause(description):
+    """Cut a description at the first sentence or ';'-clause, then hard-cap."""
+    for sep in [". ", "; ", " — "]:
+        idx = description.find(sep)
+        if 0 < idx < ROW_CAP - 20:
+            return description[: idx + (1 if sep != " — " else len(sep))].strip()
+    if len(description) <= ROW_CAP:
+        return description
+    cut = description[: ROW_CAP - 1]
+    # fall back to the last comma/colon inside the budget
+    for sep in [", ", ": ", " ("]:
+        idx = cut.rfind(sep)
+        if idx > ROW_CAP // 2:
+            return cut[:idx].rstrip(",;: ") + "…"
+    return cut.rstrip(",;: ") + "…"
+
+
+def infer_modules(body, path):
+    mods = sorted(set(re.findall(r"\blx\.[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)?\b", body)))
+    return [m for m in mods if not m.startswith("lx.wayland.protocols")][:4] or \
+           (["(harness/docs)"] if "harness" in path or "adr" in path else ["(general)"])
+
+
+def main():
+    repo = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    mem_dir = os.path.join(repo, ".zcode", "memories")
+    records = []
+    errors = []
+    shortened = []
+    for fname in sorted(os.listdir(mem_dir)):
+        if not (fname.startswith("lumen-") and fname.endswith(".md")):
+            continue
+        path = os.path.join(mem_dir, fname)
+        fm, body = parse_frontmatter(path)
+        if fm is None or "name" not in fm or "description" not in fm:
+            errors.append(f"{fname}: missing or malformed frontmatter (need name + description)")
+            continue
+        title = fname[len("lumen-"):-len(".md")].replace("-", " ")
+        if "summary" in fm and fm["summary"]:
+            row = fm["summary"]
+            if len(row) > ROW_CAP:
+                errors.append(f"{fname}: summary is {len(row)} chars (cap {ROW_CAP}) — shorten the summary, the detail belongs in the record")
+        else:
+            row = first_clause(fm["description"])
+            if len(fm["description"]) > ROW_CAP:
+                shortened.append(fname)
+        modules = [m.strip() for m in re.split(r"[,\s]+", fm.get("modules", "")) if m.strip()] \
+            or infer_modules(body, fname)
+        topics = [t.strip() for t in re.split(r"[,\s]+", fm.get("topics", "")) if t.strip()]
+        mdate = re.search(r"(\d{4}-\d{2}-\d{2})", fm["description"])
+        lines = body.count("\n") + 1
+        records.append({
+            "file": fname, "title": title, "row": row, "modules": modules,
+            "topics": topics, "date": mdate.group(1) if mdate else "",
+            "supersedes": fm.get("supersedes", ""), "lines": lines,
+        })
+
+    if errors:
+        for e in errors:
+            print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+
+    stamp = datetime.date.today().isoformat()
+    # --- MEMORY.md (flat, generated — do not hand-edit rows) -------------------
+    mem = [
+        "<!-- Generated by scripts/gen-memory-index.py — do not hand-edit rows;",
+        f"     edit the records' frontmatter (summary:, ≤{ROW_CAP} chars) and regenerate. -->",
+        "",
+    ]
+    for r in records:
+        mem.append(f"- [{r['title']}](lumen-{r['title'].replace(' ', '-')}.md) — {r['row']}")
+    open(os.path.join(mem_dir, "MEMORY.md"), "w").write("\n".join(mem) + "\n")
+
+    # --- INDEX.md (by module, with topics/dates) -------------------------------
+    by_mod = {}
+    for r in records:
+        for m in r["modules"]:
+            by_mod.setdefault(m, []).append(r)
+    idx = [
+        "<!-- Generated by scripts/gen-memory-index.py — retrieval layer for the",
+        "     archive (and for lumen-decisions/lumen-build-run lookups): grep the",
+        "     module slice instead of the whole archive. Do not hand-edit. -->",
+        "",
+        f"# Memory index by module ({len(records)} records, generated {stamp})",
+        "",
+    ]
+    for m in sorted(by_mod):
+        idx.append(f"## {m}")
+        idx.append("")
+        for r in sorted(by_mod[m], key=lambda r: r["date"], reverse=True):
+            extra = []
+            if r["topics"]:
+                extra.append("topics: " + ", ".join(r["topics"]))
+            if r["supersedes"]:
+                extra.append("supersedes " + r["supersedes"])
+            if r["lines"] > 120:
+                extra.append(f"LONG ({r['lines']} lines — split candidate)")
+            idx.append(f"- **{r['title']}** ({r['date'] or 'undated'}) — {r['row']}"
+                       + (f"  [{'; '.join(extra)}]" if extra else ""))
+        idx.append("")
+
+    open(os.path.join(mem_dir, "INDEX.md"), "w").write("\n".join(idx) + "\n")
+
+    print(f"memory index: {len(records)} records → MEMORY.md ({sum(len(r['row']) for r in records)} row chars) + INDEX.md ({len(by_mod)} modules)")
+    if shortened:
+        print(f"note: {len(shortened)} derived rows auto-shortened (add an explicit summary: to these records):")
+        for f in shortened:
+            print(f"  - {f}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

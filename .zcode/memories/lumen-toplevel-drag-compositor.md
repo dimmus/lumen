@@ -4,6 +4,10 @@ description: "2026-11-12: compositor side of xdg-toplevel-drag-v1 (worktree 0600
 metadata:
   node_type: memory
   type: project
+summary: "xdg-toplevel-drag-v1 served: wm_dragged_window third pointer mode, source-mark invalid_source, unmap_epoch re-attach; ctest 131/133 known-red era; g-latency WARN = host noise via A/B"
+modules: lx.compositor
+topics: protocol, drag
+
 ---
 
 Verified 2026-11-12 in worktree `/home/dimmus/lumen-wt/toplevel-drag-compositor` (branch

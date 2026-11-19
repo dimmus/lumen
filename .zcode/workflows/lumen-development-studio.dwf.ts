@@ -11,13 +11,15 @@ whenToUse: A non-trivial Lumen change or multi-task request that must go through
   bounded task → lumen-gated-change instead; cross-compositor benchmarking →
   lumen-compositor-bench.
 args:
-  app_smoke_min:
-    type: number
-    description: "Host-calibrated app-smoke floor: when set >0, exit 1 with at least
-      this many PASS rows counts as host noise, not a failure (notebook ≈140 —
-      its ~36 VM-geometry rows fail regardless of the change). 0 = the exit code
-      decides."
-    default: 0
+  app_smoke_tolerated_failset:
+    type: json
+    description: 'Row names app-smoke may FAIL on this host without it being the
+      change''s fault (json array, e.g. the notebook''s VM-geometry rows).
+      Tolerance is by exact row NAME, never by pass-count floor — a change that
+      breaks exactly one new row never clears a real failing-set comparison.
+      Rows in the set that PASS are reported as improvements. Empty = the exit
+      code decides.'
+    default: "[]"
   base:
     type: string
     description: Git ref (commit/branch) each task worktree is cut from
@@ -31,7 +33,8 @@ args:
     description: 'Test names tolerated in a red baseline (json array, e.g.
       ["some_red_test"]): tasks proceed and every suite gate then
       requires no NEW failures beyond this set. Failures outside the set park
-      the run on an owner decision (proceed-and-tolerate vs skip).'
+      the run on an owner decision (proceed-and-tolerate vs skip). This is an
+      owner sign-off item: the gate lists every non-empty set in its reasons.'
     default: "[]"
   max_tasks:
     type: number
@@ -39,14 +42,17 @@ args:
     default: 5
   run_bench:
     type: boolean
-    description: Also run scripts/ui-bench.sh (engine bench against the stored
-      baseline) in each task's verification
+    description: "Also run scripts/ui-bench.sh even in tasks whose diff does not
+      require a bench. ADDITIVE only: the classifier (scripts/classify-change.py)
+      derives required evidence from each task's diff and an operator knob can
+      add evidence, never waive it."
     default: false
   run_smokes:
     type: boolean
-    description: "Run drag-smoke and app-smoke with --join-seat-session in each
-      task's verification (needs a quiet host: one DRM master, no other
-      session)"
+    description: "Run drag-smoke and app-smoke with --join-seat-session even in
+      tasks whose diff does not require them (additive — required seat evidence
+      cannot be waived). The smoke/bench scripts take the seat-broker ticket
+      themselves (scripts/seat-lock.sh; the lumen-seat skill)."
     default: true
   smoke_env:
     type: json
@@ -142,13 +148,33 @@ interface FixReport {
   summary: string;
   /** One "hash subject" line per fix commit. */
   commits: string[];
+  /** True when the failure is NOT patchable (wrong approach, invariant conflict) and the
+      task should route back to planning instead of burning another fix round. */
+  designLevel?: boolean;
 }
 
 interface GateVerdict {
   /** READY only when acceptance is met with independent evidence and nothing regressed. */
-  verdict: "READY" | "BLOCKED" | "NOT_READY";
+  verdict: "READY" | "BLOCKED" | "NOT_READY" | "NEEDS_REDESIGN";
   /** Each reason one sentence; cites the evidence it rests on. */
   reasons: string[];
+}
+
+/** Independent read of the evidence by the analyst stage (never the runner). */
+interface Analysis {
+  /** One paragraph: what the evidence establishes and what it does not. */
+  verdict: string;
+  /** Coverage gaps and provenance problems, one sentence each (may be empty). */
+  gaps: string[];
+}
+
+/** What scripts/classify-change.py derives from a task's diff. */
+interface RequiredEvidence {
+  classes: string[];
+  required: { ctest: boolean; smokes: boolean; bench_ab: boolean; goldens: boolean };
+  render_path: boolean;
+  decisive_backend_blocked_on_host: boolean;
+  host: string;
 }
 
 interface MemoryRecord {
@@ -171,11 +197,7 @@ interface WorkflowReport {
 /** What the owner decided to do about a busy seat: freed it, or smoke-less delivery. */
 type SeatPlan = "freed" | "skip";
 
-const WT_ROOT = "/home/dimmus/lumen-wt";
-const MAIN_WS = "/home/dimmus/lumen";
-
 const task = String(args.task ?? "");
-const base = args.base === undefined ? "HEAD" : String(args.base);
 const branchPrefix = args.branch_prefix === undefined ? "zcode/task" : String(args.branch_prefix);
 const runSmokes = args.run_smokes !== false;
 const runBench = args.run_bench === true;
@@ -183,7 +205,29 @@ const maxTasks = typeof args.max_tasks === "number" ? args.max_tasks : 5;
 const knownRed: string[] = Array.isArray(args.known_red) ? args.known_red.map(String) : [];
 const smokeEnv: string[] = Array.isArray(args.smoke_env) ? args.smoke_env.map(String) : [];
 const envPrefix = smokeEnv.length > 0 ? smokeEnv.join(" ") + " " : "";
-const appSmokeMin = typeof args.app_smoke_min === "number" ? args.app_smoke_min : 0;
+const toleratedFailset: string[] = Array.isArray(args.app_smoke_tolerated_failset)
+  ? args.app_smoke_tolerated_failset.map(String)
+  : [];
+
+// Derived, never hardcoded to one machine's home: the main checkout is where
+// world.run's cwd is; the worktree root is its sibling 'lumen-wt' directory
+// (env override LUMEN_WT_ROOT), shared with lumen-gated-change.
+const pwdRun = await world.run("pwd", [], { output: { tail: 512 } });
+const MAIN_WS = pwdRun.stdout.trim().split("\n").pop() ?? ".";
+// Resolve the base arg to a CONCRETE SHA in the MAIN checkout before any
+// worktree exists: the symbolic default "HEAD" resolves to the TASK BRANCH
+// inside every later 'git -C <wt>' command (diff HEAD..HEAD = nothing, and
+// the resume detector would count zero unique commits on a leftover branch).
+const baseRaw = args.base === undefined ? "HEAD" : String(args.base);
+const baseResolved = baseRaw === "HEAD"
+  ? (await world.run("git", ["rev-parse", "HEAD"], { output: { tail: 512 } })).stdout.trim().split("\n").pop() ?? "HEAD"
+  : baseRaw;
+const wtRootRun = await world.run(
+  "bash",
+  ["-c", `echo "\${LUMEN_WT_ROOT:-$(dirname '${MAIN_WS}')/lumen-wt}"`],
+  { output: { tail: 512 } },
+);
+const WT_ROOT = wtRootRun.stdout.trim().split("\n").pop() ?? "../lumen-wt";
 
 /** Test names ctest reported under "The following tests FAILED:" (empty when it never got there). */
 function failedTests(out: string): string[] {
@@ -192,6 +236,22 @@ function failedTests(out: string): string[] {
   const names: string[] = [];
   for (const line of out.slice(marker).split("\n").slice(1)) {
     const m = /^\s*-?\s*\d+ - (\S+) \(/.exec(line);
+    if (m !== null && m[1] !== undefined) names.push(m[1]);
+  }
+  return names;
+}
+
+/** "Total Tests: N" from ctest -N — the tree's own computed count, never quoted from memory. */
+function ctestTotal(out: string): number {
+  const m = /Total Tests: (\d+)/.exec(out);
+  return m !== null && m[1] !== undefined ? Number(m[1]) : -1;
+}
+
+/** app-smoke failing row names, e.g. ["Z2", "N8"] (empty when none). */
+function smokeFailRows(out: string): string[] {
+  const names: string[] = [];
+  for (const line of out.split("\n")) {
+    const m = /^FAIL\s+(\S+)/.exec(line);
     if (m !== null && m[1] !== undefined) names.push(m[1]);
   }
   return names;
@@ -207,108 +267,86 @@ if (task === "") {
   return empty;
 }
 
+// One studio run per worktree root (scripts/run-lock.sh): two concurrent runs
+// collide on <WT_ROOT>/<task-id> worktrees and on the main checkout's memory
+// commits. Heartbeat at every task; stale (no heartbeat for 6 h) is an owner
+// decision with the exact force-release command — never auto-broken.
+phase("Take the run lock");
+const runOwner = `studio ${task.split("\n")[0].slice(0, 60)}`;
+const runLock = await world.run("bash", ["-c", `exec '${MAIN_WS}/scripts/run-lock.sh' acquire '${runOwner.replace(/'/g, "")}'`], { output: { tail: 2048 } });
+if (runLock.exitCode !== 0) {
+  const busy: WorkflowReport = {
+    conclusion:
+      "Another studio run holds the run lock for this worktree root (or a stale lock needs an owner decision). " +
+      `${(runLock.stderr + runLock.stdout).trim().split("\n").slice(0, 2).join(" — ")}`,
+    findings: [],
+    verified: ["preflight: run-lock check ran"],
+    notCovered: ["everything — the run lock is held"],
+  };
+  return busy;
+}
+/** Releases the run lock before every workflow exit path. */
+const finishRun = async (r: WorkflowReport): Promise<WorkflowReport> => {
+  await world.run("bash", ["-c", `exec '${MAIN_WS}/scripts/run-lock.sh' release '${runOwner.replace(/'/g, "")}'`], { output: { tail: 1024 } });
+  return r;
+};
+
+// The role contracts live in .zcode/agents/*.md — the single source of truth
+// (agents and workflows drifted before; the files are binding, the personas
+// below only orient and point there).
 const plannerPersona =
-  "You are the planning stage of Lumen's development studio. Read the repository's AGENTS.md " +
-  "(especially §1.2 user rules and §3 layer/process/thread rules), .zcode/skills/lumen-decisions/SKILL.md " +
-  "(settled outcomes — never plan to re-open one), and .zcode/TODO.md (do not plan already-done work; " +
-  "it is historical — verify against code). Inspect the code the request touches. Produce the minimal " +
-  "set of gated tasks, each independently deliverable in its own git worktree with a disjoint write " +
-  "scope, topologically ordered. Small requests are ONE task. Each task's notes carry the risks, the " +
-  "relevant settled decisions, and host limits (this VM has no hardware Vulkan — the GL path runs here; " +
-  "hardware Vulkan claims need the notebook). Planning is read-only: do not edit anything, do not run builds.";
+  "You are the planning stage of Lumen's development studio. Your full contract is " +
+  ".zcode/agents/lumen-planner.md — read it first, it is binding (disjoint scopes, topological " +
+  "order, verification per task, host limits). Planning is read-only.";
 
 const implementerPersona =
   "You are the implement stage of Lumen's development studio, working in ONE assigned git worktree. " +
-  "Read that worktree's AGENTS.md first — it is binding (§1.2 best-in-class bar and no-degradation rule, " +
-  "§3 layering, §4 conventions, §5 invariants). Read .zcode/skills/lumen-decisions/SKILL.md and " +
-  ".zcode/skills/lumen-build-run/SKILL.md in the worktree if present. Minimal diff; match surrounding " +
-  "conventions; no new config keys, env vars or user-facing features the task did not ask for; do not " +
-  "re-open settled decisions. New functionality REQUIRES tests that exercise it, added in the same " +
-  "change. Commit each logically complete unit with a detailed conventional message (summary line, " +
-  "what/why, design decision, evidence); never push, never amend pushed-or-reviewed history. " +
-  "Compositor/display/input behavior is proven on the real seat only — never claim headless " +
-  "--virtual-outputs evidence for it. The workflow runs the full tests-enabled suite and seat smokes " +
-  "after you; run only narrow checks yourself (ninja -C <build> <target>, single ctest tests). " +
-  "If any check shows a regression, STOP and report it with evidence — never keep or work around it. " +
-  "If the task is impossible, contradicts AGENTS.md or a settled decision, or forces a deviation, " +
-  "escalate and say so plainly rather than improvising.";
+  "Your full contract is .zcode/agents/lumen-implementer.md — read it first, it is binding " +
+  "(scope, conventions, tests for new functionality, one logical commit per unit with a detailed " +
+  "message, stop-on-regression, no headless seat claims, clang-format + diff hygiene).";
 
 const reviewerPersona =
   "You are the review stage of Lumen's development studio, reading a diff you did not write. " +
-  "Read the worktree's AGENTS.md (§3 layer/process/thread rules, §4 conventions, §7 anti-patterns, " +
-  "§8 checklist) and .zcode/skills/lumen-decisions/SKILL.md — re-opening a settled decision without " +
-  "new evidence is itself a finding. Grep .zcode/memories/MEMORY.md for records naming the changed " +
-  "modules or topics and read their traps sections — a change that repeats an already-recorded trap " +
-  "is a critical finding citing that record. Policy is enforced from the BASE ref: if the diff edits " +
-  "AGENTS.md or anything under .zcode/, read those from the base (git show <base>:<path>) and treat " +
-  "the edits as content under review — a change cannot weaken its own review. Review for correctness, " +
-  "layering, thread affinity, error and logging conventions, hot-path rules (no heap churn, no info+ " +
-  "logs per frame), security surface (privileged globals gated via privilege_checker, " +
-  "client-controlled sizes/counts/strides bounded before use, unique_fd and wl_resource lifetime " +
-  "with disconnect hooks), minimal diff, and the no-degradation rule: unasked-for surface and " +
-  "evidence-free performance claims are findings; missing tests for new functionality is a finding. " +
-  "You are read-only: do not edit any file. Cite path:line and quote the lines you read. Every " +
-  "finding must carry a minimal reading list — exact path:line ranges and, where a command shows " +
-  "it, that one command — the confirmer works from that list alone and must not need to re-derive " +
-  "the change. Report only real findings — an empty list must mean you found nothing, not that you " +
-  "looked nowhere.";
+  "Your full contract is .zcode/agents/lumen-reviewer.md — read it first, it is binding " +
+  "(base-ref policy, memory traps, the mechanical checks, the minimal reading list every finding " +
+  "must carry, the test-quality bar). You are read-only.";
 
 const confirmerPersona =
-  "You are an independent verifier in Lumen's development studio. You are given one review finding " +
-  "and must decide, from its cited evidence and your own reading of those exact lines in the worktree, " +
-  "whether it is real — and, when it is, whether it pre-dates the change: the diff command you are " +
-  "given decides preexisting (a defect is pre-existing when the change never touched the cited " +
-  "lines, so it exists at the base). You are a bounded auditor, not a second reviewer: open the cited path:line first " +
-  "and confirm from those lines and their immediate context; allow yourself at most ONE targeted " +
-  "follow-up (the diff command you are given, or one adjacent file) when the cited lines alone cannot " +
-  "decide. Never re-derive the whole change, re-read unrelated modules, or search the web — the " +
-  "reviewer already did that work, and the ask tells you which files changed. If your budget cannot " +
-  "decide it, return holds=false with reason=\"inconclusive from cited evidence\" and name the one read " +
-  "that would decide it — an honest inconclusive beats a grind. You are read-only: do not edit any " +
-  "file. If the evidence does not hold up, say so — a false finding must not survive this stage.";
+  "You are an independent verifier in Lumen's development studio: a bounded auditor, not a second " +
+  "reviewer. Your full contract is .zcode/agents/lumen-confirmer.md — read it first, it is binding. " +
+  "At most ONE targeted follow-up beyond the cited lines; an honest inconclusive beats a grind. " +
+  "You are read-only.";
 
 const fixerPersona =
   "You fix build failures, test failures and confirmed review findings in ONE assigned Lumen git " +
-  "worktree. Read its AGENTS.md §4 conventions before editing; minimal diffs only, no refactors " +
-  "beyond what the failure forces, no new features, never weaken a test or golden to pass. Commit " +
-  "each fix as one logical unit with a detailed message; never push. Do not run the full suite — " +
-  "the workflow re-gates after you; narrow checks are fine. If a failure looks environmental " +
-  "(host noise, DRM master, missing protocol stamp) rather than caused by the change, escalate and " +
-  "say so plainly rather than papering over it.";
+  "worktree. Your full contract is .zcode/agents/lumen-fixer.md — read it first, it is binding. " +
+  "Minimal diffs; never weaken a test to pass; say 'design-level' when a failure is not patchable " +
+  "so the task routes back to planning instead of burning another round.";
 
 const gatekeeperPersona =
-  "You are the final gate of Lumen's development studio for ONE task. You are read-only: do not " +
-  "implement, repair, rerun suites, or decide a regression is acceptable. Read the worktree's " +
-  "AGENTS.md §1.2 (no degradation; any measured regression stops the task and goes to the user with " +
-  "the A/B evidence) and .zcode/skills/lumen-decisions/SKILL.md. Validate the packet you are given " +
-  "against the worktree itself: acceptance criteria vs what shipped, independent review confirmed, " +
-  "tests-enabled suite counts (a plain release build has NO unit tests — a suite claim from it is " +
-  "invalid), seat-smoke results for compositor/display/input surface, A/B numbers for perf changes, " +
-  "tests covering new functionality. Missing required evidence is a hold, not a pass; environmental " +
-  "unavailability never converts to success. A confirmed finding on code this change introduced must " +
-"be fixed for READY; a confirmed pre-existing defect (the confirmer tagged it — the diff never " +
-"touched the cited lines) does not block, provided the packet records it (TODO row / memory) — " +
-"never silently accepted. You audit the packet with targeted reads and commands " +
-  "(the cited files, the suite counts, the smoke logs) — you do not re-review the whole change; when " +
-  "something would need that, say so in your reasons instead of performing it. Decide exactly one: " +
-  "READY (acceptance met, evidence " +
-  "independent and complete, nothing regressed) / NOT_READY (a gate is confirmed violated) / " +
-  "BLOCKED (evidence missing, invalid or not comparable). READY certifies the gate only — never " +
-  "permission to merge, publish or push.";
+  "You are the final gate of Lumen's development studio for ONE task. Your full contract is " +
+  ".zcode/agents/lumen-gatekeeper.md — read it first, it is binding: derived evidence cannot be " +
+  "waived, counts are computed from the tree's own ctest -N, seat evidence is brokered, " +
+  "BLOCKED-ON-HOST applies to render-path changes on hosts without hardware Vulkan, non-default " +
+  "tolerance knobs are owner sign-off items, and the verdicts are READY / NOT_READY / BLOCKED / " +
+  "NEEDS_REDESIGN (design-level findings route the task back to planning). You are read-only.";
+
+const analystPersona =
+  "You are the evidence-analysis stage of Lumen's development studio: you read the checks' " +
+  "output and say what it does and does not establish. Your full contract is " +
+  ".zcode/agents/lumen-test-analyst.md — read it first, it is binding (provenance, " +
+  "coverage vs the diff, environmental-vs-change failure diagnosis, A/B verdicts, honest " +
+  "gaps). You did not run the checks — that independence is your value. You are read-only.";
 
 const memoryPersona =
-  "You write Lumen's project memory records. Work in the MAIN checkout at " + MAIN_WS + " (not a task " +
-  "worktree). Read .zcode/skills/lumen-memory-writer/SKILL.md if present, and 2-3 existing files in " +
-  ".zcode/memories/ to match the archive's voice. Then write .zcode/memories/lumen-<kebab-topic>.md: " +
-  "YAML frontmatter (name, one dense description sentence with dates/numbers, metadata node_type: " +
-  "memory, type: project), dated verified facts with inline evidence (commits, paths, commands, " +
-  "measured numbers), explicit disproven theories where any, then **Why:** (the general lesson) and " +
-  "**How to apply:** (imperative guidance). Cross-reference with [[wiki-links]]. Add one row to " +
-  ".zcode/memories/MEMORY.md. Then commit both files on the main checkout's current branch with " +
-  "subject 'memory: <topic>' (git add the two files; never push). If a memory for this topic already " +
-  "exists, extend it with a dated section instead of forking a new file. When the task packet lists " +
-"preexistingFindings, add one open row each to .zcode/TODO.md and commit that file together with " +
-"the memory (they are defects the run proved but did not fix).";
+  "You write Lumen's project memory records. Your full contract is .zcode/agents/lumen-memory-writer.md " +
+  "and .zcode/skills/lumen-memory-writer/SKILL.md — read them first, they are binding. Work in the " +
+  "MAIN checkout at " + MAIN_WS + " (not a task worktree). Frontmatter summary/modules/topics " +
+  "(supersedes when replacing), ≤200-char index row, the index regenerated with " +
+  "scripts/gen-memory-index.py, the two-strikes Rule-proposal line for repeated traps, and the " +
+  "commit rule: on main directly, or SPOOLED to refs/heads/zcode/memory-spool when the main " +
+  "checkout sits on any other branch (a memory committed onto a feature branch is lost on switch " +
+  "back). When the task packet lists preexistingFindings, add one open row each to .zcode/TODO.md.";
 
 const verified: string[] = [];
 const notCovered: string[] = [
@@ -320,12 +358,14 @@ const readyBranches: string[] = [];
 /** Per-task branch and gate verdict, so dependent tasks can chain onto READY predecessors. */
 const branchOf = new Map<string, string>();
 const verdictOf = new Map<string, string>();
+/** Per-task computed suite count (ctest -N at baseline) — the gate compares against it. */
+const baselineCountOf = new Map<string, number>();
 
 artifact.board("tasks", {
   title: "Studio tasks",
   key: "id",
   status: "state",
-  columns: ["planned", "baseline", "implementing", "review", "verify", "gate", "done", "blocked"],
+  columns: ["planned", "baseline", "implementing", "review", "verify", "gate", "done", "blocked", "redesign"],
   cardTitle: "title",
   detail: [{ field: "branch", label: "branch" }, { field: "verdict", label: "gate" }],
 });
@@ -344,19 +384,19 @@ log(`Plan: ${tasks.length} task(s) — ${plan.objective}`);
 
 let smokesEnabled = runSmokes;
 if (runSmokes) {
-  phase("Check the seat is free for smoke verification");
-  const seat = await world.run(
-    "bash",
-    // comm is 15-char truncated: pgrep -x cannot see lumen-compositor. Match /proc/*/comm
-    // directly, plus any running smoke script.
-    ["-c", "grep -l -e lumen-composito -e '^sway$' -e '^weston$' -e '^hyprland$' /proc/[0-9]*/comm 2>/dev/null | head -5; pgrep -f '^bash .*-smoke\\.sh' | head -3; true"],
-    { output: { tail: 4096 } },
-  );
-  const holders = seat.stdout.trim().split("\n").filter((l) => l.trim() !== "");
-  if (holders.length > 0) {
+  phase("Check the seat is free for smoke verification (the broker owns the check)");
+  // One implementation of the quiet-seat triple lives in scripts/seat-lock.sh
+  // (the lumen-seat skill); the smoke/bench scripts take their own per-job
+  // tickets at run time. This is the run-level advisory look ahead of them.
+  const seat = await world.run("bash", ["-c", `exec '${MAIN_WS}/scripts/seat-lock.sh' status`], {
+    output: { tail: 4096 },
+  });
+  const busyLines = seat.stdout.trim().split("\n").filter((l) => l.startsWith("FAIL:"));
+  if (seat.exitCode !== 0 && busyLines.length > 0) {
     const seatPlan = await hole<SeatPlan>(
       "Free the seat for smoke verification",
-      `Another compositor or smoke session holds the seat (one DRM master at a time):\n${holders.join("\n")}\n` +
+      `The seat broker reports the seat busy (one DRM master at a time):\n${busyLines.join("\n")}\n` +
+        `Broker status:\n${seat.stdout.trim().split("\n").slice(0, 4).join("\n")}\n` +
         `Return "freed" once the owner has freed the seat (the run then proceeds with smokes), or "skip" to ` +
         `deliver without seat smokes — gates will record the missing seat evidence honestly.`,
     );
@@ -367,11 +407,17 @@ if (runSmokes) {
 }
 
 for (const card of tasks) {
+  // Run-lock heartbeat at every task boundary (a live run never goes stale);
+  // owner-checked so a racing second run cannot keep the first's lock alive.
+  await world.run("bash", ["-c", `exec '${MAIN_WS}/scripts/run-lock.sh' heartbeat '${runOwner.replace(/'/g, "")}'`], { output: { tail: 512 } });
+
   const wt = `${WT_ROOT}/${card.id}`;
   const branch = `${branchPrefix}/${card.id}`;
   verdictOf.set(card.id, "BLOCKED");
 
-  // Chain onto the last READY dependency: its branch carries everything this task builds on.
+  // Chain onto ALL READY dependencies: a task with two predecessors integrates
+  // BOTH branches — basing on the last one alone silently dropped the other's
+  // commits and gated a tree that was never tested.
   const depIds = card.dependsOn;
   const unreadyDeps = depIds.filter((d) => verdictOf.get(d) !== "READY");
   if (unreadyDeps.length > 0) {
@@ -385,8 +431,9 @@ for (const card of tasks) {
     report({ id: card.id, title: card.title, branch, state: "blocked", verdict: "dependency" }, "tasks");
     continue;
   }
-  const lastDep = depIds.length > 0 ? depIds[depIds.length - 1] : undefined;
-  const effBase = lastDep !== undefined ? (branchOf.get(lastDep) ?? base) : base;
+  const firstDep = depIds.length > 0 ? depIds[0] : undefined;
+  const effBase = firstDep !== undefined ? (branchOf.get(firstDep) ?? baseResolved) : baseResolved;
+  const extraDeps = depIds.slice(1).map((d) => branchOf.get(d)).filter((b): b is string => b !== undefined);
 
   phase("Set up the worktree and test-enabled baseline");
   report({ id: card.id, title: card.title, branch, state: "baseline", verdict: "" }, "tasks");
@@ -396,17 +443,23 @@ for (const card of tasks) {
   if (add.exitCode === 0) {
     haveWt = true;
   } else {
-    // The add failed. Either a previous blocked attempt left an empty worktree at the base
-    // (reset onto the effective base and reuse), or an amended run finds a branch that
-    // already holds this task's implementation (resume it: baseline and implement are done).
+    // The add failed. Reuse ONLY what is provably this task's own leftover: the
+    // worktree must be on the expected branch (a foreign branch's commits are
+    // not this task's implementation), and a hard reset is only safe when the
+    // branch tip is already contained in the effective base (nothing to lose).
+    const onBranch = await world.run("git", ["-C", wt, "branch", "--show-current"], { output: { tail: 512 } });
     const leftover = await world.run("git", ["-C", wt, "status", "--porcelain"], { output: { tail: 2048 } });
     const unique = await world.run("git", ["rev-list", "--count", `${effBase}..${branch}`], { output: { tail: 1024 } });
     const uniqueCount = unique.exitCode === 0 ? Number(unique.stdout.trim()) : Number.NaN;
-    if (leftover.exitCode === 0 && leftover.stdout.trim() === "" && uniqueCount === 0) {
-      const reset = await world.run("git", ["-C", wt, "reset", "--hard", effBase], { output: { tail: 1024 } });
-      haveWt = reset.exitCode === 0;
-      if (haveWt) log(`Task ${card.id}: reusing existing worktree, branch reset to ${effBase}`);
-    } else if (leftover.exitCode === 0 && leftover.stdout.trim() === "" && uniqueCount > 0) {
+    const isTaskBranch = onBranch.exitCode === 0 && onBranch.stdout.trim() === branch;
+    if (isTaskBranch && leftover.exitCode === 0 && leftover.stdout.trim() === "" && uniqueCount === 0) {
+      const contained = await world.run("git", ["-C", wt, "merge-base", "--is-ancestor", "HEAD", effBase], { output: { tail: 512 } });
+      if (contained.exitCode === 0) {
+        const reset = await world.run("git", ["-C", wt, "reset", "--hard", effBase], { output: { tail: 1024 } });
+        haveWt = reset.exitCode === 0;
+        if (haveWt) log(`Task ${card.id}: reusing existing worktree (tip contained in ${effBase}), branch reset`);
+      }
+    } else if (isTaskBranch && leftover.exitCode === 0 && leftover.stdout.trim() === "" && uniqueCount > 0) {
       haveWt = true;
       resumeMode = true;
       verified.push(`task ${card.id}: resuming an already-implemented branch (${uniqueCount} commit(s) beyond ${effBase}; baseline was proven in the earlier run)`);
@@ -422,6 +475,30 @@ for (const card of tasks) {
       severity: "medium",
     });
     report({ id: card.id, title: card.title, branch, state: "blocked", verdict: "worktree" }, "tasks");
+    continue;
+  }
+  // Diamond dependencies: integrate every additional predecessor branch. A
+  // conflict between READY predecessors is a planning failure — record it,
+  // park the task, and let the owner re-plan; never auto-resolve.
+  let depConflict = false;
+  for (const depBranch of extraDeps) {
+    const merge = await world.run("git", ["-C", wt, "merge", "--no-edit", depBranch], { output: { tail: 4096 } });
+    if (merge.exitCode !== 0) {
+      await world.run("git", ["-C", wt, "merge", "--abort"], { output: { tail: 1024 } });
+      depConflict = true;
+      allFindings.push({
+        where: `task ${card.id}`,
+        what: `predecessor branches ${branchOf.get(depIds[0] ?? "") ?? effBase} and ${depBranch} conflict — the plan's tasks are not independently integrable; re-plan needed`,
+        evidence: `git -C ${wt} merge --no-edit ${depBranch} → exit ${merge.exitCode} (aborted)`,
+        status: "verified",
+        severity: "high",
+      });
+      break;
+    }
+    verified.push(`task ${card.id}: integrated predecessor ${depBranch} (diamond base)`);
+  }
+  if (depConflict) {
+    report({ id: card.id, title: card.title, branch, state: "redesign", verdict: "predecessor conflict" }, "tasks");
     continue;
   }
   await world.run(
@@ -456,6 +533,8 @@ for (const card of tasks) {
         severity: "medium",
       });
     } else {
+      // A parked hole is visible on the board, not just in the transcript.
+      report({ id: card.id, title: card.title, branch, state: "blocked", verdict: "awaiting owner: red baseline" }, "tasks");
       const proceed = await hole<boolean>(
         "Decide whether to proceed on a red baseline",
         `The unchanged baseline at ${wt} fails ${names.length} test(s): ${names.join(", ")}. None are in the ` +
@@ -493,7 +572,7 @@ for (const card of tasks) {
     allFindings.push({
       where: `task ${card.id}`,
       what: `red baseline (${why}) — per the no-degradation rule there is no clean baseline to gate against; task skipped`,
-      evidence: `worktree at ${wt}, base ${base}; ${why}`,
+      evidence: `worktree at ${wt}, base ${baseResolved}; ${why}`,
       status: "verified",
       severity: "high",
     });
@@ -501,6 +580,10 @@ for (const card of tasks) {
     continue;
   }
   verified.push(`task ${card.id}: tests-enabled baseline green in worktree (configure+build+ctest at ${wt}/build/test)`);
+  const baseCountRun = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "-N"], { output: { tail: 2048 } });
+  const baseCount = ctestTotal(baseCountRun.stdout + baseCountRun.stderr);
+  baselineCountOf.set(card.id, baseCount);
+  if (baseCount >= 0) log(`Task ${card.id}: baseline registers ${baseCount} tests (ctest -N)`);
   log(`Task ${card.id}: baseline green`);
   }
 
@@ -531,34 +614,86 @@ for (const card of tasks) {
   const commitList = await world.run("git", ["-C", wt, "log", "--oneline", `${effBase}..HEAD`], { output: { tail: 4096 } });
   log(`Task ${card.id}: implemented, ${impl.commits.length} commit(s)`);
 
+  // The diff itself decides what evidence this task's gate must see — the
+  // run_smokes/run_bench knobs can add, never waive (lumen-gatekeeper).
+  const classifyRun = await world.run(
+    "python3",
+    [`${MAIN_WS}/scripts/classify-change.py`, "--repo", wt, "--base", effBase],
+    { output: { tail: 8192 } },
+  );
+  let required: RequiredEvidence = {
+    classes: [],
+    required: { ctest: true, smokes: false, bench_ab: false, goldens: false },
+    render_path: false,
+    decisive_backend_blocked_on_host: false,
+    host: "unknown",
+  };
+  if (classifyRun.exitCode === 0) {
+    try {
+      required = JSON.parse(classifyRun.stdout) as RequiredEvidence;
+    } catch {
+      log(`Task ${card.id}: classifier output unparseable — ctest-only required evidence`);
+    }
+  } else {
+    log(`Task ${card.id}: classifier failed — ctest-only required evidence`);
+  }
+  verified.push(
+    `task ${card.id}: required evidence derived from the diff: classes [${required.classes.join(", ")}] → ` +
+      `smokes=${required.required.smokes} bench=${required.required.bench_ab} goldens=${required.required.goldens} (host ${required.host})`,
+  );
+  if (required.decisive_backend_blocked_on_host) {
+    notCovered.push(
+      `task ${card.id}: render-path change on a host without hardware Vulkan — BLOCKED-ON-HOST at the gate; a notebook verification ticket is required before merge`,
+    );
+  }
+
   phase("Build and test the change");
   const fixer = agent(`Fixer ${card.id}`, { system: fixerPersona, budget: { webSearch: 0 } });
   let gateGreen = false;
   let gateRounds = 0;
+  let designEscalations = 0;
   for (let round = 1; round <= 3 && !gateGreen; round++) {
     gateRounds = round;
     const build = await world.run("cmake", ["--build", `${wt}/build/test`, "-j2"], { timeoutMs: 1_800_000, output: { tail: 32_768 } });
     if (build.exitCode !== 0) {
-      await fixer.ask<FixReport>(
-        `The build failed (round ${round}) in the worktree ${wt}. Fix it with minimal changes and commit. Tail:\n` +
+      const fixRep = await fixer.ask<FixReport>(
+        `The build failed (round ${round}) in the worktree ${wt}. Fix it with minimal changes and commit; ` +
+          `set designLevel=true ONLY if the failure is not patchable (wrong approach, invariant conflict). Tail:\n` +
           `${(build.stderr + build.stdout).slice(-4000)}`,
       );
+      if (fixRep.designLevel === true) designEscalations++;
       continue;
     }
     const tests = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 1_200_000, output: { tail: 32_768 } });
     if (tests.exitCode !== 0) {
       const fresh = failedTests(tests.stderr + tests.stdout).filter((n) => !knownRed.includes(n));
       if (fresh.length > 0) {
-        await fixer.ask<FixReport>(
+        const fixRep = await fixer.ask<FixReport>(
           `The tests-enabled suite failed (round ${round}) in ${wt}; failing: ${fresh.join(", ")} (the tolerated ` +
             `known-red set ${knownRed.length > 0 ? knownRed.join(", ") : "is empty"} does not cover these). Fix the ` +
-            `cause with minimal changes and commit — never weaken a test. Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`,
+            `cause with minimal changes and commit — never weaken a test; set designLevel=true ONLY if the failure ` +
+            `is not patchable. Tail:\n${(tests.stderr + tests.stdout).slice(-4000)}`,
         );
+        if (fixRep.designLevel === true) designEscalations++;
         continue;
       }
       // only tolerated failures remain — green modulo the known-red baseline set
     }
     gateGreen = true;
+  }
+  // Two design-level escalations = the approach, not the patch, is wrong:
+  // park the task for re-planning instead of burning the remaining budget
+  // against a stale plan.
+  if (!gateGreen && designEscalations >= 2) {
+    allFindings.push({
+      where: `task ${card.id}`,
+      what: `the fixer escalated ${designEscalations} design-level failures — the approach needs re-planning (NEEDS_REDESIGN), not more fix rounds`,
+      evidence: `${gateRounds} round(s) at ${wt}/build/test with designLevel=true twice`,
+      status: "verified",
+      severity: "high",
+    });
+    report({ id: card.id, title: card.title, branch, state: "redesign", verdict: "NEEDS_REDESIGN" }, "tasks");
+    continue;
   }
   if (!gateGreen) {
     allFindings.push({
@@ -692,10 +827,13 @@ for (const card of tasks) {
   report({ id: card.id, title: card.title, branch, state: "verify", verdict: "" }, "tasks");
   const seatEvidence: string[] = [];
   let seatFailed = false;
-  if (smokesEnabled) {
+  let requiredSeatMissing = false;
+  const needSmokes = required.required.smokes || runSmokes;
+  const needBench = required.required.bench_ab || runBench;
+  if (needSmokes && smokesEnabled) {
     for (const smoke of [
-      { name: "drag-smoke", file: "./scripts/drag-smoke.sh", timeoutMs: 420_000, minPassed: 0 },
-      { name: "app-smoke", file: "./scripts/app-smoke.sh", timeoutMs: 900_000, minPassed: appSmokeMin },
+      { name: "drag-smoke", file: "./scripts/drag-smoke.sh", timeoutMs: 420_000 },
+      { name: "app-smoke", file: "./scripts/app-smoke.sh", timeoutMs: 900_000 },
     ]) {
       let exit = -1;
       let timedOut = false;
@@ -720,14 +858,25 @@ for (const card of tasks) {
         log(`Task ${card.id}: ${smoke.name} attempt ${attempt} exit ${exit}`);
       }
       const tail = full.slice(-3000);
-      const passedRows = (full.match(/^PASS/gm) ?? []).length;
-      const tolerated = exit !== 0 && !timedOut && smoke.minPassed > 0 && passedRows >= smoke.minPassed;
+      // Tolerance is by exact failing-row NAME against the owner-blessed set —
+      // never by pass-count floor: a change that breaks exactly one new row
+      // must not clear a row-count tolerance.
+      const failRows = smokeFailRows(full);
+      const freshFails = failRows.filter((r) => !toleratedFailset.includes(r));
+      const improvedRows = toleratedFailset.filter((r) => !failRows.includes(r));
+      const tolerated = exit !== 0 && !timedOut && freshFails.length === 0 && failRows.length > 0;
+      const brokered = full.includes("seat-lock: acquired");
       seatEvidence.push(
         `${smoke.name} --join-seat-session → ` +
-          (timedOut ? "COULD NOT RUN (timed out)" : tolerated ? `PASS at host tolerance (${passedRows} PASS rows ≥ ${smoke.minPassed}; exit ${exit})` : `exit ${exit}`),
+          (timedOut
+            ? "COULD NOT RUN (timed out)"
+            : tolerated
+              ? `PASS at host tolerance (failing rows [${failRows.join(", ")}] ⊆ the tolerated set; exit ${exit})${brokered ? "" : " — NO BROKER TICKET"}` +
+                (improvedRows.length > 0 ? `; improved: [${improvedRows.join(", ")}] now PASS` : "")
+              : `exit ${exit}${brokered ? "" : " — NO BROKER TICKET"}`),
       );
       verified.push(
-        `task ${card.id}: ${smoke.name} ${exit === 0 || tolerated ? "PASS" : timedOut ? "COULD NOT RUN (timed out)" : `FAIL (exit ${exit})`} on the real seat`,
+        `task ${card.id}: ${smoke.name} ${exit === 0 || tolerated ? "PASS" : timedOut ? "COULD NOT RUN (timed out)" : `FAIL (exit ${exit}; failing rows: ${failRows.join(", ") || "see log"})`} on the real seat`,
       );
       if (timedOut) {
         allFindings.push({
@@ -740,10 +889,20 @@ for (const card of tasks) {
       } else if (tolerated) {
         allFindings.push({
           where: `task ${card.id}`,
-          what: `${smoke.name} exited ${exit} with ${passedRows} PASS rows ≥ the host-calibrated floor ${smoke.minPassed} — the failing rows are the known host-calibrated set, not a regression`,
+          what: `${smoke.name} exited ${exit} with every failing row ([${failRows.join(", ")}]) inside the tolerated failing set — the known host rows, not a regression`,
           evidence: tail,
           status: "verified",
           severity: "low",
+        });
+      } else if (exit === 3 && full.includes("seat-lock:")) {
+        // Broker-origin 3: a STALE ticket refused the job — an owner decision,
+        // never the change's failure.
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `${smoke.name} could not start: the seat broker reported a stale ticket (owner decision required, force-release) — COULD NOT RUN, not a change failure`,
+          evidence: tail,
+          status: "verified",
+          severity: "medium",
         });
       } else if (exit === 3) {
         allFindings.push({
@@ -753,27 +912,42 @@ for (const card of tasks) {
           status: "verified",
           severity: "medium",
         });
+      } else if ((exit === 2 || exit === 4) && full.includes("seat-lock:")) {
+        // Broker-origin 2 (preflight contamination) / 4 (queue wait timeout):
+        // the job never ran — environmental, never the change's.
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `${smoke.name} could not run through the seat broker (exit ${exit}: ${exit === 2 ? "preflight found the seat contaminated" : "queue wait timed out"}) — COULD NOT RUN, not a change failure`,
+          evidence: tail,
+          status: "verified",
+          severity: "medium",
+        });
       } else if (exit !== 0) {
         seatFailed = true;
         allFindings.push({
           where: `task ${card.id}`,
-          what: `${smoke.name} failed twice on the real seat — per the no-degradation rule this goes to the user with the evidence`,
+          what: `${smoke.name} failed twice on the real seat (failing rows beyond the tolerated set: ${freshFails.join(", ") || "see log"}) — per the no-degradation rule this goes to the user with the evidence`,
           evidence: tail,
           status: "verified",
           severity: "high",
         });
       }
     }
+  } else if (needSmokes && !smokesEnabled) {
+    requiredSeatMissing = required.required.smokes;
+    notCovered.push(
+      `task ${card.id}: seat smokes did not run (${runSmokes ? "owner chose smoke-less delivery at the busy-seat decision" : "run_smokes was not set"})${required.required.smokes ? " — they were REQUIRED by the diff (seat-surface change): the gate holds this against the task" : ""}`,
+    );
   } else {
-    notCovered.push(`task ${card.id}: seat smokes did not run (${runSmokes ? "owner chose smoke-less delivery at the busy-seat decision" : "run_smokes was not set"}) — compositor-surface behavior unverified on the seat`);
+    notCovered.push(`task ${card.id}: seat smokes not required by the diff (classes [${required.classes.join(", ")}]) and not requested via run_smokes`);
   }
-  if (runBench) {
+  if (needBench) {
     const bench = await world.run(
       "bash",
       ["-c", `cd '${wt}' && LUMEN_BUILD_DIR=build/test exec ./scripts/ui-bench.sh`],
       { timeoutMs: 1_800_000, output: { tail: 32_768 } },
     );
-    seatEvidence.push(`ui-bench (engine, stored baseline) → exit ${bench.exitCode}`);
+    seatEvidence.push(`ui-bench (engine, stored baseline) → exit ${bench.exitCode}${required.required.bench_ab ? " (required by the diff: render-path)" : " (operator-requested)"}`);
     verified.push(`task ${card.id}: ui-bench ${bench.exitCode === 0 ? "gate pass" : "gate FAIL (p50 +25% or worse) — goes to the user, not auto-accepted"}`);
     if (bench.exitCode !== 0) {
       seatFailed = true;
@@ -786,6 +960,35 @@ for (const card of tasks) {
       });
     }
   }
+
+  const gateCountRun = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "-N"], { output: { tail: 2048 } });
+  const gateCount = ctestTotal(gateCountRun.stdout + gateCountRun.stderr);
+  const baseCount = baselineCountOf.get(card.id) ?? -1;
+  const countLine =
+    baseCount >= 0 && gateCount >= 0
+      ? gateCount >= baseCount
+        ? `computed ${gateCount} tests via ctest -N (baseline ${baseCount})`
+        : `INVALID as a suite run: ${gateCount} registered tests vs the baseline's ${baseCount} — tests were dropped`
+      : "suite count not computable (ctest -N unreadable on one side)";
+  if (countLine.startsWith("INVALID")) seatFailed = true;
+
+  phase("Independent analysis of the evidence");
+  report({ id: card.id, title: card.title, branch, state: "verify", verdict: "analysis" }, "tasks");
+  const analysis = await agent(`Analyst ${card.id}`, { system: analystPersona, budget: { webSearch: 0 } }).ask<Analysis>(
+    `Analyze what this task's evidence does and does not establish. You did not run any of ` +
+      `it — judge provenance (counts computed, broker lines present), coverage against the ` +
+      `diff's required evidence, and whether any failure is environmental rather than the ` +
+      `change's. Worktree: ${wt} (diff base ${effBase}).
+
+` +
+      `Required evidence (from the diff): ${JSON.stringify(required)}
+` +
+      `Suite count line: ${countLine}
+` +
+      `Seat evidence: ${JSON.stringify(seatEvidence)}
+` +
+      `Verified lines for this task: ${verified.filter((v) => v.startsWith(`task ${card.id}`)).join(" | ")}`,
+  );
 
   phase("Gate the finished task on its evidence");
   report({ id: card.id, title: card.title, branch, state: "gate", verdict: "" }, "tasks");
@@ -801,13 +1004,21 @@ for (const card of tasks) {
       confirmedFindings: toFix,
       preexistingFindings,
     },
+    required,
+    tolerance: {
+      known_red: knownRed,
+      app_smoke_tolerated_failset: toleratedFailset,
+      note: "owner sign-off items — every non-default value here made red look greener; READY under one carries it explicitly",
+    },
     gate_runs: {
       baseline: "tests-enabled configure+build+ctest green before the change",
-      suite: `green after ${gateRounds} fix round(s) (tolerated known-red: ${knownRed.length > 0 ? knownRed.join(", ") : "none"})`,
-      seat: seatEvidence.length > 0 ? seatEvidence : "not run (run_smokes off)",
-      bench: runBench ? "run (see findings)" : "not run (run_bench off)",
+      suite: `green after ${gateRounds} fix round(s); ${countLine} (tolerated known-red: ${knownRed.length > 0 ? knownRed.join(", ") : "none"})`,
+      seat: seatEvidence.length > 0 ? seatEvidence : "not run (see notCovered)",
+      bench: needBench ? "run (see findings)" : "not required by the diff and not requested",
     },
+    analysis: { verdict: analysis.verdict, gaps: analysis.gaps },
     seat_failed: seatFailed,
+    required_seat_missing: requiredSeatMissing,
   };
   const gate = await agent(`Gatekeeper ${card.id}`, { system: gatekeeperPersona, budget: { webSearch: 0 } }).ask<GateVerdict>(
     `Gate this finished Lumen task. Verify the packet against the worktree at ${wt} yourself ` +
@@ -825,7 +1036,16 @@ for (const card of tasks) {
   if (gate.verdict === "READY") readyBranches.push(branch);
   branchOf.set(card.id, branch);
   verdictOf.set(card.id, gate.verdict);
-  report({ id: card.id, title: card.title, branch, state: gate.verdict === "READY" ? "done" : "blocked", verdict: gate.verdict }, "tasks");
+  report(
+    {
+      id: card.id,
+      title: card.title,
+      branch,
+      state: gate.verdict === "READY" ? "done" : gate.verdict === "NEEDS_REDESIGN" ? "redesign" : "blocked",
+      verdict: gate.verdict,
+    },
+    "tasks",
+  );
   log(`Task ${card.id}: gate ${gate.verdict}`);
 
   phase("Write the memory record and the PR text");
@@ -885,12 +1105,12 @@ for (const f of allFindings) if (f.disposition === undefined) f.disposition = "d
 const conclusion = readyBranches.length === tasks.length && tasks.length > 0
   ? `All ${tasks.length} task(s) delivered and gate-READY: ${readyBranches.join(", ")}. PR text is in the artifact; branches sit in worktrees under ${WT_ROOT} — push only on the user's go.`
   : readyBranches.length > 0
-    ? `${readyBranches.length} of ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}); the rest are blocked with recorded evidence — see findings.`
-    : `No task reached READY: ${tasks.length === 0 ? "the plan produced no tasks" : "every task blocked with recorded evidence"}. Nothing is pushed.`;
+    ? `${readyBranches.length} of ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}); the rest are blocked or need redesign with recorded evidence — see findings.`
+    : `No task reached READY: ${tasks.length === 0 ? "the plan produced no tasks" : "every task blocked, conflicted or needing redesign with recorded evidence"}. Nothing is pushed.`;
 const done: WorkflowReport = {
   conclusion,
   findings: allFindings,
   verified,
   notCovered,
 };
-return done;
+return finishRun(done);

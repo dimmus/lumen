@@ -1,6 +1,9 @@
 ---
 name: lumen-app-smoke-known-noise
 description: app-smoke groups that fail on unmodified main on this host (Z2–Z6 portal frontend) or flake (T1/T3 timing); check a baseline before blaming a change
+summary: "app-smoke groups failing on unmodified main here (Z2–Z6 broken portal frontend) and T1/T3 timing flakes — environmental; check DRM master and a baseline before blaming a change"
+modules: scripts
+topics: app-smoke, noise
 metadata:
   node_type: memory
   type: project

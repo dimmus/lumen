@@ -4,6 +4,10 @@ description: "2026-11-16 notebook task (worktree compositor-theme-env-export, 5d
 metadata:
   node_type: memory
   type: project
+summary: "Compositor always exports resolved LUMEN_THEME and re-exports on reload (env_reexports owe/drain/drop); seat debt closed 2026-11-17 (177/0/0); SIGSEGV split to its own TODO row"
+modules: lx.compositor, lx.config
+topics: theme, environment, systemd
+
 ---
 
 Verified 2026-11-16 on the **notebook** (iritur: `readlink` card0→nouveau, card1→i915; the

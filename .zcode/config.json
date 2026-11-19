@@ -13,6 +13,17 @@
               "statusMessage": "Generated-path protection check"
             }
           ]
+        },
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "bash \"${ZCODE_PROJECT_DIR}/.zcode/hooks/guard-bash-edits.sh\"",
+              "timeoutMs": 10000,
+              "statusMessage": "Bash write-to-generated-path check"
+            }
+          ]
         }
       ]
     }

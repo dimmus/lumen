@@ -4,6 +4,10 @@ description: "2026-11-17 notebook: all 329 modules/ snprintf sites migrated to �
 metadata:
   node_type: memory
   type: project
+summary: "All 329 modules/ snprintf sites → §4.3 format conventions (4 documented exceptions); format_to_n idioms, sed traps (n = *... mangling); CRLF premise retracted — both files LF"
+modules: modules
+topics: logging, format
+
 ---
 
 Verified 2026-11-17 on the notebook (task snprintf-log-migration, 6 commits 8e925e5..a49f9a0, unmerged): every one of the 329 `snprintf` sites in `modules/` migrated to the AGENTS.md §4.2/§4.3 conventions. `grep -rn snprintf modules/ --include=*.cpp --include=*.cppm --include=*.hpp` now returns exactly 4 lines: `lx.foundation/error.cppm:200` (the allowed `format_error_into`) and three `vsnprintf` renders of xkbcommon's run-time printf format (`lx.config/parse.cpp:988`, `lx.input/keymap.cppm:277,283`), each carrying a comment naming the exception — `std::format` cannot consume a foreign printf format, and the task notes forbade a shared helper ("no helper refactors beyond what format_to_n already provides"). `lx.trace.cppm`'s four bounded copies were migrated (not left).

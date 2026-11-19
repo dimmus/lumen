@@ -4,6 +4,10 @@ description: "2026-11-16 notebook task (worktree settings-startup-apply, single 
 metadata:
   node_type: memory
   type: project
+summary: "lumen-settings applies [ui] once at startup (apply_ui_live before w.open); explicit --theme stays authoritative for theme; seat reds were the concurrent-session family"
+modules: executables/lumen-settings
+topics: startup, adr-013
+
 ---
 
 Verified 2026-11-16 on the **notebook** (iritur: card0→nouveau, card1→i915; the

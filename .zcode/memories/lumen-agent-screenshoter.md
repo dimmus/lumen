@@ -4,6 +4,10 @@ description: "2026-11-17 notebook: harness gained agent-screenshoter (role + ski
 metadata:
   node_type: memory
   type: project
+summary: "Screenshot role + skill: grim over wlr-screencopy v3 or the portal path via lumen-portal-probe; xdg-desktop-portal-wlr never installed; grim flips the panel bell to DND for 2 s"
+modules: harness
+topics: screenshots, seat
+
 ---
 
 Verified 2026-11-17 on the iritur notebook (nouveau+i915 per `ls /sys/class/drm/card*/device/driver`):

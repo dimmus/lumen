@@ -4,6 +4,10 @@ description: "2026-11-13: seat-visible end of xdg-toplevel-drag-v1 (worktree b0a
 metadata:
   node_type: memory
   type: project
+summary: "lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook"
+modules: scripts, tests
+topics: drag-smoke, injection
+
 ---
 
 Verified 2026-11-13 in worktree `/home/dimmus/lumen-wt/toplevel-drag-drag-smoke` (branch

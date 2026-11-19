@@ -4,6 +4,10 @@ description: "2026-11-17 notebook: harness gained the lumen-adr knowledge skill 
 metadata:
   node_type: memory
   type: project
+summary: "When an ADR is required (cross-module/protocol, weighed alternatives, supersede) and the corpus conventions; ADR=decision, decisions=measured, TODO=open"
+modules: harness, docs/adr
+topics: adr, authoring
+
 ---
 
 Verified 2026-11-17 on the iritur notebook (nouveau card0 + i915 card1 per

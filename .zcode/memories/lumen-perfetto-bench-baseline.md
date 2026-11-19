@@ -4,6 +4,10 @@ description: "2026-11-18 notebook: ui-bench.sh --perfetto records traced S1–S4
 metadata:
   node_type: memory
   type: project
+summary: "ui-bench --perfetto = traced pass refusing measurement flags; bench timeline instrumented (spans bracket their own clock reads); first hasvk baseline traces at 9aa7b4d"
+modules: lx.trace, tests/bench
+topics: perfetto, bench
+
 ---
 
 Verified 2026-11-18 on the notebook `iritur` (hasvk HD 5500, machine key `iritur-08fd3c`),
