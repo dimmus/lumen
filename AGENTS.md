@@ -533,7 +533,8 @@ cmake --preset release
 cmake --build --preset release
 
 # The tests-enabled build — the ONLY one that can gate a change
-# (the plain release preset sets LUMEN_BUILD_TESTS=OFF → ctest sees 1 test)
+# (the plain release preset sets LUMEN_BUILD_TESTS=OFF → ctest sees only the
+# unconditionally registered script tests: scanner_golden + layer_graph)
 cmake --preset release -B build/test -DLUMEN_BUILD_TESTS=ON
 cmake --build build/test -j2
 ctest --test-dir build/test --output-on-failure -LE bench

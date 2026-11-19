@@ -4,7 +4,7 @@ description: "2026-11-12: the DSH harness was transformed into ZCode-native agen
 metadata:
   node_type: memory
   type: project
-summary: "2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; release preset registers 1 ctest — gate on build/test"
+summary: "2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; plain release registers ~no unit tests — gate on build/test"
 modules: harness
 topics: zcode, workflows
 

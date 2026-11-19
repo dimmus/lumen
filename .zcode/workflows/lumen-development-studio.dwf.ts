@@ -198,7 +198,6 @@ interface WorkflowReport {
 type SeatPlan = "freed" | "skip";
 
 const task = String(args.task ?? "");
-const base = args.base === undefined ? "HEAD" : String(args.base);
 const branchPrefix = args.branch_prefix === undefined ? "zcode/task" : String(args.branch_prefix);
 const runSmokes = args.run_smokes !== false;
 const runBench = args.run_bench === true;
@@ -215,6 +214,14 @@ const toleratedFailset: string[] = Array.isArray(args.app_smoke_tolerated_failse
 // (env override LUMEN_WT_ROOT), shared with lumen-gated-change.
 const pwdRun = await world.run("pwd", [], { output: { tail: 512 } });
 const MAIN_WS = pwdRun.stdout.trim().split("\n").pop() ?? ".";
+// Resolve the base arg to a CONCRETE SHA in the MAIN checkout before any
+// worktree exists: the symbolic default "HEAD" resolves to the TASK BRANCH
+// inside every later 'git -C <wt>' command (diff HEAD..HEAD = nothing, and
+// the resume detector would count zero unique commits on a leftover branch).
+const baseRaw = args.base === undefined ? "HEAD" : String(args.base);
+const baseResolved = baseRaw === "HEAD"
+  ? (await world.run("git", ["rev-parse", "HEAD"], { output: { tail: 512 } })).stdout.trim().split("\n").pop() ?? "HEAD"
+  : baseRaw;
 const wtRootRun = await world.run(
   "bash",
   ["-c", `echo "\${LUMEN_WT_ROOT:-$(dirname '${MAIN_WS}')/lumen-wt}"`],
@@ -400,8 +407,9 @@ if (runSmokes) {
 }
 
 for (const card of tasks) {
-  // Run-lock heartbeat at every task boundary (a live run never goes stale).
-  await world.run("bash", ["-c", `exec '${MAIN_WS}/scripts/run-lock.sh' heartbeat`], { output: { tail: 512 } });
+  // Run-lock heartbeat at every task boundary (a live run never goes stale);
+  // owner-checked so a racing second run cannot keep the first's lock alive.
+  await world.run("bash", ["-c", `exec '${MAIN_WS}/scripts/run-lock.sh' heartbeat '${runOwner.replace(/'/g, "")}'`], { output: { tail: 512 } });
 
   const wt = `${WT_ROOT}/${card.id}`;
   const branch = `${branchPrefix}/${card.id}`;
@@ -424,7 +432,7 @@ for (const card of tasks) {
     continue;
   }
   const firstDep = depIds.length > 0 ? depIds[0] : undefined;
-  const effBase = firstDep !== undefined ? (branchOf.get(firstDep) ?? base) : base;
+  const effBase = firstDep !== undefined ? (branchOf.get(firstDep) ?? baseResolved) : baseResolved;
   const extraDeps = depIds.slice(1).map((d) => branchOf.get(d)).filter((b): b is string => b !== undefined);
 
   phase("Set up the worktree and test-enabled baseline");
@@ -564,7 +572,7 @@ for (const card of tasks) {
     allFindings.push({
       where: `task ${card.id}`,
       what: `red baseline (${why}) — per the no-degradation rule there is no clean baseline to gate against; task skipped`,
-      evidence: `worktree at ${wt}, base ${base}; ${why}`,
+      evidence: `worktree at ${wt}, base ${baseResolved}; ${why}`,
       status: "verified",
       severity: "high",
     });
@@ -886,10 +894,30 @@ for (const card of tasks) {
           status: "verified",
           severity: "low",
         });
+      } else if (exit === 3 && full.includes("seat-lock:")) {
+        // Broker-origin 3: a STALE ticket refused the job — an owner decision,
+        // never the change's failure.
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `${smoke.name} could not start: the seat broker reported a stale ticket (owner decision required, force-release) — COULD NOT RUN, not a change failure`,
+          evidence: tail,
+          status: "verified",
+          severity: "medium",
+        });
       } else if (exit === 3) {
         allFindings.push({
           where: `task ${card.id}`,
           what: `${smoke.name} reported INVALID (contaminated measurement) twice — seat not quiet or foreign input`,
+          evidence: tail,
+          status: "verified",
+          severity: "medium",
+        });
+      } else if ((exit === 2 || exit === 4) && full.includes("seat-lock:")) {
+        // Broker-origin 2 (preflight contamination) / 4 (queue wait timeout):
+        // the job never ran — environmental, never the change's.
+        allFindings.push({
+          where: `task ${card.id}`,
+          what: `${smoke.name} could not run through the seat broker (exit ${exit}: ${exit === 2 ? "preflight found the seat contaminated" : "queue wait timed out"}) — COULD NOT RUN, not a change failure`,
           evidence: tail,
           status: "verified",
           severity: "medium",

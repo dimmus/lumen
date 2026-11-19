@@ -10,7 +10,10 @@
 # It screens the command string for BOTH a protected path token AND a
 # file-mutating pattern aimed at it. Legit regeneration commands (cmake,
 # ninja, ./scripts/fetch-protocols.sh) contain neither an in-place editor nor
-# a redirect onto a protected path and pass through.
+# a redirect onto a protected path and pass through. BEST-EFFORT accident
+# backstop, not a security boundary: unusual spellings (sed --in-place,
+# git checkout <ref> --, install, pathlib write_text) can pass — the
+# Edit/Write-side hook is the hard gate; this closes the common accidents.
 #
 # FAIL CLOSED on its own errors (unparseable input): exit 2 with the reason.
 # Exit codes: 0 = allow, 2 = block (stderr reason is shown to the caller).

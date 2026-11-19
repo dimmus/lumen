@@ -61,3 +61,25 @@ workflow personas only point.
 
 Related: [[lumen-zcode-agent-harness]], [[lumen-smoke-bench-harness-green]],
 [[lumen-notebook-full-green-audit]], [[lumen-unit-pair-green]].
+
+Independent review round (lumen-reviewer, base-ref policy): 14 findings — 2 CRITICAL,
+2 MAJOR, 6 MINOR, 4 NOTE — 14 confirmed / 0 refuted, all fixed in the review round. The
+CRITICALs were the classifier's own diff: it never saw uncommitted tracked edits (docs-only
+under-requiring for exactly the targeted change classes) and gated-change diffed main's
+last commit instead of the change. Both fixed (working-tree diff by default; the branch
+point captured as a concrete SHA; the studio's symbolic HEAD base resolved once at run
+start — a pre-existing degeneracy the new consumers had inherited). MAJORs: RENDER_PATH
+now carries the compositor present pipeline (compositor_impl, ui_composite,
+presentation_feedback + wire_presentation, output_manager/policy, content_update) so
+BLOCKED-ON-HOST triggers on §1.2's decisive surface. MINORs: holder-TTL persisted (a
+--ttl-min 90 holder is not stale at 25 min), atomic queue tickets, run-lock acquire under
+flock with owner-checked heartbeat, broker-origin smoke exits (2/3/4, distinguished by
+the seat-lock: line) never counted as change failures, the release-preset ctest count
+truth, and this record's own on-branch exception. NOTEs: layer-graph phantom flags and
+partition imports, the Bash guard's best-effort honesty, the spool recipe's tmp-index
+leak, run-lock's manual-invocation caveat.
+
+Rides this task branch deliberately (the record documents it); on merge approval,
+land it on main through the spool path per lumen-memory-writer — if the branch is
+dropped instead, this record dies with it, which is exactly the loss mode the spool
+rule exists for.

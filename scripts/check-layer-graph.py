@@ -6,10 +6,10 @@ docs/uml/01-package-layers.mmd) — Foundation → Runtime → Platform → Grap
 → Compositor → Desktop → Application, dependencies flow downward only — was
 prose enforced by one tired reviewer per change. This check makes it
 mechanical: it parses every `import lx.*` in modules/ and fails on any upward
-edge, on any import of a module that does not exist, and (with --allow is NOT
-given) on edges not present in the diagram's minimal set when --strict is
-passed. New modules must be added to LAYERS here in the same change that adds
-them (a module missing from the map is an error, not a default).
+edge and on any import of a module that does not exist. Partition-qualified
+imports (import lx.foo:bar) resolve to their owning module lx.foo. New modules
+must be added to LAYERS here in the same change that adds them (a module
+missing from the map is an error, not a default).
 
 Usage:
     python3 scripts/check-layer-graph.py [--root REPO] [--quiet]
@@ -45,7 +45,7 @@ LAYER_NAMES = {0: "Foundation", 1: "Runtime", 2: "Platform", 3: "Graphics",
 # build/generated, not modules/) — Platform layer, existence accepted.
 GENERATED_PREFIX = "lx.wayland.protocols"
 
-IMPORT_RE = re.compile(r"^\s*(?:export\s+)?import\s+(lx\.[a-zA-Z0-9_.]+)\s*;", re.M)
+IMPORT_RE = re.compile(r"^\s*(?:export\s+)?import\s+(lx\.[a-zA-Z0-9_.]+)(?::[a-zA-Z0-9_]+)?\s*;", re.M)
 
 
 def module_of(path):

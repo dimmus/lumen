@@ -89,9 +89,11 @@ done
 if [[ ${#cxx[@]} -gt 0 ]]; then
   if command -v clang-format >/dev/null 2>&1; then
     # --Werror makes every needed reformat an error; -n writes nothing.
-    if ! clang-format --dry-run --Werror --style=file "${cxx[@]}" >/dev/null 2>/tmp/diff-hygiene-fmt.txt; then
+    local fmtlog; fmtlog=$(mktemp /tmp/diff-hygiene-fmt.XXXXXX)
+    if ! clang-format --dry-run --Werror --style=file "${cxx[@]}" >/dev/null 2>"$fmtlog"; then
       echo "HYGIENE: clang-format disagrees on:" >&2
-      grep -oE '^[^ ]+\.(cpp|cppm|h|hpp)' /tmp/diff-hygiene-fmt.txt 2>/dev/null | sort -u | sed 's/^/  /' >&2
+      grep -oE '^[^ ]+\.(cpp|cppm|h|hpp)' "$fmtlog" 2>/dev/null | sort -u | sed 's/^/  /' >&2
+      rm -f "$fmtlog"
       echo "  run: clang-format -i --style=file <files> (the .clang-format file is the contract)" >&2
       fail=1
     fi

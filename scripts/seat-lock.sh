@@ -133,10 +133,13 @@ cs_try_grant() { # ID RANK TTL_MIN — GRANTED | QUEUED | BUSY | STALE <id> <pid
   local t
   t=$(now)
   if [[ -f "$HELD" ]]; then
-    local hpid mtime
+    local hpid mtime httl
     hpid=$(field "$HELD" pid)
     mtime=$(stat -c %Y "$HELD" 2>/dev/null || echo 0)
-    if (( t - mtime > ttl_min * 60 )) && ! pid_alive "$hpid"; then
+    # The HOLDER's requested TTL governs staleness, not whoever is asking —
+    # a holder that asked --ttl-min 90 must not be judged stale at 25.
+    httl=$(field "$HELD" ttl); [[ -n "$httl" ]] || httl=$ttl_min
+    if (( t - mtime > httl * 60 )) && ! pid_alive "$hpid"; then
       echo "STALE $(field "$HELD" id) $hpid"
       return 0
     fi
@@ -153,8 +156,8 @@ cs_try_grant() { # ID RANK TTL_MIN — GRANTED | QUEUED | BUSY | STALE <id> <pid
     if [[ -z "$best_key" || "$key" < "$best_key" ]]; then best="$f"; best_key="$key"; fi
   done
   if [[ "$(field "$best" id 2>/dev/null)" == "$id" ]]; then
-    printf 'id=%s\nclass=%s\nowner=%s\npid=%s\nstarted=%s\ndriver=%s\n' \
-      "$id" "$(field "$best" class)" "$(field "$best" owner)" "$$" "$(now)" "$(host_driver)" >"$HELD"
+    printf 'id=%s\nclass=%s\nowner=%s\npid=%s\nstarted=%s\nttl=%s\ndriver=%s\n' \
+      "$id" "$(field "$best" class)" "$(field "$best" owner)" "$$" "$(now)" "${LUMEN_SEAT_TTL_MIN:-$DEFAULT_TTL_MIN}" "$(host_driver)" >"$HELD.tmp" && mv "$HELD.tmp" "$HELD"
     rm -f "$best"
     echo "GRANTED $id"
   else
@@ -199,8 +202,10 @@ cmd_acquire() {
   mkdir -p "$QUEUE_DIR"
 
   local id="ticket-$(date +%Y%m%d%H%M%S)-$$-$RANDOM"
+  # Atomic publish (tmp + mv): a ctrl-lock sweep that reads a half-written
+  # ticket sees pid= and deletes a LIVE waiter's queue slot.
   printf 'id=%s\nclass=%s\nowner=%s\nrank=%s\nenqueued=%s\npid=%s\n' \
-    "$id" "$class" "$owner" "$(class_rank "$class")" "$(now)" "$$" >"$QUEUE_DIR/$id"
+    "$id" "$class" "$owner" "$(class_rank "$class")" "$(now)" "$$" >"$QUEUE_DIR/$id.tmp" && mv "$QUEUE_DIR/$id.tmp" "$QUEUE_DIR/$id"
 
   local deadline t out
   t=$(now)
@@ -272,7 +277,8 @@ cmd_status() {
     t=$(now)
     age=$(( t - mtime ))
     echo "holder: ticket $id class $class owner $owner pid $pid age ${age}s alive $(pid_alive "$pid" && echo yes || echo NO)"
-    ttl=$(( ${LUMEN_SEAT_TTL_MIN:-$DEFAULT_TTL_MIN} * 60 ))
+    local httl; httl=$(field "$HELD" ttl); [[ -n "$httl" ]] || httl=${LUMEN_SEAT_TTL_MIN:-$DEFAULT_TTL_MIN}
+    ttl=$(( httl * 60 ))
     if (( t - mtime > ttl )) && ! pid_alive "$pid"; then
       echo "STALE: holder pid is dead and the TTL passed — owner decision required:"
       echo "  scripts/seat-lock.sh force-release $id"
@@ -299,6 +305,7 @@ cmd_with() {
   while [[ $# -gt 0 && "$1" != "--" ]]; do
     case "$1" in
       --wait) wait=$2; shift 2 ;;
+      --ttl-min) export LUMEN_SEAT_TTL_MIN=$2; shift 2 ;;
       --no-preflight) no_preflight=1; shift ;;
       *) echo "with: unknown option $1" >&2; exit 2 ;;
     esac

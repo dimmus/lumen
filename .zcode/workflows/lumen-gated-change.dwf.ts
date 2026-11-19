@@ -226,6 +226,11 @@ if (!status.clean) {
   };
   return dirty;
 }
+// The branch point as a CONCRETE SHA: the classifier diffs the worktree's
+// working tree against it (the new branch has no commits of its own yet —
+// 'branch~1' would be main's last commit, the wrong diff entirely).
+const branchPoint = (await world.run("git", ["rev-parse", "HEAD"], { output: { tail: 512 } }))
+  .stdout.trim().split("\n").pop() ?? "HEAD";
 const add = await world.run("git", ["worktree", "add", wt, "-b", branch], { output: { tail: 4096 } });
 if (add.exitCode !== 0) {
   const taken: WorkflowReport = {
@@ -269,7 +274,7 @@ log(`Implemented; ${impl.changedFiles.length} files touched`);
 phase("Derive the required evidence from the diff");
 const classifyRun = await world.run(
   "python3",
-  ["scripts/classify-change.py", "--repo", wt, "--base", branch + "~1"],
+  ["scripts/classify-change.py", "--repo", wt, "--base", branchPoint],
   { output: { tail: 8192 }, },
 );
 let required: RequiredEvidence = {

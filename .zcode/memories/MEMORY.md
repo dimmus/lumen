@@ -45,4 +45,4 @@
 - [vulkan 13 floor](lumen-vulkan-13-floor.md) — Vulkan 1.3 floor + dynamic rendering/sync2 + shared pipeline cache + host_image_copy/memory_budget/memory_priority, 2026-10-28 merged to main as PR #57 (bf1cdc0);
 - [vulkan capture green rounds](lumen-vulkan-capture-green-rounds.md) — Close-out chronology split from [[lumen-vulkan-capture-green]] —
 - [vulkan capture green](lumen-vulkan-capture-green.md) — Vulkan capture parity: SIGUSR1 read-back 3.33 ms, window capture + capture-dmabuf in lx.gfx behind void*; Z7 root-caused to fence-fd reuse; app-smoke 176/0/1 with all backend rows PASS
-- [zcode agent harness](lumen-zcode-agent-harness.md) — 2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; release preset registers 1 ctest — gate on build/test
+- [zcode agent harness](lumen-zcode-agent-harness.md) — 2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; plain release registers ~no unit tests — gate on build/test

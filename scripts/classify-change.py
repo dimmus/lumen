@@ -35,6 +35,20 @@ import subprocess
 import sys
 
 RENDER_PATH = ("modules/lx.gfx/", "modules/lx.scene/", "modules/lx.text/", "modules/lx.theme/")
+# The compositor-owned present pipeline (AGENTS.md §5: scanout evaluate →
+# assign_plane OR merged_render_pass, presentation feedback, the composite
+# tick): render-path by the gatekeeper's own BLOCKED-ON-HOST definition, even
+# though the module as a whole is seat-surface. Narrow by file — the rest of
+# lx.compositor (wire_*, input, tiling, …) is not the present path.
+PRESENT_PIPELINE = (
+    "modules/lx.compositor/compositor_impl",
+    "modules/lx.compositor/ui_composite",
+    "modules/lx.compositor/presentation_feedback",
+    "modules/lx.compositor/wire_presentation",
+    "modules/lx.compositor/output_manager",
+    "modules/lx.compositor/output_policy",
+    "modules/lx.compositor/content_update",
+)
 SEAT_SURFACE = (
     "modules/lx.compositor/", "modules/lx.input/", "modules/lx.drm/",
     "modules/lx.session/", "modules/lx.shell/", "modules/lx.wayland.server/",
@@ -62,8 +76,14 @@ def detect_host():
 
 
 def changed_files(repo, base, head):
+    """Changed paths vs base. With no --head, the diff is against the WORKING
+    TREE (committed + uncommitted tracked edits) — the classifier must see
+    uncommitted work, or a seat-surface change silently classifies docs-only."""
     files = []
-    r = run_git(repo, ["diff", "--name-only", base + ".." + head])
+    if head:
+        r = run_git(repo, ["diff", "--name-only", base + ".." + head])
+    else:
+        r = run_git(repo, ["diff", "--name-only", base])
     if r.returncode == 0:
         files += [f for f in r.stdout.splitlines() if f.strip()]
     r = run_git(repo, ["ls-files", "--others", "--exclude-standard"])
@@ -81,7 +101,7 @@ def classify(files, host):
         return any(rx.search(p) for rx in DOC_PATTERNS)
 
     for p in files:
-        if p.startswith(RENDER_PATH) or p.startswith("tests/bench"):
+        if p.startswith(RENDER_PATH) or p.startswith(PRESENT_PIPELINE) or p.startswith("tests/bench"):
             classes.add("render-path")
             render_path = True
         if p.startswith(SEAT_SURFACE) or p.startswith("protocols/"):
@@ -135,8 +155,7 @@ def main():
     a = ap.parse_args()
 
     host = detect_host() if a.host == "auto" else a.host
-    head = a.head or "HEAD"
-    files = changed_files(a.repo, a.base, head)
+    files = changed_files(a.repo, a.base, a.head)
     verdict = classify(files, host)
     verdict["host"] = host
     verdict["changed"] = files[: a.max_files]

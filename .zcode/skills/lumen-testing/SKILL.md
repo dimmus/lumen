@@ -55,7 +55,10 @@ total registers is INVALID as a suite run. Seat checks: evidence without the bro
 unbrokered concurrent job is exactly what the broker prevents.
 
 Smoke exit semantics: 0 PASS (may warn), 1 FAIL, 2 COULD NOT RUN, 3 INVALID from foreign
-input. drag latency gates: median ≤ 1.5 refresh periods + 4 ms; p95 warn at 2 periods
+input — and through the seat broker additionally: broker 2 (preflight found the seat
+contaminated), broker 3 (stale ticket — owner decision), broker 4 (queue wait timeout);
+broker-origin exits carry a `seat-lock:` line in the output and are environmental,
+never the change's. drag latency gates: median ≤ 1.5 refresh periods + 4 ms; p95 warn at 2 periods
 + 4 ms. Bench artifacts land in `<machine>-<driver>/<date>-<sha>.json` which can collide
 on same date/revision — copy/hash after each round; `--update-baseline` needs reviewed
 authorization, never during verification.

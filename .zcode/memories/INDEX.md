@@ -36,7 +36,7 @@
 - **agent screenshoter** (2026-11-17) — Screenshot role + skill: grim over wlr-screencopy v3 or the portal path via lumen-portal-probe; xdg-desktop-portal-wlr never installed; grim flips the panel bell to DND for 2 s  [topics: screenshots, seat]
 - **notebook full green audit** (2026-11-15) — All five legs PASS on one session set at merged tree c316906: ctest 134/134 ×2, drag PASS, app-smoke 177/0/0, both benches green; the 6bc4820 evidence force-add reverted (0 tracked files)  [topics: audit, evidence; LONG (123 lines — split candidate)]
 - **smoke bench harness green** (2026-11-14) — Harness task: injection autodetect by name, build-fresh kills mtime false-trips, host-aware geometry, quiet-CPU PM-QoS fail-closed, bench warm-up gate; overwrite loop ended by namespace split  [topics: smoke, bench, uinput]
-- **zcode agent harness** (2026-11-12) — 2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; release preset registers 1 ctest — gate on build/test  [topics: zcode, workflows]
+- **zcode agent harness** (2026-11-12) — 2026-11-12: DSH transformed to .zcode/ agents/skills/workflows; no Docker, no headless seat verification, worktree per task; plain release registers ~no unit tests — gate on build/test  [topics: zcode, workflows]
 
 ## lx.app
 

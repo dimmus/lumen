@@ -21,14 +21,15 @@ the format. What the skill does not say:
 
     ```bash
     cd <main>
-    export GIT_INDEX_FILE=$(mktemp)
+    tmpidx=$(mktemp)                       # capture the path BEFORE unsetting
+    export GIT_INDEX_FILE=$tmpidx
     git read-tree HEAD
     git add .zcode/memories/<file> .zcode/memories/INDEX.md .zcode/TODO.md
     tree=$(git write-tree)
     parent=$(git rev-parse -q --verify refs/heads/zcode/memory-spool || git rev-parse HEAD)
     commit=$(git commit-tree "$tree" -p "$parent" -m "memory: <topic>")
     git update-ref refs/heads/zcode/memory-spool "$commit"
-    unset GIT_INDEX_FILE; rm -f "$GIT_INDEX_FILE"
+    unset GIT_INDEX_FILE; rm -f "$tmpidx"
     ```
 
     Report "spooled to zcode/memory-spool — merge with `git merge zcode/memory-spool`
