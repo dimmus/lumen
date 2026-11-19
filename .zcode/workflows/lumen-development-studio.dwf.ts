@@ -160,6 +160,14 @@ interface GateVerdict {
   reasons: string[];
 }
 
+/** Independent read of the evidence by the analyst stage (never the runner). */
+interface Analysis {
+  /** One paragraph: what the evidence establishes and what it does not. */
+  verdict: string;
+  /** Coverage gaps and provenance problems, one sentence each (may be empty). */
+  gaps: string[];
+}
+
 /** What scripts/classify-change.py derives from a task's diff. */
 interface RequiredEvidence {
   classes: string[];
@@ -315,6 +323,13 @@ const gatekeeperPersona =
   "BLOCKED-ON-HOST applies to render-path changes on hosts without hardware Vulkan, non-default " +
   "tolerance knobs are owner sign-off items, and the verdicts are READY / NOT_READY / BLOCKED / " +
   "NEEDS_REDESIGN (design-level findings route the task back to planning). You are read-only.";
+
+const analystPersona =
+  "You are the evidence-analysis stage of Lumen's development studio: you read the checks' " +
+  "output and say what it does and does not establish. Your full contract is " +
+  ".zcode/agents/lumen-test-analyst.md — read it first, it is binding (provenance, " +
+  "coverage vs the diff, environmental-vs-change failure diagnosis, A/B verdicts, honest " +
+  "gaps). You did not run the checks — that independence is your value. You are read-only.";
 
 const memoryPersona =
   "You write Lumen's project memory records. Your full contract is .zcode/agents/lumen-memory-writer.md " +
@@ -918,8 +933,6 @@ for (const card of tasks) {
     }
   }
 
-  phase("Gate the finished task on its evidence");
-  report({ id: card.id, title: card.title, branch, state: "gate", verdict: "" }, "tasks");
   const gateCountRun = await world.run("ctest", ["--test-dir", `${wt}/build/test`, "-N"], { output: { tail: 2048 } });
   const gateCount = ctestTotal(gateCountRun.stdout + gateCountRun.stderr);
   const baseCount = baselineCountOf.get(card.id) ?? -1;
@@ -930,6 +943,27 @@ for (const card of tasks) {
         : `INVALID as a suite run: ${gateCount} registered tests vs the baseline's ${baseCount} — tests were dropped`
       : "suite count not computable (ctest -N unreadable on one side)";
   if (countLine.startsWith("INVALID")) seatFailed = true;
+
+  phase("Independent analysis of the evidence");
+  report({ id: card.id, title: card.title, branch, state: "verify", verdict: "analysis" }, "tasks");
+  const analysis = await agent(`Analyst ${card.id}`, { system: analystPersona, budget: { webSearch: 0 } }).ask<Analysis>(
+    `Analyze what this task's evidence does and does not establish. You did not run any of ` +
+      `it — judge provenance (counts computed, broker lines present), coverage against the ` +
+      `diff's required evidence, and whether any failure is environmental rather than the ` +
+      `change's. Worktree: ${wt} (diff base ${effBase}).
+
+` +
+      `Required evidence (from the diff): ${JSON.stringify(required)}
+` +
+      `Suite count line: ${countLine}
+` +
+      `Seat evidence: ${JSON.stringify(seatEvidence)}
+` +
+      `Verified lines for this task: ${verified.filter((v) => v.startsWith(`task ${card.id}`)).join(" | ")}`,
+  );
+
+  phase("Gate the finished task on its evidence");
+  report({ id: card.id, title: card.title, branch, state: "gate", verdict: "" }, "tasks");
   const packet = {
     card,
     branch,
@@ -954,6 +988,7 @@ for (const card of tasks) {
       seat: seatEvidence.length > 0 ? seatEvidence : "not run (see notCovered)",
       bench: needBench ? "run (see findings)" : "not required by the diff and not requested",
     },
+    analysis: { verdict: analysis.verdict, gaps: analysis.gaps },
     seat_failed: seatFailed,
     required_seat_missing: requiredSeatMissing,
   };
