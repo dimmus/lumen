@@ -5,6 +5,8 @@ description: The Lumen seat broker contract — scripts/seat-lock.sh acquire/rel
 
 # The seat broker (lumen-seat)
 
+> **Scope:** mixed — the broker model (tickets, priority, stale=owner decision) is general; `scripts/seat-lock.sh` and its preflight are current-project.
+
 One host, one seat, one DRM master, one broker. Every job that starts a
 compositor, injects input, or measures on the real seat holds a ticket for its
 whole run. Two seat jobs on one host contaminate each other's evidence — the

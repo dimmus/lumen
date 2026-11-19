@@ -5,6 +5,8 @@ description: Write a Lumen project memory record in .zcode/memories/ — importa
 
 # Writing Lumen memories
 
+> **Scope:** mixed — the archive format and rules are general; paths, the generator script and the spool ref are current-project.
+
 `.zcode/memories/` is the project's long-term evidence archive: what was measured, what
 broke and how it was fixed, what was learned about hosts, protocols and upstreams. A
 memory's job is to save a future session from re-deriving (or re-breaking) something.

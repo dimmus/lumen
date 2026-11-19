@@ -5,6 +5,8 @@ description: Lumen's settled technical decisions and measured outcomes that must
 
 # Settled decisions & measured outcomes (do not re-litigate without new evidence)
 
+> **Scope:** current-project — these settled outcomes are this codebase's; the do-not-re-litigate discipline is the portable part.
+
 Full-fidelity records: `.zcode/memories/lumen-*.md` (one file per item below, with
 numbers). Retrieval goes through the generated `.zcode/memories/INDEX.md`
 (`scripts/gen-memory-index.py` — grouped by module with topics); this file is the

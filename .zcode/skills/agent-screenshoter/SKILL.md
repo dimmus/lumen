@@ -5,6 +5,8 @@ description: Take screenshots (and pick colors) on Lumen's live seat — per-hos
 
 # Screenshots on the Lumen seat (agent-screenshoter)
 
+> **Scope:** current-project — hosts, tool inventories and wire contracts are this project's.
+
 Two hosts share the hostname `iritur`. Detect which one you are on before anything else:
 `ls /sys/class/drm/card*/device/driver` (vmwgfx → VM; i915+nouveau → notebook) — same
 rule as `lumen-build-run`. Inventories below do **not** transfer between them.

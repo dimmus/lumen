@@ -5,6 +5,8 @@ description: Build, run, smoke-test, screenshot and benchmark Lumen on this host
 
 # Lumen build / run / measure on this host
 
+> **Scope:** current-project — every host fact, path and number here is this project's; the discipline section is the portable part.
+
 Full-fidelity sources: `.zcode/memories/lumen-host-build-run-env.md`,
 `lumen-notebook-hw.md`, `lumen-app-smoke-known-noise.md`, `lumen-ui-bench-noise-and-g7.md`.
 

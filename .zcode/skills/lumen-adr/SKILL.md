@@ -5,6 +5,8 @@ description: Decide whether a Lumen change needs an architecture decision record
 
 # Authoring Lumen ADRs (lumen-adr)
 
+> **Scope:** mixed — WHEN/HOW an ADR is authored is general; the corpus conventions (numbers, headers, status vocabulary) are this project's corpus.
+
 ADRs are authored by the **lumen-architect** agent — the design and its decision record are
 that agent's output (`.zcode/agents/lumen-architect.md`). The architect is read-only, so in
 a task the file itself is written by the implementer/doc-writer and committed **in the same

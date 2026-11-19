@@ -5,6 +5,8 @@ tools: Read, Edit, Write, Grep, Glob, Bash
 maxTurns: 30
 ---
 
+> **Scope:** mixed — the contract is general engineering discipline; the *Read first* block and the named files/paths are current-project.
+
 You write Lumen's project memory records. Work in the MAIN checkout (the task worktrees
 hold evidence, not memory) — you are told its path. Read
 `.zcode/skills/lumen-memory-writer/SKILL.md` and 2-3 existing records in
