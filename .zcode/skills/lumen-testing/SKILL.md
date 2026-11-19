@@ -21,7 +21,7 @@ superseded by this skill): `.agents/skills/lumen-test-agent/references/test-matr
 
 | Change surface | Required evidence |
 | --- | --- |
-| Any code | Tests-enabled ctest suite green (`build/test`, 133 non-bench tests as of 2026-11, 138 registered incl. bench — the `release` preset has none); on a tree with a tolerated known-red set, green = no new failures beyond it (see `lumen-build-run`) |
+| Any code | Tests-enabled ctest suite green (`build/test`; the `release` preset has none). **Counts are computed, never quoted**: the tree's own `ctest -N` total decides — a suite claim without its computed count, or fewer registered tests than the baseline ran, is INVALID. On a tree with a tolerated known-red set, green = no new failures beyond it (the set's semantics: owner-blessed test names, recorded by the studio `known_red` arg or the gated-change tree's baseline; gated-change refuses a red baseline outright — it has no known_red by design) |
 | New functionality | New tests exercising it, in the same change |
 | Compositor, display, input, shell, protocols | + seat smokes: `drag-smoke.sh --join-seat-session` and `app-smoke.sh --join-seat-session` (quiet host, one DRM master) |
 | Rendering/perf-relevant | + interleaved A/B `ui-bench` (≥3 rounds, both binaries pinned) vs the base; FAIL p50 +25 %, WARN p50 +10 %/p95 +25 % |
@@ -39,14 +39,20 @@ Every executed check records: exact argv, working tree + build dir identity (com
 dirty hash), environment overrides that matter (`LUMEN_*`), exit code, the counts the
 output actually printed, artifact paths (logs/JSON) with sha256 when they gate anything,
 and who ran it (agent identity — independence is checked at the gate). Store artifacts
-under the tree's `build/evidence/<date>-<name>/` (gitignored; quote paths in reports).
+under the tree's `evidence/<date>-<name>/` — repo-root `evidence/`, the path
+`.gitignore`'s `/evidence/` rule covers (NOT `build/evidence/`, which a reconfigure
+wipes; memories citing `evidence/<date>-<run>/` mean this same place). Quote paths in
+reports; evidence is never merged.
 
 ## Status vocabulary (exact)
 
 `PASS / FAIL / NOT RUN / UNSUPPORTED / COULD NOT RUN / INVALID (contaminated measurement
 — foreign input, load spike, second compositor on the seat)`. Execution vs assessment are
 separate: "completed, exit 0" is not PASS until the printed counts were checked against
-what the check gates. A suite that ran 1 test where 138 exist is INVALID as a suite run.
+what the check gates. A suite that ran fewer tests than the tree's computed `ctest -N`
+total registers is INVALID as a suite run. Seat checks: evidence without the broker's
+`seat-lock: acquired` line is INVALID (`lumen-seat` skill) — contamination from an
+unbrokered concurrent job is exactly what the broker prevents.
 
 Smoke exit semantics: 0 PASS (may warn), 1 FAIL, 2 COULD NOT RUN, 3 INVALID from foreign
 input. drag latency gates: median ≤ 1.5 refresh periods + 4 ms; p95 warn at 2 periods

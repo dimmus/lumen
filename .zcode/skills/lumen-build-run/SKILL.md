@@ -63,7 +63,7 @@ cmake --build --preset release      # ~526 ninja steps, ~15 min cold on 2 cores
 ```bash
 cmake --preset release -S . -B build/test -DLUMEN_BUILD_TESTS=ON
 cmake --build build/test -j2
-ctest --test-dir build/test --output-on-failure -LE bench   # 134 non-bench tests as of 2026-11 (139 registered incl. bench)
+ctest --test-dir build/test --output-on-failure -LE bench   # counts COMPUTED per run: ctest -N is the truth
 ```
 
 The plain `release` preset sets `LUMEN_BUILD_TESTS=OFF` → `ctest` on `build/release` sees
@@ -100,12 +100,13 @@ instances — a headless run is not evidence for that surface (unit ctest and th
   ```bash
   bash -c 'echo $$ | sudo tee /sys/fs/cgroup/user.slice/user-1000.slice/session-1.scope/cgroup.procs >/dev/null; exec ./scripts/tty-smoke.sh'
   ```
-- One compositor holds DRM master at a time: check
-  `grep -l lumen-composito /proc/[0-9]*/comm` (**never `pgrep -x lumen-compositor` — comm
-  is truncated to 15 chars, so the name never matches**), `pgrep -f "^bash .*-smoke\.sh"`
-  (plain `pgrep -f smoke.sh` matches your own shell), and `/proc/loadavg`, before and
-  after seat work. `loginctl list-sessions` shows whether a user desktop session on tty1
-  holds the seat.
+- One compositor holds DRM master at a time, and every seat job holds a broker ticket
+  (`scripts/seat-lock.sh` — the smoke/bench scripts take it themselves; wrap anything
+  ad-hoc the same way; see `.zcode/skills/lumen-seat/SKILL.md`). The quiet-seat triple
+  (compositor via /proc/*/comm — **never `pgrep -x lumen-compositor`, comm is truncated
+  to 15 chars**; foreign smoke; loadavg) has ONE implementation:
+  `scripts/seat-lock.sh status`, run before and after seat work. `loginctl
+  list-sessions` shows whether a user desktop session on tty1 holds the seat.
 - Input injection without uinput: `scripts/inject-input.py` — writes `input_event` structs
   to the existing nodes as root. The smoke scripts pick the nodes themselves
   (`scripts/inject-devices.sh`): the virtual "Lumen Inject Mouse" by name wherever the
@@ -214,8 +215,10 @@ The `lumen-compositor-bench` workflow automates this — prefer it over manual r
 
 ## Gotchas
 
-- `lx.shell.cppm` and `lx.drm.cppm` use CRLF — scripted/Python edits silently strip it
-  (tell: `git diff --stat` whole-file rewrite); restore CRLF after.
+- Line endings: `.gitattributes` pins `eol=lf` repo-wide (both formerly-CRLF files are
+  LF at HEAD). A scripted/Python edit that flips endings is INVISIBLE to `git diff` —
+  commit normalizes it — so run `scripts/diff-hygiene.sh <base>` before committing; it
+  scans the working tree, not the diff.
 - Push needs SSH: `git push git@github.com:dimmus/lumen.git <branch>` (https origin has no
   credential helper).
 - `pkill -f` self-matching patterns kill your own shell — build patterns at runtime.
