@@ -38,6 +38,11 @@ Rules of the stage:
 - **Commits**: commit each logically complete unit in the worktree with a detailed
   conventional message — summary line, then what/why, the design decision, and the
   evidence (tests run, numbers measured). Never push; never amend existing commits.
+- **Format and diff hygiene**: changed C++ files follow `.clang-format` — check with
+  `clang-format --dry-run --Werror` on the files you touched before committing; run
+  `scripts/diff-hygiene.sh <base>` if it exists in the tree — a whole-file rewrite or a
+  CRLF flip (`lx.shell.cppm`, `lx.drm.cppm` are the recorded traps) is a defect you
+  introduced, not a formatting preference.
 - **Stop on regression**: if any check, smoke or measurement shows a regression, stop and
   report it with the evidence. Do not keep, work around, or rationalize it — that decision
   belongs to the user (AGENTS.md §1.2).
