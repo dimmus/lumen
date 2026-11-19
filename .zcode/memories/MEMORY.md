@@ -10,6 +10,7 @@
 - [compositor theme env export](lumen-compositor-theme-env-export.md) — Compositor always exports resolved LUMEN_THEME and re-exports on reload (env_reexports owe/drain/drop); seat debt closed 2026-11-17 (177/0/0); SIGSEGV split to its own TODO row
 - [frame pacing fix](lumen-frame-pacing-fix.md) — 2026-11-04: four-entry aim ring + observe_commit_late whole-path lead fixed fast-client frame pacing (59.9 fps, 1 late/200); k_client_margin_ns must not absorb handoff costs
 - [gpu ui engine plan](lumen-gpu-ui-engine-plan.md) — GPUI-style primitive renderer plan and phase history (ADR-010: PRs #31–#54, #74–#77); Phase 5 deleted the retained-widget API; shell/portal/lx.app all on lx.ui.host
+- [harness review green](lumen-harness-review-green.md) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes
 - [host build run env](lumen-host-build-run-env.md) — How to build and run Lumen on this VM host (vmwgfx, lavapipe-only Vulkan, GL path, running \"as tty1\" from SSH, input injection without uinput)
 - [kernel features branch](lumen-kernel-features-branch.md) — PSI + fence deadlines + pidfd + fdinfo + CLOSEFB shipped b4550d3; EEVDF/RT scheduling REVERTED (cursor p95 25.5→35.2 ms); expect drm_timeline_ops::query caller updates on merge
 - [malloc replacement measured](lumen-malloc-replacement-measured.md) — jemalloc/mimalloc/tcmalloc measured against glibc for lumen-compositor on 2026-10-27 — no speed gain, more memory;

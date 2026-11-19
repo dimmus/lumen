@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (44 records, generated 2026-11-19)
+# Memory index by module (45 records, generated 2026-11-19)
 
 ## (general)
 
@@ -30,6 +30,7 @@
 
 ## harness
 
+- **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
 - **sanitizer sweep green** (2026-11-18) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions  [topics: asan, tsan, sanitizers; LONG (128 lines — split candidate)]
 - **adr skill** (2026-11-17) — When an ADR is required (cross-module/protocol, weighed alternatives, supersede) and the corpus conventions; ADR=decision, decisions=measured, TODO=open  [topics: adr, authoring]
 - **agent screenshoter** (2026-11-17) — Screenshot role + skill: grim over wlr-screencopy v3 or the portal path via lumen-portal-probe; xdg-desktop-portal-wlr never installed; grim flips the panel bell to DND for 2 s  [topics: screenshots, seat]
@@ -135,6 +136,7 @@
 
 ## scripts
 
+- **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
 - **uinput key bitmap format** (2026-11-17) — /proc KEY bitmap is 64-bit words MSW-first: 70000 0 0 0 0 IS BTN_LEFT/RIGHT/MIDDLE — never read caps from /proc text, use EVIOCGBIT; two gate records' 'no BTN codes' were misreadings  [topics: uinput, evdev]
 - **smoke bench harness green** (2026-11-14) — Harness task: injection autodetect by name, build-fresh kills mtime false-trips, host-aware geometry, quiet-CPU PM-QoS fail-closed, bench warm-up gate; overwrite loop ended by namespace split  [topics: smoke, bench, uinput]
 - **toplevel drag drag smoke** (2026-11-13) — lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook  [topics: drag-smoke, injection]
