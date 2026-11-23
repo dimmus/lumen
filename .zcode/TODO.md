@@ -211,6 +211,7 @@ current when an item closes.
   row first named four; four designated tests added 2026-11-24): six §5 invariants had no
   designated test. One is closed: GPU pool reuse across frames — `test_gpu_pools` (both
   pools over 64 simulated frames; its semaphore half runs on the notebook's hasvk device).
+  Closed is the missing test only: the pools are on no frame path, which is the next row.
   Three keep a narrowed marker for what the new test cannot evidence: the memory-pressure
   cascade — `test_memory_pressure_cascade` drives the import-cache and buffer-lifecycle
   legs from one started compositor's own coordinator; the `shm_pool_.trim()` leg stays GAP
@@ -227,6 +228,23 @@ current when an item closes.
   kms_damage contract (the commit half exists, but `page_flip_event::applied_damage` is
   written nowhere — lx.drm/atomic.cppm:120). Close each by adding the check named in the
   row, or by building what the row describes; never by weakening the row.
+- [ ] **The §5 GPU pools are on no frame path** (reported 2026-11-24 with `test_gpu_pools`;
+  docs/invariants.md "GPU pools" row): AGENTS.md §5 says "GPU pools: use `pipeline_cache`
+  and `lx.gfx.semaphore_pool` (`timeline_semaphore_pool`) — no per-frame create/destroy",
+  and neither pool is on a frame path. Nothing under modules/ or executables/ calls
+  `timeline_semaphore_pool::acquire` — not the `semaphore_pool()` accessor of the
+  `syncobj_bridge` that owns one (lx.gfx/syncobj_bridge.cppm:44, 58, 77) — and
+  `pipeline_cache::acquire` has one caller, `frame_renderer::draw_to_headless`, which drops
+  the id it is handed (lx.gfx/renderer.cppm:536). The Vulkan composite path makes its own:
+  `vulkan_compositor::initialize` creates its fences and its exportable semaphores once per
+  frame slot (lx.gfx/vk_renderer.cppm:1907-1942), and its pipelines go through a
+  `VkPipelineCache` (lx.gfx/vk_renderer.cppm:168-173). `test_gpu_pools` evidences the two
+  pools themselves, driven directly; it cannot show a frame getting back what an earlier
+  frame used until a frame path uses what a pool hands back. Not measured: whether any
+  frame path creates or destroys per frame regardless. Close by a frame path that uses what
+  the pools hand back, with a test that sees that frame — or, if the composite path's own
+  means are the design to keep, by an owner decision that rewrites the §5 line and the row
+  to say so.
 - [ ] **Remaining LONG memory records** (2026-11-19; count corrected 2026-11-23): the
   "19" counts "LONG" marker *lines* in the generated `.zcode/memories/INDEX.md` — one per
   module group a record is filed under. They cover 12 distinct records; 13 files under
