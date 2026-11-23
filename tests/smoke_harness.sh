@@ -249,36 +249,42 @@ done
 # takes the run down with exit 2 when it finds one (scripts/seat-lock.sh:85-127, 327-333),
 # and its lock dir is derived from XDG_RUNTIME_DIR (:41) — unset, the host's real one.
 # So this is a wrapper: it refuses every runtime dir but the fixture's private one,
-# records the argv it was given, and execs the tree's real broker with --no-preflight
-# (:309) ahead of the `--`: acquire, export, run and release for real, the host-dependent
-# preflight off. The first lines are the harness's own: where the private dir, the tree's
-# broker and the argv log are — fixed here, not read back from the environment.
+# records the argv it was given, and execs a broker with --no-preflight (:309) ahead of the
+# `--`: acquire, export, run and release for real, the host-dependent preflight off. The
+# fixture's is written in front of the tree's real broker; the hermeticity probes below
+# write the same text once more behind a stand-in. The first lines are the harness's own:
+# where the private dir, the broker and the argv log are — fixed here, not read back from
+# the environment.
 SEAT="$P/runtime"                          # the fixture's private XDG_RUNTIME_DIR
 BROKER_ARGV="$TMP/perfetto-broker-argv"    # one line per call reaching the wrapper
 mkdir -m 700 "$SEAT"
 : >"$BROKER_ARGV"
-{
-  echo '#!/usr/bin/env bash'
-  printf 'private_runtime=%q\n' "$SEAT"
-  printf 'broker=%q\n' "$ROOT/scripts/seat-lock.sh"
-  printf 'argv_log=%q\n' "$BROKER_ARGV"
-  cat <<'EOF'
-# Written by tests/smoke_harness.sh into the perfetto fixture, for the copied ui-bench.sh
-# to re-exec. See there: the real broker runs, against the fixture's private lock dir
-# only, with the preflight off. Anything else is refused — exit 2, by name.
-set -u
-if [[ "${XDG_RUNTIME_DIR:-}" != "$private_runtime" ]]; then
-  echo "seat-lock.sh (smoke_harness fixture): refusing — XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR:-}' is not the fixture's private runtime dir" >&2
-  exit 2
-fi
-printf '%s\n' "$*" >>"$argv_log"
-opts=()
-while [[ $# -gt 0 && "$1" != "--" ]]; do opts+=("$1"); shift; done
-[[ $# -gt 0 ]] || { echo "seat-lock.sh (smoke_harness fixture): no -- before the job" >&2; exit 2; }
-exec "$broker" "${opts[@]}" --no-preflight "$@"
+write_seat_lock() { # FILE BROKER — the wrapper, written in front of the broker given
+  {
+    echo '#!/usr/bin/env bash'
+    printf 'private_runtime=%q\n' "$SEAT"
+    printf 'broker=%q\n' "$2"
+    printf 'argv_log=%q\n' "$BROKER_ARGV"
+    cat <<'EOF'
+    # Written by tests/smoke_harness.sh for the perfetto fixture's copied ui-bench.sh to
+    # re-exec — and once more, behind a stand-in broker, for the harness's own
+    # XDG_RUNTIME_DIR-unset probe; see there. The broker runs against the fixture's private
+    # lock dir only, with the preflight off. Anything else is refused — exit 2, by name.
+    set -u
+    if [[ "${XDG_RUNTIME_DIR:-}" != "$private_runtime" ]]; then
+      echo "seat-lock.sh (smoke_harness fixture): refusing — XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR:-}' is not the fixture's private runtime dir" >&2
+      exit 2
+    fi
+    printf '%s\n' "$*" >>"$argv_log"
+    opts=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do opts+=("$1"); shift; done
+    [[ $# -gt 0 ]] || { echo "seat-lock.sh (smoke_harness fixture): no -- before the job" >&2; exit 2; }
+    exec "$broker" "${opts[@]}" --no-preflight "$@"
 EOF
-} >"$P/scripts/seat-lock.sh"
-chmod +x "$P/scripts/seat-lock.sh"
+  } >"$1"
+  chmod +x "$1"
+}
+write_seat_lock "$P/scripts/seat-lock.sh" "$ROOT/scripts/seat-lock.sh"
 
 # Mechanism guard — the fixture is complete and verbatim. Everything the copied ui-bench.sh
 # reaches for under $ROOT/scripts/, exec'd or sourced on any path, is staged: the next
@@ -423,23 +429,40 @@ check "and released after it" "held=absent queued=0" "$(seat_state)"
 # Hermeticity: the wrapper serves its private runtime dir only. XDG_RUNTIME_DIR unset is
 # the case to refuse hardest — the tree's broker would then derive the host's real lock
 # dir (scripts/seat-lock.sh:41), where a seat job of the host's may hold a ticket: this
-# ctest takes none there, and asserts nothing about it.
-guard() { # "": XDG_RUNTIME_DIR unset; else that dir → rc, the output in $TMP/guard.log
-  if [[ -z "$1" ]]; then
-    env -u XDG_RUNTIME_DIR bash "$P/scripts/seat-lock.sh" with smoke harness-probe -- true
+# ctest takes none there, asserts nothing about it — and must not get there even when the
+# guard under test is broken. So that one probe never has the tree's broker behind the
+# wrapper it runs: it runs the wrapper's twin, the same text written a second time behind
+# a stand-in broker that records the call and exits 99. The foreign-dir probe runs the
+# fixture's own wrapper: its runtime dir is the harness's, so a broken guard would lock
+# only there.
+STANDIN="$TMP/broker-stand-in"             # the twin's broker: records the call, exits 99
+REACHED="$TMP/broker-stand-in-reached"
+{
+  echo '#!/usr/bin/env bash'
+  printf 'reached=%q\n' "$REACHED"
+  echo 'echo "stand-in broker reached: $*" >>"$reached"'
+  echo 'exit 99'
+} >"$STANDIN"
+chmod +x "$STANDIN"
+: >"$REACHED"
+write_seat_lock "$TMP/seat-lock-twin.sh" "$STANDIN"
+guard() { # WRAPPER "": XDG_RUNTIME_DIR unset; else that dir → rc, the output in $TMP/guard.log
+  if [[ -z "$2" ]]; then
+    env -u XDG_RUNTIME_DIR bash "$1" with smoke harness-probe -- true
   else
-    XDG_RUNTIME_DIR="$1" bash "$P/scripts/seat-lock.sh" with smoke harness-probe -- true
+    XDG_RUNTIME_DIR="$2" bash "$1" with smoke harness-probe -- true
   fi >"$TMP/guard.log" 2>&1
 }
 : >"$BROKER_ARGV"
-guard ""; rc=$?
-check "XDG_RUNTIME_DIR unset: refused (exit 2) — it would mean the host's real lock dir" 2 "$rc"
-contains "and says so" "$(cat "$TMP/guard.log")" "is not the fixture's private runtime dir"
-guard "$TMP/xdg-foreign"; rc=$?
+guard "$P/scripts/seat-lock.sh" "$TMP/xdg-foreign"; rc=$?
 check "XDG_RUNTIME_DIR elsewhere: refused (exit 2)" 2 "$rc"
 contains "and says so" "$(cat "$TMP/guard.log")" "is not the fixture's private runtime dir"
+guard "$TMP/seat-lock-twin.sh" ""; rc=$?
+check "XDG_RUNTIME_DIR unset: refused (exit 2), probed on the wrapper's twin — behind the tree's broker it would mean the host's real lock dir" \
+      2 "$rc"
+contains "and says so" "$(cat "$TMP/guard.log")" "is not the fixture's private runtime dir"
 check "a refused call reaches no broker: nothing locked, nothing logged" "" \
-      "$(ls -A "$TMP/xdg-foreign" 2>/dev/null)$(cat "$BROKER_ARGV")"
+      "$(ls -A "$TMP/xdg-foreign" 2>/dev/null)$(cat "$BROKER_ARGV")$(cat "$REACHED")"
 
 echo "inject-input.py — the key table and the pixel mapping:"
 python3 -I - "$ROOT/scripts/inject-input.py" <<'PY'
