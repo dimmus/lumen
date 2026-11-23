@@ -409,10 +409,12 @@ check "brokered and released the same" "1 held=absent queued=0" "$(brokered_run)
 
 # The chain apart from ui-bench.sh: a job the wrapper is given runs under the tree's real
 # broker, which holds the ticket in the private lock dir while it runs — the very id the
-# job was given — and leaves nothing behind.
+# job was given — and leaves nothing behind. The first row is the job's exit status alone;
+# which broker ran it is the second row's to prove (a stand-in that only exports the
+# three variables exits 0 as well).
 XDG_RUNTIME_DIR="$SEAT" bash "$P/scripts/seat-lock.sh" with smoke harness-probe -- \
   bash "$P/probe-job.sh" >"$TMP/probe.log" 2>&1; rc=$?
-check "a job through the fixture's seat-lock.sh runs under the tree's real broker" 0 "$rc"
+check "a job through the fixture's seat-lock.sh runs, exit 0 — that it ran under the tree's real broker is the next row's proof" 0 "$rc"
 check "the ticket is held in the private lock dir while the job runs, the one it was given" \
       "held: smoke harness-probe same-id-yes
 job: class=smoke locked=1 ticket=set" "$(grep -v '^seat-lock:' "$TMP/probe.log")"
