@@ -10,11 +10,7 @@ topics: invariants, overflow, memory-pressure, present-mode
 
 ---
 
-Verified 2026-11-24 on the **notebook** (iritur i915/hasvk, [[lumen-notebook-hw]]).
-Worktree `/home/dimmus/lumen-wt/invariant-gap-tests`, branch `zcode/task/invariant-gap-tests`
-off f936cda, HEAD **976b3a1** (9 commits, tree clean, nothing under modules/ or
-executables/ in any commit). Gate verdict READY. Ran this session: `ctest -N` in the
-worktree build = **146**; in main's build = **142** (branch not yet merged when written).
+Verified 2026-11-24 on the **notebook** (iritur i915/hasvk, [[lumen-notebook-hw]]). Worktree `/home/dimmus/lumen-wt/invariant-gap-tests`, branch `zcode/task/invariant-gap-tests` off f936cda, HEAD **976b3a1** (9 commits, tree clean, nothing under modules/ or executables/ in any commit; gate READY). Ran this session: `ctest -N` = **146** in the worktree build, **142** in main's (branch not yet merged when written).
 
 - **What landed — one commit per row, card's lowest-risk-first order.** f19e07d
   `test_present_mode` (7 cases: resolve_present_mode per tier, explicit modes unchanged,
@@ -67,10 +63,7 @@ worktree build = **146**; in main's build = **142** (branch not yet merged when 
   call. (2) A 65th pipeline_cache key is NOT pinned: acquire hands a fresh uncached id
   when full (renderer.cppm:456) — the "no pool" behaviour; pinning it would make a fix
   look like a regression. (3) One `start()` per process, all cascade scenarios inside one
-  ctest case: a third `start()` in a process fails (finding (e)). (4) Report lines use
-  `std::println`, not the tests' usual `std::printf` — the Mimosa hook declined the
-  printf forms. (5) The card's TODO line numbers (198-205) were stale — the row sat at
-  210-217 in the task tree; match TODO rows by content, not by line.
+  ctest case: a third `start()` in a process fails (finding (e)). (4) Report lines use `std::println` — the Mimosa hook declined the tests' usual `std::printf` forms. (5) The card's TODO line numbers (198-205) were stale — the row sat at 210-217 in the task tree; match TODO rows by content, not by line.
 - **Host findings.** (a) hasvk creates timeline semaphores with OPAQUE_FD export
   (semaphore_pool.cppm:60-77). (b) A compositor's own import cache fills in a ctest via
   `import_cache().acquire(key, desc)` with plain descriptors on its default device
@@ -94,10 +87,10 @@ seat-less mode; diff-hygiene.sh:92 `local` outside a function + its /tmp leak).
 
 **Fuckup class worth remembering:** the gate was green while test_overflow_caps' report
 case asserted `sizeof(rest)/sizeof(rest[0]) == 4` — a constant vs its own literal cannot
-fail on a product change. A test that only checks its own bookkeeping passes every
-mutation; the fix (3b9e260) holds the report to the module tree. Residual, disclosed:
-that case fails when the binary runs alone under `--filter` (only earlier cases fill
-`driven()`); ctest runs the whole binary, so the suite is unaffected.
+fail on a product change, so a self-referential assertion passes every mutation; the fix
+(3b9e260) holds the report to the module tree. Residual, disclosed: the case fails when
+the binary runs alone under `--filter` (only earlier cases fill `driven()`); ctest runs
+the whole binary, so the suite is unaffected.
 
 **Why:** a GAP row closes only at the strength of what its test can observe — where the
 invariant's last leg has no exported observable (`shm_pool_.trim()`, the selected present
@@ -117,8 +110,4 @@ reviewer/gate checklist item — grep the diff for tests constructing `lumen::co
 or calling `start()`; any hit demands either a broker ticket or a seat-less start mode,
 and forbids "no seat" in its registration comment.
 
-Related: [[lumen-memory-pressure-green]] (the staging leg row 30 narrows; staging_bytes
-observable), [[lumen-notebook-hw]] (hasvk device string), [[lumen-vulkan-capture-green]]
-(base lineage), [[lumen-unit-pair-green]] (suite-count discipline),
-[[lumen-smoke-harness-broker-fixture]] (the seat-broker contract the start() finding
-brushes against).
+Related: [[lumen-memory-pressure-green]] (the staging leg row 30 narrows; staging_bytes observable), [[lumen-notebook-hw]] (hasvk device string), [[lumen-vulkan-capture-green]] (base lineage), [[lumen-unit-pair-green]] (suite-count discipline), [[lumen-smoke-harness-broker-fixture]] (the seat-broker contract the start() finding brushes against).
