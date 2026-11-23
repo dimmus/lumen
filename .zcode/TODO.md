@@ -14,12 +14,24 @@ current when an item closes.
   and HTTPS has no credential helper, so the PR of record is the PR-text artifact +
   the merge commit — owner may install `gh` if real PR objects are wanted (then the
   workflows gain a PR step).
-- [ ] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
+- [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
   `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
   ui-bench.sh now re-execs `$ROOT/scripts/seat-lock.sh` — 13 sub-FAILs, every traced
   pass exits 127. One-line fix in `tests/smoke_harness.sh` (stage seat-lock.sh too, or
   stub the broker in the fixture) + its own gated round.
+  **Closed 2026-11-23 (notebook, tests-only — `tests/smoke_harness.sh` alone):**
+  `49 ok / 13 FAIL` → **`82 ok / 0 FAIL`**, `smoke_harness: PASS` in 2.0 s under ctest
+  (TIMEOUT 60). Design in one line: the fixture writes its own `scripts/seat-lock.sh`
+  wrapper — it refuses any `XDG_RUNTIME_DIR` but the fixture's private one, records its
+  argv and execs the tree's real broker with `--no-preflight` ahead of the `--`, so the
+  acquire/export/release contract runs for real in a private lock dir while the
+  host-dependent /proc preflight (exit 2 whenever a compositor or smoke runs) stays off.
+  A plain copy of the broker was the wrong "stage it too": it fails on a busy host and,
+  with `XDG_RUNTIME_DIR` unset, takes tickets in the host's real lock dir. The harness
+  now asserts the broker contract per pass, the two hermeticity guards, and a mechanism
+  guard (every `$ROOT/scripts/` reference of the copied ui-bench.sh is staged; the
+  verbatim copies are byte-identical).
 - [ ] **test_protocol_conformance session-lock rows flake under load** (seen
   2026-11-19 and again 2026-11-23 during heavy parallel session activity — both times
   failing the "session lock" sub-rows, both times PASSING on a quiet standalone rerun;
