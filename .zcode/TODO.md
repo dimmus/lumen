@@ -208,7 +208,30 @@ current when an item closes.
   rows had already passed; menu/tray code is untouched by the branch → pre-existing on
   main, only observable under ASan. Next: targeted repro (ASan shell + tray menu
   open/activate/close loop) to capture the full report.
-- [ ] **lumen-settings transient "no writable config.toml" banner** (2026-11-17 seat redo,
+- [x] **lumen-settings transient "no writable config.toml" banner** — closed 2026-11-24
+  (settings-no-writable-banner: reproduced on the notebook seat, fixed, fix proven there).
+  It is not transient: on `a89cbad` the banner is up by +2 s after a fresh launch with no
+  input event, through +30 s, over a writable user file, and goes only after a successful
+  write. Root cause: `session::repaint()` turned `untouched` into `memory_only` on any
+  call, and ten callers that are not edits went through it — `set_current`,
+  `toggle_expanded`, `open_group`, `begin_edit_action`, `cancel_edit_action`,
+  `begin_binding_capture`, `stop_binding_capture`, `set_open_menu`, `capture_binding_key`
+  (two branches). The launch trigger is `main.cpp`'s `shortcut_input::on_keymap` →
+  `stop_binding_capture()`: the keymap reaches the client 86 ms into a launch
+  (WAYLAND_DEBUG trace). Fix: those callers re-describe through `refresh()`; `repaint()`
+  stays with the five failure tails. Regression ctest:
+  `settings_banner_is_raised_only_by_an_edit_that_did_not_reach_the_file` — red on the
+  pre-fix logic (13 of 13 non-edit callers named), green after. Seat A/B, one
+  class-smoke ticket per job, same procedure and the same two keys written: pre-fix
+  banner PRESENT on 13 of 17 shots; fixed PRESENT only on the two shots of an edit that
+  cannot be written (directory read-only), ABSENT after the next successful write. ctest
+  141/141. Evidence, mirrored to the main checkout:
+  `/home/dimmus/lumen/evidence/2026-11-24-settings-no-writable-banner/` (REPRO.md, `pre/`,
+  `post/`, `post-run1/`, `keymap-trace/`, two recorded pre-fix attempts). **Seen, not
+  fixed (outside this fix):** `repaint()` escalates only from `untouched`, so after one
+  successful write a later edit that cannot be written applies to the session and shows
+  nothing — no banner (probe in the unit harness, `session::repaint()`).
+  As written (2026-11-17 seat redo,
   supplement): a "Changes are not being saved / There is no writable config.toml" banner
   showed ~10 s after a fresh lumen-settings launch and vanished after the first successful
   write — while locate_config resolved the real user file and the writes demonstrably
