@@ -1787,6 +1787,17 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_gpu_pools PRIVATE tests)
     add_test(NAME test_gpu_pools COMMAND test_gpu_pools)
 
+    # The memory-pressure cascade (AGENTS.md §5; docs/invariants.md "Memory-pressure
+    # cascade"): a started compositor's own coordinator driving its own import cache and
+    # buffer lifecycle. On virtual outputs — no card, no DRM master, no seat.
+    add_executable(test_memory_pressure_cascade tests/test_memory_pressure_cascade.cpp)
+    target_link_libraries(test_memory_pressure_cascade PRIVATE lx.compositor lx.runtime lx.gfx)
+    lumen_apply_module_properties(test_memory_pressure_cascade)
+    lumen_link_platform(test_memory_pressure_cascade)
+    target_include_directories(test_memory_pressure_cascade PRIVATE tests)
+    add_test(NAME test_memory_pressure_cascade COMMAND test_memory_pressure_cascade)
+    set_tests_properties(test_memory_pressure_cascade PROPERTIES TIMEOUT 90)
+
     # A sanitizer report must fail the test, not just print to stderr.
     set(LUMEN_TSAN_OPTS "halt_on_error=1")
     set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
