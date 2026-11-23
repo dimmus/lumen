@@ -60,10 +60,18 @@ current when an item closes.
   `.zcode/memories/lumen-settings-key-capture-seat.md`. To a capture/smoke run it looks
   exactly like "capture silently records nothing" (stale client modifier state until the
   refocus re-sends the keymap). Next: reproduce under real-typing cadence, then decide
-  whether the arming path can observe coalesced/reordered press pairs.
+  whether the arming path can observe coalesced/reordered press pairs. (2026-11-23: the
+  evidence directory is not in the main checkout — it lives in the worktree
+  `../lumen-wt/settings-key-capture-close-out/evidence/2026-11-17-shortcut-capture/`.)
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
   schema-side rows in `lumen-settings` waiting on their own compositor feature (rule store
   behind the inert `zlm_window_rules_v1`; `[[input.device]]` override plumbing), not on the app.
+  **Corrected 2026-11-23:** the compositor side is on main since `0439bc4` (2026-11-06:
+  the window-rules store `window_rules.cpp`, its control methods in `control.cpp`, WM use in
+  `window_manager.cppm`, and the `[[input.device]]` edit API in `lx.config/edit.cppm`).
+  What remains is the two editor UIs in lumen-settings — an unstarted feature, not a
+  blocked row. `docs/adr/013-settings-app.md` carries the same stale "waits on the
+  compositor" claim; fix it at the ADR's next touch.
 - [ ] **Owed VM golden check (unit-pair-green)** — run `./build/test/lumen-ui-gallery --check`
   on the dev VM (tests-enabled build of the unit-pair-green tree, or main once it merges) at
   the next VM session and record the result; then check this row off. It is the open condition
@@ -128,7 +136,12 @@ current when an item closes.
   write — while locate_config resolved the real user file and the writes demonstrably
   worked (`evidence/2026-11-17-seat-redo/d-supplements/shot-pre-flip-banner-zoom.png`);
   no startup path setting the banner's memory_only state was found by source reading.
-  Reproduce, then fix the stale banner state.
+  Reproduce, then fix the stale banner state. **Lead 2026-11-23 (read from source, not
+  yet reproduced):** `session::repaint()` flips `save_` from `untouched` to `memory_only`
+  on *any* repaint (`executables/lumen-settings/settings_ui.cppm:1250-1254`) and
+  `set_open_menu` calls `repaint()` (`:314-317`) — so opening or dismissing a dropdown
+  with nothing edited raises the banner until a write succeeds. Decide on the seat by
+  opening a dropdown without editing.
 - [x] **snprintf-log-migration gate BLOCKED: seat evidence owed + vsnprintf acceptance
   unratified** — closed 2026-11-23 (reconciliation; closing note at the end of this row).
   As written 2026-11-17: branch `zcode/task/snprintf-log-migration` 8e925e5..b556db2,
@@ -182,14 +195,19 @@ current when an item closes.
   bench owner compare`, ticket held mid-run, released after, exit 0. Next touch of
   `lumen-seat` SKILL.md §"Who holds a ticket": move compare.sh from "Calls the broker by
   hand" to the self-brokering list (left undone here — a skill edit owes an eval rerun).
-- [ ] **Invariant GAPs** (docs/invariants.md, 2026-11-19): four §5 invariants have no
-  designated test — content-hint scanout priority policy, GPU pool reuse across frames,
-  present-mode policy (discrete→mailbox / integrated→fifo_relaxed), and the kms_damage
-  contract in kms_atomic_commit/presentation_feedback. Close each by adding the check
-  named in the row; never by weakening the row.
-- [ ] **Remaining LONG memory records** (2026-11-19): 19 records are 121–300 lines —
-  split candidates listed in the generated `.zcode/memories/INDEX.md` ("LONG" markers);
-  the ≤120-line rule applies at next touch, split all of them eventually.
+- [ ] **Invariant GAPs** (docs/invariants.md, 2026-11-19; count corrected 2026-11-23 — the
+  row first named four): six §5 invariants have no designated test — the memory-pressure
+  cascade (the coordinator's pressure signal driving the consumers' eviction as one
+  cascade), overflow caps across the fixed-capacity structures, content-hint scanout
+  priority policy, GPU pool reuse across frames, present-mode policy (discrete→mailbox /
+  integrated→fifo_relaxed), and the kms_damage contract in
+  kms_atomic_commit/presentation_feedback. Close each by adding the check named in the
+  row; never by weakening the row.
+- [ ] **Remaining LONG memory records** (2026-11-19; count corrected 2026-11-23): the
+  "19" counts "LONG" marker *lines* in the generated `.zcode/memories/INDEX.md` — one per
+  module group a record is filed under. They cover 12 distinct records; 13 files under
+  `.zcode/memories/` exceed 120 raw lines (127–275). The ≤120-line rule applies at next
+  touch, split all of them eventually.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
