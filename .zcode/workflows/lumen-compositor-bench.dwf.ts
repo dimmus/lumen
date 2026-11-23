@@ -5,11 +5,10 @@ description: "Benchmark Lumen's speed and memory footprint against sway, weston
   (socket, first presented frame), commit→present p50/p95, callback fps,
   animating and idle CPU %, RssAnon MB and shutdown time. Produces a comparison
   table, a markdown report and a memory record."
-whenToUse: When the user asks how fast or how heavy Lumen is compared to sway,
+whenToUse: "When the user asks how fast or how heavy Lumen is compared to sway,
   weston or hyprland, or asks for a cross-compositor startup/latency/CPU/memory
   comparison. Needs a quiet seat (no other compositor or smoke session) and the
-  lumen release build.
-  scope: current-project — harness paths, hosts and comparators are Lumen's.
+  lumen release build."
 args:
   include_hyprland:
     type: boolean
@@ -26,6 +25,7 @@ args:
     description: "Compositors to compare (json array); names: lumen, weston, sway, hyprland"
     default: '["lumen", "weston", "sway"]'
 */
+// Scope: current-project — harness paths, hosts and comparators are Lumen's.
 interface CompRow {
   /** Compositor name as compare.sh reports it: lumen, weston, sway, hyprland. */
   name: string;

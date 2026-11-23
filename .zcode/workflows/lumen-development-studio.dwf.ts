@@ -7,12 +7,11 @@ description: "Lumen's development studio orchestrator: plan a request into gated
   then merge every gate-READY branch into main (topological order, merged tree
   re-gated) and push. Anything below READY is delivered as branch + evidence
   for the owner — never merged, never pushed."
-whenToUse: A non-trivial Lumen change or multi-task request that must go through
+whenToUse: "A non-trivial Lumen change or multi-task request that must go through
   the full gated studio (plan / implement / review / verify / gate / memory), or
   when the user asks for the studio or coordinated delivery on Lumen. One
   bounded task → lumen-gated-change instead; cross-compositor benchmarking →
-  lumen-compositor-bench.
-  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
+  lumen-compositor-bench."
 args:
   app_smoke_tolerated_failset:
     type: json
@@ -71,6 +70,7 @@ args:
       protocol, fix, optimization)"
     required: true
 */
+// Scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 interface TaskCard {
   /** Short kebab-case id, unique across this plan, e.g. "toplevel-drag-protocol". */
   id: string;

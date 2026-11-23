@@ -13,7 +13,6 @@ whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
   workflow for one Lumen change. For multi-task requests or full studio delivery
   (worktrees, commits, PR text, memory records) use lumen-development-studio
   instead. Not for small fixes or doc-only edits."
-  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 args:
   branch:
     type: string
@@ -36,6 +35,7 @@ args:
     description: The change to implement (what you would tell the implementer)
     required: true
 */
+// Scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 interface ImplResult {
   /** 2-4 sentences: what was implemented and the shape of the solution. */
   summary: string;
