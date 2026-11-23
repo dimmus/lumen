@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (47 records, generated 2026-11-23)
+# Memory index by module (48 records, generated 2026-11-24)
 
 ## (general)
 
@@ -19,6 +19,10 @@
 ## (harness/docs)
 
 - **smoke bench harness green rounds** (undated) — Close-out chronology split from [[lumen-smoke-bench-harness-green]] —  [LONG (251 lines — split candidate)]
+
+## docs
+
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 
 ## docs/adr
 
@@ -47,6 +51,7 @@
 
 ## lx.compositor
 
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **compositor theme env export** (2026-11-16) — Compositor always exports resolved LUMEN_THEME and re-exports on reload (env_reexports owe/drain/drop); seat debt closed 2026-11-17 (177/0/0); SIGSEGV split to its own TODO row  [topics: theme, environment, systemd; LONG (177 lines — split candidate)]
 - **memory pressure green** (2026-11-15) — Spurious critical-pressure WARN fixed by fixing the measurement: staging judges bytes_in_flight (backlog), not bytes_mapped (rounding read 64 MiB as 100%); thresholds unchanged; final 177/0/0  [topics: memory, pressure; LONG (123 lines — split candidate)]
 - **vulkan capture green** (2026-11-15) — Vulkan capture parity: SIGUSR1 read-back 3.33 ms, window capture + capture-dmabuf in lx.gfx behind void*; Z7 root-caused to fence-fd reuse; app-smoke 176/0/1 with all backend rows PASS  [topics: vulkan, capture]
@@ -74,6 +79,7 @@
 
 ## lx.gfx
 
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **vulkan capture green** (2026-11-15) — Vulkan capture parity: SIGUSR1 read-back 3.33 ms, window capture + capture-dmabuf in lx.gfx behind void*; Z7 root-caused to fence-fd reuse; app-smoke 176/0/1 with all backend rows PASS  [topics: vulkan, capture]
 - **vulkan capture green rounds** (undated) — Close-out chronology split from [[lumen-vulkan-capture-green]] —  [LONG (232 lines — split candidate)]
 
@@ -84,8 +90,13 @@
 
 ## lx.runtime
 
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **memory pressure green** (2026-11-15) — Spurious critical-pressure WARN fixed by fixing the measurement: staging judges bytes_in_flight (backlog), not bytes_mapped (rounding read 64 MiB as 100%); thresholds unchanged; final 177/0/0  [topics: memory, pressure; LONG (123 lines — split candidate)]
 - **kernel features branch** (2026-10-28) — PSI + fence deadlines + pidfd + fdinfo + CLOSEFB shipped b4550d3; EEVDF/RT scheduling REVERTED (cursor p95 25.5→35.2 ms); expect drm_timeline_ops::query caller updates on merge  [topics: kernel, psi]
+
+## lx.scene
+
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 
 ## lx.shell
 
@@ -103,6 +114,7 @@
 
 ## lx.text
 
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **shell first paint wip** (2026-10-25) — Shell first-paint work: font-match persistence merged as PR #44 (2026-10-25);
 
 ## lx.trace
@@ -111,6 +123,7 @@
 
 ## lx.ui
 
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **settings key capture seat** (2026-11-17) — ADR-013 key capture proven live (Super+Shift+y, splice gen 57→58, reserved Super+Escape refuses); trap: injected Super-chords trip the tap grab mid-chord — open TODO row  [topics: bindings, capture, adr-013]
 - **gpu ui engine plan** (2026-10-24) — GPUI-style primitive renderer plan and phase history (ADR-010: PRs #31–#54, #74–#77); Phase 5 deleted the retained-widget API; shell/portal/lx.app all on lx.ui.host  [topics: adr-010, ui-engine]
 
@@ -147,6 +160,7 @@
 
 ## tests
 
+- **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **unit pair green** (2026-11-14) — Tolerated {ui_gallery, test_task_model} pair retired with zero production code: stale expectations from a65d06b + goldens predating the chevron fix; cross-host claim retracted; 133/133  [topics: goldens, known-red; LONG (155 lines — split candidate)]
 - **toplevel drag drag smoke** (2026-11-13) — lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook  [topics: drag-smoke, injection]
 

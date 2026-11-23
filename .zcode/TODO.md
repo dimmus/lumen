@@ -14,6 +14,52 @@ current when an item closes.
   and HTTPS has no credential helper, so the PR of record is the PR-text artifact +
   the merge commit — owner may install `gh` if real PR objects are wanted (then the
   workflows gain a PR step).
+- [ ] **~event_loop() leaks its source-table slots** (found 2026-11-24, review of
+  invariant-gap-tests; pre-existing; medium): the destructor
+  (modules/lx.runtime/lx.runtime.cppm:333-341) unregisters the strand and closes fds but
+  never removes the loop's sources from the process-wide table (`loop_state()`,
+  k_max_event_sources 32, :287-297; `add_source` returns silently when full, :512-516;
+  dispatch walks every remaining slot, :391-396), so a destroyed compositor leaves
+  dangling `event_source*` there and a THIRD `compositor::start()` in one process fails
+  with "no event source slot" (compositor_impl.cpp:10272-10275) — only four
+  `loop.remove_source` calls exist (compositor_impl.cpp:3968, 3983, 3990, 9362). This is
+  why test_memory_pressure_cascade runs all four scenarios inside one ctest case.
+  Fix shape: remove sources in ~event_loop(), or hand each source an owner hook.
+- [ ] **compositor::start() has no seat-less mode** (found 2026-11-24, same review;
+  pre-existing; medium): `logind_session::open()` (compositor_impl.cpp:9592) and
+  `begin_input()` (:9744) are unconditional — a compositor built for virtual outputs
+  still takes the user's logind session (found via sd_uid_get_display) and opens the
+  real libinput seat; observed during the invariant-gap-tests suite,
+  `loginctl show-session 1 -p Type` read `wayland` mid-run and `tty` after. Every
+  in-process compositor ctest (~20 files) therefore touches the seat without a broker
+  ticket. Fix shape: a start option that skips logind/input for virtual-outputs
+  instances (or broker coordination for test runs); would also give the cascade test a
+  hermetic fixture.
+- [ ] **text_input_node::insert treats drop_oldest as reject** (found 2026-11-24 with
+  test_overflow_caps; pre-existing; low): modules/lx.ui/text_input.cppm:934 refuses the
+  insertion when `overflow_` is `drop_oldest`, but the enum says "Evict oldest, accept
+  new" (lx.runtime/memory.cppm:42) and the partition's own contract
+  (text_input.cppm:70-76) names only reject / drop_newest / warn_and_drop. Decide:
+  honour drop_oldest or narrow the contract; the test prints the departure and pins
+  only "no growth".
+- [ ] **text_layout's line cap ignores overflow_action::reject** (found 2026-11-24 with
+  test_overflow_caps; pre-existing since f97a813; medium): under `reject` the pass
+  succeeds with the lines that fit and `truncated()` set, where the partition's contract
+  (modules/lx.text/lines.cppm:55-57) says reject fails the pass with an empty layout —
+  the wrap pass calls `over_cap`, which only warns (:1246-1248, :1274-1278), while the
+  byte/glyph/run caps do honour reject (:835-840, :933-938). Also named by the
+  "Invariant GAPs" overflow-caps marker.
+- [ ] **container_node::add never warns under warn_and_drop** (found 2026-11-24 with
+  test_overflow_caps; pre-existing since 1a44c01; low): modules/lx.scene/lx.scene.cppm:547-558
+  has no log call on any path, but the enum defines warn_and_drop as "Log warn, then
+  drop_newest" (lx.runtime/memory.cppm:43). Also named by the "Invariant GAPs"
+  overflow-caps marker.
+- [ ] **scripts/diff-hygiene.sh prints a `local` error on every run and leaks its
+  format log** (found 2026-11-24, same review; pre-existing; low): line 92 uses `local`
+  at top level ("local: can only be used in a function" before the summary line) and the
+  clang-format temp file is removed only in the failure branch (:96) — 7
+  /tmp/diff-hygiene-fmt.* files left from clean runs. One-line fix each; fold into the
+  next scripts/ touch.
 - [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
   `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
