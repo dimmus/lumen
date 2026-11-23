@@ -1777,6 +1777,16 @@ if(LUMEN_BUILD_TESTS)
         LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
     add_test(NAME test_overflow_caps COMMAND test_overflow_caps)
 
+    # The GPU pools (AGENTS.md §5; docs/invariants.md "GPU pools"): `pipeline_cache` and
+    # `timeline_semaphore_pool` handing back what an earlier frame used. The semaphore half
+    # brings up a Vulkan device (the sanitizer environment below).
+    add_executable(test_gpu_pools tests/test_gpu_pools.cpp)
+    target_link_libraries(test_gpu_pools PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_gpu_pools)
+    lumen_link_platform(test_gpu_pools)
+    target_include_directories(test_gpu_pools PRIVATE tests)
+    add_test(NAME test_gpu_pools COMMAND test_gpu_pools)
+
     # A sanitizer report must fail the test, not just print to stderr.
     set(LUMEN_TSAN_OPTS "halt_on_error=1")
     set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
@@ -1834,6 +1844,11 @@ if(LUMEN_BUILD_TESTS)
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout test_downsample
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
     list(APPEND LUMEN_SANITIZER_EXCLUDES test_dmabuf_composite test_kms_vulkan_scanout test_downsample)
+    # It brings up a Vulkan device for its semaphore pool: the ICD's teardown needs the same
+    # settings, and a wedged driver must not hang the suite.
+    set_tests_properties(test_gpu_pools PROPERTIES TIMEOUT 120
+        ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    list(APPEND LUMEN_SANITIZER_EXCLUDES test_gpu_pools)
     # Bringing up an EGL display leaks the dri2 driver's process-lifetime globals; on
     # this toolchain those frames symbolize to Mesa source paths, so no object-name
     # leak: pattern can match them (the Vulkan ICD's "<unknown module>" case below with
