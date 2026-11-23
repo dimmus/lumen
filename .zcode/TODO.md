@@ -129,8 +129,9 @@ current when an item closes.
   worked (`evidence/2026-11-17-seat-redo/d-supplements/shot-pre-flip-banner-zoom.png`);
   no startup path setting the banner's memory_only state was found by source reading.
   Reproduce, then fix the stale banner state.
-- [ ] **snprintf-log-migration gate BLOCKED: seat evidence owed + vsnprintf acceptance
-  unratified** (2026-11-17, branch `zcode/task/snprintf-log-migration` 8e925e5..b556db2,
+- [x] **snprintf-log-migration gate BLOCKED: seat evidence owed + vsnprintf acceptance
+  unratified** — closed 2026-11-23 (reconciliation; closing note at the end of this row).
+  As written 2026-11-17: branch `zcode/task/snprintf-log-migration` 8e925e5..b556db2,
   unmerged; code side verified — ctest 136/136 gate-verified at b556db2, interleaved
   ui-bench A/B vs 9dabcaf 0 FAIL in all 6 pairs, final grep = 4 documented exceptions):
   the implementer's drag/app-smoke PASS runs left no surviving evidence and the gate-time
@@ -146,6 +147,14 @@ current when an item closes.
   renders of xkbcommon's run-time printf format (std::format cannot consume it; the task
   notes forbade a helper) — ratify the amended acceptance or direct another resolution
   (see `.zcode/memories/lumen-snprintf-log-migration.md`).
+  **Closing note (2026-11-23):** both smokes were re-verified PASS on the notebook on
+  2026-11-18 after the uinput-holder restart (the record's "Seat re-verification
+  2026-11-18 — the authoritative evidence"), and the branch was merged into main the same
+  day (`08bde4e`, tip `95372af`): all 329 sites migrated, 4 documented exceptions — the
+  three `std::vsnprintf` renders sit on main at `lx.config/parse.cpp:988` and
+  `lx.input/keymap.cppm:277,283`. The amended acceptance is taken as ratified by that
+  merge and by the record's own "How to apply" (one commented `vsnprintf` at a
+  foreign-printf boundary); reopen if that is not the owner's view.
 
 - [x] **Tracked CRLF files on main past .gitattributes** (found 2026-11-19 by
   scripts/diff-hygiene.sh) — closed 2026-11-23 (owner decision: untrack): 12 blobs under
@@ -164,10 +173,15 @@ current when an item closes.
   prevents run collisions. Needs a live workflow run to validate engine semantics
   (report/board interleaving, world.run isolation) before shipping — do not land it
   unexercised.
-- [ ] **compare.sh broker wiring** (2026-11-19): ~/lumen-compare's compare.sh lives
-  outside the repo; the lumen-compositor-bench workflow now wraps its invocation with
-  scripts/seat-lock.sh (class bench), but direct manual runs of compare.sh are still
-  unbrokered — wrap or document at the next notebook session.
+- [x] **compare.sh broker wiring** (2026-11-19) — closed 2026-11-23 (notebook session,
+  owner-approved wrap): ~/lumen-compare's compare.sh lives outside the repo and now
+  re-execs itself through `scripts/seat-lock.sh with bench compare --` on a direct run —
+  the guard sits before its first side effect, and `LUMEN_SEAT_LOCKED=1` from an outer
+  wrap (the lumen-compositor-bench workflow) means it proceeds, so that wrap still
+  composes. Verified: `ROUNDS=1 NAMES=lumen ./compare.sh` → `seat-lock: acquired class
+  bench owner compare`, ticket held mid-run, released after, exit 0. Next touch of
+  `lumen-seat` SKILL.md §"Who holds a ticket": move compare.sh from "Calls the broker by
+  hand" to the self-brokering list (left undone here — a skill edit owes an eval rerun).
 - [ ] **Invariant GAPs** (docs/invariants.md, 2026-11-19): four §5 invariants have no
   designated test — content-hint scanout priority policy, GPU pool reuse across frames,
   present-mode policy (discrete→mailbox / integrated→fifo_relaxed), and the kms_damage
@@ -179,7 +193,9 @@ current when an item closes.
 
 ## Host-limited gates (ADR-010; VM cannot close these)
 
-- [ ] **Vulkan capture green** (replaces the portal task, owner decision 2026-11-14): make
+- [x] **Vulkan capture green** (replaces the portal task, owner decision 2026-11-14) —
+  closed 2026-11-23 (reconciliation; closing note at the end of this row). The ask as
+  written then: make
   the Vulkan composite path serve what its GL/CPU siblings do, so the app-smoke rows that
   now WARN naming the gap turn into real PASSes — the SIGUSR1 debug read-back (GL path
   only, `compositor_impl.cpp` `write_screenshot`): S2 T4 T7 L2 L3 Q4 O2 O6 M1 N6 Y1 and
@@ -188,6 +204,17 @@ current when an item closes.
   half closed 2026-11-14 in `smoke-bench-harness-green` (host-aware geometry, injector
   pixel-exactness, REL-capable virtual mouse, the backend-limited WARNs and the A/B
   evidence under `evidence/2026-11-14-ui-bench-ab/`).
+  **Closing note (2026-11-23; delivered 2026-11-15, on main):** the Vulkan composite path
+  serves its GL/CPU siblings' capture — SIGUSR1 read-back (`write_screenshot` via a
+  one-shot pooled `read_back`), window capture through the un-gated
+  `ext_foreign_toplevel_image_capture_source_manager_v1`, capture dma-buf — all in
+  `lx.gfx` behind `void*` interfaces; the rows that WARNed naming the gap are real PASSes
+  (notebook app-smoke 177/0/0). Record: `.zcode/memories/lumen-vulkan-capture-green.md`
+  (gate READY after two NOT_READY rounds). On main by content: the capture-manager symbol
+  in `wire_capture.cpp`, `wire_install.cpp`, `wire_foreign_toplevel.cpp` and
+  `lx.portal/desktop.cpp` with the branch tip's counts, `read_back_wait_fence` /
+  `vkCmdCopyImageToBuffer` in `lx.gfx/vk_renderer.cppm`, `test_vk_capture` registered in
+  `CMakeLists.txt`.
 - [x] **Frame-callback / repaint-lead misses for fast-answering clients** (2026-11-03
   found, 2026-11-04 fixed): a wl_surface.frame-driven client answering in ~0.1 ms got
   46–53 fps with ~25 % of frames a period late, while ticks cost 0.4 ms and health said
