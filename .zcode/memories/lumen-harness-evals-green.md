@@ -81,9 +81,10 @@ sandboxes, no seat job, the live session out of scope.
   `smoke_harness` fails deterministically — the hermetic perfetto fixture stages
   ui-bench.sh + bench-warmup.sh but not `seat-lock.sh`, which ui-bench.sh re-execs since
   the seat-broker merge ba80f18 (pre-existing, not change-caused; the TODO row with the
-  one-line fix rides the branch). `test_protocol_conformance` session-lock rows are a
-  load flake: red twice (2026-11-19, 2026-11-23) always under heavy parallel session
-  activity, PASS on quiet standalone rerun both times (TODO row corrected in 6071e47).
+  one-line fix rides the branch; CLOSED 2026-11-23, see How to apply).
+  `test_protocol_conformance` session-lock rows are a load flake: red twice
+  (2026-11-19, 2026-11-23) always under heavy parallel session activity, PASS on quiet
+  standalone rerun both times (TODO row corrected in 6071e47).
   diff-hygiene clean vs base. Mimosa full scan: 3 static path-traversal findings, all in
   pre-existing scripts untouched by the diff.
 
@@ -96,9 +97,17 @@ sandbox roots) that contracts must state up front, not discover by fire — twic
 Eval subjects are lead-dispatched, never nested; pin the project root in every dispatch
 to a memory-writer. Landing follows the flipped policy — studio re-gates the merged tree
 in `build/merge-gate`, red merged tree resets and never pushes; gated-change is ff-only
-after a verified commit handoff. A `smoke_harness` red on the perfetto fixture at gate
-time is the ba80f18 staging gap, not the change under test. The TODO rows (fixture fix,
-flake signature) arrive with the harness-evals merge — do not duplicate them.
+after a verified commit handoff. **Superseded 2026-11-23 — no longer grounds to dismiss a
+`smoke_harness` red:** the ba80f18 staging gap is closed by 3f317c8 on branch
+`zcode/task/smoke-harness-hermetic-broker` (review fixes 9579cdc, bc33b6a, f936cda) — the
+perfetto fixture stages its own `seat-lock.sh` wrapper in front of the tree's real broker,
+`49 ok / 13 FAIL` → `82 ok / 0 FAIL`. On a tree that carries it, a red there is the change
+under test, or host noise to be diagnosed — no longer this gap; on one that does not, the
+gap's signature is 13 sub-FAILs, every traced pass exit 127 at ui-bench.sh:107. The
+wrapper's unset-XDG_RUNTIME_DIR refusal is probed on a twin behind a stand-in broker: with
+the real one behind it, a broken guard would put this ctest into the host's lock dir. TODO
+rows, not to be duplicated: the flake signature (6071e47, with the harness-evals merge),
+the fixture fix (ticked by 3f317c8).
 
 Rule proposal: the eval playbook gains a round-start checklist item — "lead confirms
 every subject is lead-dispatched and no tester prompt implies self-dispatch" — plus an
