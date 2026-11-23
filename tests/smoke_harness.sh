@@ -271,7 +271,7 @@ if [[ "${XDG_RUNTIME_DIR:-}" != "$private_runtime" ]]; then
   echo "seat-lock.sh (smoke_harness fixture): refusing — XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR:-}' is not the fixture's private runtime dir" >&2
   exit 2
 fi
-printf '%s\n' "$*" >"$argv_log"
+printf '%s\n' "$*" >>"$argv_log"
 opts=()
 while [[ $# -gt 0 && "$1" != "--" ]]; do opts+=("$1"); shift; done
 [[ $# -gt 0 ]] || { echo "seat-lock.sh (smoke_harness fixture): no -- before the job" >&2; exit 2; }
