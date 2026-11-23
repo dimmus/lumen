@@ -1764,6 +1764,19 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_present_mode PRIVATE tests)
     add_test(NAME test_present_mode COMMAND test_present_mode)
 
+    # The overflow caps (AGENTS.md §5; docs/invariants.md "Overflow caps"): every
+    # fixed-capacity structure a test can reach, past its capacity under each
+    # `overflow_action` its API offers — never silent unbounded growth.
+    add_executable(test_overflow_caps tests/test_overflow_caps.cpp)
+    target_link_libraries(test_overflow_caps PRIVATE
+        lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y lx.trace)
+    lumen_apply_module_properties(test_overflow_caps)
+    lumen_link_platform(test_overflow_caps)
+    target_include_directories(test_overflow_caps PRIVATE tests)
+    target_compile_definitions(test_overflow_caps PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+    add_test(NAME test_overflow_caps COMMAND test_overflow_caps)
+
     # A sanitizer report must fail the test, not just print to stderr.
     set(LUMEN_TSAN_OPTS "halt_on_error=1")
     set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
