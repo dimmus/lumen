@@ -25,7 +25,7 @@
 //
 // What `compositor::start()` does to the session is `start()`'s to do, and this test does
 // not make it smaller: a compositor attaches to the logind session it finds for the user
-// and opens the libinput seat (compositor_impl.cpp:9592, 9746), virtual outputs or not.
+// and opens the libinput seat (compositor_impl.cpp:9592, 9744), virtual outputs or not.
 // This is unit evidence about the wiring on one started compositor — one start per process,
 // since a third `compositor::start()` in a process fails ("no event source slot") — and it
 // is not a claim about a seat.

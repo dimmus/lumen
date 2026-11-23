@@ -1789,7 +1789,9 @@ if(LUMEN_BUILD_TESTS)
 
     # The memory-pressure cascade (AGENTS.md §5; docs/invariants.md "Memory-pressure
     # cascade"): a started compositor's own coordinator driving its own import cache and
-    # buffer lifecycle. On virtual outputs — no card, no DRM master, no seat.
+    # buffer lifecycle. On virtual outputs — no card, no DRM master, no KMS. Not "no seat":
+    # `start()` takes control of the user's logind session and opens the libinput seat
+    # whatever the outputs are (the test's header says the same).
     add_executable(test_memory_pressure_cascade tests/test_memory_pressure_cascade.cpp)
     target_link_libraries(test_memory_pressure_cascade PRIVATE lx.compositor lx.runtime lx.gfx)
     lumen_apply_module_properties(test_memory_pressure_cascade)
