@@ -18,7 +18,9 @@
 // partition never names. Nothing here is bent to fit them.
 //
 // The last case also prints every `overflow_action::` site under modules/ that this test
-// does not drive, by name, with what it would take.
+// does not drive, by name, with what it would take, and holds that report to the tree: a
+// module file that names an action and that no case drives and the report does not name
+// fails it.
 #include "lumen_test.hpp"
 
 import std;
@@ -914,7 +916,8 @@ LUMEN_TEST(overflow_caps_report_names_what_is_not_pinned_or_driven) {
         const char* needs;
     };
     // Every `overflow_action::` site under modules/ that no case above drives (grep -rn
-    // 'overflow_action::' modules/); the rest are comments restating a case's own policy.
+    // 'overflow_action::' modules/). Of the files that name an action and are neither
+    // driven nor listed here, each names it in a comment only (`commented`, below).
     const site rest[]{
         {"lx.ui/icon.cppm:518-520",
          "icon_cache: an async raster job's waiters (k_job_waiters = 4, reject)",
@@ -942,8 +945,50 @@ LUMEN_TEST(overflow_caps_report_names_what_is_not_pinned_or_driven) {
     std::println("  driven: {} structure(s)", driven().size());
     for (const std::string& s : driven())
         std::println("    {}", s);
-    // The report is part of the test: these four must not go silently unmentioned.
-    expect(sizeof(rest) / sizeof(rest[0]) == 4, "the not-driven list must name the four sites");
+    // The report is held to the tree, by file. A module file that names an action is one a
+    // case drove, one the list above names, or one that names it in a comment only.
+    // Anything else is a site nobody has accounted for.
+    const char* const commented[]{
+        "lx.gfx/swapchain.cppm",        // `k_swapchain_retired`, the cap `retire` keeps
+        "lx.wayland.client/types.cppm", // `dmabuf_tranche::dropped`, dmabuf.cpp's counter
+    };
+    const std::filesystem::path modules{LUMEN_TEST_MODULES_DIR};
+    expect(std::filesystem::is_directory(modules),
+           "the modules directory of the tree this test was built from must be there");
+    unsigned naming = 0;
+    std::vector<std::string> unmentioned;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator{modules}) {
+        if (!entry.is_regular_file())
+            continue;
+        std::ifstream in{entry.path(), std::ios::binary};
+        expect(in.is_open(), std::format("a module file must be readable: {}", entry.path()));
+        const std::string text{std::istreambuf_iterator<char>{in}, {}};
+        if (text.find("overflow_action::") == std::string::npos)
+            continue;
+        ++naming;
+        const std::string file = entry.path().lexically_relative(modules).generic_string();
+        const std::string prefix = file + ":";
+        bool named =
+            std::find(std::begin(commented), std::end(commented), file) != std::end(commented);
+        for (const std::vector<std::string>* const list : {&driven(), &not_driven()})
+            for (const std::string& s : *list)
+                named = named || s.starts_with(prefix);
+        for (const site& s : rest)
+            named = named || std::string_view{s.where}.starts_with(prefix);
+        if (!named)
+            unmentioned.push_back(file);
+    }
+    std::println("  module files naming an action: {} ({} not accounted for)", naming,
+                 unmentioned.size());
+    std::ranges::sort(unmentioned);
+    std::string files;
+    for (const std::string& file : unmentioned)
+        std::format_to(std::back_inserter(files), "{} ", file);
+    expect(unmentioned.empty(),
+           std::format("module file(s) naming an overflow_action that no case drives and the "
+                       "report does not name — drive the site in a case above, or name it in "
+                       "the report: {}",
+                       files));
 }
 
 int main(int argc, char** argv) {

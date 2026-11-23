@@ -1766,7 +1766,9 @@ if(LUMEN_BUILD_TESTS)
 
     # The overflow caps (AGENTS.md §5; docs/invariants.md "Overflow caps"): every
     # fixed-capacity structure a test can reach, past its capacity under each
-    # `overflow_action` its API offers — never silent unbounded growth.
+    # `overflow_action` its API offers — never silent unbounded growth. Its last case
+    # reads modules/ of this tree: a file there that names an action and that no case
+    # drives and its report does not name fails it.
     add_executable(test_overflow_caps tests/test_overflow_caps.cpp)
     target_link_libraries(test_overflow_caps PRIVATE
         lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y lx.trace)
@@ -1774,7 +1776,8 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_overflow_caps)
     target_include_directories(test_overflow_caps PRIVATE tests)
     target_compile_definitions(test_overflow_caps PRIVATE
-        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts"
+        LUMEN_TEST_MODULES_DIR="${CMAKE_SOURCE_DIR}/modules")
     add_test(NAME test_overflow_caps COMMAND test_overflow_caps)
 
     # The GPU pools (AGENTS.md §5; docs/invariants.md "GPU pools"): `pipeline_cache` and
