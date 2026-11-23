@@ -20,12 +20,13 @@ current when an item closes.
   ui-bench.sh now re-execs `$ROOT/scripts/seat-lock.sh` — 13 sub-FAILs, every traced
   pass exits 127. One-line fix in `tests/smoke_harness.sh` (stage seat-lock.sh too, or
   stub the broker in the fixture) + its own gated round.
-- [ ] **test_protocol_conformance session-lock rows fail on the notebook** (seen
-  2026-11-19, tree a87aef8 + harness-only change — pre-existing by construction, the
-  diff touches no product/test code): "session lock: destroy after locked",
-  "configure at the output's logical size, then locked", "locker died while locked",
-  "abandoned lock replacement" rows FAIL. Diagnose on a quiet seat (brokered), check
-  whether the VM shows them too, then fix or record as host-specific known-red.
+- [ ] **test_protocol_conformance session-lock rows flake under load** (seen
+  2026-11-19 and again 2026-11-23 during heavy parallel session activity — both times
+  failing the "session lock" sub-rows, both times PASSING on a quiet standalone rerun;
+  2026-11-23 rerun clean on the notebook). Timing-sensitive, not change-caused (the
+  harness change touches no product/test code). Next occurrence: capture the failing
+  sub-rows with timestamps and check for libinput/seat-event delay correlation before
+  considering a stabilization fix (retry-once in the test or a wider timeout).
 - [x] **Agent-level parallelism landed** (2026-11-19, this change): gated-change
   confirmations now dispatch under `Promise.all` (studio already did), and
   `lumen-studio` §Lead duties mandates parallel dispatch of independent role agents.
