@@ -32,6 +32,7 @@
 - [shell first paint wip](lumen-shell-first-paint-wip.md) — Shell first-paint work: font-match persistence merged as PR #44 (2026-10-25);
 - [smoke bench harness green rounds](lumen-smoke-bench-harness-green-rounds.md) — Close-out chronology split from [[lumen-smoke-bench-harness-green]] —
 - [smoke bench harness green](lumen-smoke-bench-harness-green.md) — Harness task: injection autodetect by name, build-fresh kills mtime false-trips, host-aware geometry, quiet-CPU PM-QoS fail-closed, bench warm-up gate; overwrite loop ended by namespace split
+- [smoke harness broker fixture](lumen-smoke-harness-broker-fixture.md) — smoke_harness perfetto fixture carries the seat broker hermetically (wrapper→real broker --no-preflight, private lock dir); 49/13→82/0; mutations flip it; review noise 6/6/0, 2 preexisting
 - [snprintf log migration](lumen-snprintf-log-migration.md) — All 329 modules/ snprintf sites → §4.3 format conventions (4 documented exceptions); format_to_n idioms, sed traps (n = *... mangling); CRLF premise retracted — both files LF
 - [tiling adr012](lumen-tiling-adr012.md) — Master-stack tiling per workspace shipped in PR #58 (merged 2026-10-28, 7ef5039);
 - [toplevel drag compositor](lumen-toplevel-drag-compositor.md) — xdg-toplevel-drag-v1 served: wm_dragged_window third pointer mode, source-mark invalid_source, unmap_epoch re-attach; ctest 131/133 known-red era; g-latency WARN = host noise via A/B

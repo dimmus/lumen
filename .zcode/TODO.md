@@ -32,6 +32,26 @@ current when an item closes.
   now asserts the broker contract per pass, the two hermeticity guards, and a mechanism
   guard (every `$ROOT/scripts/` reference of the copied ui-bench.sh is staged; the
   verbatim copies are byte-identical).
+- [ ] **ui_bench_e2e_dry_run is not hermetic — it takes a REAL bench ticket** (found
+  2026-11-23, review of smoke-harness-hermetic-broker; pre-existing): `add_test
+  (ui_bench_e2e_dry_run` (CMakeLists.txt:1250-1253, TIMEOUT 30) runs
+  `scripts/ui-bench.sh --e2e --dry-run --no-build`, whose guard (ui-bench.sh:106-108)
+  re-execs the real `seat-lock.sh` in the REAL lock dir (`/run/user/<uid>/lumen-seat`,
+  seat-lock.sh:41) with the real /proc preflight — exit 2 whenever a compositor or
+  smoke runs on the host, and TIMEOUT 30 expires if a real seat job holds the seat
+  (the broker waits DEFAULT_WAIT 900, seat-lock.sh:45) — so the `-LE bench` suite's
+  green depends on host state, the same dependence smoke_harness just shed. Observed:
+  during the 2026-11-23 full suite (137/137) the real queue/seat.lock mtimes moved
+  (~0.14 s ticket; attributed by elimination — smoke_harness left both untouched in
+  every isolated run). Fix shape: like smoke_harness's fixture — a wrapper + private
+  XDG_RUNTIME_DIR, or a --no-preflight/private-dir path for the dry-run.
+- [ ] **CMakeLists.txt smoke_harness registration comment is stale** (found
+  2026-11-23, same review; low): the comment above the registration
+  (CMakeLists.txt:1255-1257) still describes a three-leg harness (build freshness,
+  inject-devices lookup, inject-input key table) and omits the bench warm-up gate, the
+  --perfetto traced pass and the seat-broker leg the harness now runs. One-line
+  comment repair — fold into the next CMakeLists.txt edit rather than a dedicated
+  diff.
 - [ ] **test_protocol_conformance session-lock rows flake under load** (seen
   2026-11-19 and again 2026-11-23 during heavy parallel session activity — both times
   failing the "session lock" sub-rows, both times PASSING on a quiet standalone rerun;
