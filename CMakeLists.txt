@@ -1754,6 +1754,55 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_kms_vulkan_scanout PRIVATE tests)
     add_test(NAME test_kms_vulkan_scanout COMMAND test_kms_vulkan_scanout)
 
+    # The present-mode policy (AGENTS.md §5; docs/invariants.md "Present mode"):
+    # `resolve_present_mode` per GPU tier, explicit modes unchanged, `output_manager`
+    # following the tier with a per-output mode winning.
+    add_executable(test_present_mode tests/test_present_mode.cpp)
+    target_link_libraries(test_present_mode PRIVATE lx.compositor lx.gfx)
+    lumen_apply_module_properties(test_present_mode)
+    lumen_link_platform(test_present_mode)
+    target_include_directories(test_present_mode PRIVATE tests)
+    add_test(NAME test_present_mode COMMAND test_present_mode)
+
+    # The overflow caps (AGENTS.md §5; docs/invariants.md "Overflow caps"): every
+    # fixed-capacity structure a test can reach, past its capacity under each
+    # `overflow_action` its API offers — never silent unbounded growth. Its last case
+    # reads modules/ of this tree: a file there that names an action and that no case
+    # drives and its report does not name fails it.
+    add_executable(test_overflow_caps tests/test_overflow_caps.cpp)
+    target_link_libraries(test_overflow_caps PRIVATE
+        lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y lx.trace)
+    lumen_apply_module_properties(test_overflow_caps)
+    lumen_link_platform(test_overflow_caps)
+    target_include_directories(test_overflow_caps PRIVATE tests)
+    target_compile_definitions(test_overflow_caps PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts"
+        LUMEN_TEST_MODULES_DIR="${CMAKE_SOURCE_DIR}/modules")
+    add_test(NAME test_overflow_caps COMMAND test_overflow_caps)
+
+    # The GPU pools (AGENTS.md §5; docs/invariants.md "GPU pools"): `pipeline_cache` and
+    # `timeline_semaphore_pool` handing back what an earlier frame used. The semaphore half
+    # brings up a Vulkan device (the sanitizer environment below).
+    add_executable(test_gpu_pools tests/test_gpu_pools.cpp)
+    target_link_libraries(test_gpu_pools PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_gpu_pools)
+    lumen_link_platform(test_gpu_pools)
+    target_include_directories(test_gpu_pools PRIVATE tests)
+    add_test(NAME test_gpu_pools COMMAND test_gpu_pools)
+
+    # The memory-pressure cascade (AGENTS.md §5; docs/invariants.md "Memory-pressure
+    # cascade"): a started compositor's own coordinator driving its own import cache and
+    # buffer lifecycle. On virtual outputs — no card, no DRM master, no KMS. Not "no seat":
+    # `start()` takes control of the user's logind session and opens the libinput seat
+    # whatever the outputs are (the test's header says the same).
+    add_executable(test_memory_pressure_cascade tests/test_memory_pressure_cascade.cpp)
+    target_link_libraries(test_memory_pressure_cascade PRIVATE lx.compositor lx.runtime lx.gfx)
+    lumen_apply_module_properties(test_memory_pressure_cascade)
+    lumen_link_platform(test_memory_pressure_cascade)
+    target_include_directories(test_memory_pressure_cascade PRIVATE tests)
+    add_test(NAME test_memory_pressure_cascade COMMAND test_memory_pressure_cascade)
+    set_tests_properties(test_memory_pressure_cascade PROPERTIES TIMEOUT 90)
+
     # A sanitizer report must fail the test, not just print to stderr.
     set(LUMEN_TSAN_OPTS "halt_on_error=1")
     set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
@@ -1811,6 +1860,11 @@ if(LUMEN_BUILD_TESTS)
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout test_downsample
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
     list(APPEND LUMEN_SANITIZER_EXCLUDES test_dmabuf_composite test_kms_vulkan_scanout test_downsample)
+    # It brings up a Vulkan device for its semaphore pool: the ICD's teardown needs the same
+    # settings, and a wedged driver must not hang the suite.
+    set_tests_properties(test_gpu_pools PROPERTIES TIMEOUT 120
+        ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    list(APPEND LUMEN_SANITIZER_EXCLUDES test_gpu_pools)
     # Bringing up an EGL display leaks the dri2 driver's process-lifetime globals; on
     # this toolchain those frames symbolize to Mesa source paths, so no object-name
     # leak: pattern can match them (the Vulkan ICD's "<unknown module>" case below with
