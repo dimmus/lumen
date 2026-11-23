@@ -3,13 +3,16 @@ description: "Lumen's development studio orchestrator: plan a request into gated
   tasks, run each in its own git worktree (test-enabled baseline → implement
   with logical commits → build+test gates → independent review → per-finding
   confirmation (pre-existing defects recorded, not fixed) → fixes → real-seat
-  smokes → evidence gate → memory record), and assemble a PR description per
-  task. Never pushes — branches are delivered for the user's decision."
+  smokes → evidence gate → memory record), assemble a PR description per task,
+  then merge every gate-READY branch into main (topological order, merged tree
+  re-gated) and push. Anything below READY is delivered as branch + evidence
+  for the owner — never merged, never pushed."
 whenToUse: A non-trivial Lumen change or multi-task request that must go through
   the full gated studio (plan / implement / review / verify / gate / memory), or
   when the user asks for the studio or coordinated delivery on Lumen. One
   bounded task → lumen-gated-change instead; cross-compositor benchmarking →
   lumen-compositor-bench.
+  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 args:
   app_smoke_tolerated_failset:
     type: json
@@ -1094,7 +1097,7 @@ for (const card of tasks) {
   await artifact.markdown(
     "pr-texts",
     [`# PR descriptions — ${plan.objective}`, "", ...prSections].join("\n"),
-    { title: "PR descriptions per task", description: "Assembled from each task's implementation, review and gate evidence. Push only after the user approves.", primary: true },
+    { title: "PR descriptions per task", description: "Assembled from each task's implementation, review and gate evidence. READY tasks are merged and pushed by the run; this artifact is the PR of record on this gh-less host.", primary: true },
   );
 }
 
@@ -1102,11 +1105,124 @@ for (const card of tasks) {
 // resolve; infra/status findings default to deferred-to-user (the owner decides on them).
 for (const f of allFindings) if (f.disposition === undefined) f.disposition = "deferred-to-user";
 
+// Positive work ends merged into main and pushed (owner standing rule, 2026-11-19):
+// every gate-READY branch merges in topological order, the MERGED tree re-runs the
+// tests-enabled suite once (each task was gated alone; the combination never was),
+// and only a green merged main is pushed. Anything below READY — BLOCKED (incl.
+// BLOCKED-ON-HOST), NOT_READY, NEEDS_REDESIGN — never merges here; its branch and
+// evidence go to the owner. No gh CLI / HTTPS credentials on this host: the PR-text
+// artifact plus the merge commit is the PR of record, pushed over SSH.
+// The headline states what actually landed, not what was attempted: landingLanded
+// is set only when the merges survived the merged-tree re-gate, landingPushed only
+// when origin took them.
+let landingLanded = false;
+let landingPushed = false;
+if (readyBranches.length > 0) {
+  phase("Merge READY branches into main, re-gate the merged tree, push");
+  const onMain = await world.run("git", ["-C", MAIN_WS, "branch", "--show-current"], { output: { tail: 512 } });
+  const mainClean = await world.run("git", ["-C", MAIN_WS, "status", "--porcelain"], { output: { tail: 2048 } });
+  if (onMain.exitCode !== 0 || onMain.stdout.trim() !== "main" || mainClean.stdout.trim() !== "") {
+    allFindings.push({
+      where: "merge+push",
+      what: `READY branches (${readyBranches.join(", ")}) were NOT merged: the main checkout at ${MAIN_WS} is not a clean main (on "${onMain.stdout.trim()}", ${mainClean.stdout.trim() === "" ? "clean" : "dirty"}) — merge by hand or re-run`,
+      evidence: `git -C ${MAIN_WS} branch --show-current + status --porcelain at merge time`,
+      status: "verified",
+      severity: "medium",
+    });
+    notCovered.push("merge+push of READY branches — the main checkout was not on a clean main");
+  } else {
+    const preMerge = (await world.run("git", ["-C", MAIN_WS, "rev-parse", "HEAD"], { output: { tail: 512 } })).stdout.trim().split("\n").pop() ?? "";
+    let mergeOk = true;
+    // Merge notices are held back from `verified` until the landing survives the
+    // re-gate — a rolled-back merge must not live on as a "merged" evidence row.
+    const mergedNow: string[] = [];
+    for (const card of tasks) {
+      if (verdictOf.get(card.id) !== "READY") continue;
+      const branch = branchOf.get(card.id);
+      if (branch === undefined) continue;
+      const merge = await world.run("git", ["-C", MAIN_WS, "merge", "--no-edit", branch], { output: { tail: 4096 } });
+      if (merge.exitCode !== 0) {
+        // Stop at the first conflict: every later merge would sit on an untested base.
+        await world.run("git", ["-C", MAIN_WS, "merge", "--abort"], { output: { tail: 1024 } });
+        await world.run("git", ["-C", MAIN_WS, "reset", "--hard", preMerge], { output: { tail: 1024 } });
+        mergeOk = false;
+        allFindings.push({
+          where: `merge ${card.id}`,
+          what: `branch ${branch} conflicts when merged into main — the READY tasks are not integrable together; main was reset to ${preMerge}, branches kept; the owner decides the integration`,
+          evidence: `git -C ${MAIN_WS} merge --no-edit ${branch} → exit ${merge.exitCode} (aborted, main reset)`,
+          status: "verified",
+          severity: "high",
+        });
+        break;
+      }
+      mergedNow.push(`merged ${branch} into main (${card.title})`);
+    }
+    if (mergeOk) {
+      const cfg = await world.run(
+        "cmake",
+        ["--preset", "release", "-S", MAIN_WS, "-B", `${MAIN_WS}/build/merge-gate`, "-DLUMEN_BUILD_TESTS=ON"],
+        { timeoutMs: 600_000, output: { tail: 4096 } },
+      );
+      const build = cfg.exitCode === 0
+        ? await world.run("cmake", ["--build", `${MAIN_WS}/build/merge-gate`, "-j2"], { timeoutMs: 1_800_000, output: { tail: 32_768 } })
+        : undefined;
+      const tests = build !== undefined && build.exitCode === 0
+        ? await world.run("ctest", ["--test-dir", `${MAIN_WS}/build/merge-gate`, "--output-on-failure", "-LE", "bench"], { timeoutMs: 1_200_000, output: { tail: 32_768 } })
+        : undefined;
+      const fresh = tests === undefined ? ["(no test run)"] : failedTests(tests.stderr + tests.stdout).filter((n) => !knownRed.includes(n));
+      if (tests !== undefined && fresh.length === 0) {
+        const push = await world.run(
+          "git",
+          ["-C", MAIN_WS, "push", "origin", "main", ...readyBranches],
+          { timeoutMs: 300_000, output: { tail: 4096 } },
+        );
+        verified.push(...mergedNow);
+        if (push.exitCode === 0) {
+          landingLanded = true;
+          landingPushed = true;
+          verified.push(`pushed main + ${readyBranches.length} READY branch(es) to origin (owner standing rule 2026-11-19)`);
+        } else {
+          landingLanded = true;
+          allFindings.push({
+            where: "push",
+            what: `merged main is green but the push failed — the merges are local and complete; nothing is lost (main at the merge, branches kept); the owner pushes (SSH remote required)`,
+            evidence: (push.stderr + push.stdout).trim().split("\n").slice(-3).join(" | "),
+            status: "verified",
+            severity: "medium",
+          });
+        }
+      } else {
+        // Never leave main red: undo the merges, keep the READY branches, report.
+        await world.run("git", ["-C", MAIN_WS, "reset", "--hard", preMerge], { output: { tail: 1024 } });
+        allFindings.push({
+          where: "merge re-gate",
+          what: `the merged main failed its tests-enabled re-gate (${fresh.join(", ")}) — main was reset to ${preMerge}; each branch was green alone, the combination is not; the owner decides the integration`,
+          evidence: tests === undefined ? "configure/build of the merged tree failed" : (tests.stderr + tests.stdout).slice(-1500),
+          status: "verified",
+          severity: "high",
+        });
+        verified.push(`merge attempt rolled back: main reset to ${preMerge} after the merged-tree re-gate failed — nothing landed, branches and worktrees kept`);
+        notCovered.push("push — the merged tree is not green");
+      }
+    }
+  }
+}
+
+// The headline states what actually landed, not what was attempted:
+// landingLanded is set only when the merges survived the merged-tree re-gate,
+// landingPushed only when origin took them.
+const landingNote = readyBranches.length === 0
+  ? "Nothing is merged or pushed."
+  : landingPushed
+    ? "All READY branches were merged into main (merged tree re-gated) and pushed; PR text per task is in the artifact (the PR of record on this gh-less host)."
+    : landingLanded
+      ? "READY branches were merged into main locally, but the PUSH failed — the owner pushes over SSH; nothing is lost."
+      : "Landing held: the merge phase did not complete (see findings/notCovered) — branches and worktrees are kept for the owner.";
 const conclusion = readyBranches.length === tasks.length && tasks.length > 0
-  ? `All ${tasks.length} task(s) delivered and gate-READY: ${readyBranches.join(", ")}. PR text is in the artifact; branches sit in worktrees under ${WT_ROOT} — push only on the user's go.`
+  ? `All ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}). ${landingNote}`
   : readyBranches.length > 0
-    ? `${readyBranches.length} of ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}); the rest are blocked or need redesign with recorded evidence — see findings.`
-    : `No task reached READY: ${tasks.length === 0 ? "the plan produced no tasks" : "every task blocked, conflicted or needing redesign with recorded evidence"}. Nothing is pushed.`;
+    ? `${readyBranches.length} of ${tasks.length} task(s) gate-READY (${readyBranches.join(", ")}); the rest are blocked or need redesign with recorded evidence — see findings. ${landingNote}`
+    : `No task reached READY: ${tasks.length === 0 ? "the plan produced no tasks" : "every task blocked, conflicted or needing redesign with recorded evidence"}. Nothing is merged or pushed.`;
 const done: WorkflowReport = {
   conclusion,
   findings: allFindings,

@@ -5,6 +5,8 @@ description: Lumen's settled technical decisions and measured outcomes that must
 
 # Settled decisions & measured outcomes (do not re-litigate without new evidence)
 
+> **Scope:** current-project — these settled outcomes are this codebase's; the do-not-re-litigate discipline is the portable part.
+
 Full-fidelity records: `.zcode/memories/lumen-*.md` (one file per item below, with
 numbers). Retrieval goes through the generated `.zcode/memories/INDEX.md`
 (`scripts/gen-memory-index.py` — grouped by module with topics); this file is the
@@ -14,6 +16,20 @@ the frontmatter, then regenerate.
 The user's standing rules behind all of these: **best-in-class bar** (compare wlroots/sway,
 KWin, Mutter, Smithay/niri, Hyprland; measure, don't assert) and **no degradation**
 (every change earns its place by measurement; the Vulkan backend is the gate).
+
+## Two license levels (how to answer a request that touches a settled item)
+
+- **Settled-closed** (no re-entry license in the record): refuse to plan it; state the
+  recorded evidence and what NEW evidence would reopen it. No plan is produced.
+- **Licensed for re-proposal** (the record or its TODO row carries an explicit license —
+  "if re-proposed, start from those review findings", "Parked — one fix round each"): a
+  re-proposal may be *developed*, but the reopen/no-reopen decision is the owner's.
+  Deliverable: the premise check (correct the caller's grounds if factually wrong),
+  the falsifier, a **go/no-go question** — and at most a sketch of what a plan must
+  survive. A full staged execution plan before the owner's go is agent-driven
+  relitigation, which the license does not grant. When the caller's stated premise is
+  wrong, correct it and ask whether to proceed on the corrected grounds before
+  planning anything (the ask-when-deviating rule).
 
 ## Ruled out by measurement
 

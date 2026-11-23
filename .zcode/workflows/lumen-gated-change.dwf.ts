@@ -13,6 +13,7 @@ whenToUse: "A single non-trivial Lumen change (feature, optimization, refactor)
   workflow for one Lumen change. For multi-task requests or full studio delivery
   (worktrees, commits, PR text, memory records) use lumen-development-studio
   instead. Not for small fixes or doc-only edits."
+  scope: current-project — the pipeline shape is portable; commands, scripts and hosts are Lumen's.
 args:
   branch:
     type: string
@@ -128,10 +129,11 @@ const wt = `${WT_ROOT}/gated-${slug}`;
 const implementerPersona =
   "You are the implement stage of Lumen's gated change workflow. Your full contract is " +
   ".zcode/agents/lumen-implementer.md — read it first, it is binding. You work in the " +
-  "worktree you are given; commit nothing unless told (this workflow hands off uncommitted; " +
-  "state so plainly if you did). Do not run the full test suite — the workflow gates the " +
-  "build after you; narrow checks are fine. If the task is impossible, contradicts AGENTS.md, " +
-  "or would regress something measured, escalate and say so plainly rather than working around it.";
+  "worktree you are given; leave the work uncommitted until the workflow tells you to " +
+  "commit (it does once its final gate is green). Do not run the full test suite — the " +
+  "workflow gates the build after you; narrow checks are fine. If the task is impossible, " +
+  "contradicts AGENTS.md, or would regress something measured, escalate and say so plainly " +
+  "rather than working around it.";
 
 const reviewerPersona =
   "You are the review stage of Lumen's gated change workflow, reading a diff you did not write. " +
@@ -345,23 +347,30 @@ log(`Review returned ${review.findings.length} finding(s)`);
 phase("Confirm each finding against the code");
 const confirmed: Finding[] = [];
 const refuted: Finding[] = [];
-for (let i = 0; i < review.findings.length; i++) {
-  const finding = review.findings[i];
-  if (finding === undefined) continue;
-  const confirmation = await agent(`confirmer-${i + 1}`, { system: confirmerPersona, budget: { webSearch: 0 } }).ask<Confirmation>(
-    `Decide whether this finding is real — from its cited evidence, by reading those exact lines.\n\n` +
-      `Change under review: the uncommitted diff in worktree ${wt} on branch ${branch} (git -C ${wt} diff HEAD plus untracked files).\n\n` +
-      `Finding:\n${JSON.stringify(finding, null, 2)}\n\n` +
-      `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
-      `(e.g. git -C ${wt} diff HEAD -- <the cited path> — it also decides preexisting: cited lines untouched ` +
-      `by the diff mean the defect exists at the base); do not re-derive the change. If that budget cannot ` +
-      `decide it, return holds=false with reason "inconclusive from cited evidence" and the one read ` +
-      `that would decide it. Report exactly what you read.`,
-  );
+// Independent findings confirm in PARALLEL (the studio's pattern): each
+// confirmer is a bounded auditor working from cited evidence only — they
+// share nothing mutable, so concurrency buys wall-clock time for nothing.
+const confirmations = await Promise.all(
+  review.findings.map((finding, i) =>
+    agent(`confirmer-${i + 1}`, { system: confirmerPersona, budget: { webSearch: 0 } }).ask<Confirmation>(
+      `Decide whether this finding is real — from its cited evidence, by reading those exact lines.\n\n` +
+        `Change under review: the uncommitted diff in worktree ${wt} on branch ${branch} (git -C ${wt} diff HEAD plus untracked files).\n\n` +
+        `Finding:\n${JSON.stringify(finding, null, 2)}\n\n` +
+        `Bounded procedure: open the finding's cited path:line first; one targeted follow-up at most ` +
+        `(e.g. git -C ${wt} diff HEAD -- <the cited path> — it also decides preexisting: cited lines untouched ` +
+        `by the diff mean the defect exists at the base); do not re-derive the change. If that budget cannot ` +
+        `decide it, return holds=false with reason "inconclusive from cited evidence" and the one read ` +
+        `that would decide it. Report exactly what you read.`,
+    ),
+  ),
+);
+review.findings.forEach((finding, i) => {
+  const confirmation = confirmations[i];
+  if (confirmation === undefined) return;
   if (confirmation.holds) confirmed.push({ ...finding, preexisting: confirmation.preexisting });
   else refuted.push(finding);
   report({ ...finding, preexisting: confirmation.preexisting, holds: confirmation.holds, reason: confirmation.reason });
-}
+});
 // Dispositions: refuted stays refuted; confirmed findings on code this change introduced are
 // fixed below; confirmed pre-existing defects are recorded for .zcode/TODO.md and deferred to
 // the user — the fixer must not widen the diff by repairing debt the change did not introduce.
@@ -475,10 +484,63 @@ if (blockedOnHost) {
   );
 }
 
+// Positive work lands (owner standing rule, 2026-11-19): a gate-green,
+// not-blocked change is committed by its implementer (who knows the logical
+// units), merged into main FAST-FORWARD ONLY (the light path does not
+// fabricate merge confidence — if main moved, the combination goes to the
+// owner), and pushed. No gh CLI on this host: the report artifact plus the
+// merge commit is the PR of record.
+let mergedAndPushed = false;
+let mergedNotPushed = false;
+if (!gateFailed && !blockedOnHost) {
+  phase("Commit, merge into main (ff-only) and push — positive work lands");
+  const commitAsk = await implementer.ask(
+    `The change passed its final gate. Commit the work in ${wt} now as logical units with detailed ` +
+      `messages (you wrote it — you know the units; summary line, what/why, evidence). Reply with the ` +
+      `commit list only.`,
+  );
+  // The gate tested the WORKING TREE (untracked files included); the merge lands
+  // commits. A partial commit would ff-merge a tree that was never gated — verify
+  // the commits captured everything before anything lands.
+  const leftover = await world.run("git", ["-C", wt, "status", "--porcelain"], { output: { tail: 2048 } });
+  const countRun = await world.run("git", ["-C", wt, "rev-list", "--count", `${branchPoint}..HEAD`], { output: { tail: 512 } });
+  const commitCount = countRun.exitCode === 0 ? Number(countRun.stdout.trim()) : Number.NaN;
+  if (leftover.exitCode !== 0 || leftover.stdout.trim() !== "" || !(commitCount >= 1)) {
+    verified.push(
+      `NOT landed: the commit handoff is incomplete in ${wt} (${leftover.stdout.trim() !== "" ? "uncommitted/untracked changes remain" : "zero commits on the branch"}) — ` +
+        `the merge would land a tree that was never gated; the branch holds the gated working tree for a manual commit+merge`,
+    );
+  } else {
+    verified.push(`committed on ${branch}: ${commitCount} commit(s) — ${commitAsk}`);
+    const onMain = await world.run("git", ["-C", MAIN_WS, "branch", "--show-current"], { output: { tail: 512 } });
+    const mainClean = await world.run("git", ["-C", MAIN_WS, "status", "--porcelain"], { output: { tail: 2048 } });
+    if (onMain.exitCode !== 0 || onMain.stdout.trim() !== "main" || mainClean.stdout.trim() !== "") {
+      verified.push(`NOT merged: the main checkout at ${MAIN_WS} is not a clean main — the branch ${branch} is ready for a manual merge`);
+    } else {
+      const merge = await world.run("git", ["-C", MAIN_WS, "merge", "--ff-only", branch], { output: { tail: 4096 } });
+      if (merge.exitCode !== 0) {
+        verified.push(
+          `NOT merged: main moved since ${branchPoint} — a fast-forward is impossible and the light path does ` +
+            `not merge untested combinations; merge ${branch} by hand (it was gated green on its own tree)`,
+        );
+      } else {
+        const push = await world.run("git", ["-C", MAIN_WS, "push", "origin", "main", branch], { timeoutMs: 300_000, output: { tail: 4096 } });
+        if (push.exitCode === 0) {
+          mergedAndPushed = true;
+          verified.push(`merged ${branch} into main (ff) and pushed origin main+branch (owner standing rule 2026-11-19)`);
+        } else {
+          mergedNotPushed = true;
+          verified.push(`merged ${branch} into main (ff) but the PUSH failed — the merge is local and complete; the owner pushes (SSH remote required): ${(push.stderr + push.stdout).trim().split("\n").slice(-2).join(" | ")}`);
+        }
+      }
+    }
+  }
+}
+
 const markdown = [
   `# Gated change: ${task.split("\n")[0]}`,
   "",
-  `Worktree \`${wt}\`, branch \`${branch}\`, uncommitted there, ready to review and commit. The main checkout was never switched.`,
+  `Worktree \`${wt}\`, branch \`${branch}\`${mergedAndPushed ? " — merged into main (ff) and pushed" : mergedNotPushed ? " — merged into main (ff), push pending (see Gate)" : ", ready to review"}. The main checkout was never switched.`,
   "",
   "## Implementation",
   "",
@@ -521,7 +583,11 @@ const done: WorkflowReport = {
     ? "The change is implemented and reviewed, but a final gate FAILED — per the no-degradation rule this needs the user's decision before commit."
     : blockedOnHost
       ? `The change is implemented, reviewed and suite-green on branch ${branch} in worktree ${wt} — but this host cannot certify the decisive backend (BLOCKED-ON-HOST); a notebook ticket is required before merge.`
-      : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt}, uncommitted and ready.`,
+      : mergedAndPushed
+        ? `The change is gate-green, committed on ${branch}, merged into main (fast-forward) and pushed — positive work lands (owner standing rule 2026-11-19).`
+        : mergedNotPushed
+          ? `The change is gate-green, committed on ${branch} and merged into main (fast-forward) — the PUSH failed (SSH remote); the owner pushes, nothing is lost locally.`
+          : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt} — landing needs the owner (commit handoff incomplete, main not on a clean main, or main moved past a fast-forward).`,
   findings: reportFindings,
   verified,
   notCovered,

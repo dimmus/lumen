@@ -5,6 +5,8 @@ description: Write a Lumen project memory record in .zcode/memories/ — importa
 
 # Writing Lumen memories
 
+> **Scope:** mixed — the archive format and rules are general; paths, the generator script and the spool ref are current-project.
+
 `.zcode/memories/` is the project's long-term evidence archive: what was measured, what
 broke and how it was fixed, what was learned about hosts, protocols and upstreams. A
 memory's job is to save a future session from re-deriving (or re-breaking) something.
@@ -22,6 +24,14 @@ Write one when a task produced any of:
 Do not write a memory for routine work whose value is fully captured by the commit
 message and docs; do not duplicate an existing memory — extend it (append a dated
 section) instead of forking a new one.
+
+**Step zero — resolve the archive's repo before touching anything.** An explicitly
+dispatched project root is authoritative over habit and over the current working
+directory: run `git -C <root> rev-parse --show-toplevel` and `git -C <root> branch
+--show-current` THERE first, and write only inside that tree. (A dispatched
+memory-writer once wrote to the main checkout out of habit while its assigned
+project root was a different tree — the record landed in the wrong archive and had
+to be reverted.)
 
 ## Format (match the existing archive)
 

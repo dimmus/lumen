@@ -6,6 +6,32 @@ current when an item closes.
 
 ## Now
 
+- [ ] **Push/merge policy flipped — the pre-2026-11-19 "never pushed without asking"
+  notes elsewhere in this file are historical** (owner standing rule, 2026-11-19): all
+  positive work (gate-READY) now ends committed, merged into main by the run
+  (topological order, merged tree re-gated; ff-only on the light path) and pushed to
+  origin over SSH. Below-READY outcomes still go to the owner. `gh` is not installed
+  and HTTPS has no credential helper, so the PR of record is the PR-text artifact +
+  the merge commit — owner may install `gh` if real PR objects are wanted (then the
+  workflows gain a PR step).
+- [ ] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
+  pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
+  `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
+  ui-bench.sh now re-execs `$ROOT/scripts/seat-lock.sh` — 13 sub-FAILs, every traced
+  pass exits 127. One-line fix in `tests/smoke_harness.sh` (stage seat-lock.sh too, or
+  stub the broker in the fixture) + its own gated round.
+- [ ] **test_protocol_conformance session-lock rows flake under load** (seen
+  2026-11-19 and again 2026-11-23 during heavy parallel session activity — both times
+  failing the "session lock" sub-rows, both times PASSING on a quiet standalone rerun;
+  2026-11-23 rerun clean on the notebook). Timing-sensitive, not change-caused (the
+  harness change touches no product/test code). Next occurrence: capture the failing
+  sub-rows with timestamps and check for libinput/seat-event delay correlation before
+  considering a stabilization fix (retry-once in the test or a wider timeout).
+- [x] **Agent-level parallelism landed** (2026-11-19, this change): gated-change
+  confirmations now dispatch under `Promise.all` (studio already did), and
+  `lumen-studio` §Lead duties mandates parallel dispatch of independent role agents.
+  Engine-level parallel task LANES remain deferred (row below) — a 2-core host makes
+  parallel builds counterproductive; parallelism belongs to agents, not compiles.
 - [x] **Commit/PR the ADR-013 settings-app tree** — closed 2026-11-17: everything merged to
   main (`ebe7046` portal Settings, `eaaf7ba` LUMEN_THEME export, `9022e74` settings-startup
   apply); 136/136 ctest at merged main. Push/PR remains the owner's call (never pushed

@@ -1,7 +1,11 @@
 ---
 name: lumen-testing
-description: Lumen's verification discipline — test matrices (tests-enabled ctest, seat smokes, sanitizers, goldens, benches), evidence contracts and status vocabulary for reviewing and testing every code change, with tests required for new functionality. Use when planning or executing Lumen verification, judging evidence, or deciding what a change must pass; supersedes the DSH testing skills' Docker/headless-era guidance.
+description: Lumen's verification discipline — test matrices (tests-enabled ctest, seat smokes, sanitizers, goldens, benches), evidence contracts and status vocabulary for reviewing and testing every code change, with tests required for new functionality. Use when planning or executing Lumen verification, judging evidence, or deciding what a change must pass.
 ---
+
+> **Scope:** mixed — the discipline (matrices, evidence contracts, status vocabulary,
+> no-weakening) is general; the commands, hosts, scripts and ctest labels are
+> current-project.
 
 # Lumen testing discipline
 
@@ -12,10 +16,10 @@ surface. Unit ctest and the in-process `ui-bench` engine bench are valid supplem
 evidence. Host facts, verified commands and known noise live in
 `.zcode/skills/lumen-build-run/SKILL.md` — read it first.
 
-Deep catalogs still apply from the DSH archive (kept for reference, environment text
-superseded by this skill): `.agents/skills/lumen-test-agent/references/test-matrix.md`,
-`diagnostics.md`, `tool-setup.md`, `evidence-contract.md`, and
-`.agents/skills/lumen-script-runner/references/script-catalog.md` (all 20 repo scripts).
+Deep catalogs (ported 2026-11-19 from the removed DSH archive; environment text there
+is superseded by this skill): `references/test-matrix.md`, `references/diagnostics.md`,
+`references/tool-setup.md`, `references/evidence-contract.md`, and
+`references/script-catalog.md` (all 20 repo scripts) — beside this file.
 
 ## What a change must pass (proportionate to what it touches)
 

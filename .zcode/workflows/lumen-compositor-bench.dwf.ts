@@ -9,6 +9,7 @@ whenToUse: When the user asks how fast or how heavy Lumen is compared to sway,
   weston or hyprland, or asks for a cross-compositor startup/latency/CPU/memory
   comparison. Needs a quiet seat (no other compositor or smoke session) and the
   lumen release build.
+  scope: current-project — harness paths, hosts and comparators are Lumen's.
 args:
   include_hyprland:
     type: boolean

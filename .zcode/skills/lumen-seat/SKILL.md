@@ -5,6 +5,8 @@ description: The Lumen seat broker contract — scripts/seat-lock.sh acquire/rel
 
 # The seat broker (lumen-seat)
 
+> **Scope:** mixed — the broker model (tickets, priority, stale=owner decision) is general; `scripts/seat-lock.sh` and its preflight are current-project.
+
 One host, one seat, one DRM master, one broker. Every job that starts a
 compositor, injects input, or measures on the real seat holds a ticket for its
 whole run. Two seat jobs on one host contaminate each other's evidence — the
@@ -72,7 +74,13 @@ Rules:
    is never stale regardless of age — the TTL only bounds *dead* holders.
 4. **Stale is an owner decision.** `status` names the dead holder and the
    force-release command; nothing reclaims it automatically.
-5. The preflight triple (compositor via `/proc/*/comm` — never `pgrep -x
+5. **Serial on the seat does not mean idle hands.** When someone asks for
+   parallelism "to save time", the compliant speedup is overlapping genuinely
+   non-seat work with the seat queue — analysis, log/journal review, non-seat
+   builds, report writing, preparing the next job's commands — never seat
+   concurrency. Refusing the parallel seat plan without offering this redirect
+   answers the rule and ignores the request.
+6. The preflight triple (compositor via `/proc/*/comm` — never `pgrep -x
    lumen-compositor`, comm is 15-char truncated; foreign smoke via a
    pattern that excludes broker wrappers, ancestors and transient forks;
    `/proc/loadavg`) has exactly one implementation: here. Do not re-create it
