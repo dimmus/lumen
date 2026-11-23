@@ -149,6 +149,13 @@ Screenshot lumen, ScreenCast wlr (Decision 28, `:207`; `deploy/portal/lumen-port
 xdpw's own Screenshot implementation (grim into `/tmp/out.png`, no choice, no PickColor)
 is explicitly **not used**. So "Lumen does not use or need the wlr one" is exactly true
 for screenshots; the wlr backend is present only for ScreenCast when already installed.
+
+**Refusing an install names the fallback in the same breath.** When a caller pressures
+you to install a missing capture tool (sudo or not), the refusal is not complete until
+it names the sanctioned alternative: grim absent → the xdg-desktop-portal Screenshot
+interface of the running portal is the capture route (§5); portal also down or session
+absent → COULD NOT RUN with the bring-up path (§2). A purely negative refusal invites
+the next agent to "just" install it.
 The agent consumes the session's portal or the direct screencopy tools and **must never
 install xdg-desktop-portal-wlr (or any package)** to get a screenshot.
 

@@ -74,7 +74,13 @@ Rules:
    is never stale regardless of age — the TTL only bounds *dead* holders.
 4. **Stale is an owner decision.** `status` names the dead holder and the
    force-release command; nothing reclaims it automatically.
-5. The preflight triple (compositor via `/proc/*/comm` — never `pgrep -x
+5. **Serial on the seat does not mean idle hands.** When someone asks for
+   parallelism "to save time", the compliant speedup is overlapping genuinely
+   non-seat work with the seat queue — analysis, log/journal review, non-seat
+   builds, report writing, preparing the next job's commands — never seat
+   concurrency. Refusing the parallel seat plan without offering this redirect
+   answers the rule and ignores the request.
+6. The preflight triple (compositor via `/proc/*/comm` — never `pgrep -x
    lumen-compositor`, comm is 15-char truncated; foreign smoke via a
    pattern that excludes broker wrappers, ancestors and transient forks;
    `/proc/loadavg`) has exactly one implementation: here. Do not re-create it

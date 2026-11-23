@@ -39,10 +39,25 @@ Procedure:
    follow-up coaching. If
    the subject asks you a clarifying question, answer only with facts a user plausibly
    would know from the ASK — never with the correct direction.
+
+   **Dispatch reality (learned 2026-11-19): subagents cannot spawn subagents in this
+   harness.** When you ARE a subagent (no Agent tool of your own), do NOT improvise
+   subprocess workarounds (headless CLI, app-server driving — all dead ends, and one
+   burned a rate limit trying). Instead: stage the sandbox, pin the exact subject
+   dispatch prompt verbatim to `<sandbox>/dispatch-prompt-<N>.md`, and hand back to
+   the LEAD — the lead performs the Agent dispatch from the top-level session (the
+   only context with the tool) and returns the subject's output for your transcript.
+   Never edit harness config, provider config or credentials to make a dispatch
+   happen; that is out of bounds for a stagehand.
 4. Record `<sandbox>/transcript.md`: the ASK, every command the subject ran (from the
    sandbox's shell history if SETUP created one, otherwise the subject's reported
    actions), the files it created/modified (paths + what changed), and its final answer
    verbatim. Facts only — no evaluation language anywhere in the transcript.
+   Capture the command/action trail, not just the final answer — round 1's evaluators
+   could only judge inspection-order criteria from footprints in the answer and the
+   sandbox (when the lead performs the dispatch per the note below, relay the
+   subject's own action list into the transcript; a subject that reports its commands
+   verbatim makes every order-of-operations criterion independently verifiable).
 
 Output contract: the sandbox path, the transcript path, whether every SETUP
 precondition held (each with the check that proved it), and any deviation you made in

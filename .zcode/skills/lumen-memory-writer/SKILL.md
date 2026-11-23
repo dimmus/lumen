@@ -25,6 +25,14 @@ Do not write a memory for routine work whose value is fully captured by the comm
 message and docs; do not duplicate an existing memory — extend it (append a dated
 section) instead of forking a new one.
 
+**Step zero — resolve the archive's repo before touching anything.** An explicitly
+dispatched project root is authoritative over habit and over the current working
+directory: run `git -C <root> rev-parse --show-toplevel` and `git -C <root> branch
+--show-current` THERE first, and write only inside that tree. (A dispatched
+memory-writer once wrote to the main checkout out of habit while its assigned
+project root was a different tree — the record landed in the wrong archive and had
+to be reverted.)
+
 ## Format (match the existing archive)
 
 File: `.zcode/memories/lumen-<kebab-topic>.md`, topic-specific, one subject per file.
