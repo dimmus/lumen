@@ -202,7 +202,7 @@ filled fill(started_compositor& c, lx::client_id client, unsigned frame_from) {
     cache.tick(++f.frame);
 
     // What was built, before any pressure.
-    expect(cache.size() == f.k_spare + 4, "four spare and four shown buffers must be cached");
+    expect(cache.size() == f.k_spare + 4, "eight spare and four shown buffers must be cached");
     expect(life.pending_release_count() == 1, "surface 1's superseded buffer must wait to go back");
     expect(life.has_unreleased_frames(), "surface 2's superseded buffer must be in flight");
     expect(f.frame < cache.config().stale_frame_threshold, "no buffer may be stale yet");
