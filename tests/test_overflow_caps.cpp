@@ -568,20 +568,23 @@ LUMEN_TEST(overflow_text_input_each_documented_action) {
                where(action, "the text must never outgrow the capacity"));
 
         // (iii): the same field, the policy changed, the same insertion answers the new one.
+        // Full, the field refuses under either policy, so its text goes back to six bytes
+        // first — over the selection, which is room whatever the policy is.
         if (documented) {
             lx::ui::text_input_props other{};
             other.max_bytes = 8;
             other.overflow = action == overflow_action::reject ? overflow_action::drop_newest
                                                                : overflow_action::reject;
             (void)field.apply(other);
-            lx::ui::text_input_node probe;
-            (void)probe.apply(other);
-            expect(probe.insert("abcdef"), "the probe field must fill the same");
-            const bool probe_taken = probe.insert("XYZW");
-            expect(probe_taken == (other.overflow == overflow_action::drop_newest) &&
-                       (probe_taken ? probe.text() == "abcdefXY" : probe.text() == "abcdef"),
-                   std::format("the field must answer the insertion under {} as that action says",
-                               name(other.overflow)));
+            field.select_all();
+            expect(field.insert("abcdef") && field.text() == "abcdef",
+                   "the same field must take its six bytes back over the selection");
+            const bool takes = other.overflow == overflow_action::drop_newest;
+            const bool taken = field.insert("XYZW");
+            expect(
+                taken == takes && field.text() == (takes ? "abcdefXY" : "abcdef"),
+                std::format("the same field must answer the insertion under {} as that action says",
+                            name(other.overflow)));
         }
     }
     // The cut is at a character boundary: "ä" is two bytes, only one fits.
