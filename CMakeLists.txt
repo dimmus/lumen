@@ -1754,6 +1754,16 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_kms_vulkan_scanout PRIVATE tests)
     add_test(NAME test_kms_vulkan_scanout COMMAND test_kms_vulkan_scanout)
 
+    # The present-mode policy (AGENTS.md §5; docs/invariants.md "Present mode"):
+    # `resolve_present_mode` per GPU tier, explicit modes unchanged, `output_manager`
+    # following the tier with a per-output mode winning.
+    add_executable(test_present_mode tests/test_present_mode.cpp)
+    target_link_libraries(test_present_mode PRIVATE lx.compositor lx.gfx)
+    lumen_apply_module_properties(test_present_mode)
+    lumen_link_platform(test_present_mode)
+    target_include_directories(test_present_mode PRIVATE tests)
+    add_test(NAME test_present_mode COMMAND test_present_mode)
+
     # A sanitizer report must fail the test, not just print to stderr.
     set(LUMEN_TSAN_OPTS "halt_on_error=1")
     set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")

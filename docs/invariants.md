@@ -38,7 +38,7 @@ per run.
 | Content hints get scanout priority | `test_protocol_conformance` (hint surface) — priority *policy* itself: **GAP** (no test drives hint-dependent scanout selection) | — |
 | Frame hot path: no heap alloc, no info+ logs, no sync I/O | `bench_ui` (`alloc_counting.hpp`, G5 zero-alloc gates), reviewer hot-path checklist | bench + review |
 | GPU pools: no per-frame create/destroy (`pipeline_cache`, semaphore pools) | **GAP** (no dedicated test observes pool reuse across frames; bench G5 sees the allocation side) | — |
-| Present mode: discrete → mailbox, integrated → fifo_relaxed | **GAP** (mode selection is config logic without a designated test; `test_card_select`/`test_device_select` cover selection, not the mode policy) | — |
+| Present mode: discrete → mailbox, integrated → fifo_relaxed | `test_present_mode` (the selection policy: `resolve_present_mode` per tier, explicit modes returned unchanged, `output_manager` following `set_gpu_tier`, a per-output `set_present_mode` winning) — the selected mode reaching the frame path: **GAP** (`output_manager::present_mode_for` has no caller outside `output_manager.cppm`: the compositor feeds the tier, nothing reads the mode back, so no test can observe a present in it) | ctest (+ GAP) |
 | KMS damage via `kms_atomic_commit`, reported in `presentation_feedback` | **GAP** (no test names `kms_damage`; atomic commit paths covered by `test_kms_device`/`test_crtc_alloc` without the damage contract) | — |
 | Frame pipeline end-to-end on the seat | `drag-smoke` (g rows: input→present latency, frame-perfect resize), `app-smoke` (present stalls, pacing WARN families) | seat smokes |
 
