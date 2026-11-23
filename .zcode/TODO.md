@@ -147,13 +147,15 @@ current when an item closes.
   notes forbade a helper) — ratify the amended acceptance or direct another resolution
   (see `.zcode/memories/lumen-snprintf-log-migration.md`).
 
-- [ ] **Tracked CRLF files on main past .gitattributes** (found 2026-11-19 by
-  scripts/diff-hygiene.sh): 12 blobs under `evidence/2026-11-18-sanitizer-sweep/`
-  (app-smoke/drag-smoke/asan logs) were force-added with CRLF bytes and sit in the tree
-  against the `eol=lf` policy — and `evidence/` is supposed to never merge at all (37
-  files tracked there total). Owner decision: `git rm -r --cached evidence/` on main
-  (history keeps them) or accept as-is; diff-hygiene reports them as baseline debt until
-  then.
+- [x] **Tracked CRLF files on main past .gitattributes** (found 2026-11-19 by
+  scripts/diff-hygiene.sh) — closed 2026-11-23 (owner decision: untrack): 12 blobs under
+  `evidence/2026-11-18-sanitizer-sweep/` (app-smoke/drag-smoke/asan logs) had been
+  force-added with CRLF bytes against the `eol=lf` policy, and `evidence/` never merges
+  (37 files were tracked there in total). `git rm -r --cached evidence/` on main: the files
+  stay on disk and in history and the `/evidence/` ignore rule covers them, so
+  diff-hygiene no longer reports the debt. Branches cut before this change that edit
+  those paths show delete/modify conflicts on `evidence/` when merged — resolve by keeping
+  them untracked.
 - [ ] **Studio parallel task lanes** (deferred 2026-11-19 from the harness review): the
   engine supports concurrency (confirmers already run under Promise.all) but the task
   loop is strictly sequential with shared mutable state (knownRed, branchOf, the board).
