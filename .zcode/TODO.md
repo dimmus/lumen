@@ -14,6 +14,49 @@ current when an item closes.
   and HTTPS has no credential helper, so the PR of record is the PR-text artifact +
   the merge commit — owner may install `gh` if real PR objects are wanted (then the
   workflows gain a PR step).
+- [ ] **A spool commit parented on a task tip lands that tip by fast-forward — a bypassed
+  landing** (found 2026-11-24 with run dwfrun-e4cd1b91; high; source:
+  `.zcode/memories/lumen-todo-fixes-round.md`): the memory-writer spool recipe falls back
+  to `git rev-parse HEAD` for its parent (lumen-memory-writer.md:31), so f836bc6 was
+  spooled on the unlanded tip f936cda; the next memory-writer's contract step
+  `git merge --ff-only zcode/memory-spool` then moved main 0796540 → f836bc6 at
+  2026-11-23 23:37:46, landing 3f317c8, 9579cdc, bc33b6a, f936cda ahead of the landing
+  phase — regardless of the gate, without the merged-tree re-gate. The same commit rule
+  rides the workflow prompts (lumen-development-studio.dwf.ts:350,
+  lumen-compositor-bench.dwf.ts:232). Fix shape, both halves: a spool commit's parent is
+  main's tip (or the spool tip when main is its ancestor), never a task tip; and the
+  landing asserts main moved only by its own merges since the base its tasks were cut
+  from — `preMerge` as read at :1134 is too late to see an earlier bypass.
+- [ ] **Studio landing counts untracked tool state as a dirty main** (found 2026-11-24
+  with run dwfrun-e4cd1b91; medium; source:
+  `.zcode/memories/lumen-todo-fixes-round.md`): the landing's clean-main check is
+  `git status --porcelain` (lumen-development-studio.dwf.ts:1123-1124), which lists
+  untracked files — Mimosa's `.mimosa/` at the repo root made a clean main read "dirty"
+  and the phase declined with "merge by hand or re-run". In this clone only: `.mimosa/`
+  in `.git/info/exclude`. Owner decision: change the check or ignore `.mimosa/` in
+  `.gitignore`. For that decision: the merge-gate configures `-S MAIN_WS` (:1162-1163)
+  and the module build globs `*.cppm`/`*.cpp` from the working tree
+  (cmake/LumenCXXModules.cmake:51-56), so a blanket `--untracked-files=no` would let an
+  untracked source be gated but not pushed — ignore the tool directory and keep the
+  check strict, or scope the relaxation to non-source paths.
+- [ ] **known_red filters the test under repair out of every workflow gate** (found
+  2026-11-24 with run dwfrun-e4cd1b91 — card `known_red: ["smoke_harness"]` for the task
+  fixing smoke_harness; medium; source:
+  `.zcode/memories/lumen-todo-fixes-round.md`): lumen-development-studio.dwf.ts:529,
+  :672, :793 and the landing re-gate :1172 all drop known-red names before judging, so
+  the orchestrator's "green" said nothing about the one test the task existed to fix —
+  its pass rested on the reviewer's unfiltered run and the gatekeeper's targeted run;
+  both gatekeepers flagged it. Fix shape: a task whose diff touches a known-red test
+  shows that test green UNFILTERED at its gate (run by name, its `Passed` line recorded
+  in the gate reasons); READY is refused without it.
+- [ ] **lumen-studio skill: AmendWorkflow drops a run's arguments — restate them in the
+  draft before amending** (found 2026-11-24, two amended runs of dwfrun-e4cd1b91; source:
+  `.zcode/memories/lumen-todo-fixes-round.md`): `.zcode/skills/lumen-studio/SKILL.md`
+  (:36-39, :110) sends a lead to repair a run with `AmendWorkflow` + `path` edits; the
+  first amended run (dwfrun-13a56143) exited at once with "No task was given". Also to
+  say there: an amended run does not replay finished stages — `world.run` steps execute
+  live again (dwfrun-ed413453 re-took the run lock and re-ran the Planner) — so amending
+  repairs a run, it never re-issues a landing. A skill edit owes an eval rerun.
 - [ ] **~event_loop() leaks its source-table slots** (found 2026-11-24, review of
   invariant-gap-tests; pre-existing; medium): the destructor
   (modules/lx.runtime/lx.runtime.cppm:333-341) unregisters the strand and closes fds but

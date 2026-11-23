@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (48 records, generated 2026-11-24)
+# Memory index by module (49 records, generated 2026-11-24)
 
 ## (general)
 
@@ -35,6 +35,7 @@
 ## harness
 
 - **smoke harness broker fixture** (2026-11-23) — smoke_harness perfetto fixture carries the seat broker hermetically (wrapper→real broker --no-preflight, private lock dir); 49/13→82/0; mutations flip it; review noise 6/6/0, 2 preexisting  [topics: smoke, seat-broker, hermeticity]
+- **todo fixes round** (2026-11-23) — Workflows unloadable 4 days (scope: key) fixed; evidence/ untracked; 8 TODO rows reconciled. Landing declined on untracked .mimosa/, then BYPASSED by a spool-parent ff; by-hand a89cbad 141/141.  [topics: landing, memory-spool, workflows, amend, todo-reconciliation]
 - **harness evals green** (2026-11-19) — Push policy flipped 2026-11-19: READY merges+pushes (no gh CLI). DSH archive purged. Skill evals round 1: 8/8 PASS 9.0-10.0, 4 skill fixes. Traps: no nested dispatch, rate limit x2, sandbox escape.  [topics: evals, landing-policy, dsh-purge, dispatch]
 - **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
 - **sanitizer sweep green** (2026-11-18) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions  [topics: asan, tsan, sanitizers; LONG (128 lines — split candidate)]
@@ -152,6 +153,7 @@
 ## scripts
 
 - **smoke harness broker fixture** (2026-11-23) — smoke_harness perfetto fixture carries the seat broker hermetically (wrapper→real broker --no-preflight, private lock dir); 49/13→82/0; mutations flip it; review noise 6/6/0, 2 preexisting  [topics: smoke, seat-broker, hermeticity]
+- **todo fixes round** (2026-11-23) — Workflows unloadable 4 days (scope: key) fixed; evidence/ untracked; 8 TODO rows reconciled. Landing declined on untracked .mimosa/, then BYPASSED by a spool-parent ff; by-hand a89cbad 141/141.  [topics: landing, memory-spool, workflows, amend, todo-reconciliation]
 - **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
 - **uinput key bitmap format** (2026-11-17) — /proc KEY bitmap is 64-bit words MSW-first: 70000 0 0 0 0 IS BTN_LEFT/RIGHT/MIDDLE — never read caps from /proc text, use EVIOCGBIT; two gate records' 'no BTN codes' were misreadings  [topics: uinput, evdev]
 - **smoke bench harness green** (2026-11-14) — Harness task: injection autodetect by name, build-fresh kills mtime false-trips, host-aware geometry, quiet-CPU PM-QoS fail-closed, bench warm-up gate; overwrite loop ended by namespace split  [topics: smoke, bench, uinput]
