@@ -105,6 +105,17 @@ current when an item closes.
   ticket. Fix shape: a start option that skips logind/input for virtual-outputs
   instances (or broker coordination for test runs); would also give the cascade test a
   hermetic fixture.
+- [ ] **Five non-virtual protocol tests still take the user's logind session on a
+  free-display host** (found 2026-11-24 with seatless-virtual-start; pre-existing;
+  low): the seat-less start fix (83f99ac, branch `zcode/task/seatless-virtual-start`)
+  makes every virtual-outputs compositor test hermetic, but tests that set no
+  `virtual_outputs` still ride the real-display path the diff leaves semantically
+  identical — the gate ctest's live poller saw six wayland episodes from
+  test_protocol_bind, test_shell_bridge, test_protocol_conformance,
+  test_window_protocols and test_pointer_protocols (each ~0.1–1.3 s, Type back to
+  tty), so a full `ctest -LE bench` on a free-display host is still not session-safe.
+  Fix shape: derive seat-less starts for these too if their assertions survive no real
+  seat, or broker-coordinate suite runs; re-check once the branch lands.
 - [ ] **text_input_node::insert treats drop_oldest as reject** (found 2026-11-24 with
   test_overflow_caps; pre-existing; low): modules/lx.ui/text_input.cppm:934 refuses the
   insertion when `overflow_` is `drop_oldest`, but the enum says "Evict oldest, accept
@@ -150,7 +161,11 @@ current when an item closes.
   §4.4 "changed C++ files pass clang-format --dry-run --Werror" is unmeetable there
   short of an unrelated reformat, and 47 of 60 sampled tracked .cppm files are not
   whole-file clean at HEAD. Decide: one whole-tree reformat commit, or diff-hygiene
-  judging added lines only. (The script's own `local`-at-top-level bug is the row above.)
+  judging added lines only. Same debt re-measured 2026-11-24 with seatless-virtual-start
+  on modules/lx.compositor/compositor_impl.cpp: 307 distinct violation lines at base
+  87327dd and at HEAD alike, zero on the change's added lines (violation-line set ∩
+  `git diff -U0` added lines = ∅), so diff-hygiene exits 1 on that 5-file diff with no
+  added line at fault. (The script's own `local`-at-top-level bug is the row above.)
 - [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
   `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and

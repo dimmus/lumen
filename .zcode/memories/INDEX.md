@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (53 records, generated 2026-11-24)
+# Memory index by module (55 records, generated 2026-11-24)
 
 ## (general)
 
@@ -55,6 +55,8 @@
 
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
+- **seatless virtual start closeout** (2026-11-24) — Closeout: gate numbers (142/142, smokes PASS, vulkan A/B rounds), dead-assert forensics + getpeername proof, review findings detail, honest gaps  [topics: seat-less, bench, seat-broker, gate]
+- **seatless virtual start** (2026-11-24) — Seat-less start() for virtual outputs (83f99ac..6d8d5e8): no logind session, no input seat, keymap kept; red artifact-backed; ctest 142/142, smokes PASS, vulkan A/B clean; noise 3/3/0/1  [topics: seat-less, virtual-outputs, logind, libinput, hermetic-tests, seat-broker]
 - **super tap mid chord repro** (2026-11-24) — Super tap mid-chord NOT_REPRODUCED (notebook 2026-11-24): 45 chords, 0 fires, control 6/6 at 161-182 us; 2026-11-17 sighting = lone-meta tap + saved chord binding; no product change; noise 2/2/0/0.  [topics: keybindings, tap, injection, seat, repro]
 - **compositor theme env export** (2026-11-16) — Compositor always exports resolved LUMEN_THEME and re-exports on reload (env_reexports owe/drain/drop); seat debt closed 2026-11-17 (177/0/0); SIGSEGV split to its own TODO row  [topics: theme, environment, systemd; LONG (177 lines — split candidate)]
 - **memory pressure green** (2026-11-15) — Spurious critical-pressure WARN fixed by fixing the measurement: staging judges bytes_in_flight (backlog), not bytes_mapped (rounding read 64 MiB as 100%); thresholds unchanged; final 177/0/0  [topics: memory, pressure; LONG (123 lines — split candidate)]
@@ -102,6 +104,10 @@
 ## lx.scene
 
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
+
+## lx.session
+
+- **seatless virtual start** (2026-11-24) — Seat-less start() for virtual outputs (83f99ac..6d8d5e8): no logind session, no input seat, keymap kept; red artifact-backed; ctest 142/142, smokes PASS, vulkan A/B clean; noise 3/3/0/1  [topics: seat-less, virtual-outputs, logind, libinput, hermetic-tests, seat-broker]
 
 ## lx.shell
 
@@ -172,6 +178,8 @@
 
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
+- **seatless virtual start closeout** (2026-11-24) — Closeout: gate numbers (142/142, smokes PASS, vulkan A/B rounds), dead-assert forensics + getpeername proof, review findings detail, honest gaps  [topics: seat-less, bench, seat-broker, gate]
+- **seatless virtual start** (2026-11-24) — Seat-less start() for virtual outputs (83f99ac..6d8d5e8): no logind session, no input seat, keymap kept; red artifact-backed; ctest 142/142, smokes PASS, vulkan A/B clean; noise 3/3/0/1  [topics: seat-less, virtual-outputs, logind, libinput, hermetic-tests, seat-broker]
 - **settings no writable banner** (2026-11-24) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141  [topics: banner, seat-repro, wayland-debug, injection]
 - **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **unit pair green** (2026-11-14) — Tolerated {ui_gallery, test_task_model} pair retired with zero production code: stale expectations from a65d06b + goldens predating the chevron fix; cross-host claim retracted; 133/133  [topics: goldens, known-red; LONG (155 lines — split candidate)]
