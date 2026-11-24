@@ -523,7 +523,7 @@ LUMEN_TEST(overflow_root_table_drops_past_capacity) {
     drove("lx.ui/context.cppm:220-231 detail::register_root (the root table, warn_and_drop)");
 }
 
-// `text_input_node::insert` (text_input.cppm:918-985): an insertion that does not fit the
+// `text_input_node::insert` (text_input.cppm:918-987): an insertion that does not fit the
 // capacity. The partition's contract (text_input.cppm:70-79) names all four actions:
 // `reject` refuses the insertion whole, `drop_newest` / `warn_and_drop` keep what fits,
 // cut at a character boundary, and `drop_oldest` — the enum's "Evict oldest, accept new" —
@@ -662,7 +662,39 @@ LUMEN_TEST(overflow_text_input_each_documented_action) {
                "the eviction must run from the front — the prefix, then the suffix's oldest "
                "bytes — and keep the newest of the old text after the insertion");
     }
-    drove("lx.ui/text_input.cppm:918-985 text_input_node::insert (all four policies)");
+    // A multi-byte character can straddle the eviction point: the bump to a character
+    // boundary then evicts more than the insertion adds, and the suffix shift's
+    // destination reaches back over the prefix shift's source. The prefix shift must run
+    // first — with the suffix's copy ahead of it, a byte that stayed was silently turned
+    // into its neighbour. Two shapes: "ä" (two bytes) with the caret mid-text, and a
+    // three-byte "€" whose selection it evicts past is one byte.
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 9;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("abcäefgh"), // "ä" is two bytes: nine in all
+               "the field must take its nine bytes");
+        field.set_selection(6, 6); // the caret mid-text, just right of the "ä"
+        expect(field.insert("ZZZZ") && field.text() == "eZZZZfgh",
+               "a two-byte character straddling the eviction point must leave what stays "
+               "intact, not swap a byte for its neighbour");
+    }
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 9;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("ab€cdef"), // "€" is three bytes: nine in all
+               "the field must take its nine bytes");
+        field.set_selection(6, 7); // one byte, the "d"
+        expect(field.insert("ZZZZ") && field.text() == "cZZZZef",
+               "a three-byte character straddling the eviction point must not corrupt the "
+               "prefix that stays");
+    }
+    drove("lx.ui/text_input.cppm:918-987 text_input_node::insert (all four policies)");
 }
 
 // A virtualised list's chunk slots (list.cppm:392, `k_list_max_chunks` = 32 of 16 rows): a

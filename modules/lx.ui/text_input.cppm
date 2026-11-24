@@ -978,12 +978,14 @@ bool lx::ui::text_input_node::insert_core(std::string_view s, std::uint32_t span
     if (take == 0 && a == b)
         return false;
     char* d = data();
-    // Close the selection's gap and open the insertion's in one move; under drop_oldest
-    // the evicted bytes went first, so what stays shifts down by them.
+    // Close the selection's gap and open the insertion's; under drop_oldest the evicted
+    // bytes went first, so what stays shifts down by them. The prefix shift must run
+    // first: the character-boundary bump can evict more than the insertion adds, and the
+    // suffix shift's destination then overlaps the prefix's source [evict_before, a).
     const std::uint32_t at = a - evict_before;
-    std::memmove(d + at + take, d + b + evict_after, n - b - evict_after);
     if (evict_before)
         std::memmove(d, d + evict_before, at);
+    std::memmove(d + at + take, d + b + evict_after, n - b - evict_after);
     std::memcpy(d + at, s.data(), take);
     set_size(static_cast<std::uint32_t>(n - (b - a) + take - evict_before - evict_after));
     caret_ = anchor_ = static_cast<std::uint32_t>(at + take);
