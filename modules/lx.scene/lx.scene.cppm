@@ -6,12 +6,19 @@ import lx.foundation;
 import lx.gfx;
 import lx.runtime;
 import lx.scheduler;
+import lx.trace;
 
 export module lx.scene;
 
 import std;
 
 export import :snapshot;
+
+namespace {
+
+constexpr lx::trace::category log_container{"scene.container"};
+
+} // namespace
 
 export namespace lx::scene {
 
@@ -232,6 +239,9 @@ private:
     scene_node* children_[128]{};
     unsigned count_ = 0;
     lx::runtime::overflow_action child_overflow_ = lx::runtime::overflow_action::drop_newest;
+    /// Set by the warn_and_drop path of `add`: a cap warns once per overflow episode, not
+    /// once per push while it lasts (ADR-010 §4.4) — re-armed when `remove` makes room.
+    bool child_overflow_warned_ = false;
 };
 
 class surface_node : public scene_node {
@@ -554,6 +564,12 @@ bool lx::scene::container_node::add(scene_node* c) {
         children_[count_ - 1] = c;
         return true;
     }
+    // The enum's warn_and_drop is "Log warn, then drop_newest" (lx.runtime/memory.cppm):
+    // warn once per overflow episode, then keep refusing like drop_newest.
+    if (child_overflow_ == lx::runtime::overflow_action::warn_and_drop && !child_overflow_warned_) {
+        child_overflow_warned_ = true;
+        log_container.warn("container child cap reached");
+    }
     return false;
 }
 bool lx::scene::container_node::remove(scene_node* c) {
@@ -566,6 +582,9 @@ bool lx::scene::container_node::remove(scene_node* c) {
         for (unsigned j = i + 1; j < count_; ++j)
             children_[j - 1] = children_[j];
         children_[--count_] = nullptr;
+        // Room again: a later overflow is a new episode and warns again (the draw_list
+        // re-arm idiom, snapshot_buffer.cppm's clear_lists).
+        child_overflow_warned_ = false;
         return true;
     }
     return false;
