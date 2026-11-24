@@ -53,9 +53,10 @@ export namespace lx::text {
 // under a cap of `text_layout_limits` — UTF-8 bytes (text beyond is cut at a character
 // boundary), shaped glyphs, shaped runs, lines and attribute spans (the rest are dropped).
 // A cap applies the limits' `overflow`: `reject` makes the pass fail (the layout is empty
-// and `update` returns the error); the others keep what fits and set `truncated()`,
-// `warn_and_drop` warning once per layout. Per glyph about 20 B, per cluster 28 B, per line
-// 64 B, per run 64 B, plus one byte per text byte.
+// and `update` returns the error; a refused wrap pass is retried by any later wrap input
+// change, a refused shape pass only by a shape input); the others keep what fits and set
+// `truncated()`, `warn_and_drop` warning once per layout. Per glyph about 20 B, per cluster
+// 28 B, per line 64 B, per run 64 B, plus one byte per text byte.
 //
 // Hit testing: `hit_test` maps a point to a logical position and its affinity (`upstream`:
 // the caret sits on the trailing edge of the cluster before the position, not the leading
@@ -439,6 +440,7 @@ private:
     mutable bool shape_dirty_ = true;
     mutable bool wrap_dirty_ = true;
     mutable lx::error error_{};
+    mutable bool wrap_error_ = false; ///< error_ is a refused wrap pass (a wrap input retries it)
     mutable std::vector<std::uint8_t> pos_{};
     mutable std::vector<paragraph> paragraphs_{};
     mutable std::vector<item> items_{};
@@ -763,6 +765,7 @@ lx::result<void> lx::text::text_layout::refresh() const {
         shape_dirty_ = false;
         wrap_dirty_ = true;
         error_ = {};
+        wrap_error_ = false;
         if (const lx::result<void> r = shape_pass(); !r) {
             error_ = r.get_error();
             paragraphs_.clear();
@@ -778,9 +781,24 @@ lx::result<void> lx::text::text_layout::refresh() const {
     }
     if (wrap_dirty_) {
         wrap_dirty_ = false;
+        // A latched wrap-pass error does not outlive the wrap inputs that caused it: any wrap
+        // input change retries the pass (the shape outputs survived the refuse). A shape-pass
+        // error still latches — its outputs are gone, and only a shape input rebuilds them.
+        if (wrap_error_) {
+            wrap_error_ = false;
+            error_ = {};
+        }
         if (error_.domain == lx::error_domain::none)
-            if (const lx::result<void> r = wrap_pass(); !r)
+            if (const lx::result<void> r = wrap_pass(); !r) {
                 error_ = r.get_error();
+                wrap_error_ = true;
+                // A failed pass leaves the layout empty (as a failed shape pass does above):
+                // the lines the wrap pass had built before its cap refused are dropped, not
+                // kept — `reject` is all or nothing.
+                lines_.clear();
+                line_runs_.clear();
+                width_ = height_ = 0;
+            }
     }
     if (error_.domain != lx::error_domain::none)
         return error_;
@@ -1244,6 +1262,10 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
         const std::int32_t h = round_px(static_cast<std::int32_t>(size_pt_ * scale_ * 1.2f * 64.f));
         for (const paragraph& p : paragraphs_) {
             if (lines_.size() >= limits_.max_lines) {
+                // The refuse returns before the flag, as the input-cut refuse does: a failed
+                // pass leaves nothing that could be "truncated".
+                if (limits_.overflow == lx::runtime::overflow_action::reject)
+                    return lx::invalid_argument("text_layout: line cap reached");
                 lines_cut_ = over_cap(true);
                 break;
             }
@@ -1272,6 +1294,10 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
             const std::uint32_t ce = p.cluster_end;
             do {
                 if (lines_.size() >= limits_.max_lines) {
+                    // The refuse returns before the flag, as the input-cut refuse does: a
+                    // failed pass leaves nothing that could be "truncated".
+                    if (limits_.overflow == lx::runtime::overflow_action::reject)
+                        return lx::invalid_argument("text_layout: line cap reached");
                     lines_cut_ = over_cap(true);
                     stop = true;
                     break;
