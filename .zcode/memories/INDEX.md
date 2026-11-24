@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (57 records, generated 2026-11-25)
+# Memory index by module (58 records, generated 2026-11-25)
 
 ## (general)
 
@@ -30,6 +30,7 @@
 
 ## executables/lumen-settings
 
+- **settings written banner escalation** (2026-11-25) — banner escalates from `written` too (1bc8b2e, READY): repaint() gates on != memory_only; probe 'state=1 banner=0' at base; (f')/(g') legs red at :468; ctest 141/141; noise 3/3/0/3  [topics: banner, save-state, settings, review-noise]
 - **settings no writable banner** (2026-11-24) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141  [topics: banner, seat-repro, wayland-debug, injection]
 - **settings startup apply** (2026-11-16) — lumen-settings applies [ui] once at startup (apply_ui_live before w.open); explicit --theme stays authoritative for theme; seat reds were the concurrent-session family  [topics: startup, adr-013; LONG (142 lines — split candidate)]
 
@@ -178,6 +179,7 @@
 
 ## tests
 
+- **settings written banner escalation** (2026-11-25) — banner escalates from `written` too (1bc8b2e, READY): repaint() gates on != memory_only; probe 'state=1 banner=0' at base; (f')/(g') legs red at :468; ctest 141/141; noise 3/3/0/3  [topics: banner, save-state, settings, review-noise]
 - **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32): both wrap-pass sites refuse, refresh empties the layout, wrap-input retry; tests pin both paths; BLOCKED on final-tree vulkan A/B; noise 5/5/0+1  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]

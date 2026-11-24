@@ -34,6 +34,7 @@
 - [settings key capture seat](lumen-settings-key-capture-seat.md) — ADR-013 key capture proven live (Super+Shift+y, splice gen 57→58, reserved Super+Escape refuses); trap: injected Super-chords trip the tap grab mid-chord — open TODO row
 - [settings no writable banner](lumen-settings-no-writable-banner.md) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141
 - [settings startup apply](lumen-settings-startup-apply.md) — lumen-settings applies [ui] once at startup (apply_ui_live before w.open); explicit --theme stays authoritative for theme; seat reds were the concurrent-session family
+- [settings written banner escalation](lumen-settings-written-banner-escalation.md) — banner escalates from `written` too (1bc8b2e, READY): repaint() gates on != memory_only; probe 'state=1 banner=0' at base; (f')/(g') legs red at :468; ctest 141/141; noise 3/3/0/3
 - [shell first paint wip](lumen-shell-first-paint-wip.md) — Shell first-paint work: font-match persistence merged as PR #44 (2026-10-25);
 - [smoke bench harness green rounds](lumen-smoke-bench-harness-green-rounds.md) — Close-out chronology split from [[lumen-smoke-bench-harness-green]] —
 - [smoke bench harness green](lumen-smoke-bench-harness-green.md) — Harness task: injection autodetect by name, build-fresh kills mtime false-trips, host-aware geometry, quiet-CPU PM-QoS fail-closed, bench warm-up gate; overwrite loop ended by namespace split

@@ -162,6 +162,11 @@ current when an item closes.
   not exercised on the seat, no test pins it; until now tracked only inside the ticked
   banner row. Fix shape: escalate from any state that is not `memory_only` (`written`
   included), with the regression test's (f)/(g) legs extended to write-then-fail.
+  Fixed on branch `zcode/task/settings-banner-written-state` (2026-11-25; commit 1bc8b2e
+  off 87327dd: repaint() escalates from any state that is not `memory_only`
+  (settings_ui.cppm:1261), doc comment amended; (f') write-then-fail and (g') recovery
+  legs added, red-proven at test_settings_ui.cpp:468 with the fix reverted; ctest 141/141
+  -LE bench at HEAD) — gate **READY**; land, then tick. Line numbers above are base-tree.
 - [ ] **Whole-file clang-format debt trips diff-hygiene on most diffs — decision** (found
   2026-11-24 with settings-no-writable-banner; pre-existing; low): settings_ui.cppm is
   not whole-file clean at base and at HEAD alike (`clang-format --dry-run --Werror`

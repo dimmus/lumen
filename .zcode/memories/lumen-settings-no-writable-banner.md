@@ -1,6 +1,6 @@
 ---
 name: lumen-settings-no-writable-banner
-description: "2026-11-24 notebook: the lumen-settings 'There is no writable config.toml' banner REPRODUCED and fixed (023443e, gate READY at ebedef5, branch zcode/task/settings-no-writable-banner) — it is up from launch, not a ~10 s transient: wl_keyboard.keymap arrives 86 ms after spawn, on_keymap (main.cpp:99) → stop_binding_capture() → session::repaint() flipped untouched→memory_only, and ten non-edit call sites rode the same path; fix routes non-edits through refresh(), leaves repaint() to the five write-failure tails, adds settings::k_banner_key; regression test red pre-fix (13/13 callers raise), green after; seat A/B (tickets -10256 pre / -15838 post): banner PRESENT 13/17 shots pre, only the unwritable edit f1/f2 post; ctest 141/141 -LE bench at ebedef5; sibling defect open: after one successful write (state written) a failing edit raises nothing."
+description: "2026-11-24 notebook: the lumen-settings 'There is no writable config.toml' banner REPRODUCED and fixed (023443e, gate READY at ebedef5, branch zcode/task/settings-no-writable-banner) — it is up from launch, not a ~10 s transient: wl_keyboard.keymap arrives 86 ms after spawn, on_keymap (main.cpp:99) → stop_binding_capture() → session::repaint() flipped untouched→memory_only, and ten non-edit call sites rode the same path; fix routes non-edits through refresh(), leaves repaint() to the five write-failure tails, adds settings::k_banner_key; regression test red pre-fix (13/13 callers raise), green after; seat A/B (tickets -10256 pre / -15838 post): banner PRESENT 13/17 shots pre, only the unwritable edit f1/f2 post; ctest 141/141 -LE bench at ebedef5; sibling defect (no banner from `written`) fixed 2026-11-25 — [[lumen-settings-written-banner-escalation]]."
 metadata:
   node_type: memory
   type: project
@@ -70,9 +70,10 @@ again that session ([[lumen-settings-key-capture-seat]] :43); root cause read fr
   pointer hovers the window (hover calls no session method; first input +97 s pre / +56 s post);
   `WAYLAND_DEBUG=1` on the client is the tool that names a launch-time trigger like this one.
 - **Adjacent, NOT fixed here (own TODO row):** `repaint()` escalates only from `untouched`, so after
-  one successful write (`state == written`) a later edit that cannot reach the file is applied to the
-  session and shows nothing — the banner's purpose, missed; probe in the unit harness, never
-  exercised on the seat. Found while probing the fix; it is the mirror image of the false banner.
+one successful write (`state == written`) a later edit that cannot reach the file is applied to the
+session and shows nothing — the banner's purpose, missed; probe in the unit harness, never
+exercised on the seat. Found while probing the fix; it is the mirror image of the false banner.
+(Fixed 2026-11-25 — [[lumen-settings-written-banner-escalation]].)
 - Deviations of record: six seat jobs for a card that asked for one — the two invalid pre attempts
   (driver sent clicks without the window origin; the Cursor "Theme" text input mistaken for a
   dropdown), post-run1 (repeat of the fixed run) and the keymap trace each hold their own ticket and
