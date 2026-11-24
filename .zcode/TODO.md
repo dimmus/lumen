@@ -68,6 +68,33 @@ current when an item closes.
   `loop.remove_source` calls exist (compositor_impl.cpp:3968, 3983, 3990, 9362). This is
   why test_memory_pressure_cascade runs all four scenarios inside one ctest case.
   Fix shape: remove sources in ~event_loop(), or hand each source an owner hook.
+- [ ] **add_source silently no-ops when the process-wide source table is full** (found
+  2026-11-24, review of event-loop-slot-leak; pre-existing; low): the leak fix (fe97caf,
+  branch `zcode/task/event-loop-slot-leak`) removed the cross-lifetime leak that made a
+  fresh loop hit the full-table branch, but the branch itself stays result-less —
+  `if (!source || state.source_count >= k_max_event_sources) return;`
+  (modules/lx.runtime/lx.runtime.cppm:534-535 post-fix) gives no signal, so a genuinely
+  full table still drops sources silently; the only guard is the caller's own count
+  check (compositor_impl.cpp:10272-10275, "no event source slot for theme completion").
+  Fix shape: an overflow_action parameter or a bool/result return, with test_event_loop
+  pinning the full-table behaviour.
+- [ ] **loop_state() — the process-wide event-source table — is unsynchronized** (found
+  2026-11-24, same review; pre-existing; low): the `static lx_runtime_loop_state s;`
+  (modules/lx.runtime/lx.runtime.cppm:298-301 post-fix) has no lock, and the
+  constructor's `register_strand(affinity::ui, …)` (:334) already structurally assumed
+  one live UI loop per process. The leak fix adds ~event_loop()'s reclaim loop
+  (:347-354) as another writer under the same assumption — it runs on the same thread
+  as its loop's add/remove calls, so no new race window. Decide: document/enforce the
+  single-live-UI-loop assumption or guard the table.
+- [ ] **remove_source matches by pointer only, ignoring owners[]** (found 2026-11-24,
+  same review; pre-existing; low): the find loop
+  (modules/lx.runtime/lx.runtime.cppm:546-557 post-fix) removes the first entry whose
+  `sources[i] == source` regardless of which loop added it — a loop removing a source
+  another live loop added would pluck that loop's table entry and `EPOLL_CTL_DEL`
+  against its own epoll, which does not hold the fd (the ctl is ignored). No current
+  caller does this (the four `loop.remove_source` sites: compositor_impl.cpp:3968, 3983,
+  3990, 9362 — from the task card, not independently re-verified). Fix shape: require
+  `owners[i] == this` in the match before removing.
 - [ ] **compositor::start() has no seat-less mode** (found 2026-11-24, same review;
   pre-existing; medium): `logind_session::open()` (compositor_impl.cpp:9592) and
   `begin_input()` (:9744) are unconditional — a compositor built for virtual outputs
