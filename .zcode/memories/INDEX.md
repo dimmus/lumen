@@ -127,7 +127,7 @@
 
 ## lx.text
 
-- **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32, landed 8d7eb41): wrap sites refuse, refresh empties, wrap-input retry; A/B unblocked gate, S4 update +26% = sub-µs wander; noise 5/5/0+1  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
+- **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32, landed 8d7eb41, reverified 0f404dc): wrap refuse, empty, wrap-retry; A/B unblocked gate, S4 +26% sub-µs; noise 5/5/0+1, 3/3/0+2; ui-bench needs tests=ON  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **shell first paint wip** (2026-10-25) — Shell first-paint work: font-match persistence merged as PR #44 (2026-10-25);
 
@@ -180,7 +180,7 @@
 ## tests
 
 - **settings written banner escalation** (2026-11-25) — banner escalates from `written` too (1bc8b2e, READY): repaint() gates on != memory_only; probe 'state=1 banner=0' at base; (f')/(g') legs red at :468; ctest 141/141; noise 3/3/0/3  [topics: banner, save-state, settings, review-noise]
-- **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32, landed 8d7eb41): wrap sites refuse, refresh empties, wrap-input retry; A/B unblocked gate, S4 update +26% = sub-µs wander; noise 5/5/0+1  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
+- **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32, landed 8d7eb41, reverified 0f404dc): wrap refuse, empty, wrap-retry; A/B unblocked gate, S4 +26% sub-µs; noise 5/5/0+1, 3/3/0+2; ui-bench needs tests=ON  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **seatless virtual start closeout** (2026-11-24) — Closeout: gate numbers (142/142, smokes PASS, vulkan A/B rounds), dead-assert forensics + getpeername proof, review findings detail, honest gaps  [topics: seat-less, bench, seat-broker, gate]

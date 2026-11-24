@@ -187,7 +187,12 @@ current when an item closes.
   on modules/lx.compositor/compositor_impl.cpp: 307 distinct violation lines at base
   87327dd and at HEAD alike, zero on the change's added lines (violation-line set ∩
   `git diff -U0` added lines = ∅), so diff-hygiene exits 1 on that 5-file diff with no
-  added line at fault. (The script's own `local`-at-top-level bug is the row above.)
+  added line at fault. Third instance 2026-11-25 with text-layout-line-cap-reject:
+  modules/lx.text/lines.cppm fails whole-file clang-format at base 58aa184 and HEAD
+  cb4dd32 alike (9 disagreement regions — :252, :495, :761, :852-853, :1372-1373,
+  :1407-1409, :1561-1562, :1614, :1671-1672), none inside the landed diff's 6 hunks —
+  diff-hygiene exits 1 with no added line at fault. (The script's own
+  `local`-at-top-level bug is the row above.)
 - [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
   `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
