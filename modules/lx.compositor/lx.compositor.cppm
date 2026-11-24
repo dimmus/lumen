@@ -113,9 +113,11 @@ struct config {
     /// "NAME=S[,NAME=S...]".
     const char* output_render_scales = nullptr;
     /// Virtual outputs instead of the KMS display (`--virtual-outputs`, headless and
-    /// multi-output protocol tests; no card is opened when set): "WxH[@S][,WxH[@S]...]",
-    /// laid out left to right, each with its own frame clock. Null: the display's
-    /// connectors, or one HEADLESS-1 without a display.
+    /// multi-output protocol tests; no card is opened when set, and no logind session
+    /// taken nor input seat opened — a seat-less start, unless `session_mode` says this
+    /// is the session's own display server): "WxH[@S][,WxH[@S]...]", laid out left to
+    /// right, each with its own frame clock. Null: the display's connectors, or one
+    /// HEADLESS-1 without a display.
     const char* virtual_outputs = nullptr;
     /// Started as the session's display server by systemd (`--session`, the
     /// lumen-compositor.service unit): once the socket is served, the session environment

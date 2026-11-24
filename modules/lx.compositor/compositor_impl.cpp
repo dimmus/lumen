@@ -2454,6 +2454,12 @@ void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
 }
 
 void compositor_impl::begin_input() {
+    // A seat-less start (`start` decided it: virtual outputs, not the session's display
+    // server) opens no seat at all — no logind round trips, no udev walk, no /dev/input
+    // node touched, the same state as a host with no session for the user. The keymap
+    // below is still compiled: clients are told the layout at bind time, and a compositor
+    // that never found a keyboard still has to answer it.
+    const bool seat_less = cfg.virtual_outputs && *cfg.virtual_outputs && !cfg.session_mode;
     // Device nodes are opened through logind when there is a session; without one libinput
     // falls back to opening them directly, which works for root or a member of the input
     // group and fails cleanly otherwise.
@@ -2507,7 +2513,7 @@ void compositor_impl::begin_input() {
     const bool num_lock = config_.current().keyboard.numlock;
     const bool configured = keymap.layout || keymap.variant || keymap.options || keymap.model ||
                             keymap.rules;
-    input_open_thread_ = std::thread([this, provider, keymap, num_lock, configured] {
+    input_open_thread_ = std::thread([this, provider, keymap, num_lock, configured, seat_less] {
         const auto t0 = std::chrono::steady_clock::now();
         // Compile a keymap regardless of whether devices open. Clients are told the layout
         // at bind time, and a compositor that never found a keyboard still has to answer it.
@@ -2532,13 +2538,15 @@ void compositor_impl::begin_input() {
             (void)km.set_num_lock(true);
         const auto t1 = std::chrono::steady_clock::now();
         lx::trace::timeline_instant("startup", "input keymap compiled");
-        input_opened_.emplace(
-            lx::input::input_manager::open(provider, "seat0", keymap, num_lock, &km));
-        lx::trace::timeline_instant("startup", "input seat assigned");
-        input_timing_.keymap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        input_timing_.libinput_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
-                .count();
+        if (!seat_less) {
+            input_opened_.emplace(
+                lx::input::input_manager::open(provider, "seat0", keymap, num_lock, &km));
+            lx::trace::timeline_instant("startup", "input seat assigned");
+            input_timing_.keymap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            input_timing_.libinput_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
+                    .count();
+        }
         // Not taken (no seat): the keymap the device-less compositor still answers with.
         if (km.valid())
             input_devices_.default_seat().keymap() = std::move(km);
@@ -9589,7 +9597,18 @@ lx::result<void> compositor::start() {
         probe = std::thread([&probed] { probed = gfx::device_selector::probe_devices(); });
     }
 
-    if (auto session = session::logind_session::open(); session)
+    // `--virtual-outputs` asks for a compositor that is not the seat's display server.
+    // Besides skipping the card below, such a start takes no logind session and opens no
+    // input seat: an in-process test compositor must not TakeControl the user's login (a
+    // text login's Type reads "wayland" for as long as the test lives) nor hold the
+    // seat's event nodes through it. The session's own display server (`--session`)
+    // always takes the full seat path, virtual outputs or not. Computed here — before the
+    // session open, which it decides; `begin_input` makes the same decision for the seat.
+    const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
+    const bool seat_less = want_virtual && !impl_->cfg.session_mode;
+    if (seat_less)
+        log_session.info("virtual outputs: seat-less start (no logind session, no input seat)");
+    else if (auto session = session::logind_session::open(); session)
         impl_->logind_ = std::move(session).value();
 
     // The card: LUMEN_DRM_DEVICE when set, else the display devices sysfs lists, best first
@@ -9598,7 +9617,6 @@ lx::result<void> compositor::start() {
     // TakeDevice for the node; fall back to direct open. `--virtual-outputs` asks for virtual
     // outputs instead of the display: no card is opened (headless and multi-output protocol
     // tests on a host whose display is free to take).
-    const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
     if (!want_virtual) {
         lx::result<drm::kms_device> opened =
             lx::make_error(lx::drm_err::open_failed, "no display device (/sys/class/drm)");

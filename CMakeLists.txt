@@ -1792,9 +1792,8 @@ if(LUMEN_BUILD_TESTS)
 
     # The memory-pressure cascade (AGENTS.md §5; docs/invariants.md "Memory-pressure
     # cascade"): a started compositor's own coordinator driving its own import cache and
-    # buffer lifecycle. On virtual outputs — no card, no DRM master, no KMS. Not "no seat":
-    # `start()` takes control of the user's logind session and opens the libinput seat
-    # whatever the outputs are (the test's header says the same).
+    # buffer lifecycle. On virtual outputs — no card, no DRM master, no KMS, and (the
+    # seat-less start) no logind session and no libinput seat: the fixture is hermetic.
     add_executable(test_memory_pressure_cascade tests/test_memory_pressure_cascade.cpp)
     target_link_libraries(test_memory_pressure_cascade PRIVATE lx.compositor lx.runtime lx.gfx)
     lumen_apply_module_properties(test_memory_pressure_cascade)
@@ -1802,6 +1801,17 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_memory_pressure_cascade PRIVATE tests)
     add_test(NAME test_memory_pressure_cascade COMMAND test_memory_pressure_cascade)
     set_tests_properties(test_memory_pressure_cascade PROPERTIES TIMEOUT 90)
+
+    # The seat-less virtual-outputs start: no logind session taken, no real input seat
+    # opened, the keymap still compiled. Hermetic — asserts on the compositor's own
+    # process, never on the host.
+    add_executable(test_seatless_virtual_start tests/test_seatless_virtual_start.cpp)
+    target_link_libraries(test_seatless_virtual_start PRIVATE lx.compositor lx.runtime)
+    lumen_apply_module_properties(test_seatless_virtual_start)
+    lumen_link_platform(test_seatless_virtual_start)
+    target_include_directories(test_seatless_virtual_start PRIVATE tests)
+    add_test(NAME test_seatless_virtual_start COMMAND test_seatless_virtual_start)
+    set_tests_properties(test_seatless_virtual_start PROPERTIES TIMEOUT 90)
 
     # A sanitizer report must fail the test, not just print to stderr.
     set(LUMEN_TSAN_OPTS "halt_on_error=1")
