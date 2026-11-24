@@ -128,19 +128,40 @@ current when an item closes.
   (launcher open/close in the compositor log) — not a capture defect; see
   `.zcode/memories/lumen-settings-key-capture-seat.md` and the open row below.
 - [ ] **Super tap grab fires mid-chord (compositor tap-arming corner)** (2026-11-17, found
-  by the settings-key-capture seat run; low; pre-existing): during an injected
-  Super+Shift+y chord the shell's Super tap grab armed and fired anyway — the launcher
-  overlay layer mapped and stole keyboard focus ~20 ms after the meta press — although
-  `observe_tap` resets `tap_owner_` on every press
+  by the settings-key-capture seat run; low; pre-existing; **2026-11-24: NOT reproduced at
+  any cadence — most plausibly never a tap defect; see below before spending more on it**):
+  during an injected Super+Shift+y chord the shell's Super tap grab armed and fired anyway
+  — the launcher overlay layer mapped and stole keyboard focus ~20 ms after the meta press
+  — although `observe_tap` resets `tap_owner_` on every press
   (`modules/lx.compositor/keybindings.cppm:420-423`). Evidence:
   `evidence/2026-11-17-shortcut-capture/` (inj-s2.jsonl t4-chord: shift press 20 ms after
   meta; launcher-tap-events.txt: layer map surface=6 `lumen-launcher` + focus steal) — see
   `.zcode/memories/lumen-settings-key-capture-seat.md`. To a capture/smoke run it looks
   exactly like "capture silently records nothing" (stale client modifier state until the
-  refocus re-sends the keymap). Next: reproduce under real-typing cadence, then decide
-  whether the arming path can observe coalesced/reordered press pairs. (2026-11-23: the
-  evidence directory is not in the main checkout — it lives in the worktree
+  refocus re-sends the keymap). (2026-11-23: the evidence directory is not in the main
+  checkout — it lives in the worktree
   `../lumen-wt/settings-key-capture-close-out/evidence/2026-11-17-shortcut-capture/`.)
+  **2026-11-24 repro attempt (task super-tap-mid-chord, seat, one class-smoke ticket):
+  NOT_REPRODUCED.** 45 injected Super+Shift+y chords under a µs timeline (compositor and
+  shell lines stamped on the injector's CLOCK_MONOTONIC; every event's kernel frame
+  verified, 0 foreign input): cadence A = the original 20 ms spacing, 20/20 no fire;
+  cadence B = human-like 80–200 ms gaps, 100–300 ms holds, both roll and both release
+  orders plus meta-first release with y still down, 25/25 no fire; control = lone Super
+  taps, 6/6 fired, each action 161–182 µs after the *release of a Super pressed alone*
+  (the only shape that ever fires — matching `observe_tap` and its unit tests). No
+  `grab activated` line at either session: the configured `"Super"` tap binding shadows
+  the shell's tap grab, and the 2026-11-17 config had that binding too. The original
+  observation is explained by two by-design mechanisms its untimestamped logs cannot
+  separate from a mid-chord fire: the session's own lone-meta tap (`inj-s2.jsonl:137-138`,
+  t11-meta — opens the launcher by design) and, after the capture test saved it,
+  `"Super+Shift+y" = "shell.launcher"` matching every later chord at `match_binding`
+  (compositor_impl.cpp:1788) — logging the same action line as a tap fire. The "~20 ms
+  after the meta press" claim has no timestamped artifact behind it. The key path is
+  unchanged since that tree (only logging refactors 96e336a/8e925e5), so this was not
+  fixed in between. Evidence: `evidence/2026-11-24-super-tap-mid-chord/` in the
+  super-tap-mid-chord worktree, mirrored to `/home/dimmus/lumen/evidence/2026-11-24-super-tap-mid-chord/`
+  (REPRO.md, VERDICT.md, run/TIMELINE.md + summary.json + raw logs). Left unticked:
+  nothing was fixed; owner call whether to close as misattributed.
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
   schema-side rows in `lumen-settings` waiting on their own compositor feature (rule store
   behind the inert `zlm_window_rules_v1`; `[[input.device]]` override plumbing), not on the app.
