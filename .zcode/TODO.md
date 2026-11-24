@@ -123,7 +123,7 @@ current when an item closes.
   (text_input.cppm:70-76) names only reject / drop_newest / warn_and_drop. Decide:
   honour drop_oldest or narrow the contract; the test prints the departure and pins
   only "no growth".
-- [ ] **text_layout's line cap ignores overflow_action::reject** (found 2026-11-24 with
+- [x] **text_layout's line cap ignores overflow_action::reject** (found 2026-11-24 with
   test_overflow_caps; pre-existing since f97a813; medium): under `reject` the pass
   succeeds with the lines that fit and `truncated()` set, where the partition's contract
   (modules/lx.text/lines.cppm:55-57) says reject fails the pass with an empty layout —
@@ -134,12 +134,19 @@ current when an item closes.
   text-input-drop-oldest: both wrap-pass sites return the pass failure under reject,
   refresh() empties the layout on a refused pass, any wrap-input change retries it,
   truncated() stays false on a refuse; tests pin all five caps on both wrap paths incl.
-  a face-independent estimate leg; ctest 141/141 at HEAD) — gate **BLOCKED** on the
+  a face-independent estimate leg; ctest 141/141 at HEAD) — gate was **BLOCKED** on the
   required bench A/B: decisive Vulkan benched only at intermediate 4a77de4 and
-  single-run-vs-stored-baseline is below the interleaved discipline. Collect the
-  interleaved ≥3-round vulkan A/B (base 58aa184 vs cb4dd32 builds), re-gate, land,
-  then tick. Line numbers above are base-tree; HEAD: contract :55-59, reject returns
-  :1268/:1300.
+  single-run-vs-stored-baseline is below the interleaved discipline.  **Landed
+  2026-11-25** (merge 8d7eb41, non-ff, pushed): the unblock A/B collected — 6
+  interleaved hasvk vulkan runs (3× base 58aa184, 3× cb4dd32, pin 3, setarch -R,
+  quiet-CPU hold + warm-up verified per run, six distinct bench tickets, seat quiet
+  before/after); no stage regression survives adjudication (S4 update +26 % is
+  0.091 µs — under the bench's own 1 µs sub-microsecond floor, the candidate reads
+  where the stored baseline itself records that stage (0.451 µs) and yesterday's
+  intermediate tree (0.409–0.433 µs) while the day's base side (0.341–0.373 µs) is
+  the outlier era; S4 update is bench-side s4_before_frame, no lx.text on its path);
+  merged tree re-gated 143/143 -LE bench (build/merge-gate). Line numbers above are
+  base-tree; HEAD: contract :55-59, reject returns :1268/:1300.
 - [ ] **container_node::add never warns under warn_and_drop** (found 2026-11-24 with
   test_overflow_caps; pre-existing since 1a44c01; low): modules/lx.scene/lx.scene.cppm:547-558
   has no log call on any path, but the enum defines warn_and_drop as "Log warn, then
