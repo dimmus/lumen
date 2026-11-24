@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (55 records, generated 2026-11-24)
+# Memory index by module (56 records, generated 2026-11-24)
 
 ## (general)
 
@@ -136,6 +136,7 @@
 ## lx.ui
 
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
+- **text input drop oldest** (2026-11-24) — drop_oldest honoured (4253aaf+58aa184): evict front at char boundary; review caught suffix-before-prefix memmove text corruption shipped green, fixed+pinned; 141/141, goldens 5/5; noise 2/2/0/1  [topics: text-input, overflow, drop-oldest, utf8, memmove, review-noise]
 - **settings key capture seat** (2026-11-17) — ADR-013 key capture proven live (Super+Shift+y, splice gen 57→58, reserved Super+Escape refuses); trap: injected Super-chords trip the tap grab mid-chord — open TODO row  [topics: bindings, capture, adr-013]
 - **gpu ui engine plan** (2026-10-24) — GPUI-style primitive renderer plan and phase history (ADR-010: PRs #31–#54, #74–#77); Phase 5 deleted the retained-widget API; shell/portal/lx.app all on lx.ui.host  [topics: adr-010, ui-engine]
 
@@ -181,6 +182,7 @@
 - **seatless virtual start closeout** (2026-11-24) — Closeout: gate numbers (142/142, smokes PASS, vulkan A/B rounds), dead-assert forensics + getpeername proof, review findings detail, honest gaps  [topics: seat-less, bench, seat-broker, gate]
 - **seatless virtual start** (2026-11-24) — Seat-less start() for virtual outputs (83f99ac..6d8d5e8): no logind session, no input seat, keymap kept; red artifact-backed; ctest 142/142, smokes PASS, vulkan A/B clean; noise 3/3/0/1  [topics: seat-less, virtual-outputs, logind, libinput, hermetic-tests, seat-broker]
 - **settings no writable banner** (2026-11-24) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141  [topics: banner, seat-repro, wayland-debug, injection]
+- **text input drop oldest** (2026-11-24) — drop_oldest honoured (4253aaf+58aa184): evict front at char boundary; review caught suffix-before-prefix memmove text corruption shipped green, fixed+pinned; 141/141, goldens 5/5; noise 2/2/0/1  [topics: text-input, overflow, drop-oldest, utf8, memmove, review-noise]
 - **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **unit pair green** (2026-11-14) — Tolerated {ui_gallery, test_task_model} pair retired with zero production code: stale expectations from a65d06b + goldens predating the chevron fix; cross-host claim retracted; 133/133  [topics: goldens, known-red; LONG (155 lines — split candidate)]
 - **toplevel drag drag smoke** (2026-11-13) — lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook  [topics: drag-smoke, injection]
