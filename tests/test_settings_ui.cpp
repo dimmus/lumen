@@ -457,6 +457,25 @@ LUMEN_TEST(settings_banner_is_raised_only_by_an_edit_that_did_not_reach_the_file
         LUMEN_CHECK(s.state() == settings::session::save_state::written);
         LUMEN_CHECK(!banner_shown(h));
         LUMEN_CHECK(file_text() != original);
+        // (f') the write-then-fail case: one write has succeeded (`written` just above),
+        // the directory is read-only again — the next edit that cannot reach the file
+        // applies to the session and raises the banner from `written` too, not only
+        // from `untouched`.
+        const std::string written_text = file_text();
+        LUMEN_CHECK(::chmod(rdir, 0500) == 0);
+        s.set_bool(row, !value);
+        LUMEN_CHECK(*static_cast<bool*>(f) == !value);
+        LUMEN_CHECK(s.state() == settings::session::save_state::memory_only);
+        LUMEN_CHECK(banner_shown(h));
+        LUMEN_CHECK(switch_is_on() == !value);
+        LUMEN_CHECK(file_text() == written_text);
+        // (g') writable again: the same edit writes and the banner goes.
+        LUMEN_CHECK(::chmod(rdir, 0700) == 0);
+        s.set_bool(row, !value);
+        LUMEN_CHECK(*static_cast<bool*>(f) == !value);
+        LUMEN_CHECK(s.state() == settings::session::save_state::written);
+        LUMEN_CHECK(!banner_shown(h));
+        LUMEN_CHECK(file_text() != written_text);
         ::unsetenv("LUMEN_CONFIG");
         std::filesystem::remove_all(rdir);
     }

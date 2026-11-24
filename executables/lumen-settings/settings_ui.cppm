@@ -320,9 +320,11 @@ public:
     [[nodiscard]] unsigned open_menu() const { return open_menu_; }
 
     /// One repaint after an edit that did not reach the file (the status bar's note):
-    /// the one place `untouched` becomes `memory_only`, so only an edit's failure tail
-    /// calls it. Navigation and menus re-describe through `refresh()` — through here
-    /// they raised "there is no writable config.toml" over a file that was writable.
+    /// the one place the state escalates to `memory_only` — from `untouched` and from
+    /// `written` alike (one successful write must not silence a later unwritable edit),
+    /// so only an edit's failure tail calls it. Navigation and menus re-describe
+    /// through `refresh()` — through here they raised "there is no writable
+    /// config.toml" over a file that was writable.
     void repaint();
     /// A re-describe after an edit that did (the file is the truth now).
     void written() {
@@ -1256,7 +1258,7 @@ bool session::write_key(unsigned row, const lx::config::edit_value& v) {
 }
 
 void session::repaint() {
-    if (save_ == save_state::untouched)
+    if (save_ != save_state::memory_only)
         save_ = save_state::memory_only;
     refresh();
 }
