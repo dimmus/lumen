@@ -1128,6 +1128,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_runtime_psi PRIVATE tests)
     add_test(NAME test_runtime_psi COMMAND test_runtime_psi)
 
+    # The process-wide source table (event_loop::source_capacity()) outliving any one
+    # event_loop: a destroyed loop must return its slots, or a later loop in the same
+    # process inherits dead sources and a full table whose add_source silently drops.
+    add_executable(test_event_loop tests/test_event_loop.cpp)
+    target_link_libraries(test_event_loop PRIVATE lx.runtime)
+    lumen_apply_module_properties(test_event_loop)
+    target_include_directories(test_event_loop PRIVATE tests)
+    add_test(NAME test_event_loop COMMAND test_event_loop)
+
     add_executable(test_input_keymap tests/test_input_keymap.cpp)
     target_link_libraries(test_input_keymap PRIVATE lx.input)
     lumen_apply_module_properties(test_input_keymap)

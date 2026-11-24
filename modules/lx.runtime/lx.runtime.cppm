@@ -288,6 +288,10 @@ static constexpr unsigned k_max_event_sources = 32;
 
 struct lx_runtime_loop_state {
     lx::runtime::event_source* sources[k_max_event_sources]{};
+    // Which loop added each source. The table is process-wide and outlives loops — the
+    // compositor creates one per start() in one process — so a dying loop reclaims
+    // exactly its own slots, never another live loop's.
+    lx::runtime::event_loop* owners[k_max_event_sources]{};
     unsigned source_count = 0;
 };
 
@@ -333,6 +337,22 @@ lx::runtime::event_loop::event_loop() {
 lx::runtime::event_loop::~event_loop() {
     executor::global().unregister_strand(affinity::ui);
     ui_strand_.set_waker(nullptr, nullptr);
+    // Return this loop's slots in the process-wide table, before its descriptors close.
+    // Without this a destroyed loop's sources stayed: dispatch on a later loop walked
+    // them, and — the table being fixed-size — that loop's add_source silently dropped
+    // once it filled (the "no event source slot for theme completion" restart failure).
+    // Slots are matched by owner, never by dereferencing the source: an owner that
+    // destroyed a source without removing it leaves a dangling pointer in the table, and
+    // the epoll below closes regardless, so no EPOLL_CTL_DEL is wanted here.
+    auto& state = loop_state();
+    for (unsigned i = 0; i < state.source_count;) {
+        if (state.owners[i] == this) {
+            state.sources[i] = state.sources[--state.source_count];
+            state.owners[i] = state.owners[state.source_count];
+        } else {
+            ++i;
+        }
+    }
     for (int* fd : {&timer_fd_, &wake_fd_, &epoll_fd_}) {
         if (*fd >= 0)
             ::close(*fd);
@@ -513,6 +533,7 @@ void lx::runtime::event_loop::add_source(event_source* source) {
     auto& state = loop_state();
     if (!source || state.source_count >= k_max_event_sources)
         return;
+    state.owners[state.source_count] = this;
     state.sources[state.source_count++] = source;
     if (const int fd = source->poll_fd(); fd >= 0 && epoll_fd_ >= 0) {
         epoll_event ev{};
@@ -529,6 +550,7 @@ void lx::runtime::event_loop::remove_source(event_source* source) {
             if (const int fd = source->poll_fd(); fd >= 0 && epoll_fd_ >= 0)
                 (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
             state.sources[i] = state.sources[--state.source_count];
+            state.owners[i] = state.owners[state.source_count];
             return;
         }
     }
