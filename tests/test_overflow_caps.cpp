@@ -17,7 +17,8 @@
 // a site whose code departs from its own documented contract, and one whose action the
 // partition never names. Nothing here is bent to fit them. (A third — text_input's
 // drop_oldest refusing like reject — was fixed to the enum's semantics; its case now pins
-// all four actions.)
+// all four actions. A fourth — the container's warn_and_drop dropping the newest child
+// without its promised warning — was fixed the same way; its case pins the warning too.)
 //
 // The last case also prints every `overflow_action::` site under modules/ that this test
 // does not drive, by name, with what it would take, and holds that report to the tree: a
@@ -327,12 +328,17 @@ LUMEN_TEST(overflow_container_children_each_policy) {
                where(action, "the container must fill to its capacity"));
 
         unsigned taken = 0;
-        std::size_t warns = 0;
         {
             log_capture log;
             for (unsigned i = cap; i < cap + k_further; ++i)
                 taken += parent.add(&kids[i]) ? 1u : 0u;
-            warns = log.warns("");
+            // Once per overflow, not once per push (the draw_list idiom,
+            // snapshot_buffer.cppm:813-817): the enum's warn_and_drop is "Log warn, then
+            // drop_newest" (lx.runtime/memory.cppm:43).
+            expect(log.warns("container child cap reached") ==
+                       (action == overflow_action::warn_and_drop ? 1u : 0u),
+                   where(action, "the \"container child cap reached\" warning must come exactly "
+                                 "once under warn_and_drop and never otherwise"));
         }
         expect(parent.child_count() == cap,
                where(action, "the child count must stay at the capacity"));
@@ -343,12 +349,6 @@ LUMEN_TEST(overflow_container_children_each_policy) {
                where(action, "the newest child must be present under drop_oldest and only then"));
         expect(parent.child_at(0) == (evicts ? &kids[k_further] : &kids[0]),
                where(action, "the oldest child must be gone under drop_oldest and only then"));
-        if (action == overflow_action::warn_and_drop && warns == 0)
-            observed().push_back(
-                "container_node::add under warn_and_drop refuses and logs nothing: the enum's "
-                "warn_and_drop is \"Log warn, then drop_newest\" (lx.runtime/memory.cppm:43; "
-                "lx.scene/lx.scene.cppm:546-559). Nothing documents the container's policy, and "
-                "set_child_overflow_policy has no caller under modules/ or executables/");
 
         // (iii): the same full container, the policy changed, the same push.
         if (evicts) {
@@ -365,6 +365,26 @@ LUMEN_TEST(overflow_container_children_each_policy) {
                        parent.child_at(0) == &kids[1],
                    "the push a container takes after the switch must evict its oldest child");
         }
+    }
+
+    // The warning marks an overflow episode, not a container's life: `remove` making room
+    // re-arms it, as `draw_list`'s clear_lists re-arms its caps once nothing was dropped.
+    {
+        lx::scene::container_node parent;
+        parent.set_child_overflow_policy(overflow_action::warn_and_drop);
+        for (unsigned i = 0; i < cap; ++i)
+            (void)parent.add(&kids[i]);
+        {
+            log_capture log;
+            (void)parent.add(&kids[cap]); // the first overflow: its episode's one warning
+            expect(parent.remove(&kids[0]), "a child must unlink from a full container");
+            expect(parent.add(&kids[cap]), "an add must be taken once a remove made room");
+            (void)parent.add(&kids[cap + 1]); // full again: a new episode's one warning
+            expect(log.warns("container child cap reached") == 2,
+                   "a container that drained and filled again must warn per episode — the "
+                   "warning re-arms when a remove makes room");
+        }
+        expect(parent.child_count() == cap, "the container must end full, as it started");
     }
     drove("lx.scene/lx.scene.cppm:546-559 container_node::add (children, all four policies)");
 }
