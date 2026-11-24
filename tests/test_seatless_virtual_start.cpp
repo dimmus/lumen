@@ -29,6 +29,8 @@
 #include "lumen_test.hpp"
 
 #include <dirent.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 import std;
@@ -75,42 +77,61 @@ std::string open_input_fd() {
     return "";
 }
 
-/// True when this process holds a unix-socket fd whose address is the D-Bus system bus
-/// (`/proc/net/unix` names each server socket's inode; an fd's readlink carries the same
-/// inode as `socket:[N]`). That connection exists only where something talked to logind.
+/// True when this process holds an established connection whose peer is the D-Bus system
+/// bus. /proc/net/unix cannot show that: only a *bound* socket's row carries its path —
+/// a connected client's row has none — but the kernel names the peer to the client
+/// itself: getpeername() on the client returns the address the server bound
+/// (/run/dbus/system_bus_socket). That connection exists only where something talked to
+/// logind.
 bool holds_system_bus() {
-    // inode -> socket path, for the sockets that have one.
-    std::unordered_map<unsigned long long, std::string> named;
-    if (std::ifstream unix_table{"/proc/net/unix"}; unix_table) {
-        std::string line;
-        std::getline(unix_table, line); // header
-        while (std::getline(unix_table, line)) {
-            std::istringstream fields{line};
-            std::string skipped, inode, path;
-            for (int i = 0; i < 5; ++i)
-                fields >> skipped;
-            if (!(fields >> inode) || !(fields >> path))
-                continue;
-            unsigned long long n = 0;
-            std::from_chars(inode.data(), inode.data() + inode.size(), n);
-            if (n)
-                named[n] = path;
+    // The sockets this process holds (`socket:[N]` in /proc/self/fd); only they can be
+    // connected. Other fds — the DIR this loop reads among them, its own readlink says
+    // "/proc/self/fd" — are skipped by the prefix. fds that vanish between the readdir
+    // and the readlink are skipped, as in fd_targets().
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (!dir)
+        return false;
+    bool holds = false;
+    while (const dirent* entry = ::readdir(dir)) {
+        if (entry->d_name[0] == '.')
+            continue;
+        char link[64];
+        const char prefix[] = "/proc/self/fd/";
+        if (std::size(link) <= std::size(prefix) + std::strlen(entry->d_name))
+            continue;
+        *std::format_to_n(link, sizeof(link) - 1, "{}{}", prefix, entry->d_name).out = '\0';
+        char target[96];
+        const ssize_t linked = ::readlink(link, target, sizeof(target) - 1);
+        if (linked <= 0)
+            continue;
+        if (!std::string_view{target, static_cast<std::size_t>(linked)}.starts_with("socket:["))
+            continue;
+        int fd = 0;
+        const char* digits = entry->d_name;
+        const char* end = digits + std::strlen(digits);
+        if (auto [ptr, ec] = std::from_chars(digits, end, fd);
+            ec != std::errc{} || ptr != end || fd < 0)
+            continue;
+        sockaddr_un peer{};
+        socklen_t len = sizeof(peer);
+        if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) != 0)
+            continue; // not a socket we are connected through
+        if (peer.sun_family != AF_UNIX)
+            continue; // an inet socket's peer is not the bus
+        // The path may fill sun_path with no room for its NUL; make it a string.
+        char path[sizeof(peer.sun_path) + 1]{};
+        const std::size_t path_len =
+            len > sizeof(peer.sun_family)
+                ? std::min<std::size_t>(len - sizeof(peer.sun_family), sizeof(peer.sun_path))
+                : 0;
+        std::memcpy(path, peer.sun_path, path_len);
+        if (std::string_view{path}.find("system_bus_socket") != std::string_view::npos) {
+            holds = true;
+            break;
         }
     }
-    for (const std::string& target : fd_targets()) {
-        if (!target.starts_with("socket:[") || !target.ends_with("]"))
-            continue;
-        unsigned long long inode = 0;
-        const char* digits = target.data() + 8;
-        const char* end = target.data() + target.size() - 1;
-        if (auto [ptr, ec] = std::from_chars(digits, end, inode);
-            ec != std::errc{} || ptr != end || !inode)
-            continue;
-        if (const auto it = named.find(inode);
-            it != named.end() && it->second.find("system_bus_socket") != std::string::npos)
-            return true;
-    }
-    return false;
+    ::closedir(dir);
+    return holds;
 }
 
 /// The compositor every in-process fixture here is shaped like: one virtual output, the GL
