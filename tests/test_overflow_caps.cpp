@@ -844,15 +844,15 @@ LUMEN_TEST(overflow_glyph_cache_each_policy) {
     drove("lx.text/raster.cppm:413-426 glyph_cache (all four policies)");
 }
 
-// `text_layout` (lines.cppm:790-797, 834-840, 933-938, 1246-1248, 1274-1278): the caps of
-// `text_layout_limits`. The partition's contract (lines.cppm:51-57) names two outcomes for
+// `text_layout` (lines.cppm:782-802, 852-858, 951-955, 1264-1271, 1296-1304): the caps of
+// `text_layout_limits`. The partition's contract (lines.cppm:55-59) names two outcomes for
 // every cap: `reject` makes the pass fail with an empty layout; every other action keeps what
 // fits and sets `truncated()`. All five caps keep it — the line cap on both of the wrap pass's
 // paths, the shaped one and the estimate one a 0 pt font (no face resolves) takes.
 LUMEN_TEST(overflow_text_layout_each_policy) {
     constexpr const char* k_five_lines = "one\ntwo\nthree\nfour\nfive";
 
-    // The line cap with no face (the wrap pass's estimate path, lines.cppm:1246-1248): a 0 pt
+    // The line cap with no face (the wrap pass's estimate path, lines.cppm:1264-1271): a 0 pt
     // font resolves none, so the same five paragraphs are laid out as estimates. This leg
     // needs no face by construction, so it runs before the probe's skip can end the case —
     // on a host without fonts it is the line cap's only coverage.
@@ -890,7 +890,8 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
         probe.set_font({});
         probe.set_text("one");
         if (skip_without_face(probe.update().ok() && probe.has_faces(),
-                              "lx.text/lines.cppm:790-797,834-840,933-938,1246-1278 text_layout"))
+                              "lx.text/lines.cppm:782-802,852-858,951-955,1296-1304 text_layout "
+                              "(the face-needing caps)"))
             return;
     }
     for (const overflow_action action : k_actions) {
@@ -927,7 +928,7 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                        where(action, "what fits of the text must be kept and the layout flagged"));
         }
 
-        // The glyph cap and the run cap (one check, lines.cppm:834-840): "one" and "two" fit.
+        // The glyph cap and the run cap (one check, lines.cppm:852-858): "one" and "two" fit.
         for (const unsigned kind : {0u, 1u}) {
             lx::text::text_layout layout;
             lx::text::text_layout_limits lim{};
@@ -953,7 +954,7 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                        where(action, "what fits must be kept and the layout flagged"));
         }
 
-        // The line cap (the wrap pass's shaped path, lines.cppm:1274-1278).
+        // The line cap (the wrap pass's shaped path, lines.cppm:1296-1304).
         {
             lx::text::text_layout layout;
             lx::text::text_layout_limits lim{};
@@ -984,7 +985,7 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                        where(action, "what fits must be kept and the layout flagged"));
         }
     }
-    drove("lx.text/lines.cppm:790-797,834-840,933-938,1246-1248,1274-1278 text_layout (byte, "
+    drove("lx.text/lines.cppm:782-802,852-858,951-955,1264-1271,1296-1304 text_layout (byte, "
           "glyph, run and line caps, all four policies, the line cap on both wrap-pass paths)");
 }
 
