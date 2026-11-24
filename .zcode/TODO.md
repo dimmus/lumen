@@ -129,7 +129,17 @@ current when an item closes.
   (modules/lx.text/lines.cppm:55-57) says reject fails the pass with an empty layout —
   the wrap pass calls `over_cap`, which only warns (:1246-1248, :1274-1278), while the
   byte/glyph/run caps do honour reject (:835-840, :933-938). Also named by the
-  "Invariant GAPs" overflow-caps marker.
+  "Invariant GAPs" overflow-caps marker.  Fixed on branch
+  `zcode/task/text-layout-line-cap-reject` (2026-11-25; 5 commits 4a77de4..cb4dd32 off
+  text-input-drop-oldest: both wrap-pass sites return the pass failure under reject,
+  refresh() empties the layout on a refused pass, any wrap-input change retries it,
+  truncated() stays false on a refuse; tests pin all five caps on both wrap paths incl.
+  a face-independent estimate leg; ctest 141/141 at HEAD) — gate **BLOCKED** on the
+  required bench A/B: decisive Vulkan benched only at intermediate 4a77de4 and
+  single-run-vs-stored-baseline is below the interleaved discipline. Collect the
+  interleaved ≥3-round vulkan A/B (base 58aa184 vs cb4dd32 builds), re-gate, land,
+  then tick. Line numbers above are base-tree; HEAD: contract :55-59, reject returns
+  :1268/:1300.
 - [ ] **container_node::add never warns under warn_and_drop** (found 2026-11-24 with
   test_overflow_caps; pre-existing since 1a44c01; low): modules/lx.scene/lx.scene.cppm:547-558
   has no log call on any path, but the enum defines warn_and_drop as "Log warn, then

@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (56 records, generated 2026-11-24)
+# Memory index by module (57 records, generated 2026-11-25)
 
 ## (general)
 
@@ -126,6 +126,7 @@
 
 ## lx.text
 
+- **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32): both wrap-pass sites refuse, refresh empties the layout, wrap-input retry; tests pin both paths; BLOCKED on final-tree vulkan A/B; noise 5/5/0+1  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **shell first paint wip** (2026-10-25) — Shell first-paint work: font-match persistence merged as PR #44 (2026-10-25);
 
@@ -177,6 +178,7 @@
 
 ## tests
 
+- **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32): both wrap-pass sites refuse, refresh empties the layout, wrap-input retry; tests pin both paths; BLOCKED on final-tree vulkan A/B; noise 5/5/0+1  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **seatless virtual start closeout** (2026-11-24) — Closeout: gate numbers (142/142, smokes PASS, vulkan A/B rounds), dead-assert forensics + getpeername proof, review findings detail, honest gaps  [topics: seat-less, bench, seat-broker, gate]
