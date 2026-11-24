@@ -102,3 +102,7 @@ never triggered:
   (start from the task tree, hold open, kill by exact pid) is again the deciding factor —
   same family as the Nov-15/16 invalid runs; the caps side is
   [[lumen-uinput-key-bitmap-format]].
+- **Follow-up 2026-11-24:** the mid-chord fire did NOT reproduce — 45 injected chords at
+  two cadences under a µs timeline, 0 fires; the original logs are explained by the
+  session's own lone-meta tap + the saved chord binding (both by design). See
+  [[lumen-super-tap-mid-chord-repro]]; the TODO row is amended, left unticked.

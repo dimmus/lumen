@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (50 records, generated 2026-11-24)
+# Memory index by module (51 records, generated 2026-11-24)
 
 ## (general)
 
@@ -54,6 +54,7 @@
 ## lx.compositor
 
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
+- **super tap mid chord repro** (2026-11-24) — Super tap mid-chord NOT_REPRODUCED (notebook 2026-11-24): 45 chords, 0 fires, control 6/6 at 161-182 us; 2026-11-17 sighting = lone-meta tap + saved chord binding; no product change; noise 2/2/0/0.  [topics: keybindings, tap, injection, seat, repro]
 - **compositor theme env export** (2026-11-16) — Compositor always exports resolved LUMEN_THEME and re-exports on reload (env_reexports owe/drain/drop); seat debt closed 2026-11-17 (177/0/0); SIGSEGV split to its own TODO row  [topics: theme, environment, systemd; LONG (177 lines — split candidate)]
 - **memory pressure green** (2026-11-15) — Spurious critical-pressure WARN fixed by fixing the measurement: staging judges bytes_in_flight (backlog), not bytes_mapped (rounding read 64 MiB as 100%); thresholds unchanged; final 177/0/0  [topics: memory, pressure; LONG (123 lines — split candidate)]
 - **vulkan capture green** (2026-11-15) — Vulkan capture parity: SIGUSR1 read-back 3.33 ms, window capture + capture-dmabuf in lx.gfx behind void*; Z7 root-caused to fence-fd reuse; app-smoke 176/0/1 with all backend rows PASS  [topics: vulkan, capture]
@@ -153,6 +154,7 @@
 
 ## scripts
 
+- **super tap mid chord repro** (2026-11-24) — Super tap mid-chord NOT_REPRODUCED (notebook 2026-11-24): 45 chords, 0 fires, control 6/6 at 161-182 us; 2026-11-17 sighting = lone-meta tap + saved chord binding; no product change; noise 2/2/0/0.  [topics: keybindings, tap, injection, seat, repro]
 - **smoke harness broker fixture** (2026-11-23) — smoke_harness perfetto fixture carries the seat broker hermetically (wrapper→real broker --no-preflight, private lock dir); 49/13→82/0; mutations flip it; review noise 6/6/0, 2 preexisting  [topics: smoke, seat-broker, hermeticity]
 - **todo fixes round** (2026-11-23) — Workflows unloadable 4 days (scope: key) fixed; evidence/ untracked; 8 TODO rows reconciled. Landing declined on untracked .mimosa/, then BYPASSED by a spool-parent ff; by-hand a89cbad 141/141.  [topics: landing, memory-spool, workflows, amend, todo-reconciliation]
 - **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
