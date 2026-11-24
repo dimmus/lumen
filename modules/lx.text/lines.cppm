@@ -779,8 +779,15 @@ lx::result<void> lx::text::text_layout::refresh() const {
     if (wrap_dirty_) {
         wrap_dirty_ = false;
         if (error_.domain == lx::error_domain::none)
-            if (const lx::result<void> r = wrap_pass(); !r)
+            if (const lx::result<void> r = wrap_pass(); !r) {
                 error_ = r.get_error();
+                // A failed pass leaves the layout empty (as a failed shape pass does above):
+                // the lines the wrap pass had built before its cap refused are dropped, not
+                // kept — `reject` is all or nothing.
+                lines_.clear();
+                line_runs_.clear();
+                width_ = height_ = 0;
+            }
     }
     if (error_.domain != lx::error_domain::none)
         return error_;
@@ -1245,6 +1252,8 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
         for (const paragraph& p : paragraphs_) {
             if (lines_.size() >= limits_.max_lines) {
                 lines_cut_ = over_cap(true);
+                if (limits_.overflow == lx::runtime::overflow_action::reject)
+                    return lx::invalid_argument("text_layout: line cap reached");
                 break;
             }
             std::int32_t w = 0;
@@ -1273,6 +1282,8 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
             do {
                 if (lines_.size() >= limits_.max_lines) {
                     lines_cut_ = over_cap(true);
+                    if (limits_.overflow == lx::runtime::overflow_action::reject)
+                        return lx::invalid_argument("text_layout: line cap reached");
                     stop = true;
                     break;
                 }

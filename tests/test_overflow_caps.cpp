@@ -847,8 +847,8 @@ LUMEN_TEST(overflow_glyph_cache_each_policy) {
 // `text_layout` (lines.cppm:790-797, 834-840, 933-938, 1246-1248, 1274-1278): the caps of
 // `text_layout_limits`. The partition's contract (lines.cppm:51-57) names two outcomes for
 // every cap: `reject` makes the pass fail with an empty layout; every other action keeps what
-// fits and sets `truncated()`. The byte, glyph and run caps keep it. The line cap does not
-// under `reject` — driven for "no growth" only, and reported by the last case.
+// fits and sets `truncated()`. All five caps keep it — the line cap on both of the wrap pass's
+// paths, the shaped one and the estimate one a 0 pt font (no face resolves) takes.
 LUMEN_TEST(overflow_text_layout_each_policy) {
     {
         // The layout needs a face: one shaped line says there is one.
@@ -920,7 +920,7 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                        where(action, "what fits must be kept and the layout flagged"));
         }
 
-        // The line cap (the wrap pass).
+        // The line cap (the wrap pass's shaped path, lines.cppm:1274-1278).
         {
             lx::text::text_layout layout;
             lx::text::text_layout_limits lim{};
@@ -935,25 +935,40 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                 updated = layout.update();
                 expect(warns_like(log), warns_once());
             }
-            // (i), whatever the action.
-            expect(layout.lines().size() <= lim.max_lines,
-                   where(action, "the line count must stay at the capacity"));
-            if (!refuses)
+            if (refuses)
+                expect(!updated && layout.lines().empty(),
+                       where(action, "the pass must fail and leave the layout empty"));
+            else
                 expect(updated.ok() && layout.lines().size() == lim.max_lines && layout.truncated(),
                        where(action, "what fits must be kept and the layout flagged"));
-            else if (updated.ok() || !layout.lines().empty())
-                observed().push_back(std::format(
-                    "text_layout's line cap under reject does not fail the pass: update ok={}, "
-                    "{} line(s) of 5, truncated={}. The wrap pass only calls over_cap, which "
-                    "warns (lx.text/lines.cppm:1246-1248, 1274-1278); the partition's contract "
-                    "says a cap under reject makes the pass fail with an empty layout "
-                    "(lines.cppm:55-56). Both date from f97a813",
-                    updated.ok() ? 1 : 0, layout.lines().size(), layout.truncated() ? 1 : 0));
+        }
+
+        // The line cap again with no face (the wrap pass's estimate path, lines.cppm:1246-1248):
+        // a 0 pt font resolves none, so the same five paragraphs are laid out as estimates.
+        {
+            lx::text::text_layout layout;
+            lx::text::text_layout_limits lim{};
+            lim.max_lines = 2;
+            lim.overflow = action;
+            layout.set_limits(lim);
+            layout.set_font({.size_pt = 0.f});
+            layout.set_text(k_five_lines);
+            lx::result<void> updated;
+            {
+                log_capture log;
+                updated = layout.update();
+                expect(warns_like(log), warns_once());
+            }
+            if (refuses)
+                expect(!updated && layout.lines().empty(),
+                       where(action, "the pass must fail and leave the layout empty"));
+            else
+                expect(updated.ok() && layout.lines().size() == lim.max_lines && layout.truncated(),
+                       where(action, "what fits must be kept and the layout flagged"));
         }
     }
-    drove("lx.text/lines.cppm:790-797,834-840,933-938 text_layout (byte, glyph and run caps, "
-          "all four policies; the line cap under drop_newest, drop_oldest and warn_and_drop, "
-          "and under reject for no growth only)");
+    drove("lx.text/lines.cppm:790-797,834-840,933-938,1246-1248,1274-1278 text_layout (byte, "
+          "glyph, run and line caps, all four policies, the line cap on both wrap-pass paths)");
 }
 
 // `itemizer` (itemize.cppm:682-694): a paragraph with more runs than `max_runs`. The
