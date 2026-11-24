@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (58 records, generated 2026-11-25)
+# Memory index by module (59 records, generated 2026-11-25)
 
 ## (general)
 
@@ -104,6 +104,7 @@
 
 ## lx.scene
 
+- **scene container warn and drop** (2026-11-25) — The warn warn_and_drop promises, landed 2026-11-25 (e8b2500): warn-once per episode, remove() re-arms; pinned + red-proven; 143/143 twice; A/B 6x vulkan clean; 2nd sub-us A/B mover.  [topics: overflow-caps, logging, bench-ab]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 
 ## lx.session
@@ -179,6 +180,7 @@
 
 ## tests
 
+- **scene container warn and drop** (2026-11-25) — The warn warn_and_drop promises, landed 2026-11-25 (e8b2500): warn-once per episode, remove() re-arms; pinned + red-proven; 143/143 twice; A/B 6x vulkan clean; 2nd sub-us A/B mover.  [topics: overflow-caps, logging, bench-ab]
 - **settings written banner escalation** (2026-11-25) — banner escalates from `written` too (1bc8b2e, READY): repaint() gates on != memory_only; probe 'state=1 banner=0' at base; (f')/(g') legs red at :468; ctest 141/141; noise 3/3/0/3  [topics: banner, save-state, settings, review-noise]
 - **text layout line cap reject** (2026-11-25) — line cap honours reject (4a77de4..cb4dd32, landed 8d7eb41, reverified 0f404dc): wrap refuse, empty, wrap-retry; A/B unblocked gate, S4 +26% sub-µs; noise 5/5/0+1, 3/3/0+2; ui-bench needs tests=ON  [topics: text-layout, overflow, reject, wrap-retry, truncated, bench-discipline, review-noise]
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]

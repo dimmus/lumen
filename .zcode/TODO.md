@@ -147,11 +147,23 @@ current when an item closes.
   the outlier era; S4 update is bench-side s4_before_frame, no lx.text on its path);
   merged tree re-gated 143/143 -LE bench (build/merge-gate). Line numbers above are
   base-tree; HEAD: contract :55-59, reject returns :1268/:1300.
-- [ ] **container_node::add never warns under warn_and_drop** (found 2026-11-24 with
+- [x] **container_node::add never warns under warn_and_drop** (found 2026-11-24 with
   test_overflow_caps; pre-existing since 1a44c01; low): modules/lx.scene/lx.scene.cppm:547-558
   has no log call on any path, but the enum defines warn_and_drop as "Log warn, then
   drop_newest" (lx.runtime/memory.cppm:43). Also named by the "Invariant GAPs"
-  overflow-caps marker.
+  overflow-caps marker. **Landed 2026-11-25** (merge e8b2500, non-ff, pushed): the warn
+  in the module's idiom (log_container{"scene.container"}, static "container child cap
+  reached", warn-once latch per overflow episode, re-armed by remove() making room —
+  commit 4191ed0); the observed() marker flipped to the family's hard pin (exactly one
+  warn under warn_and_drop, never otherwise) plus an episode-re-arm pin, red-proven with
+  the module hunk reversed; defect confirmed on main 657da67 first ("observed, not
+  pinned (1)"); gate READY — classifier logic+render-path -> ctest 143/143 -LE bench in
+  the worktree and on the merged tree (build/merge-gate), bench_ab 6 interleaved hasvk
+  vulkan runs (3x 657da67, 3x 4191ed0, pin 3, six bench tickets, quiet CPU + host warm-up
+  per run, seat quiet before/after) with no surviving stage regression (one >=10% mover,
+  S2/update +15.4%, is +0.010 us — 100x under ABS_FLOOR_US=1.0 — and bench_ui.cpp never
+  calls container_node::add/remove). Line numbers above are base-tree; HEAD: the warn
+  block sits at the tail of container_node::add, the latch beside child_overflow_.
 - [ ] **scripts/diff-hygiene.sh prints a `local` error on every run and leaks its
   format log** (found 2026-11-24, same review; pre-existing; low): line 92 uses `local`
   at top level ("local: can only be used in a function" before the summary line) and the
@@ -191,7 +203,12 @@ current when an item closes.
   modules/lx.text/lines.cppm fails whole-file clang-format at base 58aa184 and HEAD
   cb4dd32 alike (9 disagreement regions — :252, :495, :761, :852-853, :1372-1373,
   :1407-1409, :1561-1562, :1614, :1671-1672), none inside the landed diff's 6 hunks —
-  diff-hygiene exits 1 with no added line at fault. (The script's own
+  diff-hygiene exits 1 with no added line at fault. Fourth instance 2026-11-25 with
+  scene-container-warn-and-drop: modules/lx.scene/lx.scene.cppm carries 1890
+  clang-format violation lines at base 657da67 and at HEAD 4191ed0 alike (36 distinct
+  offending line-texts), zero on the change's 19 added lines (violation-text set ∩
+  added-line set = ∅; the changed test file is clean) — diff-hygiene exits 1 with no
+  added line at fault. (The script's own
   `local`-at-top-level bug is the row above.)
 - [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
