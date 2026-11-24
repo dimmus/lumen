@@ -935,10 +935,17 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                 updated = layout.update();
                 expect(warns_like(log), warns_once());
             }
-            if (refuses)
+            if (refuses) {
                 expect(!updated && layout.lines().empty(),
                        where(action, "the pass must fail and leave the layout empty"));
-            else
+                // A wrap input change retries the refused pass: the shaped text survived the
+                // refuse, so capping the visible lines at the storage cap re-wraps it with
+                // no shape input.
+                layout.set_max_lines(lim.max_lines);
+                updated = layout.update();
+                expect(updated.ok() && layout.lines().size() == lim.max_lines,
+                       where(action, "a wrap input change must recover the refused layout"));
+            } else
                 expect(updated.ok() && layout.lines().size() == lim.max_lines && layout.truncated(),
                        where(action, "what fits must be kept and the layout flagged"));
         }
@@ -960,6 +967,8 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                 expect(warns_like(log), warns_once());
             }
             if (refuses)
+                // One line per paragraph whatever the wrap inputs: only `set_limits` (a
+                // shape input) recovers this leg's refuse.
                 expect(!updated && layout.lines().empty(),
                        where(action, "the pass must fail and leave the layout empty"));
             else
