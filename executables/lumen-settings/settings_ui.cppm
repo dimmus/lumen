@@ -163,7 +163,7 @@ public:
         open_menu_ = k_no_row;
         focus_group_[0] = '\0';
         expanded_[static_cast<unsigned>(p) % k_pane_count] = true;
-        repaint();
+        refresh();
     }
 
     // ── the sidebar tree (Zed's settings navigation) ──
@@ -174,7 +174,7 @@ public:
     void toggle_expanded(pane_id p) {
         bool& on = expanded_[static_cast<unsigned>(p) % k_pane_count];
         on = !on;
-        repaint();
+        refresh();
     }
     /// The group the pane is narrowed to (the tree's leaf click); "" shows every group.
     [[nodiscard]] std::string_view focus_group() const { return focus_group_; }
@@ -185,7 +185,7 @@ public:
         expanded_[static_cast<unsigned>(p) % k_pane_count] = true;
         open_menu_ = k_no_row;
         std::snprintf(focus_group_, sizeof(focus_group_), "%s", group ? group : "");
-        repaint();
+        refresh();
     }
 
     [[nodiscard]] lx::ui::text_buffer& query_buffer() { return query_.buffer; }
@@ -263,12 +263,12 @@ public:
         } else {
             edit_.set({});
         }
-        repaint();
+        refresh();
     }
     void cancel_edit_action() {
         stop_binding_capture();
         editing_action_ = k_no_row;
-        repaint();
+        refresh();
     }
     [[nodiscard]] lx::ui::text_buffer& edit_buffer() { return edit_.buffer; }
     /// Explicit recording keeps the text grammar available for pointer bindings.
@@ -278,12 +278,14 @@ public:
         capturing_binding_ = true;
         tap_keysym_ = tap_mod_ = 0;
         error_[0] = '\0';
-        repaint();
+        refresh();
     }
+    /// Also main's keymap handler, at every launch and every refocus, and the window's
+    /// loss of keyboard focus: a re-describe, never a save-state change.
     void stop_binding_capture() {
         capturing_binding_ = false;
         tap_keysym_ = tap_mod_ = 0;
-        repaint();
+        refresh();
     }
     [[nodiscard]] bool capturing_binding() const { return capturing_binding_; }
     /// sym: active layout first-level keysym; mods: config::key_mod. No file I/O.
@@ -313,11 +315,14 @@ public:
     /// The row whose select's dropdown is open, or `k_no_row`.
     void set_open_menu(unsigned row) {
         open_menu_ = row;
-        repaint();
+        refresh();
     }
     [[nodiscard]] unsigned open_menu() const { return open_menu_; }
 
-    /// One repaint after an edit that did not reach the file (the status bar's note).
+    /// One repaint after an edit that did not reach the file (the status bar's note):
+    /// the one place `untouched` becomes `memory_only`, so only an edit's failure tail
+    /// calls it. Navigation and menus re-describe through `refresh()` — through here
+    /// they raised "there is no writable config.toml" over a file that was writable.
     void repaint();
     /// A re-describe after an edit that did (the file is the truth now).
     void written() {
@@ -415,6 +420,9 @@ inline constexpr lx::ui::element_key k_rail_key = 0x73'0002;
 inline constexpr lx::ui::element_key k_content_key = 0x73'0003;
 /// The page column (the files header and the scrolling list).
 inline constexpr lx::ui::element_key k_page_key = 0x73'0005;
+/// The "changes are not being saved" banner under the files header: in the tree only
+/// while an edit did not reach the user layer (`session::state() == memory_only`).
+inline constexpr lx::ui::element_key k_banner_key = 0x73'0006;
 /// Pane `i`'s root entry in the navigation tree: `k_nav_key_base + i`.
 inline constexpr lx::ui::element_key k_nav_key_base = 0x73'0100;
 /// Row `i`'s value control: `k_row_control_base + i` (the catalog index).
@@ -1620,7 +1628,7 @@ bool session::capture_binding_key(unsigned sym, unsigned mods, bool pressed, boo
         if (sym == cfg::keysym::backspace && mods == 0) {
             edit_.set({});
             error_[0] = '\0';
-            repaint();
+            refresh();
             return true;
         }
         // Lock/group selectors are state changes, never a configurable modifier tap.
@@ -1642,7 +1650,8 @@ bool session::capture_binding_key(unsigned sym, unsigned mods, bool pressed, boo
         if (cfg::reserved(parsed))
             std::snprintf(error_, sizeof(error_), "%s is reserved by Lumen", canon);
     }
-    repaint();
+    // The editor's buffer holds the combo; nothing is applied until Apply writes it.
+    refresh();
     return true;
 }
 
@@ -2441,7 +2450,7 @@ namespace {
                                                      paint(warn.border)}),
                                1),
                    lx::ui::radius::md),
-        {banner_kids, 2u});
+        {banner_kids, 2u}, k_banner_key);
     lx::ui::child stack[2] = {header_row, banner};
     return st_box(st_v_flex().flex_none().w_full().gap(st_px16(8.f)), control_paint{},
                   {stack, 2u});

@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 import std;
@@ -75,6 +76,55 @@ struct harness {
     for (char& c : out)
         c = c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
     return out;
+}
+
+/// A button of that name inside the page column: the rail's pane entries are buttons
+/// too, and its "Appearance" entry shares its name with the [ui] Appearance dropdown.
+[[nodiscard]] ui_node* page_button(ui_node* root, const char* name) {
+    return find(find_key(root, settings::k_page_key), lx::a11y::role::button, name);
+}
+
+/// window.close's index into `actions()`: an action a key can be given.
+[[nodiscard]] unsigned close_action() {
+    const auto all = lx::config::actions();
+    for (unsigned i = 0; i < all.size(); ++i)
+        if (std::strcmp(all[i].name, "window.close") == 0)
+            return i;
+    return settings::session::k_no_row;
+}
+
+/// The first row of the Appearance pane of that value kind, `k_no_row` when there is none.
+[[nodiscard]] unsigned appearance_row(lx::config::value_kind kind) {
+    const std::vector<settings::row_ref>& rows = settings::catalog();
+    for (unsigned i = 0; i < rows.size(); ++i)
+        if (rows[i].owner == settings::pane_id::appearance && rows[i].desc &&
+            rows[i].desc->kind == kind)
+            return i;
+    return settings::session::k_no_row;
+}
+
+void click(harness& h, ui_node* n) {
+    LUMEN_CHECK(n);
+    if (!n)
+        return;
+    LUMEN_CHECK(h.root.pointer_move(centre(*n)));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, true));
+    LUMEN_CHECK(h.root.pointer_button(mouse_button::left, false));
+}
+
+void press_escape(harness& h) {
+    key_event esc{};
+    esc.key = key::escape;
+    esc.keycode = 1;
+    esc.pressed = true;
+    (void)h.root.key(esc);
+    esc.pressed = false;
+    (void)h.root.key(esc);
+}
+
+[[nodiscard]] bool banner_shown(harness& h) {
+    (void)h.tick();
+    return find_key(h.root.tree(), settings::k_banner_key) != nullptr;
 }
 
 } // namespace
@@ -236,6 +286,182 @@ LUMEN_TEST(settings_value_controls_edit_the_session_snapshot) {
         flipped = true;
     }
     LUMEN_CHECK(flipped);
+    settings::set_active_session(nullptr);
+}
+
+LUMEN_TEST(settings_banner_is_raised_only_by_an_edit_that_did_not_reach_the_file) {
+    // The banner's gate is the save state alone (`files_header`), and `repaint()` used
+    // to turn `untouched` into `memory_only` for every caller of it — opening a
+    // dropdown, switching panes, and the keymap that arrives at a fresh launch (main's
+    // shortcut_input::on_keymap calls stop_binding_capture). On the seat (2026-11-24,
+    // evidence/2026-11-24-settings-no-writable-banner/) the pre-fix build showed
+    // "There is no writable config.toml" from +2 s after a launch with no input at all,
+    // over a user file that was writable, until the first write succeeded.
+    char dir[] = "/tmp/lumen-settings-banner-XXXXXX";
+    LUMEN_CHECK(::mkdtemp(dir) != nullptr);
+    const std::string file = std::string(dir) + "/config.toml";
+    {
+        std::ofstream out{file};
+        out << "[focus]\nmode = \"click\"\n";
+    }
+
+    // Every caller of `repaint()` that is not an edit's failure tail, each one from
+    // `untouched` over a writable user layer: none of them is an edit. A caller that
+    // raises the banner is named and counted, so one run names them all.
+    constexpr auto untouched = settings::session::save_state::untouched;
+    unsigned decided = 0;
+    unsigned raised = 0;
+    const auto decide = [&](const char* what, void (*call)(settings::session&)) {
+        settings::session s{};
+        s.force_user_file(file.c_str());
+        settings::set_active_session(&s);
+        harness h{};
+        s.root = &h.root;
+        try {
+            const bool before = !banner_shown(h);
+            call(s);
+            const bool banner = banner_shown(h);
+            LUMEN_CHECK(before);
+            LUMEN_CHECK(!banner);
+            LUMEN_CHECK(s.state() == untouched);
+        } catch (const lumen_test::assertion_error&) {
+            ++raised;
+            std::printf("      %s: banner=%d state=%d (wanted untouched, banner down)\n", what,
+                        find_key(h.root.tree(), settings::k_banner_key) != nullptr,
+                        static_cast<int>(s.state()));
+        }
+        ++decided;
+        settings::set_active_session(nullptr);
+    };
+    decide("set_open_menu(row)", [](settings::session& s) { s.set_open_menu(3); });
+    decide("set_open_menu(none)",
+           [](settings::session& s) { s.set_open_menu(settings::session::k_no_row); });
+    decide("set_current(another pane)",
+           [](settings::session& s) { s.set_current(settings::pane_id::input); });
+    decide("set_current(the same pane)", [](settings::session& s) { s.set_current(s.current()); });
+    decide("toggle_expanded",
+           [](settings::session& s) { s.toggle_expanded(settings::pane_id::displays); });
+    decide("open_group",
+           [](settings::session& s) { s.open_group(settings::pane_id::appearance, "Cursor"); });
+    // With no capture in progress: what the keymap handler calls at every launch.
+    decide("stop_binding_capture(idle)", [](settings::session& s) { s.stop_binding_capture(); });
+    decide("begin_edit_action", [](settings::session& s) { s.begin_edit_action(close_action()); });
+    decide("begin_binding_capture", [](settings::session& s) {
+        s.begin_edit_action(close_action());
+        s.begin_binding_capture();
+    });
+    decide("stop_binding_capture(recording)", [](settings::session& s) {
+        s.begin_edit_action(close_action());
+        s.begin_binding_capture();
+        s.stop_binding_capture();
+    });
+    decide("cancel_edit_action", [](settings::session& s) {
+        s.begin_edit_action(close_action());
+        s.cancel_edit_action();
+    });
+    decide("capture_binding_key(a key)", [](settings::session& s) {
+        s.begin_edit_action(close_action());
+        s.begin_binding_capture();
+        (void)s.capture_binding_key('y', lx::config::mod_super, true);
+        s.stop_binding_capture();
+    });
+    decide("capture_binding_key(Backspace)", [](settings::session& s) {
+        s.begin_edit_action(close_action());
+        s.begin_binding_capture();
+        (void)s.capture_binding_key(lx::config::keysym::backspace, 0, true);
+        s.stop_binding_capture();
+    });
+    LUMEN_CHECK(decided == 13);
+    if (raised)
+        std::printf("      %u of the %u non-edit callers raised the banner\n", raised, decided);
+    LUMEN_CHECK(raised == 0);
+    LUMEN_CHECK(close_action() != settings::session::k_no_row);
+
+    // The seat procedure's (b), (c), (d) through the real controls.
+    {
+        settings::session s{};
+        s.force_user_file(file.c_str());
+        settings::set_active_session(&s);
+        harness h{};
+        s.root = &h.root;
+        const unsigned row = appearance_row(lx::config::value_kind::enumeration);
+        LUMEN_CHECK(row != settings::session::k_no_row);
+        const settings::row_ref& r = settings::catalog()[row];
+        // (b) the dropdown's trigger opens it; nothing is edited.
+        click(h, page_button(h.root.tree(), r.label));
+        LUMEN_CHECK(s.open_menu() == row);
+        LUMEN_CHECK(!banner_shown(h));
+        LUMEN_CHECK(s.state() == untouched);
+        // (c) Escape dismisses it.
+        press_escape(h);
+        LUMEN_CHECK(s.open_menu() == settings::session::k_no_row);
+        LUMEN_CHECK(!banner_shown(h));
+        LUMEN_CHECK(s.state() == untouched);
+        // (d) a rail entry switches the pane.
+        click(h, find(h.root.tree(), lx::a11y::role::button, "Input"));
+        LUMEN_CHECK(s.current() == settings::pane_id::input);
+        LUMEN_CHECK(!banner_shown(h));
+        LUMEN_CHECK(s.state() == untouched);
+        settings::set_active_session(nullptr);
+    }
+
+    // What the banner is for stays — the seat procedure's (f) and (g), with the app's
+    // own session (the located layers): an edit that cannot reach the file raises the
+    // banner and stays in the session, as the banner says; the next edit that reaches
+    // the file clears it. Its directory is made read-only for it (under root that stops
+    // nothing: these checks would then fail, not pass).
+    {
+        char rdir[] = "/tmp/lumen-settings-unwritable-XXXXXX";
+        LUMEN_CHECK(::mkdtemp(rdir) != nullptr);
+        const std::string rfile = std::string(rdir) + "/config.toml";
+        const std::string original = "[focus]\nmode = \"click\"\n";
+        {
+            std::ofstream out{rfile};
+            out << original;
+        }
+        LUMEN_CHECK(::setenv("LUMEN_CONFIG", rfile.c_str(), 1) == 0);
+        LUMEN_CHECK(::chmod(rdir, 0500) == 0);
+        settings::session s{true};
+        settings::set_active_session(&s);
+        harness h{};
+        s.root = &h.root;
+        const unsigned row = appearance_row(lx::config::value_kind::boolean);
+        LUMEN_CHECK(row != settings::session::k_no_row);
+        const settings::row_ref& r = settings::catalog()[row];
+        void* f = r.desc->field(s.config());
+        const bool value = *static_cast<bool*>(f);
+        const auto switch_is_on = [&] {
+            ui_node* sw = find(h.root.tree(), lx::a11y::role::switch_control, r.label);
+            return sw && (sw->accessibility_node().state &
+                          static_cast<unsigned>(lx::a11y::state_flag::checked));
+        };
+        const auto file_text = [&] {
+            std::ifstream in{rfile};
+            std::stringstream contents;
+            contents << in.rdbuf();
+            return contents.str();
+        };
+        LUMEN_CHECK(switch_is_on() == value);
+        // (f) the edit cannot be written: it stays in the session, and the banner says so
+        // while the header still names the file.
+        click(h, find(h.root.tree(), lx::a11y::role::switch_control, r.label));
+        LUMEN_CHECK(*static_cast<bool*>(f) == !value);
+        LUMEN_CHECK(s.state() == settings::session::save_state::memory_only);
+        LUMEN_CHECK(!s.config_path().empty());
+        LUMEN_CHECK(banner_shown(h));
+        LUMEN_CHECK(switch_is_on() == !value);
+        LUMEN_CHECK(file_text() == original);
+        // (g) writable again: the edit is written and the banner goes.
+        LUMEN_CHECK(::chmod(rdir, 0700) == 0);
+        s.set_bool(row, value);
+        LUMEN_CHECK(s.state() == settings::session::save_state::written);
+        LUMEN_CHECK(!banner_shown(h));
+        LUMEN_CHECK(file_text() != original);
+        ::unsetenv("LUMEN_CONFIG");
+        std::filesystem::remove_all(rdir);
+    }
+
+    std::filesystem::remove_all(dir);
     settings::set_active_session(nullptr);
 }
 
