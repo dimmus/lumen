@@ -23,12 +23,12 @@
 // (buffer_lifecycle.cppm:193-195). The compositor's loop is never dispatched here, so
 // nothing else reports to the coordinator — not the PSI.
 //
-// What `compositor::start()` does to the session is `start()`'s to do, and this test does
-// not make it smaller: a compositor attaches to the logind session it finds for the user
-// and opens the libinput seat (compositor_impl.cpp:9592, 9744), virtual outputs or not.
-// This is unit evidence about the wiring on one started compositor — one start per process,
-// since a third `compositor::start()` in a process fails ("no event source slot") — and it
-// is not a claim about a seat.
+// What `compositor::start()` does to the session is `start()`'s to do, and on virtual
+// outputs it is a seat-less start: no logind session is taken and no libinput seat opened
+// (compositor_impl.cpp's `seat_less` decision), so this fixture is hermetic — it may run
+// anywhere, no seat, no broker ticket. This is unit evidence about the wiring on one
+// started compositor — one start per process, since a third `compositor::start()` in a
+// process fails ("no event source slot") — and it is not a claim about a seat.
 //
 // Not driven: the third leg, `shm_pool_.trim()` (compositor_impl.cpp:2648-2649). The pool is
 // private (:1006) and nothing on the facade exposes it. Its bytes are readable only as
