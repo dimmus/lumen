@@ -60,6 +60,15 @@ constexpr lx::trace::category log_session{"compositor.session"};
 constexpr lx::trace::category log_texture{"compositor.texture"};
 constexpr lx::trace::category log_config{"config"};
 
+/// `--virtual-outputs` asks for a compositor that is not the seat's display server: no
+/// logind session is taken and no input seat opened — unless `session_mode` says this is
+/// the session's own display server, which always takes the full seat path. One predicate
+/// for `start`'s session decision and `begin_input`'s seat decision: the two sites must
+/// not drift apart.
+[[nodiscard]] bool seat_less_start(const lx::compositor::config& cfg) {
+    return cfg.virtual_outputs && *cfg.virtual_outputs && !cfg.session_mode;
+}
+
 } // namespace
 
 namespace lx::compositor::detail {
@@ -2454,12 +2463,13 @@ void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
 }
 
 void compositor_impl::begin_input() {
-    // A seat-less start (`start` decided it: virtual outputs, not the session's display
-    // server) opens no seat at all — no logind round trips, no udev walk, no /dev/input
-    // node touched, the same state as a host with no session for the user. The keymap
-    // below is still compiled: clients are told the layout at bind time, and a compositor
-    // that never found a keyboard still has to answer it.
-    const bool seat_less = cfg.virtual_outputs && *cfg.virtual_outputs && !cfg.session_mode;
+    // A seat-less start (`start` decided it through the same seat_less_start predicate:
+    // virtual outputs, not the session's display server) opens no seat at all — no logind
+    // round trips, no udev walk, no /dev/input node touched, the same state as a host with
+    // no session for the user. The keymap below is still compiled: clients are told the
+    // layout at bind time, and a compositor that never found a keyboard still has to
+    // answer it.
+    const bool seat_less = seat_less_start(cfg);
     // Device nodes are opened through logind when there is a session; without one libinput
     // falls back to opening them directly, which works for root or a member of the input
     // group and fails cleanly otherwise.
@@ -9603,9 +9613,10 @@ lx::result<void> compositor::start() {
     // text login's Type reads "wayland" for as long as the test lives) nor hold the
     // seat's event nodes through it. The session's own display server (`--session`)
     // always takes the full seat path, virtual outputs or not. Computed here — before the
-    // session open, which it decides; `begin_input` makes the same decision for the seat.
+    // session open, which it decides; `begin_input` decides the seat through the same
+    // seat_less_start predicate.
     const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
-    const bool seat_less = want_virtual && !impl_->cfg.session_mode;
+    const bool seat_less = seat_less_start(impl_->cfg);
     if (seat_less)
         log_session.info("virtual outputs: seat-less start (no logind session, no input seat)");
     else if (auto session = session::logind_session::open(); session)
