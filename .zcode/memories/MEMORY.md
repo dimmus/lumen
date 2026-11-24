@@ -29,6 +29,7 @@
 - [render scale](lumen-render-scale.md) — HiDPI supersampling (render_scale, umbriel PR 573 port) + area downsample filter, worktree claude/render-scale 2026-10-29, uncommitted;
 - [sanitizer sweep green](lumen-sanitizer-sweep-green.md) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions
 - [settings key capture seat](lumen-settings-key-capture-seat.md) — ADR-013 key capture proven live (Super+Shift+y, splice gen 57→58, reserved Super+Escape refuses); trap: injected Super-chords trip the tap grab mid-chord — open TODO row
+- [settings no writable banner](lumen-settings-no-writable-banner.md) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141
 - [settings startup apply](lumen-settings-startup-apply.md) — lumen-settings applies [ui] once at startup (apply_ui_live before w.open); explicit --theme stays authoritative for theme; seat reds were the concurrent-session family
 - [shell first paint wip](lumen-shell-first-paint-wip.md) — Shell first-paint work: font-match persistence merged as PR #44 (2026-10-25);
 - [smoke bench harness green rounds](lumen-smoke-bench-harness-green-rounds.md) — Close-out chronology split from [[lumen-smoke-bench-harness-green]] —

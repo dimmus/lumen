@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (49 records, generated 2026-11-24)
+# Memory index by module (50 records, generated 2026-11-24)
 
 ## (general)
 
@@ -30,6 +30,7 @@
 
 ## executables/lumen-settings
 
+- **settings no writable banner** (2026-11-24) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141  [topics: banner, seat-repro, wayland-debug, injection]
 - **settings startup apply** (2026-11-16) — lumen-settings applies [ui] once at startup (apply_ui_live before w.open); explicit --theme stays authoritative for theme; seat reds were the concurrent-session family  [topics: startup, adr-013; LONG (142 lines — split candidate)]
 
 ## harness
@@ -163,6 +164,7 @@
 ## tests
 
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
+- **settings no writable banner** (2026-11-24) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141  [topics: banner, seat-repro, wayland-debug, injection]
 - **unit pair green** (2026-11-14) — Tolerated {ui_gallery, test_task_model} pair retired with zero production code: stale expectations from a65d06b + goldens predating the chevron fix; cross-host claim retracted; 133/133  [topics: goldens, known-red; LONG (155 lines — split candidate)]
 - **toplevel drag drag smoke** (2026-11-13) — lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook  [topics: drag-smoke, injection]
 

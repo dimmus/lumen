@@ -103,6 +103,27 @@ current when an item closes.
   clang-format temp file is removed only in the failure branch (:96) — 7
   /tmp/diff-hygiene-fmt.* files left from clean runs. One-line fix each; fold into the
   next scripts/ touch.
+- [ ] **settings_ui: after one successful write, an edit that cannot be written raises no
+  banner** (found 2026-11-24 with settings-no-writable-banner; pre-existing; medium):
+  `session::repaint()` escalates only from `untouched`
+  (executables/lumen-settings/settings_ui.cppm:1258-1262) and the five write-failure
+  tails raise through it — so once a write has succeeded (`state == written`) a later
+  edit that cannot reach the file is applied to the session silently: no banner, in
+  exactly the state the banner exists for. Probe in the unit harness (write OK, directory
+  made read-only, `set_enum` applies in memory, state stays `written`, nothing shown);
+  not exercised on the seat, no test pins it; until now tracked only inside the ticked
+  banner row. Fix shape: escalate from any state that is not `memory_only` (`written`
+  included), with the regression test's (f)/(g) legs extended to write-then-fail.
+- [ ] **Whole-file clang-format debt trips diff-hygiene on most diffs — decision** (found
+  2026-11-24 with settings-no-writable-banner; pre-existing; low): settings_ui.cppm is
+  not whole-file clean at base and at HEAD alike (`clang-format --dry-run --Werror`
+  exit 1, ~360 offending lines; my diff-count 368), test_settings_ui.cpp 9 — so
+  `scripts/diff-hygiene.sh <base>` exits 1 on that change's format step with not one
+  added line inside a hunk (104/104 and 8/8 hunks identical base vs head), AGENTS.md
+  §4.4 "changed C++ files pass clang-format --dry-run --Werror" is unmeetable there
+  short of an unrelated reformat, and 47 of 60 sampled tracked .cppm files are not
+  whole-file clean at HEAD. Decide: one whole-tree reformat commit, or diff-hygiene
+  judging added lines only. (The script's own `local`-at-top-level bug is the row above.)
 - [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
   `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
