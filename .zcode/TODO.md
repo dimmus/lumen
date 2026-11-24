@@ -285,13 +285,20 @@ current when an item closes.
   status line (`launcher.cppm` `status_line_[]`). The 2026-11-18 deterministic 5/5 mass-FAIL
   on this branch vs green base was the panel fix's stack perturbation flipping the
   intermittent bug — evidence in `evidence/2026-11-18-sanitizer-sweep/seat-regression/`.
-- [ ] **lumen-shell heap-use-after-free at tray-menu close** (found 2026-11-18, ASan shell
-  on the seat, sanitizer-sweep branch): after `shell.menu: menu tray: closed` the ASan
-  lumen-shell reports `heap-use-after-free READ of size 8` and dies before printing a stack
-  (`abort_on_error` + log truncation) — shell-n.log:184-186 of
-  `evidence/2026-11-18-sanitizer-sweep/seat-regression/asan-final-shell-n.log`. The tray
-  rows had already passed; menu/tray code is untouched by the branch → pre-existing on
-  main, only observable under ASan. Next: targeted repro (ASan shell + tray menu
+- [x] **lumen-shell heap-use-after-free at tray-menu close** (found 2026-11-18, ASan shell
+  on the seat, sanitizer-sweep branch; FIXED 2026-11-24, task `shell-tray-menu-uaf`):
+  `menu_popup::close_from()` destroyed the level's surface — its `ui_context` — while the
+  menu's own input router was still delivering the Enter that activated the row; the key
+  dispatch's tail (`ui_root::key` → `overlays.after_input()`) then read the freed context.
+  Full report captured on the seat (READ + freed-by + allocated-by stacks, written by the
+  sanitizer runtime) and reproduced in-process by `test_shell_menu`'s new popup-close
+  phase. Fix: the teardown waits for the delivery (and the popup-done listener) to return
+  and drains in `after_dispatch()` — the calendar popup's rule; post-fix seat loop 30/30
+  clean (capture was 1/1). Evidence:
+  `/home/dimmus/lumen/evidence/2026-11-24-shell-tray-menu-uaf/`. Sighting: shell-n.log:184-186
+  of `evidence/2026-11-18-sanitizer-sweep/seat-regression/asan-final-shell-n.log` (the tray
+  rows had already passed; menu/tray code untouched by the branch → pre-existing on
+  main, only observable under ASan). Next: targeted repro (ASan shell + tray menu
   open/activate/close loop) to capture the full report.
 - [x] **lumen-settings transient "no writable config.toml" banner** — closed 2026-11-24
   (settings-no-writable-banner: reproduced on the notebook seat, fixed, fix proven there).

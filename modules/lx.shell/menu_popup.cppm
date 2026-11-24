@@ -158,6 +158,10 @@ private:
                     lx::ui::host::layer_role* parent_layer, lx::rect2i anchor,
                     std::vector<menu_entry>* items, unsigned serial, bool submenu);
     void close_from(unsigned index);
+    /// A close that waits for an input delivery (or the popup-done listener) to return:
+    /// the level's teardown is deferred to `after_dispatch()` — `close_from` records the
+    /// lowest index still asked for, `k_menu_max_levels` none.
+    void defer_close(unsigned index);
     void describe_level(unsigned index);
     [[nodiscard]] lx::ui::child build_ui(unsigned index);
     void activate(unsigned index, int row, unsigned serial);
@@ -183,6 +187,13 @@ private:
     static constexpr unsigned k_icon_slots = 32;
     icon_slot icon_slots_[k_menu_max_levels][k_icon_slots]{};
     unsigned levels_ = 0;
+    /// The deferred close's index (`k_menu_max_levels`: none). A level's surface must not
+    /// be destroyed while its own input router is delivering (the router's dispatch still
+    /// touches the root and its ui context after the handler returns — the heap-use-after-
+    /// free at tray-menu close, evidence/2026-11-24-shell-tray-menu-uaf/) nor inside the
+    /// Wayland popup-done listener; both drain in `after_dispatch()`, as the calendar
+    /// popup's close does.
+    unsigned close_pending_from_ = k_menu_max_levels;
     activate_fn on_activate_ = nullptr;
     closed_fn on_closed_ = nullptr;
     submenu_fn on_submenu_ = nullptr;

@@ -353,8 +353,24 @@ bool lx::shell::menu_popup::open(lx::ui::host::layer_role& layer, lx::rect2i anc
                                  std::vector<menu_entry> items, unsigned serial,
                                  activate_fn on_activate, closed_fn on_closed,
                                  submenu_fn on_submenu, void* user, const char* name) {
-    if (is_open())
+    // open() must not run inside the menu's own input delivery: close() below would
+    // re-defer via the live delivering() check (the levels stay counted open) and
+    // open_level(0) would build on the occupied level. calendar_popup::open refuses the
+    // same situation with an error; so does this — the deferred close stays pending for
+    // after_dispatch() to drain.
+    for (unsigned i = 0; i < levels_; ++i) {
+        if (level_[i].surface.valid() && level_[i].surface.input().delivering()) {
+            log_menu.error(lx::invalid_argument("menu popup opened during input delivery"));
+            return false;
+        }
+    }
+    // A deferred close leaves the levels counted open; finish it here (the guard above
+    // makes the invariant checked, not assumed) so `open_level(0)` finds the level free —
+    // and the replaced menu's on_closed (the tray's "closed" event) still runs.
+    if (close_pending_from_ < k_menu_max_levels || is_open()) {
+        close_pending_from_ = k_menu_max_levels;
         close();
+    }
     ++generation_;
     if (!g_.ui || !g_.ui->started() || !layer.valid() || items.empty())
         return false;
@@ -430,11 +446,10 @@ bool lx::shell::menu_popup::open_level(unsigned index, lx::ui::host::popup_role*
     l.role.grab(serial);
     l.role.set_done_handler(
         [](void* user) {
+            // The Wayland popup listener must finish before its role is destroyed (the
+            // calendar popup's rule): the close lands in after_dispatch().
             const root_ref& r = *static_cast<root_ref*>(user);
-            if (r.index == 0)
-                r.self->close();
-            else
-                r.self->close_from(r.index);
+            r.self->defer_close(r.index);
         },
         &root_refs_[index]);
     root_refs_[index] = {this, index};
@@ -454,10 +469,25 @@ bool lx::shell::menu_popup::open_level(unsigned index, lx::ui::host::popup_role*
     return true;
 }
 
+void lx::shell::menu_popup::defer_close(unsigned index) {
+    if (close_pending_from_ > index)
+        close_pending_from_ = index;
+}
+
 void lx::shell::menu_popup::close_from(unsigned index) {
+    if (index >= levels_)
+        return;
     // Top-down: an xdg_popup that is not the topmost must not be destroyed first.
     while (levels_ > index) {
         level& l = level_[levels_ - 1];
+        if (l.surface.valid() && l.surface.input().delivering()) {
+            // The router's key/pointer dispatch still touches the root and its ui context
+            // after the handler returns (`input_router::delivering()`'s rule): this
+            // level's teardown waits for the delivery to return — after_dispatch()
+            // drains it, as the calendar popup's close does.
+            defer_close(index);
+            return;
+        }
         l.role.destroy();
         l.surface.destroy();
         l.items = nullptr;
@@ -473,6 +503,8 @@ void lx::shell::menu_popup::close() {
     if (!is_open())
         return;
     close_from(0);
+    if (close_pending_from_ == 0)
+        return; // the teardown waits for a delivery: so does everything after it
     log_menu.info("menu {}: closed", name_);
     root_.clear();
     const closed_fn fn = on_closed_;
@@ -849,6 +881,16 @@ void lx::shell::menu_popup::describe_level(unsigned index) {
 }
 
 void lx::shell::menu_popup::after_dispatch() {
+    if (close_pending_from_ < k_menu_max_levels) {
+        // The delivery (or the popup-done listener) that asked for the close has
+        // returned: the teardown is safe now.
+        const unsigned from = close_pending_from_;
+        close_pending_from_ = k_menu_max_levels;
+        if (from == 0)
+            close();
+        else
+            close_from(from);
+    }
     for (unsigned i = 0; i < levels_; ++i) {
         level& l = level_[i];
         if (!l.surface.valid())

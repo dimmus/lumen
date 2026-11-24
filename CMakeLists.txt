@@ -812,8 +812,8 @@ if(LUMEN_BUILD_TESTS)
         lumen_apply_module_properties(popup-probe)
         lumen_link_platform(popup-probe)
         add_executable(test_shell_menu tests/test_shell_menu.cpp)
-        target_link_libraries(test_shell_menu PRIVATE lx.shell lx.ui lx.scene lx.gfx lx.runtime
-            lx.a11y lx.text lx.layout ${LIBPNG_LINK_LIBRARIES})
+        target_link_libraries(test_shell_menu PRIVATE lx.shell lx.compositor lx.ui.host lx.ui
+            lx.scene lx.gfx lx.runtime lx.a11y lx.text lx.layout ${LIBPNG_LINK_LIBRARIES})
         lumen_apply_module_properties(test_shell_menu)
         lumen_link_platform(test_shell_menu)
         target_include_directories(test_shell_menu PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
