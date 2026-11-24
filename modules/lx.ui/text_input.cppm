@@ -72,7 +72,11 @@ constexpr lx::trace::category log_ui{"ui"};
 // assigned more, a smaller `max_bytes` — is cut to it at a character boundary when the props
 // are applied. An insertion that does not fit follows `overflow`: `reject`
 // refuses it whole, `drop_newest` / `warn_and_drop` keep what fits (cut at a character
-// boundary); `rejected()` counts both. The preedit has `k_preedit_capacity`. Nothing
+// boundary), and `drop_oldest` evicts from the front of the text — the bytes before the
+// selection first, then those after it, never the new ones (the newest); an insertion
+// larger than the whole capacity keeps what fits, there being nothing older left.
+// `rejected()` counts every insertion the capacity refused, cut, or made evict. The
+// preedit has `k_preedit_capacity`. Nothing
 // allocates per keystroke: the text, display and preedit buffers are fixed, the layout keeps
 // its storage. UI affinity.
 
@@ -219,7 +223,7 @@ public:
     [[nodiscard]] std::uint32_t selection_end() const { return std::max(caret_, anchor_); }
     [[nodiscard]] std::string_view preedit() const { return {preedit_, preedit_size_}; }
     [[nodiscard]] std::uint32_t capacity() const;
-    /// Insertions refused or cut by the capacity.
+    /// Insertions the capacity refused, cut, or made evict the oldest bytes.
     [[nodiscard]] std::uint64_t rejected() const { return rejected_; }
     /// The caret shows now (focused, in the blink's on phase).
     [[nodiscard]] bool caret_visible() const;
@@ -233,7 +237,8 @@ public:
 
     /// Programmatic editing (what the keys do).
     void set_selection(std::uint32_t anchor, std::uint32_t caret);
-    /// Replaces the selection with `utf8`; false when the capacity refused it all.
+    /// Replaces the selection with `utf8`; false when the capacity refused it all. Under
+    /// `drop_oldest` the oldest bytes are evicted to take the new ones (see above).
     bool insert(std::string_view utf8);
     void select_all();
 
@@ -244,6 +249,8 @@ private:
     void set_size(std::uint32_t n);
     /// Cuts the text to `capacity()` at a character boundary; true when it did.
     bool clamp_to_capacity();
+    /// insert()'s core; `span`, when given, receives the [begin, end) the new bytes took.
+    bool insert_core(std::string_view utf8, std::uint32_t span[2]);
     void erase(std::uint32_t begin, std::uint32_t end);
     void changed();
     void sync_text();
@@ -912,6 +919,10 @@ void lx::ui::text_input_node::erase(std::uint32_t begin, std::uint32_t end) {
 }
 
 bool lx::ui::text_input_node::insert(std::string_view s) {
+    return insert_core(s, nullptr);
+}
+
+bool lx::ui::text_input_node::insert_core(std::string_view s, std::uint32_t span[2]) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     // One line: a pasted line break becomes a space, and stops there.
     std::size_t len = s.size();
@@ -929,24 +940,59 @@ bool lx::ui::text_input_node::insert(std::string_view s) {
     const std::uint32_t used = n - (b - a);
     const std::uint32_t room = used < capacity() ? capacity() - used : 0u;
     std::size_t take = s.size();
+    // drop_oldest: the oldest bytes the insertion evicted — from ahead of the selection,
+    // then (only if the prefix alone could not make room) from past it.
+    std::uint32_t evict_before = 0;
+    std::uint32_t evict_after = 0;
     if (take > room) {
         ++rejected_;
-        if (overflow_ == lx::runtime::overflow_action::reject || overflow_ == lx::runtime::overflow_action::drop_oldest)
+        if (overflow_ == lx::runtime::overflow_action::reject)
             return false;
-        take = lx_ui_ti_cut(s, room);
-        if (overflow_ == lx::runtime::overflow_action::warn_and_drop && rejected_ == 1)
-            log_ui.warn("text_input: an insertion was cut to the capacity");
-        if (take == 0)
-            return false;
+        if (overflow_ == lx::runtime::overflow_action::drop_oldest) {
+            // "Evict oldest, accept new" (the enum): the eviction is of the old text, from
+            // its front, at a character boundary — the new bytes are the newest and are
+            // never evicted. An insertion larger than the whole capacity keeps what fits
+            // (the drop_newest limit; there is nothing older left to evict by then).
+            take = lx_ui_ti_cut(s, capacity());
+            const std::uint32_t evict = take > room ? static_cast<std::uint32_t>(take) - room : 0u;
+            const char* old = data();
+            evict_before = std::min(a, evict);
+            while (evict_before < a && lx_ui_ti_continuation(old[evict_before]))
+                ++evict_before;         // the text that stays must begin on a character
+            if (evict_before < evict) { // the prefix was not enough: the suffix's oldest
+                std::uint32_t at = b + (evict - evict_before);
+                while (at < n && lx_ui_ti_continuation(old[at]))
+                    ++at;
+                evict_after = at - b;
+            }
+            if (take == 0)
+                return false;
+        } else {
+            take = lx_ui_ti_cut(s, room);
+            if (overflow_ == lx::runtime::overflow_action::warn_and_drop && rejected_ == 1)
+                log_ui.warn("text_input: an insertion was cut to the capacity");
+            if (take == 0)
+                return false;
+        }
     }
     if (take == 0 && a == b)
         return false;
     char* d = data();
-    // Close the selection's gap and open the insertion's in one move.
-    std::memmove(d + a + take, d + b, n - b);
-    std::memcpy(d + a, s.data(), take);
-    set_size(static_cast<std::uint32_t>(n - (b - a) + take));
-    caret_ = anchor_ = static_cast<std::uint32_t>(a + take);
+    // Close the selection's gap and open the insertion's; under drop_oldest the evicted
+    // bytes went first, so what stays shifts down by them. The prefix shift must run
+    // first: the character-boundary bump can evict more than the insertion adds, and the
+    // suffix shift's destination then overlaps the prefix's source [evict_before, a).
+    const std::uint32_t at = a - evict_before;
+    if (evict_before)
+        std::memmove(d, d + evict_before, at);
+    std::memmove(d + at + take, d + b + evict_after, n - b - evict_after);
+    std::memcpy(d + at, s.data(), take);
+    set_size(static_cast<std::uint32_t>(n - (b - a) + take - evict_before - evict_after));
+    caret_ = anchor_ = static_cast<std::uint32_t>(at + take);
+    if (span) {
+        span[0] = at;
+        span[1] = static_cast<std::uint32_t>(at + take);
+    }
     changed();
     return true;
 }
@@ -1210,15 +1256,22 @@ bool lx::ui::text_input_node::drop_text(lx::point2i at, std::string_view utf8) {
         return false;
     const std::uint32_t before = size();
     caret_ = anchor_ = i;
-    if (!insert(utf8))
+    std::uint32_t span[2]{};
+    if (!insert_core(utf8, span))
         return false;
-    const std::uint32_t added = size() - before;
-    // Dropped ahead of the text being dragged out of this field: that text moved right.
+    // Dropped ahead of the text being dragged out of this field: that text moved by the
+    // insertion — right, or left under drop_oldest, whose eviction can shrink the text
+    // (the shift clamps if the eviction reached into what is being dragged).
+    const std::int64_t moved = static_cast<std::int64_t>(size()) - before;
     if (dragging_ && i <= drag_begin_) {
-        drag_begin_ += added;
-        drag_end_ += added;
+        const auto shifted = [moved](std::uint32_t at) {
+            return static_cast<std::uint32_t>(
+                std::max<std::int64_t>(0, static_cast<std::int64_t>(at) + moved));
+        };
+        drag_begin_ = shifted(drag_begin_);
+        drag_end_ = std::max(drag_begin_, shifted(drag_end_));
     }
-    set_selection(i, i + added);
+    set_selection(span[0], span[1]);
     return true;
 }
 

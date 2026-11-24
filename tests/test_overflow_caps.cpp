@@ -13,9 +13,11 @@
 // one's. What a structure documents for itself decides which actions apply to it — where the
 // partition's contract names fewer than the enum's four, only those are pinned.
 //
-// Three things this test found are reported by its last case and pinned only as "no growth":
-// a site whose code departs from its own documented contract, and two whose action the
-// partition never names. Nothing here is bent to fit them.
+// Two things this test found are reported by its last case and pinned only as "no growth":
+// a site whose code departs from its own documented contract, and one whose action the
+// partition never names. Nothing here is bent to fit them. (A third — text_input's
+// drop_oldest refusing like reject — was fixed to the enum's semantics; its case now pins
+// all four actions.)
 //
 // The last case also prints every `overflow_action::` site under modules/ that this test
 // does not drive, by name, with what it would take, and holds that report to the tree: a
@@ -521,10 +523,12 @@ LUMEN_TEST(overflow_root_table_drops_past_capacity) {
     drove("lx.ui/context.cppm:220-231 detail::register_root (the root table, warn_and_drop)");
 }
 
-// `text_input_node::insert` (text_input.cppm:931-940): an insertion that does not fit the
-// capacity. The partition's contract (text_input.cppm:70-76) names three actions: `reject`
-// refuses the insertion whole, `drop_newest` / `warn_and_drop` keep what fits, cut at a
-// character boundary; `rejected()` counts both. `drop_oldest` it does not name.
+// `text_input_node::insert` (text_input.cppm:918-987): an insertion that does not fit the
+// capacity. The partition's contract (text_input.cppm:70-79) names all four actions:
+// `reject` refuses the insertion whole, `drop_newest` / `warn_and_drop` keep what fits,
+// cut at a character boundary, and `drop_oldest` — the enum's "Evict oldest, accept new" —
+// evicts from the front of the text, at a character boundary, never the new bytes;
+// `rejected()` counts every insertion the capacity refused, cut, or made evict.
 LUMEN_TEST(overflow_text_input_each_documented_action) {
     for (const overflow_action action : k_actions) {
         lx::ui::text_input_node field;
@@ -551,28 +555,34 @@ LUMEN_TEST(overflow_text_input_each_documented_action) {
                where(action, "the text must never outgrow the capacity"));
         expect(field.rejected() == 1,
                where(action, "an insertion that did not fit must be counted"));
-        const bool documented = action != overflow_action::drop_oldest;
-        if (documented)
-            expect(
-                taken == (action != overflow_action::reject) &&
-                    field.text() == (action == overflow_action::reject ? "abcdef" : "abcdefXY"),
-                where(action, "reject must refuse the insertion whole; the others keep what fits"));
-        else if (!taken && field.text() == "abcdef")
-            observed().push_back(
-                "text_input_node::insert under drop_oldest refuses like reject (lx.ui/"
-                "text_input.cppm:934). The partition's contract names reject, drop_newest and "
-                "warn_and_drop only (text_input.cppm:70-76), and the enum says drop_oldest is "
-                "\"Evict oldest, accept new\" (lx.runtime/memory.cppm:41)");
-        // A good many further pushes: still no growth.
+        // (ii): the action's own outcome. Two of the six bytes fit, so drop_newest keeps
+        // "XY"; drop_oldest takes all four by evicting the two oldest ("ab"), the new bytes
+        // (the newest) landing before what stayed.
+        const char* const kept = action == overflow_action::reject        ? "abcdef"
+                                 : action == overflow_action::drop_oldest ? "cdefXYZW"
+                                                                          : "abcdefXY";
+        expect(taken == (action != overflow_action::reject) && field.text() == kept,
+               where(action, "reject must refuse the insertion whole; drop_newest and "
+                             "warn_and_drop keep what fits; drop_oldest evicts the oldest "
+                             "bytes and takes the insertion"));
+        if (action == overflow_action::drop_oldest)
+            expect(field.caret() == field.text().size() && !field.has_selection(),
+                   where(action, "the caret must sit after the taken insertion, selecting "
+                                 "nothing"));
+        // A good many further pushes: still no growth, and each action keeps its own text.
         for (unsigned i = 0; i < k_further; ++i)
             (void)field.insert("0123456789");
         expect(field.text().size() <= field.capacity(),
                where(action, "the text must never outgrow the capacity"));
+        // An insertion larger than the whole capacity: everything else refused or ignored
+        // it; drop_oldest emptied the field for it, and it alone holds the last push's head.
+        expect(field.text() == (action == overflow_action::drop_oldest ? "01234567" : kept),
+               where(action, "the further pushes must leave each action's own text"));
 
         // (iii): the same field, the policy changed, the same insertion answers the new one.
         // Full, the field refuses under either policy, so its text goes back to six bytes
         // first — over the selection, which is room whatever the policy is.
-        if (documented) {
+        {
             lx::ui::text_input_props other{};
             other.max_bytes = 8;
             other.overflow = action == overflow_action::reject ? overflow_action::drop_newest
@@ -587,6 +597,17 @@ LUMEN_TEST(overflow_text_input_each_documented_action) {
                 taken == takes && field.text() == (takes ? "abcdefXY" : "abcdef"),
                 std::format("the same field must answer the insertion under {} as that action says",
                             name(other.overflow)));
+            // And changed to drop_oldest, the same insertion evicts for itself.
+            if (action == overflow_action::drop_oldest) {
+                lx::ui::text_input_props oldest{};
+                oldest.max_bytes = 8;
+                oldest.overflow = overflow_action::drop_oldest;
+                (void)field.apply(oldest);
+                expect(field.insert("XYZW") && field.text() == "cdefXYZW" &&
+                           field.rejected() == 3 + k_further,
+                       where(action, "the same field under drop_oldest must evict the oldest "
+                                     "bytes for the insertion"));
+            }
         }
     }
     // The cut is at a character boundary: "ä" is two bytes, only one fits.
@@ -599,8 +620,81 @@ LUMEN_TEST(overflow_text_input_each_documented_action) {
         expect(field.insert("ab") && field.insert("äö") && field.text() == "abä",
                "an insertion cut at the capacity must be cut at a character boundary");
     }
-    drove("lx.ui/text_input.cppm:931-940 text_input_node::insert (reject, drop_newest, "
-          "warn_and_drop; drop_oldest not in the partition's contract)");
+    // drop_oldest's eviction is at a character boundary too: "ä" is two bytes, and evicting
+    // "two bytes' worth" from "aäbX" takes the whole of "aä" — what stays starts on one.
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 5;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("aäbX") && field.insert("YZ") && field.text() == "bXYZ",
+               "the eviction must take whole characters from the front, never split one");
+    }
+    // The eviction shifts what it did not evict — the selection math above the cap check
+    // (selection_begin/end feed the room) must not leave the caret clamped to the end:
+    // a selection mid-text is replaced, the oldest bytes before it go, and the caret lands
+    // after the insertion, mid-text.
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 8;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("abcdefgh"), "the field must take its eight bytes");
+        field.set_selection(5, 7); // "fg"
+        expect(field.insert("1234") && field.text() == "cde1234h",
+               "evicting ahead of a replaced selection must keep the bytes after it");
+        expect(field.caret() == 7 && field.anchor() == 7 && !field.has_selection(),
+               "the caret must sit after the insertion, shifted with the text, not clamped");
+    }
+    // The bytes before the selection are the oldest and go first; when they cannot make
+    // room alone, the eviction continues past the selection — never into the new bytes.
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 8;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("abcdefgh"), "the field must take its eight bytes");
+        field.set_selection(1, 1); // the caret alone, one byte in
+        expect(field.insert("XYZ") && field.text() == "XYZdefgh" && field.caret() == 3,
+               "the eviction must run from the front — the prefix, then the suffix's oldest "
+               "bytes — and keep the newest of the old text after the insertion");
+    }
+    // A multi-byte character can straddle the eviction point: the bump to a character
+    // boundary then evicts more than the insertion adds, and the suffix shift's
+    // destination reaches back over the prefix shift's source. The prefix shift must run
+    // first — with the suffix's copy ahead of it, a byte that stayed was silently turned
+    // into its neighbour. Two shapes: "ä" (two bytes) with the caret mid-text, and a
+    // three-byte "€" whose selection it evicts past is one byte.
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 9;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("abcäefgh"), // "ä" is two bytes: nine in all
+               "the field must take its nine bytes");
+        field.set_selection(6, 6); // the caret mid-text, just right of the "ä"
+        expect(field.insert("ZZZZ") && field.text() == "eZZZZfgh",
+               "a two-byte character straddling the eviction point must leave what stays "
+               "intact, not swap a byte for its neighbour");
+    }
+    {
+        lx::ui::text_input_node field;
+        lx::ui::text_input_props props{};
+        props.max_bytes = 9;
+        props.overflow = overflow_action::drop_oldest;
+        (void)field.apply(props);
+        expect(field.insert("ab€cdef"), // "€" is three bytes: nine in all
+               "the field must take its nine bytes");
+        field.set_selection(6, 7); // one byte, the "d"
+        expect(field.insert("ZZZZ") && field.text() == "cZZZZef",
+               "a three-byte character straddling the eviction point must not corrupt the "
+               "prefix that stays");
+    }
+    drove("lx.ui/text_input.cppm:918-987 text_input_node::insert (all four policies)");
 }
 
 // A virtualised list's chunk slots (list.cppm:392, `k_list_max_chunks` = 32 of 16 rows): a
