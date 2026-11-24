@@ -42,6 +42,7 @@
 - [toplevel drag compositor](lumen-toplevel-drag-compositor.md) — xdg-toplevel-drag-v1 served: wm_dragged_window third pointer mode, source-mark invalid_source, unmap_epoch re-attach; ctest 131/133 known-red era; g-latency WARN = host noise via A/B
 - [toplevel drag drag smoke](lumen-toplevel-drag-drag-smoke.md) — lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook
 - [toplevel drag protocol registration](lumen-toplevel-drag-protocol-registration.md) — xdg-toplevel-drag-v1 manifest block (glue only); suite 133-era known-red tolerated; smoke trap LUMEN_BUILD_DIR; review dedup 578e08c≡d4e96d5
+- [tray menu uaf](lumen-tray-menu-uaf.md) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1
 - [ui bench noise and g7](lumen-ui-bench-noise-and-g7.md) — 2026-10-28 audit of ADR-010 Phases 0–4 \"regressions\": all host drift;
 - [ui phase5](lumen-ui-phase5.md) — ADR-010 Phase 5 (shell adoption + deletion) started 2026-10-29 by workflows on branch claude/ui-phase5;
 - [uinput key bitmap format](lumen-uinput-key-bitmap-format.md) — /proc KEY bitmap is 64-bit words MSW-first: 70000 0 0 0 0 IS BTN_LEFT/RIGHT/MIDDLE — never read caps from /proc text, use EVIOCGBIT; two gate records' 'no BTN codes' were misreadings

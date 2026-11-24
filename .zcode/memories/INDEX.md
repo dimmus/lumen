@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (51 records, generated 2026-11-24)
+# Memory index by module (52 records, generated 2026-11-24)
 
 ## (general)
 
@@ -39,7 +39,7 @@
 - **todo fixes round** (2026-11-23) — Workflows unloadable 4 days (scope: key) fixed; evidence/ untracked; 8 TODO rows reconciled. Landing declined on untracked .mimosa/, then BYPASSED by a spool-parent ff; by-hand a89cbad 141/141.  [topics: landing, memory-spool, workflows, amend, todo-reconciliation]
 - **harness evals green** (2026-11-19) — Push policy flipped 2026-11-19: READY merges+pushes (no gh CLI). DSH archive purged. Skill evals round 1: 8/8 PASS 9.0-10.0, 4 skill fixes. Traps: no nested dispatch, rate limit x2, sandbox escape.  [topics: evals, landing-policy, dsh-purge, dispatch]
 - **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
-- **sanitizer sweep green** (2026-11-18) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions  [topics: asan, tsan, sanitizers; LONG (128 lines — split candidate)]
+- **sanitizer sweep green** (2026-11-18) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions  [topics: asan, tsan, sanitizers; LONG (133 lines — split candidate)]
 - **adr skill** (2026-11-17) — When an ADR is required (cross-module/protocol, weighed alternatives, supersede) and the corpus conventions; ADR=decision, decisions=measured, TODO=open  [topics: adr, authoring]
 - **agent screenshoter** (2026-11-17) — Screenshot role + skill: grim over wlr-screencopy v3 or the portal path via lumen-portal-probe; xdg-desktop-portal-wlr never installed; grim flips the panel bell to DND for 2 s  [topics: screenshots, seat]
 - **notebook full green audit** (2026-11-15) — All five legs PASS on one session set at merged tree c316906: ctest 134/134 ×2, drag PASS, app-smoke 177/0/0, both benches green; the 6bc4820 evidence force-add reverted (0 tracked files)  [topics: audit, evidence; LONG (123 lines — split candidate)]
@@ -103,6 +103,7 @@
 
 ## lx.shell
 
+- **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **animations close ghost** (2026-11-14) — Notebook re-verify: blur-toggle damage non-reproducible; NEW pre-existing bug — closing a FLOATING window with animations on freezes a full-opacity ghost (fade stalls with no other animation)  [topics: animations, ghost, bugs]
 - **unit pair green** (2026-11-14) — Tolerated {ui_gallery, test_task_model} pair retired with zero production code: stale expectations from a65d06b + goldens predating the chevron fix; cross-host claim retracted; 133/133  [topics: goldens, known-red; LONG (155 lines — split candidate)]
 - **panel blur fix** (2026-11-13) — Blur manager rebinds per-connection via pre-connect global_handler; live blur rebuilds panels; first hasvk blur pixels; gates BLOCKED ×2 then closed by committed gate-time smokes  [topics: blur, panel; LONG (206 lines — split candidate)]
@@ -132,6 +133,7 @@
 
 ## lx.ui.host
 
+- **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **ui phase5** (2026-10-29) — ADR-010 Phase 5 (shell adoption + deletion) started 2026-10-29 by workflows on branch claude/ui-phase5;
 - **gpu ui engine plan** (2026-10-24) — GPUI-style primitive renderer plan and phase history (ADR-010: PRs #31–#54, #74–#77); Phase 5 deleted the retained-widget API; shell/portal/lx.app all on lx.ui.host  [topics: adr-010, ui-engine]
 
@@ -145,7 +147,7 @@
 
 ## modules
 
-- **sanitizer sweep green** (2026-11-18) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions  [topics: asan, tsan, sanitizers; LONG (128 lines — split candidate)]
+- **sanitizer sweep green** (2026-11-18) — First ASan+UBSan/TSan sweep: 97/136→136/136 both, eight defect classes (render_node UAF, fdinfo race, nothrow-new pairs, retained-text stack lifetime ×4 origins); five name suppressions  [topics: asan, tsan, sanitizers; LONG (133 lines — split candidate)]
 - **snprintf log migration** (2026-11-17) — All 329 modules/ snprintf sites → §4.3 format conventions (4 documented exceptions); format_to_n idioms, sed traps (n = *... mangling); CRLF premise retracted — both files LF  [topics: logging, format]
 
 ## protocols
@@ -155,6 +157,7 @@
 ## scripts
 
 - **super tap mid chord repro** (2026-11-24) — Super tap mid-chord NOT_REPRODUCED (notebook 2026-11-24): 45 chords, 0 fires, control 6/6 at 161-182 us; 2026-11-17 sighting = lone-meta tap + saved chord binding; no product change; noise 2/2/0/0.  [topics: keybindings, tap, injection, seat, repro]
+- **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **smoke harness broker fixture** (2026-11-23) — smoke_harness perfetto fixture carries the seat broker hermetically (wrapper→real broker --no-preflight, private lock dir); 49/13→82/0; mutations flip it; review noise 6/6/0, 2 preexisting  [topics: smoke, seat-broker, hermeticity]
 - **todo fixes round** (2026-11-23) — Workflows unloadable 4 days (scope: key) fixed; evidence/ untracked; 8 TODO rows reconciled. Landing declined on untracked .mimosa/, then BYPASSED by a spool-parent ff; by-hand a89cbad 141/141.  [topics: landing, memory-spool, workflows, amend, todo-reconciliation]
 - **harness review green** (2026-11-19) — Harness review fixed: seat broker, run lock, fail-closed hooks, agents single-source, classifier-derived evidence, layer_graph ctest, diff-hygiene, memory schema + generated indexes  [topics: zcode, review, broker, layer-graph, memory]
@@ -167,6 +170,7 @@
 
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **settings no writable banner** (2026-11-24) — settings banner up from launch (keymap +86 ms → repaint() memory_only via 10 non-edit callers); fixed 023443e (non-edits refresh()); seat A/B 13/17 pre PRESENT → only unwritable edit; ctest 141/141  [topics: banner, seat-repro, wayland-debug, injection]
+- **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **unit pair green** (2026-11-14) — Tolerated {ui_gallery, test_task_model} pair retired with zero production code: stale expectations from a65d06b + goldens predating the chevron fix; cross-host claim retracted; 133/133  [topics: goldens, known-red; LONG (155 lines — split candidate)]
 - **toplevel drag drag smoke** (2026-11-13) — lumen-square --toplevel-drag client + drag-smoke row j: final run PASS zero warnings, +240,+160 exact; traps: gitignored protocol XML compiled out silently, VM injection nodes fail on notebook  [topics: drag-smoke, injection]
 

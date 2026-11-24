@@ -71,3 +71,18 @@ Facts from the 2026-11-04 bug-fix session:
 
 **Why:** hardware results arrive as pasted logs; a future session needs the device context to read them.
 **How to apply:** when the user pastes notebook logs, assume this hardware; ask them to log out of Lumen before benches. Related: [[lumen-no-degradation-rule]], [[lumen-best-in-class-bar]].
+
+Facts from the 2026-11-24 tray-UAF session (kernel 7.3.5; [[lumen-tray-menu-uaf]]):
+
+- **Button injection has a dead window**: 10:01–10:52 the seat's button injection failed
+  host-wide — motions landed, zero button events reached any client (drag-smoke's
+  identical 11-row zero-button signature on a freshly rebuilt zero-diff main AND the
+  task tree). Kernel-side delivery verified good throughout (a direct evdev read of the
+  uinput node saw both EV_ABS and EV_KEY/BTN_LEFT; across a restarted holder fresh from
+  `uinput-mouse.py`, single and dual virtual mice, fresh compositors, `EVIOCGKEY` empty);
+  it recovered by 10:52 without intervention — the same tree+build that failed at 10:06
+  passed unchanged. When buttons die: A/B a fresh main build before blaming a diff.
+- **First injected event(s) after a quiet spell can be dropped**: the tray-UAF repro
+  loop lost seat runs 2–7 to this plus a mark-before-inject race; warm-up motion pairs
+  before every injection group and a counted retry for a missed stage are now the loop's
+  standard (app-smoke's N6 tray row's 1 px double-move is the same phenomenon).

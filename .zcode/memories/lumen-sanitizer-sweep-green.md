@@ -135,3 +135,8 @@ N8 idle-row noise discounted by rerun); drag-smoke PASS at HEAD; ctest 136/136. 
 evidence/2026-11-18-sanitizer-sweep/seat-regression/. NEW pre-existing finding, recorded
 as a TODO row: heap-use-after-free READ of size 8 at tray-menu close (stack lost to abort
 + truncation; menu/tray untouched by this branch). DBG scaffolding dropped (2698a85).
+
+**Resolved 2026-11-24**: that tray-menu heap-use-after-free was captured (complete
+runtime-written ASan report, seat repro 1/1), root-caused (teardown inside the menu's
+own input delivery — NOT the retained-text class above) and fixed; 30/30 clean post-fix.
+See [[lumen-tray-menu-uaf]].
