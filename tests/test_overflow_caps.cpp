@@ -850,6 +850,40 @@ LUMEN_TEST(overflow_glyph_cache_each_policy) {
 // fits and sets `truncated()`. All five caps keep it — the line cap on both of the wrap pass's
 // paths, the shaped one and the estimate one a 0 pt font (no face resolves) takes.
 LUMEN_TEST(overflow_text_layout_each_policy) {
+    constexpr const char* k_five_lines = "one\ntwo\nthree\nfour\nfive";
+
+    // The line cap with no face (the wrap pass's estimate path, lines.cppm:1246-1248): a 0 pt
+    // font resolves none, so the same five paragraphs are laid out as estimates. This leg
+    // needs no face by construction, so it runs before the probe's skip can end the case —
+    // on a host without fonts it is the line cap's only coverage.
+    for (const overflow_action action : k_actions) {
+        lx::text::text_layout layout;
+        lx::text::text_layout_limits lim{};
+        lim.max_lines = 2;
+        lim.overflow = action;
+        layout.set_limits(lim);
+        layout.set_font({.size_pt = 0.f});
+        layout.set_text(k_five_lines);
+        lx::result<void> updated;
+        {
+            log_capture log;
+            updated = layout.update();
+            expect(log.warns("text_layout: a storage cap cut the text") ==
+                       (action == overflow_action::warn_and_drop ? 1u : 0u),
+                   where(action, "the cut warning must come exactly once under warn_and_drop "
+                                 "and never otherwise"));
+        }
+        if (action == overflow_action::reject)
+            // One line per paragraph whatever the wrap inputs: only `set_limits` (a shape
+            // input) recovers this leg's refuse.
+            expect(!updated && layout.lines().empty() && !layout.truncated(),
+                   where(action, "the pass must fail and leave the layout empty and not flag "
+                                 "what it refused to lay out"));
+        else
+            expect(updated.ok() && layout.lines().size() == lim.max_lines && layout.truncated(),
+                   where(action, "what fits must be kept and the layout flagged"));
+    }
+
     {
         // The layout needs a face: one shaped line says there is one.
         lx::text::text_layout probe;
@@ -859,7 +893,6 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                               "lx.text/lines.cppm:790-797,834-840,933-938,1246-1278 text_layout"))
             return;
     }
-    constexpr const char* k_five_lines = "one\ntwo\nthree\nfour\nfive";
     for (const overflow_action action : k_actions) {
         const bool refuses = action == overflow_action::reject;
         const auto warns_like = [&](const log_capture& log) {
@@ -947,33 +980,6 @@ LUMEN_TEST(overflow_text_layout_each_policy) {
                 expect(updated.ok() && layout.lines().size() == lim.max_lines,
                        where(action, "a wrap input change must recover the refused layout"));
             } else
-                expect(updated.ok() && layout.lines().size() == lim.max_lines && layout.truncated(),
-                       where(action, "what fits must be kept and the layout flagged"));
-        }
-
-        // The line cap again with no face (the wrap pass's estimate path, lines.cppm:1246-1248):
-        // a 0 pt font resolves none, so the same five paragraphs are laid out as estimates.
-        {
-            lx::text::text_layout layout;
-            lx::text::text_layout_limits lim{};
-            lim.max_lines = 2;
-            lim.overflow = action;
-            layout.set_limits(lim);
-            layout.set_font({.size_pt = 0.f});
-            layout.set_text(k_five_lines);
-            lx::result<void> updated;
-            {
-                log_capture log;
-                updated = layout.update();
-                expect(warns_like(log), warns_once());
-            }
-            if (refuses)
-                // One line per paragraph whatever the wrap inputs: only `set_limits` (a
-                // shape input) recovers this leg's refuse.
-                expect(!updated && layout.lines().empty() && !layout.truncated(),
-                       where(action, "the pass must fail and leave the layout empty and not "
-                                     "flag what it refused to lay out"));
-            else
                 expect(updated.ok() && layout.lines().size() == lim.max_lines && layout.truncated(),
                        where(action, "what fits must be kept and the layout flagged"));
         }
