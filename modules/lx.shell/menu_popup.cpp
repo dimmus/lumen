@@ -353,8 +353,19 @@ bool lx::shell::menu_popup::open(lx::ui::host::layer_role& layer, lx::rect2i anc
                                  std::vector<menu_entry> items, unsigned serial,
                                  activate_fn on_activate, closed_fn on_closed,
                                  submenu_fn on_submenu, void* user, const char* name) {
-    // A deferred close leaves the levels counted open; finish it here (open never runs
-    // inside the menu's own input delivery) so `open_level(0)` finds the level free —
+    // open() must not run inside the menu's own input delivery: close() below would
+    // re-defer via the live delivering() check (the levels stay counted open) and
+    // open_level(0) would build on the occupied level. calendar_popup::open refuses the
+    // same situation with an error; so does this — the deferred close stays pending for
+    // after_dispatch() to drain.
+    for (unsigned i = 0; i < levels_; ++i) {
+        if (level_[i].surface.valid() && level_[i].surface.input().delivering()) {
+            log_menu.error(lx::invalid_argument("menu popup opened during input delivery"));
+            return false;
+        }
+    }
+    // A deferred close leaves the levels counted open; finish it here (the guard above
+    // makes the invariant checked, not assumed) so `open_level(0)` finds the level free —
     // and the replaced menu's on_closed (the tray's "closed" event) still runs.
     if (close_pending_from_ < k_menu_max_levels || is_open()) {
         close_pending_from_ = k_menu_max_levels;
