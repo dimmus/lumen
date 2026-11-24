@@ -191,7 +191,7 @@ current when an item closes.
   injected Super-chords can trip the shell's Super tap grab and steal focus mid-chord
   (launcher open/close in the compositor log) — not a capture defect; see
   `.zcode/memories/lumen-settings-key-capture-seat.md` and the open row below.
-- [ ] **Super tap grab fires mid-chord (compositor tap-arming corner)** (2026-11-17, found
+- [x] **Super tap grab fires mid-chord (compositor tap-arming corner)** (2026-11-17, found
   by the settings-key-capture seat run; low; pre-existing; **2026-11-24: NOT reproduced at
   any cadence — most plausibly never a tap defect; see below before spending more on it**):
   during an injected Super+Shift+y chord the shell's Super tap grab armed and fired anyway
@@ -224,8 +224,11 @@ current when an item closes.
   unchanged since that tree (only logging refactors 96e336a/8e925e5), so this was not
   fixed in between. Evidence: `evidence/2026-11-24-super-tap-mid-chord/` in the
   super-tap-mid-chord worktree, mirrored to `/home/dimmus/lumen/evidence/2026-11-24-super-tap-mid-chord/`
-  (REPRO.md, VERDICT.md, run/TIMELINE.md + summary.json + raw logs). Left unticked:
-  nothing was fixed; owner call whether to close as misattributed.
+  (REPRO.md, VERDICT.md, run/TIMELINE.md + summary.json + raw logs).
+  **Closed 2026-11-24 as misattributed (owner decision):** nothing to fix — the
+  2026-11-17 sighting is explained by the two by-design mechanisms above, and the
+  key path is behaviorally unchanged since that tree. If a mid-chord fire is ever
+  seen with real hands, a fresh row opens with timestamped evidence.
 - [ ] **ADR-013 open item 2: per-device override editor + window-rules UI** — both are
   schema-side rows in `lumen-settings` waiting on their own compositor feature (rule store
   behind the inert `zlm_window_rules_v1`; `[[input.device]]` override plumbing), not on the app.
