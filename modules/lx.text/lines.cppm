@@ -1262,9 +1262,11 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
         const std::int32_t h = round_px(static_cast<std::int32_t>(size_pt_ * scale_ * 1.2f * 64.f));
         for (const paragraph& p : paragraphs_) {
             if (lines_.size() >= limits_.max_lines) {
-                lines_cut_ = over_cap(true);
+                // The refuse returns before the flag, as the input-cut refuse does: a failed
+                // pass leaves nothing that could be "truncated".
                 if (limits_.overflow == lx::runtime::overflow_action::reject)
                     return lx::invalid_argument("text_layout: line cap reached");
+                lines_cut_ = over_cap(true);
                 break;
             }
             std::int32_t w = 0;
@@ -1292,9 +1294,11 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
             const std::uint32_t ce = p.cluster_end;
             do {
                 if (lines_.size() >= limits_.max_lines) {
-                    lines_cut_ = over_cap(true);
+                    // The refuse returns before the flag, as the input-cut refuse does: a
+                    // failed pass leaves nothing that could be "truncated".
                     if (limits_.overflow == lx::runtime::overflow_action::reject)
                         return lx::invalid_argument("text_layout: line cap reached");
+                    lines_cut_ = over_cap(true);
                     stop = true;
                     break;
                 }
