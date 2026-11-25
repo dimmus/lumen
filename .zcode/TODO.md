@@ -164,6 +164,15 @@ current when an item closes.
   S2/update +15.4%, is +0.010 us — 100x under ABS_FLOOR_US=1.0 — and bench_ui.cpp never
   calls container_node::add/remove). Line numbers above are base-tree; HEAD: the warn
   block sits at the tail of container_node::add, the latch beside child_overflow_.
+- [ ] **lx.scene's CMake DEPENDS omits lx.trace** (found 2026-11-25 in
+  scene-container-warn-and-drop's review; pre-existing; low): CMakeLists.txt:139-140
+  registers lx.scene with `DEPENDS lx.gfx lx.scheduler lx.runtime lx.sync`, but
+  snapshot_buffer.cppm has imported lx.trace since well before base (present at
+  657da67) and the facade does since the warn landed (4191ed0, `import lx.trace;`
+  lx.scene.cppm:9) — lx.theme's registration (:141) carries `lx.trace` explicitly.
+  The module scanner currently resolves the import so builds stay green; the gap is
+  latent and surfaces if scanner resolution ever tightens. One-line fix; fold into
+  the next CMakeLists touch.
 - [ ] **scripts/diff-hygiene.sh prints a `local` error on every run and leaks its
   format log** (found 2026-11-24, same review; pre-existing; low): line 92 uses `local`
   at top level ("local: can only be used in a function" before the summary line) and the

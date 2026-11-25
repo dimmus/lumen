@@ -1,6 +1,6 @@
 ---
 name: lumen-scene-container-warn-and-drop
-description: "container_node::add warn_and_drop warn landed 2026-11-25 (merge e8b2500, commit 4191ed0): warn-once per overflow episode re-armed by remove(), pinned in test_overflow_caps, A/B clean — and the second sub-us A/B mover adjudicated away (Rule proposal below)."
+description: "container_node::add warn_and_drop warn landed 2026-11-25 (merge e8b2500, commit 4191ed0): warn-once per overflow episode re-armed by remove(), pinned in test_overflow_caps, A/B clean — and the second sub-us A/B mover adjudicated away (Rule proposal below). Review noise 4/4/0 + 1 preexisting (lx.scene CMake DEPENDS omits lx.trace — TODO row added)."
 summary: "The warn warn_and_drop promises, landed 2026-11-25 (e8b2500): warn-once per episode, remove() re-arms; pinned + red-proven; 143/143 twice; A/B 6x vulkan clean; 2nd sub-us A/B mover."
 modules: lx.scene, tests
 topics: overflow-caps, logging, bench-ab
@@ -61,6 +61,27 @@ gated and landed.
   clang-format run on a bare /tmp copy produces, ~35x the real debt; this change's
   19 added lines intersect the violation set emptily; diff-hygiene exits 1 with no
   added line at fault (its own `local` bug row is separate).
+
+**Review pass — 2026-11-25, this task's review stage:** noise raised 4, confirmed 4,
+refuted 0, preexisting 1; all four confirmed low. (1) The test's lx.scene.cppm line
+citations went stale from the fix's own 19 added lines (cites add() :546-559 and
+children_ :232, actual :557-573/:239) — renumbered in the worktree as a129e79
+(test-only, the task-1 renumbering precedent cb4dd32) but **unlanded**: main's merged
+test still cites the base-tree numbers. (2) The first-recorded format-debt figure
+("1890 violation lines") is the style-less-/tmp-copy artifact, not the repo-style
+measurement (53 replacement operations over 36 violation lines, base = HEAD) —
+corrected on main 8545761 (the bullet above carries the corrected numbers). (3) The
+handoff note's "6 result JSONs in /tmp/scene-ab/" was imprecise — base JSONs + run
+logs there, candidate JSONs in the worktree's tests/bench/results/iritur-08fd3c-vulkan/
+— superseded on main 3baf5a6 (the bullet above states both locations). Preexisting
+(1): lx.scene's CMake DEPENDS omits lx.trace (CMakeLists.txt:139-140 vs lx.theme
+:141; import at lx.scene.cppm:9 and in snapshot_buffer since before base) — the
+scanner papers over it today; open TODO row added. Evidence-hygiene carryovers, same
+strikes the sibling's rules cover ([[lumen-text-layout-line-cap-reject]]): the
+worktree suite receipt was wiped by a zero-test ctest -N; the supplementary
+drag/app-smoke lines have no broker ticket (INVALID as brokered evidence; smokes not
+required by this diff); the "1 fix round" gate line has no artifact. At review time
+origin/main = 5858207 — corrections 8545761/3baf5a6 still unpushed.
 
 **Why:** an enum that promises "Log warn, then drop_newest" is a contract every site
 must keep — the overflow-caps lineage exists to hold each fixed-capacity structure to
