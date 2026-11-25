@@ -380,9 +380,11 @@ void sync_id(lx::toplevel_id id) {
 /// lock (nothing changes there, W.6).
 [[nodiscard]] const toplevel_record* request_target(wl_resource* r, const char* request) {
     auto* h = static_cast<handle_obj*>(wl_resource_get_user_data(r));
-    if (!h || !h->toplevel || !g_ctx || !g_ctx->toplevels)
+    if (!h)
         return nullptr;
-    const toplevel_record* rec = g_ctx->toplevels->find(h->toplevel);
+    // An inert handle names no window left (id 0 in the log).
+    const toplevel_record* rec =
+        h->toplevel && g_ctx && g_ctx->toplevels ? g_ctx->toplevels->find(h->toplevel) : nullptr;
     if (rec && rec->mapped && !session_locked())
         return rec;
     if (log_ftl.enabled(lx::trace::level::debug))
