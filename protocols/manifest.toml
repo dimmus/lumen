@@ -188,6 +188,16 @@ name = "wlr-output-power-management-unstable-v1"
 path = "unstable/wlr-output-power-management-unstable-v1.xml"
 module = "lx.wayland.protocols.output_power"
 
+# zwlr_foreign_toplevel_manager_v1 / zwlr_foreign_toplevel_handle_v1 (version 3): the mapped
+# windows with their title, app id, state, outputs and parent, and the window requests a bar
+# or a switcher makes (activate, close, minimize, maximize, fullscreen). Served by the
+# compositor (wire_wlr_foreign_toplevel.cpp) to every unsandboxed client, like
+# ext-foreign-toplevel-list beside it; zlm_shell_v1 is unchanged.
+[[wlr.protocol]]
+name = "wlr-foreign-toplevel-management-unstable-v1"
+path = "unstable/wlr-foreign-toplevel-management-unstable-v1.xml"
+module = "lx.wayland.protocols.wlr_foreign_toplevel_management"
+
 # Implemented by the app-compatibility and capture work (ADR 009)
 [[upstream.protocol]]
 name = "xdg-toplevel-icon"

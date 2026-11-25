@@ -546,4 +546,7 @@ void workspaces_sync_all() {}
 void lx::compositor::workspaces_changed(protocol_context& ctx) {
     (void)ctx;
     wire::workspaces_sync_all();
+    // The zwlr_foreign_toplevel_handle_v1 objects follow: a switch, a move or an assign
+    // changes which windows the outputs show.
+    wire::wlr_toplevels_sync_all();
 }

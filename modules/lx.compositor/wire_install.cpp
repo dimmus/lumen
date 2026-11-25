@@ -155,6 +155,9 @@ module;
 #ifdef LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1
 #include "ext-foreign-toplevel-list-v1-server-protocol.h"
 #endif
+#ifdef LUMEN_PROTOCOL_WLR_FOREIGN_TOPLEVEL_MANAGEMENT_UNSTABLE_V1
+#include "wlr-foreign-toplevel-management-unstable-v1-server-protocol.h"
+#endif
 #ifdef LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1
 #include "ext-image-capture-source-v1-server-protocol.h"
 #endif
@@ -734,6 +737,20 @@ void install_core(protocol_context& ctx) {
                                 .deny_sandboxed = true,
                                 .interface_desc = &ext_foreign_toplevel_list_v1_interface},
                                &bind_foreign_toplevel_list);
+#endif
+#ifdef LUMEN_PROTOCOL_WLR_FOREIGN_TOPLEVEL_MANAGEMENT_UNSTABLE_V1
+    // zwlr_foreign_toplevel_management_v1 v3: the same windows for bars and switchers, with
+    // the window requests they make (wire_wlr_foreign_toplevel.cpp). Its handles follow the
+    // windows through the bridge's list observer, shell or no shell. Session-wide, so hidden
+    // from sandboxed clients like the list above.
+    install_wlr_toplevel_observer(ctx);
+    if (ctx.toplevels && ctx.shell)
+        ctx.server->add_global({.interface_name = "zwlr_foreign_toplevel_manager_v1",
+                                .version = 3,
+                                .privileged = false,
+                                .deny_sandboxed = true,
+                                .interface_desc = &zwlr_foreign_toplevel_manager_v1_interface},
+                               &bind_wlr_foreign_toplevel_manager);
 #endif
 #ifdef LUMEN_PROTOCOL_EXT_WORKSPACE_V1
     // ext-workspace (design-session-and-wm W.4): the workspaces of every output, which the

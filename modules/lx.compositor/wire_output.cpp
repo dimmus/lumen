@@ -448,6 +448,8 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
     send_output_done(native);
     // ext-workspace: this output's workspace group names the new object too.
     workspace_output_bound(o->client, native, o->slot);
+    // zwlr_foreign_toplevel_handle_v1: the handles on this output enter it on the new object.
+    wlr_toplevel_output_bound(o->client, native, o->slot);
 
     // Clients often bind outputs after mapping: the surfaces already on this output get the
     // enter they missed (wlroots does the same on bind).
@@ -564,6 +566,10 @@ void outputs_changed() {
             continue;
         membership_from_rect(&s, g_ctx->tree->node_rect(s.id));
     }
+    //    The zwlr_foreign_toplevel_handle_v1 objects follow the windows, which moved with the
+    //    outputs — here, while the wl_output objects of an output that went still stand for
+    //    it: the output_leave of it has to name them.
+    wlr_toplevels_sync_all();
     // 2. Globals: a gone output's removed (its objects inert), a new output's created.
     (void)sync_globals();
     // 3. Every object of an output whose state changed (and its xdg_outputs) gets the new

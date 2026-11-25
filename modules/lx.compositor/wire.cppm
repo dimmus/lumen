@@ -1148,6 +1148,25 @@ bool cu_poll_add(int fd, unsigned key, unsigned generation);
 /// Drops (closes) every wait of `key`.
 void cu_poll_drop(unsigned key);
 
+// ── wire_wlr_foreign_toplevel.cpp (zwlr_foreign_toplevel_management_v1) ──
+//    The bind function exists only with the protocol's glue (a wlr-protocols protocol);
+//    wire_install.cpp calls it under the same `LUMEN_PROTOCOL_*` guard. The rest are no-ops
+//    without it, and return at once while no manager is bound.
+
+void bind_wlr_foreign_toplevel_manager(wayland::client_connection& client, unsigned id,
+                                       int version);
+/// The shell bridge's list observer (maps, unmaps, state, focus, moves, parents,
+/// workspaces): the foreign-toplevel handles follow the windows through it.
+void install_wlr_toplevel_observer(protocol_context& ctx);
+/// Every handle follows the window manager's state again: after a workspace change (a
+/// switch, a move or an assign changes which windows are on which output), and when the
+/// outputs changed — before a gone output's wl_output objects go inert, so that the
+/// output_leave of it still names them.
+void wlr_toplevels_sync_all();
+/// A wl_output was bound: the handles entered on that output get their output_enter on the
+/// new object, each closed by a done.
+void wlr_toplevel_output_bound(wl_client* client, wl_resource* output, unsigned slot);
+
 // ── ext-workspace-v1 (wire_workspace.cpp; design-session-and-wm W.4) ─────
 
 void bind_workspace_manager(wayland::client_connection& client, unsigned id, int version);
