@@ -612,6 +612,10 @@ void bind_wlr_foreign_toplevel_manager(wayland::client_connection& client, unsig
     g_tables = m;
     ++g_manager_count;
     wl_resource_set_implementation(native, &manager_impl, m, &manager_destroy_resource);
+    // The list is told `activated` from the keyboard focus, and the observer records nothing
+    // while no manager is bound: the tracker starts here, or the window that has the keyboard
+    // now keeps `activated` after the next focus change.
+    g_activated = wm()->keyboard_focus();
     // 1. Every window mapped now, bottom to top: toplevel, title, app id, state, outputs.
     g_ctx->toplevels->for_each_bottom_up([&](const toplevel_record& rec) {
         if (handle_obj* h = open(*m, rec)) {
