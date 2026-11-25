@@ -311,10 +311,10 @@ LUMEN_TEST(overflow_primitives_each_action) {
           "four actions + the default)");
 }
 
-// `container_node::add` (lx.scene.cppm:546-559): a child past the 128 inline slots. The
+// `container_node::add` (lx.scene.cppm:557-574): a child past the 128 inline slots. The
 // policy is `set_child_overflow_policy` (drop_newest until set).
 LUMEN_TEST(overflow_container_children_each_policy) {
-    constexpr unsigned cap = 128; // container_node::children_ (lx.scene.cppm:232)
+    constexpr unsigned cap = 128; // container_node::children_ (lx.scene.cppm:239)
     auto kids = std::make_unique<lx::scene::container_node[]>(cap + k_further);
     for (const overflow_action action : k_actions) {
         lx::scene::container_node parent;
@@ -386,7 +386,7 @@ LUMEN_TEST(overflow_container_children_each_policy) {
         }
         expect(parent.child_count() == cap, "the container must end full, as it started");
     }
-    drove("lx.scene/lx.scene.cppm:546-559 container_node::add (children, all four policies)");
+    drove("lx.scene/lx.scene.cppm:557-574 container_node::add (children, all four policies)");
 }
 
 // ── lx.ui: the structures with a fixed policy ──────────────────────────────────────────
