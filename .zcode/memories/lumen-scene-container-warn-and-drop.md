@@ -42,7 +42,14 @@ gated and landed.
   worktree ctest 143/143 -LE bench; merged tree re-gated 143/143 (build/merge-gate);
   bench_ab = 6 interleaved hasvk vulkan runs (3x base 657da67, 3x 4191ed0, pin 3,
   setarch -R by the script, quiet-CPU hold + host warm-up verified per run, six
-  distinct bench tickets, seat quiet before/after). One >=10% mover: S2/update +15.4%
+  distinct bench tickets, seat quiet before/after). Artifact locations (stated
+  precisely 2026-11-25, superseding the handoff note's "6 result JSONs in
+  /tmp/scene-ab/"): the six run logs (run1..run6 {base,cand}.log) and the three
+  base JSONs (20261125-657da67{,-2,-3}.json, git stamp 657da67) live in
+  /tmp/scene-ab/; the three candidate JSONs (20261125-4191ed0{,-2,-3}.json, git
+  stamp 4191ed0, backend vulkan) live in the task worktree's
+  tests/bench/results/iritur-08fd3c-vulkan/, where ui-bench wrote them — all six
+  exist, split across the two places. One >=10% mover: S2/update +15.4%
   = +0.010 us on a 0.065 us stage, 100x under the bench's own ABS_FLOOR_US=1.0
   (scripts/ui-bench.sh:113), and lumen-ui-bench (tests/bench_ui.cpp, CMakeLists:1242)
   never calls container_node::add/remove — the stage cannot reach the diff. All
