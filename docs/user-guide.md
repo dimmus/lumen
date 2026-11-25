@@ -290,12 +290,16 @@ the private `zlm_shell_v1` (v6; the shell only). Windows covered by an opaque wi
 composited, and their frame callbacks slow to one a second (a window being captured keeps the
 outputs' pace).
 
-Taskbars and switchers (ADR 009 Part 4's amendment): waybar and any other bar that is not
-lumen-shell lists the windows through `zwlr_foreign_toplevel_manager_v1` — title, app id,
-state (maximized, minimized, activated, fullscreen), the output the window is shown on, its
-parent — and acts on them (activate, close, minimize, maximize, fullscreen) exactly as the
-shell's panel does; the highlighted window is the one that has the keyboard. Nothing changes
-while the session is locked. Sandboxed clients do not see the global.
+Taskbars and switchers (ADR 009 Part 4's amendment): a bar that is not lumen-shell lists the
+windows through `zwlr_foreign_toplevel_manager_v1`, the protocol waybar's taskbar speaks —
+title, app id, state (maximized, minimized, activated, fullscreen), the output the window is
+shown on, its parent — and acts on them (activate, close, minimize, maximize, fullscreen)
+exactly as the shell's panel does. The highlighted window (`activated`) is the window
+manager's focus decision, the one the shell's panel highlights too: it stays that window
+while a layer surface or the lock screen holds the keys, and none has it while no window has
+the keyboard. Nothing changes while the session is locked. Sandboxed clients do not see the
+global. Driven on the seat with `lumen-probe wlr-toplevels`; waybar itself has not been run
+against it.
 
 Screen capture (ADR 009 Part 4): grim (`-o` an output, `-T` a window, also a covered one),
 wf-recorder and xdg-desktop-portal-wlr work; frames carry only what changed and are copied
