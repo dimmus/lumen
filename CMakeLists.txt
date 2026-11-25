@@ -1381,6 +1381,16 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_ext_workspace COMMAND test_ext_workspace)
     set_tests_properties(test_ext_workspace PROPERTIES TIMEOUT 60)
 
+    # zwlr_foreign_toplevel_management_v1 (wlr-foreign-toplevel-management-unstable-v1): the
+    # window list and window requests of bars, in-process with two virtual outputs, as above.
+    add_executable(test_foreign_toplevel_management tests/test_foreign_toplevel_management.cpp)
+    target_link_libraries(test_foreign_toplevel_management PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_foreign_toplevel_management)
+    lumen_link_platform(test_foreign_toplevel_management)
+    target_include_directories(test_foreign_toplevel_management PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_foreign_toplevel_management COMMAND test_foreign_toplevel_management)
+    set_tests_properties(test_foreign_toplevel_management PROPERTIES TIMEOUT 60)
+
     # ADR 012: master-stack tiling per workspace, in-process as above.
     add_executable(test_tiling tests/test_tiling.cpp)
     target_link_libraries(test_tiling PRIVATE lx.compositor)

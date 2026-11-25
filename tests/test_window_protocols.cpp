@@ -1289,6 +1289,11 @@ void security_cases() {
     for (const char* g : hidden)
         if (connected && has_global(boxed, g))
             leaked += std::string(" ") + g;
+    // Session-wide like the list above (ADR 009 Part 4 amendment): it lists every window,
+    // and its requests act on any of them. Looked up on its own line: that initializer is
+    // packed against .clang-format, and an element added to it would be its to reformat.
+    if (connected && has_global(boxed, "zwlr_foreign_toplevel_manager_v1"))
+        leaked += " zwlr_foreign_toplevel_manager_v1";
     for (const char* g : visible)
         if (connected && !has_global(boxed, g))
             missing += std::string(" ") + g;
@@ -1337,6 +1342,10 @@ void globals_case() {
             missing += std::string(" ") + g;
     check("every Part B global is advertised to an unsandboxed client", missing.empty(),
           missing.empty() ? "all 11" : "missing:" + missing);
+    // Beside them (ADR 009 Part 4 amendment), on its own line for the reason the sandbox
+    // case gives.
+    check("zwlr_foreign_toplevel_manager_v1 is advertised to an unsandboxed client",
+          has_global(c, "zwlr_foreign_toplevel_manager_v1"), "the global is in the registry");
     disconnect(c);
 }
 
