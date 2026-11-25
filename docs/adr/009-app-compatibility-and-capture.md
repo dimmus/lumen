@@ -7,7 +7,9 @@
 > implemented. Part 3 (pointer: pointer-constraints-unstable-v1,
 > relative-pointer-unstable-v1, pointer-gestures-unstable-v1 v3) implemented. Part 4
 > (screen capture: ext-foreign-toplevel-list-v1, ext-image-capture-source-v1,
-> ext-image-copy-capture-v1, wlr-screencopy v3, the capture indicator) implemented. Part 5
+> ext-image-copy-capture-v1, wlr-screencopy v3, the capture indicator) implemented; its
+> amendment (wlr-foreign-toplevel-management-unstable-v1 v3 for bars that are not the shell,
+> on the toplevel observer's third slot) implemented. Part 5
 > (portals: xdg-desktop-portal-wlr for ScreenCast, xdg-desktop-portal-lumen for Screenshot,
 > PickColor and the source chooser, the session environment) implemented.
 
@@ -48,7 +50,13 @@ views, the worker read-back, lock/pause/power/hotplug hooks, virtual-output CPU 
 `output_view_config::root`), `lx.shell` (the panel's capture dot), `lumen-probe toplevels|
 capture|cursor-capture|animate`, `scripts/app-smoke.sh` group Y, `scripts/monitor-smoke.sh`
 step `capture`, `tests/test_capture.cpp`, `tests/test_capture_protocols.cpp`,
-`tests/test_gl_capture.cpp`, `tests/test_vk_capture.cpp`.
+`tests/test_gl_capture.cpp`, `tests/test_vk_capture.cpp`. Part 4 amendment:
+`lx.compositor` (`wire_wlr_foreign_toplevel.cpp`; `:shell_bridge` — the list observer slot
+and its `updated` callback; `wire.cppm`, `wire_install.cpp`; `wire_output.cpp` and
+`wire_workspace.cpp` — the sync hook lines), `protocols/manifest.toml` (the
+`[wlr.protocol]` entry), `lumen-probe wlr-toplevels`, `scripts/app-smoke.sh` row Q8,
+`tests/test_foreign_toplevel_management.cpp`, `tests/test_window_protocols.cpp` (the global's
+two lists).
 Part 5: `lx.portal` (reworked: `:compose`, `:png`, `:files`, `:chooser`, `:desktop`,
 `:overlay`, `:service`; the Flatpak-token stub removed), `executables/xdg-desktop-portal-lumen`,
 `deploy/portal/` (`lumen.portal`, `lumen-portals.conf`, the D-Bus service),
@@ -184,6 +192,56 @@ deviations are in its implementation notes.
 24. **wlr-screencopy v3** is a front end of the same core: one one-shot session per frame,
     `copy_with_damage` per (client, output) damage points.
 
+### Part 4, as built — amendment: bars that are not the shell (2026-11-25)
+
+25. **wlr-foreign-toplevel-management-unstable-v1** is served at version 3
+    (`zwlr_foreign_toplevel_manager_v1`, `zwlr_foreign_toplevel_handle_v1`;
+    `wire_wlr_foreign_toplevel.cpp`), beside ext-foreign-toplevel-list: every mapped window
+    with its title, app id, state (`maximized`, `minimized`, `activated`, `fullscreen`), the
+    outputs it is shown on and its parent, and the requests a taskbar or a switcher makes —
+    `activate`, `close`, minimize, maximize, fullscreen — which are the zlm policy bridge's
+    requests' own calls (`window_manager::activate` unminimizes, switches to the window's
+    workspace, raises it and gives it the keyboard). The owner's request for it is the
+    decision; this note is its as-built record.
+    - *Why this one, and why the shell keeps zlm.* waybar-class bars and switchers speak
+      this protocol. `zlm_shell_v1` is unchanged: it carries what this protocol has no event
+      for (workspaces as the shell's own handles, the attention flags, icons, the bell, the
+      stacking index, the configuration). ext-foreign-toplevel-list (FT1) stays the read-only
+      list the capture pickers use; this one adds state, outputs, parent and the requests.
+    - *How it follows the windows.* Through the shell bridge's **third observer slot**
+      (`set_list_observer`): map, unmap, state and focus, and an `updated` callback that the
+      geometry, parent and workspace emissions give it. Event-driven, never polled: with no
+      manager bound every entry returns before iterating, a change batch allocates nothing
+      (the handles sit in their manager's fixed-capacity table, grown a block at a time;
+      titles and app ids are compared by hash), and every handle is compared again only at
+      the workspace and outputs entry points. Alternatives that lost: a per-tick diff over
+      all handles (polled, and the emissions already mark each change); the capture list's
+      observer slot extended instead (the control observer would publish a window-changed
+      on every move, and a second `set_observer` silently drops ext-foreign-toplevel-list);
+      the hooks in `compositor_impl.cpp` (a render-path file to the change classifier: a
+      bench A/B for a change that touches no pixel).
+    - *Semantics chosen.* `activated` is the window manager's focus decision — what
+      `focus_changed` tells the shell — so a bar and lumen-shell's panel highlight the same
+      window, and none has it while no window has the keyboard. The output is the one whose
+      active workspace lists the window (a sticky or fullscreen one: the one it is on), and
+      minimizing sends no `output_leave`: waybar's taskbar shows a task on `output_enter`
+      and hides it on `output_leave` (`src/modules/wlr/taskbar.cpp`, read 2026-11-25), so
+      the button that restores a minimized window stays. `parent` names the window's parent
+      while that one is mapped, null otherwise (zlm's `toplevel_parent` rule); a child listed
+      before its parent gets it once every handle of the list exists, before its `done`.
+      After `closed` the handle is inert; after `finished` the handles are the client's and
+      go on working, as in wlroots.
+    - *Security model.* `privileged = false`, `deny_sandboxed = true`: every unsandboxed
+      same-UID client — a bar, a script — can activate, close, minimize, maximize or
+      fullscreen any window (the protocol's model, as in sway, Hyprland and wlroots), and
+      the session lock is the only refusal: behind it every request changes nothing, while
+      the events keep reporting what the compositor itself does. `set_rectangle` is checked
+      (`invalid_rectangle`: a negative width or height, or exactly one of them zero) and
+      kept as a hint, the last one winning.
+    - *Not built.* A consumer of the `set_rectangle` hint (the minimize animation has no
+      target of its own yet). waybar itself was not run against it (not installed on the
+      hosts): the seat row drives the protocol with `lumen-probe wlr-toplevels`.
+
 ## Decision (Part 5)
 
 The design is `design-app-compat-capture.md` §0 (P1–P3, E1) and Part E; deviations are in
@@ -252,3 +310,9 @@ its implementation notes.
   and vmwgfx's GBM has no modifier support, so it casts through shm; offering the implicit
   modifier as well trips an xdpw 0.8.4 assertion on such drivers, so the capture
   constraints stay LINEAR), Flatpak callers (the document-portal path of a sandboxed app).
+- Part 4 amendment (item 25): a bar that is not the shell lists every window with its state,
+  output and parent, and acts on it as the shell's panel does; `activated` agrees with
+  lumen-shell's panel. Proven on the notebook's seat with `lumen-probe wlr-toplevels` (the
+  list as three windows map, `set_minimized`, `activate` restoring the window with the
+  keyboard, `close`). Not exercised: waybar itself (not installed), and a consumer of the
+  `set_rectangle` hint (none exists).

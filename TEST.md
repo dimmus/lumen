@@ -465,7 +465,13 @@ fullscreen window and its black backdrop are gone from a screenshot on another w
 back on its own; Q5 Super+H minimizes, a click on the panel entry restores (keyboard
 included), and `xdg_toplevel.set_minimized` minimizes; Q6 a window on a workspace that is not
 shown is still captured (`lumen-probe capture`, frames keep coming); Q7 while locked, Super+2
-and an ext-workspace activate change nothing (`ext-workspace: commit while locked; ignored`).
+and an ext-workspace activate change nothing (`ext-workspace: commit while locked; ignored`);
+Q8 `lumen-probe wlr-toplevels` (a zwlr_foreign_toplevel_management_v1 client printing every
+event) binds before three windows map and lists each as it maps (`toplevel`, `title`,
+`app_id`, `state`, `output_enter`, `parent`, `done`, then `activated`); its `set_minimized`
+minimizes one, its `activate` brings it back with the keyboard (the window is told
+`suspended`, then activated again), its `close` closes another (the client is asked to, the
+bar is told `closed`).
 monitor-smoke's `workspaces` group puts two workspaces on Virtual-2 (lumen-vmw-layout),
 unplugs it — the active workspace's window stays visible on Virtual-1, the other workspace is
 appended there — and plugs it back: both return, the active one active again, and the shell's
@@ -486,7 +492,25 @@ again after a late ext-workspace bind with the shell's own handle, the sticky fl
 minimized state), `test_task_model` (membership, the current-workspace filter, minimized
 dimmed, the indicator's cells, hit and diff), `test_control` (`ListWorkspaces`, a window's
 workspace, the `workspace` event), `test_window_protocols` (a sandboxed client does not see
-ext_workspace_manager_v1), `test_config` (the workspace and minimize default bindings).
+ext_workspace_manager_v1 nor zwlr_foreign_toplevel_manager_v1), `test_config` (the workspace
+and minimize default bindings).
+
+Unit tests of foreign-toplevel management (zwlr_foreign_toplevel_management_v1, ADR 009
+Part 4's amendment): `test_foreign_toplevel_management` (in-process with two virtual outputs;
+libwayland-client clients against the compositor: the bind lists the windows bottom to top,
+each with its opening batch of title, app_id, state, output_enter, parent and done, a child
+listed before its parent getting `parent(that handle)` before its `done`; a window mapped
+later gets the same batch; a title, an app id, each state bit, an output change by a
+workspace switch, a move and an assign, and a parent that maps after its child and unmaps
+each send only what changed, closed by one done, and no event is left open; `activated` is the
+window manager's focus decision and none without one; `closed` at unmap, the handle inert
+afterwards — every request but destroy ignored, none an error; `stop` → `finished`, no
+further toplevel event, the handles still working; a version 1 or 2 client gets no event its
+version lacks; a wl_output bound later gets its output_enter; activate, close, minimize,
+maximize and fullscreen seen through the window client's configures and the compositor's
+state; `set_rectangle` accepted and its four `invalid_rectangle` shapes; behind the session
+lock every request changes nothing while the events keep reporting; a handle or wl_output the
+client destroyed is named no more).
 
 ```bash
 # Switching and snapping (ADR 011 Part 4, design-session-and-wm K, T.3)

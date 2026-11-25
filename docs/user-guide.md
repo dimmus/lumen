@@ -283,11 +283,19 @@ Protocols served: `wl_compositor` (v6), `wl_subcompositor`, `wl_seat` (v9), `wl_
 `ext_data_control_manager_v1`, `zwlr_data_control_manager_v1` (v2),
 `wp_security_context_manager_v1`, `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1`,
 `zwp_pointer_gestures_v1` (v3), `ext_foreign_toplevel_list_v1`,
+`zwlr_foreign_toplevel_manager_v1` (v3),
 `ext_output_image_capture_source_manager_v1`, `ext_foreign_toplevel_image_capture_source_manager_v1`
 (GL and CPU backends), `ext_image_copy_capture_manager_v1`, `zwlr_screencopy_manager_v1` (v3), and
 the private `zlm_shell_v1` (v6; the shell only). Windows covered by an opaque window are not
 composited, and their frame callbacks slow to one a second (a window being captured keeps the
 outputs' pace).
+
+Taskbars and switchers (ADR 009 Part 4's amendment): waybar and any other bar that is not
+lumen-shell lists the windows through `zwlr_foreign_toplevel_manager_v1` — title, app id,
+state (maximized, minimized, activated, fullscreen), the output the window is shown on, its
+parent — and acts on them (activate, close, minimize, maximize, fullscreen) exactly as the
+shell's panel does; the highlighted window is the one that has the keyboard. Nothing changes
+while the session is locked. Sandboxed clients do not see the global.
 
 Screen capture (ADR 009 Part 4): grim (`-o` an output, `-T` a window, also a covered one),
 wf-recorder and xdg-desktop-portal-wlr work; frames carry only what changed and are copied

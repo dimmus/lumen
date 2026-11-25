@@ -50,6 +50,7 @@ per run.
 | Workspaces are compositor state served as `ext-workspace-v1` | `test_workspaces`, `test_ext_workspace` | ctest |
 | Tiling optional per workspace, never the default (ADR-012) | `test_tiling` | ctest |
 | Shell startup snapshot contract (`zlm_policy_bridge_v1`) | `test_shell_bridge` | ctest |
+| A bar that is not the shell lists and acts on the windows through `zwlr_foreign_toplevel_manager_v1` (ADR 009 Part 4 amendment), hidden from sandboxed clients | `test_foreign_toplevel_management`, `app-smoke` Q8 | ctest + seat smoke |
 | Stacking-first WM (raise/focus/geometry) | `test_wm_geometry`, `test_activation_policy`, `test_layer_arrange`, `test_switcher` | ctest |
 
 ## UI engine invariants (ADR-010 Phase 5)

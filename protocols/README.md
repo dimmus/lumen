@@ -88,6 +88,14 @@ attached to its `xdg_toplevel_drag_v1` with the pointer (KWin and Hyprland seman
 plain move, no snap zones), the attached window is no drag target, and the move ends with
 the drag.
 
+zwlr_foreign_toplevel_management_v1 (wlr-foreign-toplevel-management-unstable-v1, from
+wlr-protocols, served at version 3 — ADR 009 Part 4's amendment) is the window list and the
+window requests of taskbars and switchers: for clients that are not the shell, what
+`zlm_policy_bridge_v1` is to lumen-shell. Every mapped window with its title, app id, state,
+outputs and parent; `activate`, `close`, minimize, maximize and fullscreen on it
+(`wire_wlr_foreign_toplevel.cpp`). Like ext-foreign-toplevel-list beside it, it is offered to
+every unsandboxed client and hidden from sandboxed ones; `zlm_shell_v1` is unchanged.
+
 Sources: `[upstream]` (wayland, wayland-protocols at `wayland_protocols_tag`), `[wlr]`
 (wlr-protocols), and `[wlroots]` — wlroots' own `protocol/` directory at a release tag
 (0.20.2), fetched with a sparse checkout into `upstream/wlroots/`. It provides
