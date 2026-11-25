@@ -204,9 +204,12 @@ current when an item closes.
   cb4dd32 alike (9 disagreement regions — :252, :495, :761, :852-853, :1372-1373,
   :1407-1409, :1561-1562, :1614, :1671-1672), none inside the landed diff's 6 hunks —
   diff-hygiene exits 1 with no added line at fault. Fourth instance 2026-11-25 with
-  scene-container-warn-and-drop: modules/lx.scene/lx.scene.cppm carries 1890
-  clang-format violation lines at base 657da67 and at HEAD 4191ed0 alike (36 distinct
-  offending line-texts), zero on the change's 19 added lines (violation-text set ∩
+  scene-container-warn-and-drop: modules/lx.scene/lx.scene.cppm carries 53
+  clang-format replacement operations over 36 distinct violation lines at base
+  657da67 and at HEAD 4191ed0 alike under the repo .clang-format (corrected
+  2026-11-25 from "1890 violation lines" — that figure is what a style-less
+  clang-format run on a bare /tmp copy of the file produces, ~35x the real debt),
+  zero on the change's 19 added lines (violation-line set ∩
   added-line set = ∅; the changed test file is clean) — diff-hygiene exits 1 with no
   added line at fault. (The script's own
   `local`-at-top-level bug is the row above.)

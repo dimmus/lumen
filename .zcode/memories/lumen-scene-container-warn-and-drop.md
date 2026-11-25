@@ -48,10 +48,12 @@ gated and landed.
   never calls container_node::add/remove — the stage cannot reach the diff. All
   composite frame p50s flat to -3%.
 - Format debt, fourth measured instance for the decision row (.zcode/TODO.md
-  "Whole-file clang-format debt" row): lx.scene.cppm carries 1890 violation lines at
-  base and HEAD alike; this change's 19 added lines intersect the violation-text set
-  emptily; diff-hygiene exits 1 with no added line at fault (its own `local` bug row
-  is separate).
+  "Whole-file clang-format debt" row): lx.scene.cppm carries 36 violation lines (53
+  replacement operations) at base and HEAD alike under the repo .clang-format —
+  corrected 2026-11-25 from "1890 violation lines", a figure a style-less
+  clang-format run on a bare /tmp copy produces, ~35x the real debt; this change's
+  19 added lines intersect the violation set emptily; diff-hygiene exits 1 with no
+  added line at fault (its own `local` bug row is separate).
 
 **Why:** an enum that promises "Log warn, then drop_newest" is a contract every site
 must keep — the overflow-caps lineage exists to hold each fixed-capacity structure to
