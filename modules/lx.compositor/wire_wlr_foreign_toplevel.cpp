@@ -596,14 +596,23 @@ void bind_wlr_foreign_toplevel_manager(wayland::client_connection& client, unsig
     for (manager_obj* m = g_tables; m; m = m->next)
         if (m->resource && m->client == c)
             ++mine;
-    auto* m = mine < k_max_managers_per_client && g_manager_count < k_max_managers
-                  ? new (std::nothrow) manager_obj{}
-                  : nullptr;
-    if (!m) {
+    if (mine >= k_max_managers_per_client || g_manager_count >= k_max_managers) {
         // Bounded: such a manager is done before it starts.
+        if (log_ftl.enabled(lx::trace::level::debug))
+            log_ftl.debug("wlr-toplevel bind refused client={}: managers of this client {}/{}, in "
+                          "all {}/{}; finished at once",
+                          client.id(), mine, k_max_managers_per_client, g_manager_count,
+                          k_max_managers);
         wl_resource_set_implementation(native, &manager_impl, nullptr, nullptr);
         zwlr_foreign_toplevel_manager_v1_send_finished(native);
         wl_resource_destroy(native);
+        return;
+    }
+    auto* m = new (std::nothrow) manager_obj{};
+    if (!m) {
+        // As a handle whose resource could not be made: the client is told.
+        wl_resource_destroy(native);
+        wl_client_post_no_memory(c);
         return;
     }
     m->resource = native;
