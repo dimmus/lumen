@@ -465,7 +465,7 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
                 tests/clients/lumen-probe-compat.cpp tests/clients/lumen-probe-window.cpp
                 tests/clients/lumen-probe-pointer.cpp tests/clients/lumen-probe-capture.cpp
                 tests/clients/lumen-probe-input.cpp tests/clients/lumen-probe-workspace.cpp
-                tests/clients/lumen-probe-sni.cpp)
+                tests/clients/lumen-probe-wlr-toplevel.cpp tests/clients/lumen-probe-sni.cpp)
             target_link_libraries(lumen-probe PRIVATE lumen-protocol-glue)
             lumen_link_platform(lumen-probe)
             target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)

@@ -378,6 +378,10 @@
 #     Q6 lumen-probe capture of a window on a hidden workspace: frames keep coming, the
 #        window's own pixels
 #     Q7 the session lock: Super+2 and an ext-workspace activate while locked change nothing
+#     Q8 zwlr_foreign_toplevel_management_v1: lumen-probe wlr-toplevels (a bar) lists three
+#        windows as they map (toplevel, title, app_id, state, output_enter, parent, done);
+#        its set_minimized minimizes one, its activate brings it back with the keyboard, its
+#        close closes another (the client is asked to, the bar is told closed)
 #   O  switching and snapping (design-session-and-wm Part K; lumen-shell runs, three
 #      lumen-probe windows report their configures and what their keyboards are told)
 #     O1 a quick Alt+Tab (released within the 150 ms open delay): the previous window gets the
@@ -3426,6 +3430,28 @@ if want Q; then
   sleep 0.5
   q_ws q7-after --watch 0.2
   finish locked="$Q7_LOCKED"
+
+  # Q8 — zwlr_foreign_toplevel_management_v1: a bar's client lists the windows and acts on
+  # them. It binds before the windows map; each request is timed from its window's listing.
+  begin Q8
+  WAYLAND_DISPLAY="$SOCKET" timeout 30 "$PROBE" wlr-toplevels --watch 1 --for 20 \
+    @1200:set-minimized:q8b @2400:activate:q8b @3600:close:q8c \
+    >"$LOG_DIR/probe-q8.log" 2>&1 &
+  Q8_BAR_PID=$!
+  CLIENT_PIDS+=("$Q8_BAR_PID")
+  sleep 0.5
+  for n in a b c; do
+    start_client "probe-q8$n" "$PROBE" window --app-id "q8$n" --title "q8$n" --exit-after 20
+    eval "Q8${n^^}_PID=\$LAST_PID"
+    eval "Q8${n^^}_ID=\$(wait_map q8$n 5)"
+    eval "settle \"\$Q8${n^^}_ID\""
+  done
+  for _ in $(seq 1 250); do kill -0 "$Q8_BAR_PID" 2>/dev/null || break; sleep 0.1; done
+  forget_client "$Q8_BAR_PID"
+  for v in Q8A_PID Q8B_PID Q8C_PID; do
+    [[ -n "${!v:-}" ]] && { stop_client "${!v}"; forget_client "${!v}"; }
+  done
+  finish a="${Q8A_ID:-0}" b="${Q8B_ID:-0}" c="${Q8C_ID:-0}"
 
   for v in Q1A_PID Q1B_PID Q1C_PID; do
     [[ -n "${!v:-}" ]] && { stop_client "${!v}"; forget_client "${!v}"; }
@@ -6702,6 +6728,89 @@ if s is not None:
     ok = not acts and bool(ignored) and any(v.startswith("1*") for v in after.values())
     record("Q7 locked: Super+2 and an ext-workspace activate change nothing", ok,
            f"activations while locked {len(acts)}; ignored commits {len(ignored)}; after {after}")
+
+s = scen.get("Q8")
+if s is not None:
+    a, b, c = s.get("a", 0), s.get("b", 0), s.get("c", 0)
+    p = probe_lines("q8")
+    # The bar's log, per handle: `name h=N [arg]` — with the line each event is on.
+    ev, by_title, requests = {}, {}, []
+    for i, l in enumerate(p):
+        m = re.match(r"(\w+) h=(-?\d+)(?: (.*))?$", l)
+        if m:
+            n = int(m.group(2))
+            ev.setdefault(n, []).append((m.group(1), m.group(3) or "", i))
+            if m.group(1) == "title":
+                by_title.setdefault(m.group(3), n)
+        m = re.match(r"request (\S+) h=(-?\d+)$", l)
+        if m:
+            requests.append((m.group(1), int(m.group(2)), i))
+    hb, hc = by_title.get("q8b"), by_title.get("q8c")
+    # The opening batch of each window, as the bar gets it at the map: toplevel, title,
+    # app_id, state (none yet), output_enter, parent (null), done — then activated.
+    opening = ["toplevel", "title", "app_id", "state", "output_enter", "parent", "done"]
+    listed = {}
+    for w in ("q8a", "q8b", "q8c"):
+        e = ev.get(by_title.get(w), [])
+        listed[w] = [t for t, _, _ in e][:7] == opening and len(e) >= 9 and \
+            e[1][1] == w and e[2][1] == w and e[3][1] == "-" and bool(e[4][1]) and \
+            e[5][1] == "-> null" and e[7][0] == "state" and "activated" in e[7][1] and \
+            e[8][0] == "done"
+    # Every event of every handle is closed by one done of it before anything else of it
+    # arrives; a closed is its handle's last.
+    closed_ok = True
+    for e in ev.values():
+        seq = [t for t, _, _ in e]
+        i = 1 if seq[:1] == ["toplevel"] else 0
+        while i < len(seq):
+            if seq[i] == "closed":
+                closed_ok = closed_ok and i == len(seq) - 1
+                break
+            j = i
+            while j < len(seq) and seq[j] != "done":
+                closed_ok = closed_ok and seq[j] not in ("closed", "toplevel")
+                j += 1
+            if j == len(seq) or j == i:
+                closed_ok = False
+                break
+            i = j + 1
+    def ran(name, handle): # the line the bar sent that request on, or -1
+        return next((i for n, h, i in requests if n == name and h == handle), -1)
+    def states(handle, after): # the state events of a handle after a line of the log
+        return [arg for t, arg, i in ev.get(handle, []) if t == "state" and i > after]
+    m_at, a_at, c_at = ran("set-minimized", hb), ran("activate", hb), ran("close", hc)
+    minimized = m_at >= 0 and any("minimized" in v for v in states(hb, m_at))
+    activated = a_at > m_at and any("activated" in v and "minimized" not in v
+                                    for v in states(hb, a_at))
+    went = c_at > a_at and [t for t, _, _ in ev.get(hc, [])][-1:] == ["closed"]
+    # The windows' own side: b is told suspended, then activated again; c is asked to close.
+    def configures(log):
+        return [l for l in log if l.startswith("configure ")]
+    cb = configures(probe_lines("q8b"))
+    sus = [i for i, l in enumerate(cb) if "suspended" in l]
+    back = [i for i, l in enumerate(cb) if "activated" in l and "suspended" not in l]
+    window_side = bool(sus) and bool(back) and max(back) > max(sus) and \
+        any(l == "close" for l in probe_lines("q8c"))
+    unmap = since(s, rf"compositor\.wm: unmap id={c} ")
+    # The keyboard from the bar's requests on, until the first window goes (c closing; the
+    # driver's teardown of the others follows).
+    focus = []
+    for i in range(s["comp"][0], s["comp"][1]):
+        if re.search(r"compositor\.wm: unmap id=", comp[i]):
+            break
+        m = re.search(r"compositor\.wm: focus keyboard id=(\d+)$", comp[i])
+        if m:
+            focus.append(int(m.group(1)))
+    summary = any(l.startswith("wlr-toplevels handles=") for l in p)
+    ok = a and b and c and all(listed.values()) and closed_ok and minimized and activated and \
+        went and window_side and bool(unmap) and focus[-1:] == [b] and summary
+    record("Q8 zwlr_foreign_toplevel_management_v1: a bar lists the windows as they map "
+           "(toplevel, title, app_id, state, output_enter, parent, done); set_minimized "
+           "minimizes, activate brings the window back with the keyboard, close closes one",
+           ok, f"handles a/b/c {by_title.get('q8a')}/{hb}/{hc}; listed {listed}; requests "
+           f"{[(n, h) for n, h, _ in requests]}; b minimized={minimized} activated={activated}; "
+           f"c closed={went} (window asked to close, unmapped {len(unmap)}); keyboard {focus[-1:]} "
+           f"(want {b})")
 
 # ── O: switching and snapping (design-session-and-wm Part K) ─────────────────
 def shell_o(s):
