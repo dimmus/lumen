@@ -56,6 +56,11 @@ cmake --preset release && cmake --build --preset release
 Log out with the panel's **Log out** or Ctrl+Alt+Backspace. Super opens the launcher,
 Super+Return a terminal.
 
+Open **Lumen UI Demo** from the launcher, or run `./build/release/lumen-ui-demo`
+from a Wayland session. The searchable catalog pairs live widget and layout examples
+with a list of what `lx.ui` supports natively, what it can compose, and what is still missing.
+Pass `--theme one-light` or `--theme one-dark` to preview a built-in theme.
+
 ## Documentation
 
 - [User guide](docs/user-guide.md) — building and testing, key bindings, the shell, monitors,

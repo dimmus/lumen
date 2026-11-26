@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Lumen UI Demo
+GenericName=Widget Gallery
+Comment=Explore Lumen UI widgets and layouts
+Keywords=lumen;widgets;controls;demo;gallery;
+Exec=lumen-ui-demo
+TryExec=lumen-ui-demo
+Icon=applications-development
+Terminal=false
+Type=Application
+Categories=Development;

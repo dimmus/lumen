@@ -24,6 +24,7 @@ flowchart TB
 
     subgraph FS["filesystem (install prefix)"]
         BIN["bin/lumen-compositor, lumen-shell, lumen-ctl, lumen-session"]
+        DEMO["bin/lumen-ui-demo<br/>share/applications/org.lumen.UIDemo.desktop"]
         UNITS["lib/systemd/user/*.service, lumen-shutdown.target"]
         PROT["share/lumen/protocols"]
     end
@@ -50,6 +51,7 @@ flowchart TB
     U_SHELL --> BIN
     U_SHELL -->|"StartTransientUnit (user bus)"| U_APP
     U_APP --> SK_WL
+    U_APP -->|"when launching the UI demo"| DEMO
     U_AUTO --> SK_WL
     U_APP -->|"D-Bus portal calls"| U_XDP
     U_XDP -->|"lumen-portals.conf: Screenshot"| U_PL

@@ -301,6 +301,8 @@ configure_file("${CMAKE_SOURCE_DIR}/deploy/wayland-sessions/lumen.desktop.in"
     "${CMAKE_BINARY_DIR}/share/wayland-sessions/lumen.desktop" @ONLY)
 configure_file("${CMAKE_SOURCE_DIR}/deploy/applications/org.lumen.Settings.desktop.in"
     "${CMAKE_BINARY_DIR}/share/applications/org.lumen.Settings.desktop" @ONLY)
+configure_file("${CMAKE_SOURCE_DIR}/deploy/applications/org.lumen.UIDemo.desktop"
+    "${CMAKE_BINARY_DIR}/share/applications/org.lumen.UIDemo.desktop" COPYONLY)
 
 # Diagnostic: exercises lx.input alone, so "typing does nothing" can be narrowed to
 # permissions, devices, translation or routing instead of testing all four at once.
@@ -320,6 +322,17 @@ add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app lumen-hello-ui)
 lumen_apply_module_properties(lumen-hello)
 lumen_check_executable_layers(lumen-hello lx.app)
+
+# The interactive gallery and its tests share the same native describer.
+add_library(lumen-ui-demo-ui STATIC)
+target_sources(lumen-ui-demo-ui PUBLIC FILE_SET CXX_MODULES TYPE CXX_MODULES
+    BASE_DIRS ${CMAKE_SOURCE_DIR} FILES executables/lumen-ui-demo/demo_ui.cppm)
+target_link_libraries(lumen-ui-demo-ui PUBLIC lx.ui PRIVATE lx.foundation lx.gfx lx.layout lx.trace)
+lumen_apply_module_properties(lumen-ui-demo-ui)
+add_executable(lumen-ui-demo executables/lumen-ui-demo/main.cpp)
+target_link_libraries(lumen-ui-demo PRIVATE lx.app lx.trace lx.ui lumen-ui-demo-ui)
+lumen_apply_module_properties(lumen-ui-demo)
+lumen_check_executable_layers(lumen-ui-demo lx.app)
 
 # lumen-settings' UI module (ADR-013): the schema-driven surface over lx.config + lx.ui;
 # the Varlink health polls live in the :ipc partition (libsystemd, like the control socket).
@@ -569,7 +582,7 @@ install(TARGETS ${_lumen_module_targets}
 # Compute paths between install directories, without embedding the configured prefix.
 file(RELATIVE_PATH _lumen_bin_to_lib "${CMAKE_INSTALL_FULL_BINDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
 file(RELATIVE_PATH _lumen_libexec_to_lib "${CMAKE_INSTALL_FULL_LIBEXECDIR}" "${CMAKE_INSTALL_FULL_LIBDIR}")
-foreach(_target lumen-compositor lumen-shell lumen-settings lumen-ctl)
+foreach(_target lumen-compositor lumen-shell lumen-settings lumen-ui-demo lumen-ctl)
     if(TARGET ${_target})
         set_target_properties(${_target} PROPERTIES
             BUILD_RPATH_USE_ORIGIN ON
@@ -585,7 +598,8 @@ if(LUMEN_PORTAL_BUILT)
         INSTALL_RPATH_USE_LINK_PATH FALSE)
     target_link_options(xdg-desktop-portal-lumen PRIVATE "LINKER:--enable-new-dtags")
 endif()
-install(TARGETS lumen-compositor lumen-shell lumen-settings RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS lumen-compositor lumen-shell lumen-settings lumen-ui-demo
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(TARGET lumen-ctl)
     install(TARGETS lumen-ctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
@@ -1715,6 +1729,15 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_settings_ui)
     target_include_directories(test_settings_ui PRIVATE tests)
     add_test(NAME test_settings_ui COMMAND test_settings_ui)
+
+    add_executable(test_ui_demo tests/test_ui_demo.cpp)
+    target_link_libraries(test_ui_demo PRIVATE lx.ui lx.scene lx.runtime lx.foundation lx.gfx lx.text
+        lumen-ui-demo-ui)
+    lumen_apply_module_properties(test_ui_demo)
+    target_include_directories(test_ui_demo PRIVATE tests)
+    target_compile_definitions(test_ui_demo PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+    add_test(NAME test_ui_demo COMMAND test_ui_demo)
 
     # lx.layout:flex against Chrome's layout of Taffy's fixtures, and lx.ui's flex container
     # with the per-node measure cache (ADR-010 §4.7).
