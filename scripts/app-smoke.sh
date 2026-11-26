@@ -418,6 +418,8 @@
 #     N8 idle with a history and a tray item: lumen-shell has no wakeups
 #   X  robustness: lumen-square --sub --destroy-parent-first tears the parent wl_surface
 #      down before the strip's wl_subsurface; no protocol error, compositor alive
+#   DEMO  lumen-ui-demo (optional): pointer navigation, keyboard modal open/Escape,
+#         compact resize below 700 logical px, screenshots and clean close in both themes
 #
 # Global criteria: no ERROR line and no WARN except the 600-frame budget summaries and host
 # present stalls (the 250 ms present watchdog with a flip already submitted, reported as a
@@ -458,6 +460,7 @@ SQUARE="${BUILD}/lumen-square"
 PROBE="${BUILD}/lumen-probe"
 PORTAL_PROBE="${BUILD}/lumen-portal-probe"
 SHELL_BIN="${BUILD}/lumen-shell"
+UI_DEMO="${BUILD}/lumen-ui-demo"
 INJ="${ROOT}/scripts/inject-input.py"
 # The injection nodes are picked after the log redirect (scripts/inject-devices.sh):
 # LUMEN_INJECT_POINTER / LUMEN_INJECT_KEYBOARD / LUMEN_INJECT_RELATIVE override, else they
@@ -468,7 +471,7 @@ SOCKET="lumen-app-smoke"
 LOG_DIR="${ROOT}/app-smoke-logs"
 JOIN_SEAT=0
 COUNTDOWN=3
-ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,T,U,V,W,X,Y,Z,R,Q,O,N"
+ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,T,U,V,W,X,Y,Z,R,Q,O,N,DEMO"
 SKIP_GTK=0
 SCALE=1
 while (( $# > 0 )); do
@@ -488,7 +491,7 @@ done
 want() { [[ ",${ONLY}," == *",$1,"* ]]; }
 for g in ${ONLY//,/ }; do
   case "$g" in
-    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|T|U|V|W|X|Y|Z|R|Q|O|N) ;;
+    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|T|U|V|W|X|Y|Z|R|Q|O|N|DEMO) ;;
     *) echo "unknown group '$g' (see --help)"; exit 2 ;;
   esac
 done
@@ -3829,6 +3832,145 @@ if want N; then
   SCEN=park; inject move 20 $((OUT_H - 20))
 fi
 
+if want DEMO; then
+  # Poll only fresh lines after the relevant input/capture request. Do not exit
+  # grep early: pipefail would treat a SIGPIPE from tail as a missed match.
+  demo_line() { # file, line count before action, extended regexp, timeout
+    local deadline=$((SECONDS + $4 + 1)) match
+    while (( SECONDS < deadline )); do
+      match=$(tail -n "+$(($2 + 1))" "$1" | grep -nE -- "$3" | tail -1)
+      [[ -z "$match" ]] || { printf '%s\n' "$match"; return 0; }
+      sleep 0.05
+    done
+    return 1
+  }
+
+  demo_frame_after() { # wait for a client event and then a buffer attach + commit
+    local event attach surface
+    event=$(demo_line "$1" "$2" "$3" 3) || return 1
+    attach=$(demo_line "$1" "$(($2 + ${event%%:*}))" '-> wl_surface[#@][0-9]+\.attach\(wl_buffer[#@][0-9]+,' 3) || return 1
+    surface=${attach#*-> }; surface=${surface%%.*}
+    demo_line "$1" "$(($2 + ${event%%:*} + ${attach%%:*}))" "-> $surface\.commit\(" 3 >/dev/null
+  }
+
+  demo_shot() { # destination; the main compositor output after this request
+    local before shot
+    [[ -n "${LUMEN_SEAT_TICKET:-}" ]] || return 1
+    before=$(lines "$COMP_LOG")
+    kill -USR1 "$COMP_PID" || return 1
+    shot=$(demo_line "$COMP_LOG" "$before" 'screenshot [0-9]+x[0-9]+ written to .* \(output 0\)$' 4) || return 1
+    shot=${shot#* written to }; shot=${shot% (output 0)}
+    [[ -s "$shot" ]] && mv -- "$shot" "$1"
+  }
+
+  demo_run() {
+    local theme=$1 appearance=${1#one-} tag="${demo_dir##*/}/$1" log="$demo_dir/$1.log"
+    local id x y w h px py dx before i scale120 grab_before close_before serial
+    local step wide=0 narrow=0 wide_shot=0 narrow_shot=0
+    begin "DEMO-$theme"
+    start_client "$tag" env LUMEN_LOG=debug WAYLAND_DEBUG=client "$UI_DEMO" --socket "$SOCKET" --theme "$theme"
+    local pid=$LAST_PID
+
+    # A single failure reason per theme, with any screenshots already taken retained.
+    while :; do
+      step='map and settle'
+      id=$(wait_map 'org\.lumen\.UIDemo' 8) && settle "$id" || break
+      step='theme appearance'
+      wait_for "$log" "ui_demo: theme appearance=$appearance\$" 3 || break
+      step='initial wide geometry'
+      read -r x y w h < <(geom "$id") && (( w >= 700 )) || break
+      wide=$w
+      scale120=$(grep -m1 -oE 'output 0 mode=.* \([0-9]+/120\)' "$COMP_LOG" |
+        grep -oE '[0-9]+/120' | cut -d/ -f1)
+      [[ -n "$scale120" ]] && (( scale120 > 0 )) || break
+
+      # Search has the first Tab stop. Filter to a single row, then select it
+      # with the pointer (sidebar row centre in logical content coordinates).
+      step='pointer navigation to Overlays'
+      before=$(lines "$log")
+      inject key KEY_TAB tap && inject type popover || break
+      # The last letter is evdev KEY_R (19). Wait for its press and the resulting frame.
+      demo_frame_after "$log" "$before" 'wl_keyboard[#@][0-9]+\.key\([0-9]+, [0-9]+, 19, 1\)' || break
+      px=$(( (x + 80) * scale120 / 120 )); py=$(( (y + 123) * scale120 / 120 ))
+      (( px >= 0 && px < OUT_W && py >= 0 && py < OUT_H )) || break
+      before=$(lines "$log")
+      inject move "$px" "$py" && inject button left click || break
+      demo_frame_after "$log" "$before" 'ui_demo: page selected: Overlays$' || break
+      demo_shot "$demo_dir/$theme-wide.ppm" && wide_shot=1
+
+      # From the focused navigation row: tooltip, Actions, Item options, Sample
+      # item, then Archive item. Activate with Enter, never a pointer press.
+      step='keyboard modal activation'
+      before=$(lines "$log")
+      for ((i = 0; i < 5; ++i)); do inject key KEY_TAB tap || break; done
+      (( i == 5 )) && inject key KEY_ENTER tap || break
+      demo_frame_after "$log" "$before" 'ui_demo: modal opened$' || break
+      step='Escape dismisses modal'
+      before=$(lines "$log")
+      inject key KEY_ESC tap || break
+      demo_frame_after "$log" "$before" 'ui_demo: modal closed$' || break
+
+      step='resize to compact width'
+      # Super+right-drag in the right third and middle band grabs only the
+      # right edge. The injector's coordinates are physical, geom's are logical.
+      px=$(( (x + w * 5 / 6) * scale120 / 120 )); py=$(( (y + h / 2) * scale120 / 120 ))
+      dx=$(( (w - 640) * scale120 / 120 ))
+      (( px >= dx && px < OUT_W && py >= 0 && py < OUT_H )) || break
+      before=$(lines "$log")
+      grab_before=$(lines "$COMP_LOG")
+      inject drag "$px" "$py" "$((px - dx))" "$py" --super --button right --steps 25 || break
+      demo_line "$COMP_LOG" "$grab_before" "compositor\.wm: grab end id=$id mode=resize reason=release " 3 >/dev/null || break
+      demo_frame_after "$log" "$before" 'ui_demo: layout mode=compact$' && settle "$id" || break
+      read -r x y w h < <(geom "$id") && (( w > 0 && w < 700 )) || break
+      narrow=$w
+      # The final configure can only clear the resizing state; a same-size ack
+      # need not attach another buffer. Match the commit that set this geometry.
+      serial=$(tail -n "+$((grab_before + 1))" "$COMP_LOG" |
+        grep -oE "compositor\.wm: geometry id=$id x=$x y=$y w=$w h=$h cause=commit serial=[0-9]+" | tail -1)
+      [[ -n "$serial" ]] || break
+      demo_frame_after "$log" "$before" "-> xdg_surface[#@][0-9]+\.ack_configure\(${serial##*=}\)" || break
+      demo_shot "$demo_dir/$theme-narrow.ppm" && narrow_shot=1
+
+      step='clean close'
+      before=$(lines "$log")
+      close_before=$(lines "$COMP_LOG")
+      inject key KEY_LEFTALT+KEY_F4 tap || break
+      demo_line "$log" "$before" 'xdg_toplevel[#@][0-9]+\.close\(' 3 >/dev/null || break
+      demo_line "$COMP_LOG" "$close_before" "compositor\.wm: unmap id=$id " 4 >/dev/null || break
+      for i in {1..40}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.05; done
+      kill -0 "$pid" 2>/dev/null && break
+      wait "$pid" || break
+      step=''
+      break
+    done
+    if kill -0 "$pid" 2>/dev/null; then stop_client "$pid"; fi
+    forget_client "$pid"
+    finish failed="\"$step\"" wide="$wide" narrow="$narrow" wide_shot="$wide_shot" narrow_shot="$narrow_shot"
+    SCEN=park; inject move 20 $((OUT_H - 20))
+  }
+
+  begin DEMO
+  if [[ ! -e "$UI_DEMO" ]]; then
+    finish available=0
+  else
+    build_fresh "$BUILD" lumen-ui-demo; demo_fresh=$?
+    # Keep demo traces out of the legacy top-level log sweep, and keep evidence
+    # from earlier runs even if --logs is reused.
+    demo_dir=""
+    if (( demo_fresh == 1 )); then
+      echo "DEMO: $UI_DEMO is not up to date (${build_fresh_why})."
+    else
+      (( demo_fresh != 2 )) || echo "NOTE: demo binary freshness not checked (${build_fresh_why})."
+      demo_dir=$(mktemp -d "$LOG_DIR/ui-demo-XXXXXX")
+    fi
+    finish available=1 fresh="$demo_fresh" artifacts="\"${demo_dir##*/}\""
+    if [[ -n "$demo_dir" ]]; then
+      demo_run one-dark
+      demo_run one-light
+    fi
+  fi
+fi
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 for pid in "${CLIENT_PIDS[@]}"; do stop_client "$pid"; done
 CLIENT_PIDS=()
@@ -3842,7 +3984,7 @@ fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOCTTY); b=bytearray(4)
 fcntl.ioctl(fd,0x4B3B,b); print("text" if struct.unpack("i",b)[0]==0 else "graphics")' "/dev/$VT" 2>/dev/null || echo unknown)
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
-python3 -I - "$LOG_DIR" "$COMP_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" "$OUT_W" "$OUT_H" "$RELATIVE_DEV" "$SCALE" <<'PY'
+python3 -I - "$LOG_DIR" "$COMP_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" "$OUT_W" "$OUT_H" "$RELATIVE_DEV" "$SCALE" "$ONLY" <<'PY'
 import json, math, os, re, sys
 
 log_dir, comp_rc, console, pointer_dev, keyboard_dev = sys.argv[1:6]
@@ -4008,6 +4150,48 @@ def need(name):
         record(name, False, "scenario did not run")
         return None
     return scen[name]
+
+# ── DEMO: real lx.app window in both themes ────────────────────────────────
+def demo_verdict():
+    s = scen.get("DEMO")
+    if s is None:
+        return
+    name = "DEMO map, navigate, open/dismiss modal, resize, capture and close (both themes)"
+
+    def demo_ppm(name):
+        # The write log alone does not catch a truncated screenshot (e.g. ENOSPC).
+        try:
+            with open(os.path.join(log_dir, name), "rb") as f:
+                header = f"P6\n{out_w} {out_h}\n255\n".encode("ascii")
+                return (f.read(len(header)) == header and
+                        os.fstat(f.fileno()).st_size == len(header) + 3 * out_w * out_h)
+        except OSError:
+            return False
+
+    if not s["available"]:
+        results.append((name, "N/A", "lumen-ui-demo binary absent"))
+    elif s["fresh"] == 1:
+        record(name, False, "lumen-ui-demo binary is stale; see preflight output")
+    elif not s["artifacts"]:
+        record(name, False, "could not create demo evidence directory")
+    else:
+        artifacts = s["artifacts"]
+        issues, widths = [], []
+        for theme in ("one-dark", "one-light"):
+            run = scen.get(f"DEMO-{theme}")
+            if not run:
+                issues.append(f"{theme}: scenario did not run")
+                continue
+            if run["failed"]:
+                issues.append(f"{theme}: {run['failed']}")
+            if any(CLIENT_ERR.search(line) or line.startswith("[ERROR]")
+                   for line in read(f"{artifacts}/{theme}.log")):
+                issues.append(f"{theme}: client log contains an error")
+            widths.append(f"{theme}: {run['wide']} → {run['narrow']} logical px")
+            for layout in ("wide", "narrow"):
+                if not run[f"{layout}_shot"] or not demo_ppm(f"{artifacts}/{theme}-{layout}.ppm"):
+                    issues.append(f"{theme}: no complete {layout} screenshot")
+        record(name, not issues, "; ".join([*(issues or widths), f"evidence: {artifacts}/"]))
 
 # ── A1: foot CSD ───────────────────────────────────────────────────────────
 s = scen.get("A1")
@@ -7678,6 +7862,8 @@ for w in watch:
         elif etype != 1:
             foreign.append((w["t_us"], f"{dev}: type={etype} code={code} value={value}"))
 
+# ── Verdict table ──────────────────────────────────────────────────────────
+demo_verdict()
 width = max(len(r[0]) for r in results)
 print()
 print("─" * 78)
@@ -7693,6 +7879,9 @@ if foreign:
 if any(r[1] == "FAIL" for r in results):
     print("VERDICT: FAIL")
     sys.exit(1)
+if set(sys.argv[10].split(",")) - {""} == {"DEMO"} and not scen.get("DEMO", {}).get("available"):
+    print("VERDICT: COULD NOT RUN (lumen-ui-demo binary absent)")
+    sys.exit(2)
 warned = [r[0] for r in results if r[1] == "WARN"]
 print("VERDICT: PASS" + (f" (warnings: {', '.join(warned)})" if warned else ""))
 sys.exit(0)
