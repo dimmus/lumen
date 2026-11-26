@@ -477,6 +477,13 @@ if (finalTests.exitCode === 0 && needBench) {
 const countInvalid = countNote.startsWith("INVALID");
 const gateFailed = finalTests.exitCode !== 0 || countInvalid || smokeNote.includes("FAILED") || benchNote.includes("FAILED");
 const blockedOnHost = required.decisive_backend_blocked_on_host;
+// This workflow does not take over the boot VT or restart the host. Use git as well as
+// the classifier: the main checkout may predate the display-manager evidence class.
+const bootPaths = ["executables/lumen-dm", "deploy/lumen-dm", "deploy/systemd/lumen-dm.service.in"];
+const trackedBootDiff = await world.run("git", ["-C", wt, "diff", "--quiet", branchPoint, "--", ...bootPaths]);
+const untrackedBootDiff = await world.run("git", ["-C", wt, "ls-files", "--others", "--exclude-standard", "--", ...bootPaths]);
+const bootEvidenceMissing = required.classes.includes("display-manager") || trackedBootDiff.exitCode !== 0 ||
+  untrackedBootDiff.exitCode !== 0 || untrackedBootDiff.stdout.trim() !== "";
 if (blockedOnHost) {
   verified.push(
     "BLOCKED-ON-HOST: this is a render-path change and this host has no hardware Vulkan — the decisive " +
@@ -492,7 +499,7 @@ if (blockedOnHost) {
 // merge commit is the PR of record.
 let mergedAndPushed = false;
 let mergedNotPushed = false;
-if (!gateFailed && !blockedOnHost) {
+if (!gateFailed && !blockedOnHost && !bootEvidenceMissing) {
   phase("Commit, merge into main (ff-only) and push — positive work lands");
   const commitAsk = await implementer.ask(
     `The change passed its final gate. Commit the work in ${wt} now as logical units with detailed ` +
@@ -577,17 +584,20 @@ const notCovered = [
   blockedOnHost
     ? "the decisive Vulkan present path cannot be certified on this host (no hardware Vulkan) — BLOCKED-ON-HOST, notebook ticket required"
     : "the KMS/Vulkan present path cannot be exercised on this VM (no hardware Vulkan)",
+  ...(bootEvidenceMissing ? ["display-manager boot and PAM/VT handoff require an owner-approved native seat test (ADR 015)"] : []),
 ];
 const done: WorkflowReport = {
   conclusion: gateFailed
     ? "The change is implemented and reviewed, but a final gate FAILED — per the no-degradation rule this needs the user's decision before commit."
-    : blockedOnHost
-      ? `The change is implemented, reviewed and suite-green on branch ${branch} in worktree ${wt} — but this host cannot certify the decisive backend (BLOCKED-ON-HOST); a notebook ticket is required before merge.`
-      : mergedAndPushed
-        ? `The change is gate-green, committed on ${branch}, merged into main (fast-forward) and pushed — positive work lands (owner standing rule 2026-11-19).`
-        : mergedNotPushed
-          ? `The change is gate-green, committed on ${branch} and merged into main (fast-forward) — the PUSH failed (SSH remote); the owner pushes, nothing is lost locally.`
-          : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt} — landing needs the owner (commit handoff incomplete, main not on a clean main, or main moved past a fast-forward).`,
+    : bootEvidenceMissing
+      ? `The display manager is BLOCKED on native boot and handoff evidence; nothing was landed. Candidate: ${wt}.`
+      : blockedOnHost
+        ? `The change is implemented, reviewed and suite-green on branch ${branch} in worktree ${wt} — but this host cannot certify the decisive backend (BLOCKED-ON-HOST); a notebook ticket is required before merge.`
+        : mergedAndPushed
+          ? `The change is gate-green, committed on ${branch}, merged into main (fast-forward) and pushed — positive work lands (owner standing rule 2026-11-19).`
+          : mergedNotPushed
+            ? `The change is gate-green, committed on ${branch} and merged into main (fast-forward) — the PUSH failed (SSH remote); the owner pushes, nothing is lost locally.`
+            : `The change is implemented, independently reviewed (confirmed findings fixed) and gate-green on branch ${branch} in worktree ${wt} — landing needs the owner (commit handoff incomplete, main not on a clean main, or main moved past a fast-forward).`,
   findings: reportFindings,
   verified,
   notCovered,

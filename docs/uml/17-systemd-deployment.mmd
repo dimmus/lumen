@@ -1,6 +1,11 @@
 flowchart TB
-    LOGIN["console login (bash -l) or display manager<br/>(share/wayland-sessions/lumen.desktop)"]
+    LOGIN["console login or external display manager<br/>(share/wayland-sessions/lumen.desktop)"]
     LS["lumen-session<br/>imports the login environment (recorded), restores it after"]
+    subgraph Boot["optional system display manager (seat0 / VT1)"]
+        GT["graphical.target"]
+        DM["lumen-dm.service (display-manager.service)<br/>greetd, PAM and logind"]
+        GREET["lumen-dm: Lumen UI and direct DRM/KMS<br/>unprivileged greeter UID"]
+    end
 
     subgraph Session["user session systemd --user (user@UID.service)"]
         GSP["graphical-session-pre.target"]
@@ -30,6 +35,11 @@ flowchart TB
     end
 
     LOGIN --> LS
+    GT -->|Wants| DM
+    DM --> GREET
+    GREET -->|greetd IPC| DM
+    DM -->|after PAM and greeter exit| LS
+    LS -.->|ends: restart greeter| DM
     LS -->|"systemctl --user --wait start"| U_COMP
     LS -->|"afterwards (replace-irreversibly)"| SD
     SD -.->|Conflicts| GS

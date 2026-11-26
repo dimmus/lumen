@@ -106,7 +106,7 @@ FAMILY="$(detect_family)"
 # Without a required module the session does not work (no input, no display, no text); an
 # optional one costs the feature named next to it.
 PC_REQUIRED=(wayland-server wayland-client wayland-scanner libdrm libinput libudev xkbcommon
-             egl glesv2 gbm harfbuzz freetype2 fontconfig libsystemd)
+             egl glesv2 gbm harfbuzz freetype2 fontconfig libsystemd json-c)
 declare -A PC_OPTIONAL=(
   [vulkan]="the Vulkan backend (the default on hardware with a Vulkan driver)"
   [libdisplay-info]="EDID make/model/serial beyond the base block"
@@ -154,7 +154,7 @@ plan_arch() {
   local v
   PKGS=(clang gcc cmake ninja pkgconf git python shaderc
         wayland libdrm libdisplay-info libinput systemd-libs libxkbcommon libglvnd mesa
-        harfbuzz freetype2 fontconfig fribidi libunibreak libpng librsvg libjpeg-turbo libwebp
+        harfbuzz freetype2 fontconfig fribidi libunibreak libpng librsvg libjpeg-turbo libwebp json-c
         vulkan-headers vulkan-icd-loader
         xkeyboard-config ttf-dejavu hicolor-icon-theme adwaita-icon-theme foot)
   for v in $VENDORS; do
@@ -222,7 +222,7 @@ plan_debian() {
         python3 ca-certificates glslc
         libwayland-dev libwayland-bin libdrm-dev libdisplay-info-dev libinput-dev libudev-dev
         libxkbcommon-dev libegl-dev libgles-dev libgbm-dev libharfbuzz-dev libfreetype-dev
-        libfontconfig-dev libfribidi-dev libunibreak-dev libsystemd-dev libpng-dev
+        libfontconfig-dev libfribidi-dev libunibreak-dev libsystemd-dev libpng-dev libjson-c-dev
         librsvg2-dev libturbojpeg0-dev libwebp-dev libvulkan-dev
         libegl-mesa0 libgbm1 libgl1-mesa-dri mesa-vulkan-drivers xkb-data fonts-dejavu-core
         hicolor-icon-theme adwaita-icon-theme foot)

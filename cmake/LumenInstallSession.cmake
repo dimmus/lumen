@@ -5,8 +5,9 @@
 # and nothing is written outside DIR (plus $DESTDIR).
 #
 # Set by the install(CODE) before this script: LUMEN_SOURCE_DIR, LUMEN_BINARY_DIR,
-# LUMEN_STAGE_DIR, LUMEN_UNIT_DIR_OVERRIDE, LUMEN_SYSTEMD_UNIT_DIR_USR, LUMEN_PORTAL_BUILT, LUMEN_BINDIR_REL,
-# LUMEN_LIBEXECDIR_REL, LUMEN_DATADIR_REL.
+# LUMEN_STAGE_DIR, LUMEN_UNIT_DIR_OVERRIDE, LUMEN_SYSTEMD_UNIT_DIR_USR, LUMEN_PORTAL_BUILT,
+# LUMEN_DM_BUILT, LUMEN_SYSTEMD_SYSTEM_UNIT_DIR_USR, LUMEN_SYSTEMD_SYSUSERS_DIR_USR,
+# LUMEN_BINDIR_REL, LUMEN_LIBEXECDIR_REL, LUMEN_DATADIR_REL.
 
 set(_prefix "${CMAKE_INSTALL_PREFIX}")
 set(LUMEN_BINDIR "${_prefix}/${LUMEN_BINDIR_REL}")
@@ -62,4 +63,33 @@ if(LUMEN_PORTAL_BUILT)
         "${LUMEN_STAGE_DIR}/org.freedesktop.impl.portal.desktop.lumen.service")
     file(INSTALL DESTINATION "${_sysconf}/xdg/xdg-desktop-portal-wlr" TYPE FILE FILES
         "${LUMEN_STAGE_DIR}/Lumen")
+endif()
+
+if(LUMEN_DM_BUILT)
+    set(_system_unit_dir "${_prefix}/lib/systemd/system")
+    set(_sysusers_dir "${_prefix}/lib/sysusers.d")
+    if(_prefix STREQUAL "/usr")
+        if(LUMEN_SYSTEMD_SYSTEM_UNIT_DIR_USR)
+            set(_system_unit_dir "${LUMEN_SYSTEMD_SYSTEM_UNIT_DIR_USR}")
+        endif()
+        if(LUMEN_SYSTEMD_SYSUSERS_DIR_USR)
+            set(_sysusers_dir "${LUMEN_SYSTEMD_SYSUSERS_DIR_USR}")
+        endif()
+    endif()
+    set(LUMEN_DM_CONFIG_DIR "${_sysconf}/lumen-dm")
+    set(LUMEN_DM_GREETER "${_prefix}/${LUMEN_LIBEXECDIR_REL}/lumen-dm")
+    # These paths also go in the system unit and greetd's shell command.
+    foreach(_path IN ITEMS "${LUMEN_DM_CONFIG_DIR}" "${LUMEN_DM_GREETER}" "${LUMEN_BINDIR}")
+        if(NOT _path MATCHES "^/[a-zA-Z0-9/_.+-]+$")
+            message(FATAL_ERROR "lumen-dm requires install paths without spaces or shell metacharacters: ${_path}")
+        endif()
+    endforeach()
+    lumen_stage(deploy/systemd/lumen-dm.service.in lumen-dm.service)
+    lumen_stage(deploy/lumen-dm/greetd.toml.in greetd.toml)
+    file(INSTALL DESTINATION "${_system_unit_dir}" TYPE FILE FILES
+        "${LUMEN_STAGE_DIR}/lumen-dm.service")
+    file(INSTALL DESTINATION "${_sysusers_dir}" TYPE FILE FILES
+        "${LUMEN_SOURCE_DIR}/deploy/lumen-dm/lumen-dm.conf")
+    file(INSTALL DESTINATION "${LUMEN_DM_CONFIG_DIR}" TYPE FILE FILES
+        "${LUMEN_STAGE_DIR}/greetd.toml")
 endif()

@@ -129,6 +129,23 @@ struct session_choice {
 /// reports nothing.
 [[nodiscard]] session_discovery system_session_discovery();
 
+namespace detail {
+
+/// The process's own session, as reported by sd-login. Missing facts fail closed.
+struct greeter_session_facts {
+    std::string_view process_session_id;
+    std::string_view seat;
+    std::string_view session_class;
+    unsigned uid = 0;
+    unsigned vt = 0;
+    bool local = false;
+};
+
+[[nodiscard]] session_choice discover_greeter_session(unsigned real_uid, unsigned effective_uid,
+                                                      const greeter_session_facts& facts);
+
+} // namespace detail
+
 /// The logind session this process runs in: session control (TakeControl), devices
 /// (TakeDevice / ReleaseDevice / PauseDeviceComplete), the pause and resume signals, and
 /// VT switching (Seat.SwitchTo). Owned by one thread.
@@ -147,6 +164,9 @@ public:
     /// Connects to logind, takes control of the session and reads Session.Seat, VTNr and
     /// Active and Seat.CanTTY (startup-only synchronous calls).
     [[nodiscard]] static lx::result<logind_session> open();
+    /// Only the calling process's local greeter session on seat0 with a VT. Requires matching
+    /// nonroot real/effective/session UIDs and successful nonforcing TakeControl.
+    [[nodiscard]] static lx::result<logind_session> open_greeter();
 
     [[nodiscard]] credentials peer_credentials(int socket_fd) const;
     /// Session.Active as last seen: read at `open`, then tracked from PropertiesChanged.
@@ -174,8 +194,8 @@ public:
     /// paused (DRM without master, evdev revoked) until ResumeDevice.
     [[nodiscard]] lx::result<lx::unique_fd> take_device(unsigned major, unsigned minor,
                                                         bool* inactive = nullptr);
-    /// TakeDevice for a device node, with a direct-open fallback (which logind does not
-    /// track, and `release_device` therefore leaves alone).
+    /// TakeDevice for a device node. Ordinary sessions allow a direct-open fallback
+    /// (not tracked by logind); greeter sessions never open devices directly.
     [[nodiscard]] lx::result<lx::unique_fd> take_device_path(const char* path,
                                                              bool* inactive = nullptr);
 
@@ -218,6 +238,11 @@ public:
     [[nodiscard]] long long dispatch_timeout_ns() const;
 
 private:
+#ifdef LUMEN_HAS_LOGIND
+    /// `greeter_vt` is zero for ordinary sessions and the validated VT for greeters.
+    [[nodiscard]] static lx::result<logind_session> open_session(const session_choice& choice,
+                                                                 unsigned greeter_vt);
+#endif
     void release();
     void track_taken(unsigned major, unsigned minor);
     /// The ReleaseDevice message itself, tracked or not.
@@ -236,6 +261,8 @@ private:
     bool active_ = false;
     bool has_control_ = false;
     bool can_tty_ = false;
+    // Kept on a moved-from greeter too: an empty greeter handle cannot bypass logind.
+    bool strict_devices_ = false;
     unsigned vt_nr_ = 0;
     session_found_by found_by_ = session_found_by::none;
     char type_[16]{};
@@ -288,6 +315,7 @@ lx::session::logind_session& lx::session::logind_session::operator=(logind_sessi
     active_ = other.active_;
     has_control_ = other.has_control_;
     can_tty_ = other.can_tty_;
+    strict_devices_ = other.strict_devices_;
     vt_nr_ = other.vt_nr_;
     found_by_ = other.found_by_;
     std::memcpy(type_, other.type_, sizeof(type_));
@@ -470,6 +498,21 @@ lx::session::session_discovery lx::session::system_session_discovery() {
     return d;
 }
 
+lx::session::session_choice
+lx::session::detail::discover_greeter_session(unsigned real_uid, unsigned effective_uid,
+                                              const greeter_session_facts& facts) {
+    session_choice choice{};
+    if (real_uid == 0 || real_uid != effective_uid || real_uid != facts.uid || !facts.local ||
+        facts.seat != "seat0" || facts.session_class != "greeter" || facts.vt == 0 ||
+        facts.vt > 63 || facts.process_session_id.empty() ||
+        facts.process_session_id.size() >= sizeof(choice.id))
+        return choice;
+
+    *std::format_to_n(choice.id, sizeof(choice.id) - 1, "{}", facts.process_session_id).out = '\0';
+    choice.found_by = session_found_by::process;
+    return choice;
+}
+
 void lx::session::logind_session::set_type(const char* type) {
 #ifdef LUMEN_HAS_LOGIND
     if (!bus_ || !has_control_ || session_path_[0] == '\0' || !type)
@@ -485,14 +528,53 @@ void lx::session::logind_session::set_type(const char* type) {
 
 lx::result<lx::session::logind_session> lx::session::logind_session::open() {
 #ifdef LUMEN_HAS_LOGIND
-    logind_session s{};
     const session_choice choice = discover_session(system_session_discovery());
-    if (!choice.found()) {
+    if (!choice.found())
         // Not in a logind session (e.g. some CI) — return a soft inactive session.
-        s.active_ = false;
-        s.session_id_ = "";
-        return s;
+        return logind_session{};
+    return open_session(choice, 0);
+#else
+    return lx::not_implemented("lx::session::logind_session::open");
+#endif
+}
+
+lx::result<lx::session::logind_session> lx::session::logind_session::open_greeter() {
+#ifdef LUMEN_HAS_LOGIND
+    const uid_t real_uid = ::getuid();
+    const uid_t effective_uid = ::geteuid();
+    char* id = nullptr;
+    char* seat = nullptr;
+    char* session_class = nullptr;
+    uid_t session_uid = 0;
+    unsigned vt = 0;
+    session_choice choice{};
+    // Do not use XDG_SESSION_ID or any UID-wide lookup for a greeter session.
+    if (sd_pid_get_session(0, &id) >= 0 && id && *id && sd_session_get_uid(id, &session_uid) >= 0 &&
+        sd_session_get_seat(id, &seat) >= 0 && seat &&
+        sd_session_get_class(id, &session_class) >= 0 && session_class &&
+        sd_session_get_vt(id, &vt) >= 0) {
+        choice = detail::discover_greeter_session(
+            real_uid, effective_uid,
+            {id, seat, session_class, session_uid, vt, sd_session_is_remote(id) == 0});
     }
+    free(session_class);
+    free(seat);
+    free(id);
+    if (!choice.found())
+        return lx::make_error(lx::io_err::permission_denied,
+                              "not the owner of a local greeter session on a seat0 VT");
+    return open_session(choice, vt);
+#else
+    return lx::not_implemented("lx::session::logind_session::open_greeter");
+#endif
+}
+
+#ifdef LUMEN_HAS_LOGIND
+lx::result<lx::session::logind_session>
+lx::session::logind_session::open_session(const session_choice& choice, unsigned greeter_vt) {
+    logind_session s{};
+    const bool greeter = greeter_vt != 0;
+    s.strict_devices_ = greeter;
     *std::format_to_n(s.session_id_buf_, sizeof(s.session_id_buf_) - 1, "{}", choice.id).out = '\0';
     s.session_id_ = s.session_id_buf_;
     s.found_by_ = choice.found_by;
@@ -503,9 +585,11 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
         free(type);
     }
 
-    if (sd_bus_default_system(&s.bus_) < 0 || !s.bus_) {
-        return lx::make_error(lx::io_err::not_found, "sd_bus_default_system failed");
-    }
+    // A greeter must acquire its own control, not share a thread's existing bus connection.
+    const int bus_result = greeter ? sd_bus_open_system(&s.bus_) : sd_bus_default_system(&s.bus_);
+    if (bus_result < 0 || !s.bus_)
+        return lx::make_error(lx::io_err::not_found, greeter ? "sd_bus_open_system failed"
+                                                             : "sd_bus_default_system failed");
 
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message* reply = nullptr;
@@ -534,7 +618,8 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
             seat_reply) {
             const char* seat_id = nullptr;
             const char* seat_path = nullptr;
-            if (sd_bus_message_read(seat_reply, "(so)", &seat_id, &seat_path) >= 0 && seat_path)
+            if (sd_bus_message_read(seat_reply, "(so)", &seat_id, &seat_path) >= 0 && seat_path &&
+                (!greeter || (seat_id && std::string_view{seat_id} == "seat0")))
                 *std::format_to_n(s.seat_path_, sizeof(s.seat_path_) - 1, "{}", seat_path).out = '\0';
             sd_bus_message_unref(seat_reply);
         }
@@ -567,21 +652,25 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
         }
     }
 
+    if (greeter && (!s.can_tty_ || s.vt_nr_ != greeter_vt))
+        return lx::make_error(lx::io_err::permission_denied, "logind greeter seat or VT changed");
+
     sd_bus_error take_err = SD_BUS_ERROR_NULL;
     if (sd_bus_call_method(s.bus_, "org.freedesktop.login1", s.session_path_,
                            "org.freedesktop.login1.Session", "TakeControl", &take_err, nullptr, "b",
                            0) < 0) {
         sd_bus_error_free(&take_err);
+        if (greeter)
+            return lx::make_error(lx::io_err::permission_denied,
+                                  "logind greeter TakeControl failed");
         // Continue without control — direct open fallback still works for render nodes.
         s.has_control_ = false;
         return s;
     }
     s.has_control_ = true;
     return s;
-#else
-    return lx::not_implemented("lx::session::logind_session::open");
-#endif
 }
+#endif
 
 lx::session::credentials lx::session::logind_session::peer_credentials(int socket_fd) const {
     credentials out{};
@@ -670,9 +759,11 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const ch
     struct stat st{};
     if (::stat(path, &st) == 0 && S_ISCHR(st.st_mode)) {
         auto taken = take_device(major(st.st_rdev), minor(st.st_rdev), inactive);
-        if (taken)
+        if (taken || strict_devices_)
             return taken;
     }
+    if (strict_devices_)
+        return lx::make_error(lx::io_err::permission_denied, "not a greeter device node");
     // Direct-open fallback (video group / root / render node world-writable).
     const int fd = ::open(path, O_RDWR | O_CLOEXEC);
     if (fd >= 0) {

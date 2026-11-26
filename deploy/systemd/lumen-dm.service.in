@@ -1,0 +1,19 @@
+[Unit]
+Description=Lumen Display Manager
+Documentation=man:greetd(1)
+After=systemd-user-sessions.service plymouth-quit-wait.service getty@tty1.service
+Conflicts=getty@tty1.service
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# greetd binds its socket in /run before PAM, then hands ownership to the greeter UID.
+UMask=0077
+ExecStart=greetd --config @LUMEN_DM_CONFIG_DIR@/greetd.toml
+IgnoreSIGPIPE=no
+Restart=always
+RestartSec=1s
+
+[Install]
+Alias=display-manager.service

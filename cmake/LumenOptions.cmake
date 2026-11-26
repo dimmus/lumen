@@ -1,4 +1,5 @@
 option(LUMEN_BUILD_PORTAL "Build xdg-desktop-portal-lumen (needs libsystemd, wayland-client; libpng for files)" ON)
+option(LUMEN_BUILD_DM "Build the optional lumen-dm graphical login (needs json-c, xkbcommon and systemd)" OFF)
 option(LUMEN_VULKAN_VALIDATION "Enable Vulkan validation layers" OFF)
 option(LUMEN_BUILD_TESTS "Build unit / stress tests" ON)
 option(LUMEN_BUILD_XWAYLAND "Build optional rootless XWayland bridge module" OFF)
