@@ -37,6 +37,8 @@ struct screen {
     std::string_view prompt;
     std::string_view visible_value;
     std::size_t mask_length;
+    // Insertion position in Unicode scalars, including for the masked view.
+    std::size_t caret_index;
 
     // If greetd accepted an ambiguous start, exiting releases the user session;
     // otherwise the watched greeter's exit lets the supervisor recover.
@@ -63,7 +65,10 @@ public:
     void submit();
     void cancel();
     void clear_input();
+    void place_caret(std::size_t index);
+    void move_caret(int delta);
     void erase();
+    void erase_forward();
     void append(std::string_view utf8);
     [[nodiscard]] screen view() const;
     [[nodiscard]] bool editable() const;
@@ -90,6 +95,9 @@ private:
     void cancel_session(notice after);
     void lost();
     void fatal(notice reason);
+    [[nodiscard]] std::size_t previous_scalar(std::size_t offset) const;
+    [[nodiscard]] std::size_t next_scalar(std::size_t offset) const;
+    void remove_scalar(std::size_t first, std::size_t last);
     void wipe_input();
     void wipe_tx();
     void changed();
@@ -117,6 +125,8 @@ private:
     std::array<char, k_input_bytes> input_{};
     std::size_t input_size_ = 0;
     std::size_t input_chars_ = 0;
+    std::size_t caret_byte_ = 0;
+    std::size_t caret_index_ = 0;
     std::array<char, k_prompt_bytes> prompt_{};
     std::size_t prompt_size_ = 0;
     std::array<char, k_header_bytes + k_rx_bytes> rx_{};

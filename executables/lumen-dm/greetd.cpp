@@ -41,6 +41,10 @@ unsigned scalar_bytes(std::string_view text) {
                : 0;
 }
 
+[[nodiscard]] bool continuation_byte(char byte) {
+    return (static_cast<unsigned char>(byte) & 0xc0u) == 0x80u;
+}
+
 // Serialize directly into writable, zeroizable storage. The only inputs to
 // string() are validated printable UTF-8, so quote/backslash are the only escapes.
 struct writer {
@@ -495,7 +499,7 @@ void conversation::cancel() {
 
 void conversation::wipe_input() {
     ::explicit_bzero(input_.data(), input_.size());
-    input_size_ = input_chars_ = 0;
+    input_size_ = input_chars_ = caret_byte_ = caret_index_ = 0;
 }
 
 void conversation::wipe_tx() {
@@ -514,6 +518,46 @@ bool conversation::editable() const {
     return phase_ == phase::username || phase_ == phase::visible || phase_ == phase::secret;
 }
 
+std::size_t conversation::previous_scalar(std::size_t offset) const {
+    // Input is already validated; an interior byte can only be a continuation.
+    while (continuation_byte(input_[--offset])) {
+    }
+    return offset;
+}
+
+std::size_t conversation::next_scalar(std::size_t offset) const {
+    while (++offset < input_size_ && continuation_byte(input_[offset])) {
+    }
+    return offset;
+}
+
+void conversation::place_caret(std::size_t index) {
+    if (!editable())
+        return;
+    index = std::min(index, input_chars_);
+    if (index == caret_index_)
+        return;
+    if (index == 0) {
+        caret_byte_ = 0;
+    } else if (index == input_chars_) {
+        caret_byte_ = input_size_;
+    } else {
+        for (auto current = caret_index_; current > index; --current)
+            caret_byte_ = previous_scalar(caret_byte_);
+        for (auto current = caret_index_; current < index; ++current)
+            caret_byte_ = next_scalar(caret_byte_);
+    }
+    caret_index_ = index;
+    changed();
+}
+
+void conversation::move_caret(int delta) {
+    // All indices are bounded by the byte capacity; clamp before adding delta.
+    const auto index = static_cast<int>(caret_index_);
+    const auto remaining = static_cast<int>(input_chars_ - caret_index_);
+    place_caret(static_cast<std::size_t>(index + std::clamp(delta, -index, remaining)));
+}
+
 void conversation::append(std::string_view utf8) {
     if (!editable() || utf8.empty() || utf8.size() > input_.size() - input_size_)
         return;
@@ -524,20 +568,49 @@ void conversation::append(std::string_view utf8) {
             return;
         chars.remove_prefix(n);
     }
-    std::ranges::copy(utf8, input_.data() + input_size_);
+
+    auto* const first = input_.data();
+    auto* const at = first + caret_byte_;
+    auto* const end = first + input_size_;
+    const std::less<const char*> less;
+    if (at != end && !less(utf8.data(), first) && less(utf8.data(), end)) {
+        // A caller may be inserting part of its own visible_value. Copy it before shifting.
+        std::memcpy(end, utf8.data(), utf8.size());
+        std::rotate(at, end, end + utf8.size());
+    } else {
+        if (at != end)
+            std::memmove(at + utf8.size(), at, input_size_ - caret_byte_);
+        std::memcpy(at, utf8.data(), utf8.size());
+    }
     input_size_ += utf8.size();
     input_chars_ += added;
+    caret_byte_ += utf8.size();
+    caret_index_ += added;
     changed();
 }
 
 void conversation::erase() {
-    if (!editable() || !input_size_)
+    if (!editable() || !caret_index_)
         return;
-    std::size_t start = input_size_ - 1;
-    while (start && (static_cast<unsigned char>(input_[start]) & 0xc0u) == 0x80u)
-        --start;
-    ::explicit_bzero(input_.data() + start, input_size_ - start);
-    input_size_ = start;
+    const auto last = caret_byte_;
+    caret_byte_ = previous_scalar(last);
+    --caret_index_;
+    remove_scalar(caret_byte_, last);
+}
+
+void conversation::erase_forward() {
+    if (!editable() || caret_index_ == input_chars_)
+        return;
+    remove_scalar(caret_byte_, next_scalar(caret_byte_));
+}
+
+void conversation::remove_scalar(std::size_t first, std::size_t last) {
+    auto* const data = input_.data();
+    if (last != input_size_)
+        std::memmove(data + first, data + last, input_size_ - last);
+    const auto removed = last - first;
+    input_size_ -= removed;
+    ::explicit_bzero(data + input_size_, removed);
     --input_chars_;
     changed();
 }
@@ -550,7 +623,8 @@ screen conversation::view() const {
             notice_,
             {prompt_.data(), prompt_size_},
             visible,
-            phase_ == phase::secret ? input_chars_ : 0};
+            phase_ == phase::secret ? input_chars_ : 0,
+            editable() ? caret_index_ : 0};
 }
 
 void conversation::changed() {

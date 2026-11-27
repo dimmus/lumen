@@ -120,6 +120,20 @@ static_assert([] {
            pixel_damage(b, b, form, output).count == 0;
 }());
 
+// Zero means either ordinary close or no proven visible revision.
+[[nodiscard]] constexpr bool can_retain_front(std::uint64_t handoff_revision,
+                                              std::uint64_t visible_revision,
+                                              bool primary_pending) {
+    return handoff_revision != 0 && handoff_revision == visible_revision && !primary_pending;
+}
+
+static_assert(can_retain_front(42, 42, false));
+static_assert(!can_retain_front(0, 0, false));
+static_assert(!can_retain_front(42, 0, false));
+static_assert(!can_retain_front(42, 41, false));
+static_assert(!can_retain_front(42, 43, false));
+static_assert(!can_retain_front(42, 42, true));
+
 [[nodiscard]] lx::result<drm::kms_pipeline_desc> choose_pipeline(const drm::kms_device& device,
                                                                  const drm::connector_probe& c) {
     drm::crtc_alloc_input in{};
@@ -279,8 +293,8 @@ struct kms_host::state {
             front = pending;
             pending = -1;
             const bool current = std::exchange(pending_current_content, false) && !paused && !gone;
-            if (current && event.presented) {
-                visible_content = true;
+            visible_content = current && event.presented;
+            if (visible_content) {
                 if (!first_frame_logged) {
                     first_frame_logged = true;
                     log_kms.info("first_scanout timestamp_ns={} bytes_written={} hw={}",
@@ -299,7 +313,10 @@ struct kms_host::state {
             work.set_enabled(false);
     }
 
-    void retire(bool handoff = false, bool disconnected = false) {
+    void retire(std::uint64_t handoff_revision = 0, bool disconnected = false) {
+        const bool current_front = visible_content && front >= 0 && !paused && !gone &&
+                                   !probe_due && !resume_due && !disconnected;
+        const auto visible_revision = current_front ? buffers[front].contents.form_revision : 0;
         invalidate_visibility();
         if (card.card_fd() < 0)
             return;
@@ -307,16 +324,12 @@ struct kms_host::state {
         // queue an event with the soon-to-be-dead cookie, but it cannot dereference it.
         loop.remove_source(&flips);
         flips = {-1, {[](void* self) { static_cast<state*>(self)->dispatch_flips(); }, this}};
-        if (handoff && card.supports_closefb() && card.is_master()) {
-            // A pending flip may not yet have latched. Keep both the old front and the
-            // requested FB alive without exporting their IDs beyond this file.
-            const int last = pending >= 0 ? pending : front;
-            if (last >= 0 && buffers[last].fb.hand_over() == drm::fb_released::closed) {
-                if (front >= 0 && front != last)
-                    (void)buffers[front].fb.hand_over();
-                pipe->forget_saved_state();
-            }
-        }
+        // A cursor-only commit leaves the primary plane untouched and never sets pending.
+        // Every other buffer, which may contain login prompts, goes through ordinary RMFB.
+        if (can_retain_front(handoff_revision, visible_revision, pending >= 0) && pipe &&
+            card.supports_closefb() && session.is_active() && card.is_master() &&
+            buffers[front].fb.hand_over() == drm::fb_released::closed)
+            pipe->forget_saved_state();
         if (pipe && disconnected)
             pipe->forget_saved_state();
         pipe.reset(); // restore before removing the FB; cursor/scanout still own their objects
@@ -470,7 +483,7 @@ struct kms_host::state {
 
     [[nodiscard]] lx::result<void> reconfigure(bool resumed) {
         if (gone) {
-            retire(false, true);
+            retire(0, true);
             gone = false;
         }
         if (card.card_fd() >= 0) {
@@ -497,7 +510,7 @@ struct kms_host::state {
             }
             // A different CRTC/connector or mode may need new properties and buffer sizes.
             // Reopen via logind rather than reusing a file with old cookie addresses in it.
-            retire(false, !c || (pipe && c->connector_id != pipe->connector_id()));
+            retire(0, !c || (pipe && c->connector_id != pipe->connector_id()));
         }
         return acquire_or_wait();
     }
@@ -716,7 +729,7 @@ lx::result<void> kms_host::resume() {
     return s.submit();
 }
 
-void kms_host::close(bool handoff) {
+void kms_host::close(std::uint64_t handoff_revision) {
     auto& s = *state_;
     if (!s.started)
         return;
@@ -727,7 +740,7 @@ void kms_host::close(bool handoff) {
     if (s.monitor.fd() >= 0)
         s.loop.remove_source(&s.hotplug);
     s.monitor = {};
-    s.retire(handoff);
+    s.retire(handoff_revision);
     std::vector<std::uint32_t>{}.swap(s.canvas);
     s.paused = s.gone = s.probe_due = false;
 }

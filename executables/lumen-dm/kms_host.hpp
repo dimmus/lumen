@@ -33,8 +33,9 @@ public:
     // memory named by its outstanding flip events alive. ResumeDevice returns that file.
     void suspend();
     [[nodiscard]] lx::result<void> resume();
-    // Passing handoff=true lets the last XRGB frame remain until the next DRM master.
-    void close(bool handoff = false);
+    // Retain the visible primary only if it presented the caller's neutral revision.
+    // Zero requests ordinary console restore.
+    void close(std::uint64_t handoff_revision = 0);
 
     [[nodiscard]] bool owns_device(unsigned major, unsigned minor) const;
     void device_gone(unsigned major, unsigned minor);
