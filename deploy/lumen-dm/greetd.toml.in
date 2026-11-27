@@ -1,0 +1,11 @@
+[terminal]
+vt = 1
+switch = true
+
+[general]
+# lumen-session starts the user's login shell itself. Do not source profiles for the greeter.
+source_profile = false
+
+[default_session]
+command = "@LUMEN_DM_GREETER@ @LUMEN_BINDIR@/lumen-session"
+user = "lumen-dm"

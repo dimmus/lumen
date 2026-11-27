@@ -61,6 +61,44 @@ from a Wayland session. The searchable catalog pairs live widget and layout exam
 with a list of what `lx.ui` supports natively, what it can compose, and what is still missing.
 Pass `--theme one-light` or `--theme one-dark` to preview a built-in theme.
 
+### Graphical login at boot (optional)
+
+`lumen-dm` draws the login screen directly through Lumen's DRM/KMS and input stack.
+No Wayland compositor runs before login. It authenticates through the distro's
+`greetd` PAM stack, starts `lumen-session` as the authenticated user, and returns on
+logout. It does not configure automatic login. The Arch deployment uses `greetd`
+with `pam_systemd` and `pam_umask`, and `json-c` at build and run time. Keep the
+distro's PAM policy; do not use a shared or interactive account for the greeter.
+
+The `release` preset includes `lumen-dm`; use `-DLUMEN_BUILD_DM=OFF` for a
+console-only build. The Arch installation also needs the `greetd` package for
+its PAM policy and session broker. Installing it does not require Weston.
+
+```bash
+sudo pacman -S --needed greetd  # Arch; use your distro's package elsewhere
+cmake --preset release
+cmake --build --preset release
+sudo cmake --install build/release --prefix /usr
+sudo systemd-sysusers lumen-dm.conf
+sudo systemctl daemon-reload
+```
+
+Installation does not enable anything. Before switching, verify that a text login
+on **VT2** works (Ctrl+Alt+F2), and check `systemctl is-enabled display-manager.service`.
+If another display manager owns the alias, disable it explicitly before enabling Lumen;
+do not force the alias over an active manager. Then configure the next boot:
+
+```bash
+sudo systemctl enable lumen-dm.service
+sudo systemctl set-default graphical.target   # only if the default is not already graphical
+```
+
+On the next boot the greeter takes **VT1**. If recovery is needed, use the VT2 login
+(or boot with `systemd.unit=multi-user.target`), inspect `journalctl -b -u lumen-dm.service`,
+and run `sudo systemctl disable --now lumen-dm.service`. Re-enable your previous display
+manager or return to `multi-user.target` for console logins. The installed files and
+all parent directories must be trusted, root-owned, and not writable by ordinary users.
+
 ## Documentation
 
 - [User guide](docs/user-guide.md) — building and testing, key bindings, the shell, monitors,

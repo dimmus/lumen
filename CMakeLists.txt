@@ -334,6 +334,22 @@ target_link_libraries(lumen-ui-demo PRIVATE lx.app lx.trace lx.ui lumen-ui-demo-
 lumen_apply_module_properties(lumen-ui-demo)
 lumen_check_executable_layers(lumen-ui-demo lx.app)
 
+# The greeter uses the seat and KMS directly, without a Wayland client or server.
+if(LUMEN_BUILD_DM)
+    if(NOT LIBSYSTEMD_FOUND OR NOT XKBCOMMON_FOUND OR NOT LIBDRM_FOUND OR NOT LIBINPUT_FOUND OR NOT LIBUDEV_FOUND OR NOT HARFBUZZ_FOUND)
+        message(FATAL_ERROR "lumen-dm needs systemd, libdrm, libinput, libudev, xkbcommon and text rendering")
+    endif()
+    pkg_check_modules(LUMEN_DM_JSON REQUIRED IMPORTED_TARGET json-c>=0.15)
+    add_executable(lumen-dm executables/lumen-dm/main.cpp executables/lumen-dm/greetd.cpp
+        executables/lumen-dm/kms_host.cpp)
+    target_link_libraries(lumen-dm PRIVATE lx.ui lx.scene lx.layout lx.text lx.gfx lx.runtime
+        lx.foundation lx.trace lx.drm lx.input lx.session PkgConfig::LUMEN_DM_JSON)
+    target_include_directories(lumen-dm PRIVATE ${XKBCOMMON_INCLUDE_DIRS})
+    target_link_libraries(lumen-dm PRIVATE ${XKBCOMMON_LINK_LIBRARIES})
+    lumen_apply_module_properties(lumen-dm)
+    lumen_check_executable_layers(lumen-dm lx.ui)
+endif()
+
 # lumen-settings' UI module (ADR-013): the schema-driven surface over lx.config + lx.ui;
 # the Varlink health polls live in the :ipc partition (libsystemd, like the control socket).
 add_library(lumen-settings-ui STATIC)
@@ -633,6 +649,16 @@ set(_lumen_unit_dir_usr "")
 if(PkgConfig_FOUND)
     pkg_get_variable(_lumen_unit_dir_usr systemd systemduserunitdir)
 endif()
+if(LUMEN_BUILD_DM)
+    set_target_properties(lumen-dm PROPERTIES
+        BUILD_RPATH_USE_ORIGIN ON
+        INSTALL_RPATH "$ORIGIN/${_lumen_libexec_to_lib}"
+        INSTALL_RPATH_USE_LINK_PATH FALSE)
+    target_link_options(lumen-dm PRIVATE "LINKER:--enable-new-dtags")
+    install(TARGETS lumen-dm RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+    pkg_get_variable(_lumen_system_unit_dir_usr systemd systemdsystemunitdir)
+    pkg_get_variable(_lumen_sysusers_dir_usr systemd sysusersdir)
+endif()
 install(CODE "
     set(LUMEN_SOURCE_DIR \"${CMAKE_SOURCE_DIR}\")
     set(LUMEN_BINARY_DIR \"${CMAKE_BINARY_DIR}\")
@@ -640,6 +666,9 @@ install(CODE "
     set(LUMEN_UNIT_DIR_OVERRIDE \"${LUMEN_SYSTEMD_USER_UNIT_DIR}\")
     set(LUMEN_SYSTEMD_UNIT_DIR_USR \"${_lumen_unit_dir_usr}\")
     set(LUMEN_PORTAL_BUILT ${LUMEN_PORTAL_BUILT})
+    set(LUMEN_DM_BUILT ${LUMEN_BUILD_DM})
+    set(LUMEN_SYSTEMD_SYSTEM_UNIT_DIR_USR \"${_lumen_system_unit_dir_usr}\")
+    set(LUMEN_SYSTEMD_SYSUSERS_DIR_USR \"${_lumen_sysusers_dir_usr}\")
     set(LUMEN_BINDIR_REL \"${CMAKE_INSTALL_BINDIR}\")
     set(LUMEN_LIBEXECDIR_REL \"${CMAKE_INSTALL_LIBEXECDIR}\")
     set(LUMEN_DATADIR_REL \"${CMAKE_INSTALL_DATADIR}\")
@@ -678,6 +707,17 @@ set_tests_properties(layer_graph PROPERTIES
 )
 
 if(LUMEN_BUILD_TESTS)
+    if(LUMEN_BUILD_DM)
+        add_executable(test_lumen_dm tests/test_lumen_dm.cpp executables/lumen-dm/greetd.cpp)
+        target_link_libraries(test_lumen_dm PRIVATE lx.runtime lx.foundation PkgConfig::LUMEN_DM_JSON)
+        target_include_directories(test_lumen_dm PRIVATE tests executables/lumen-dm)
+        lumen_apply_module_properties(test_lumen_dm)
+        add_test(NAME test_lumen_dm COMMAND test_lumen_dm)
+        add_test(NAME test_lumen_dm_install
+            COMMAND python3 "${CMAKE_SOURCE_DIR}/tests/test_lumen_dm_install.py"
+                "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}" "${CMAKE_COMMAND}")
+    endif()
+
     add_executable(test_result tests/test_result.cpp)
     target_link_libraries(test_result PRIVATE lx.foundation)
     lumen_apply_module_properties(test_result)

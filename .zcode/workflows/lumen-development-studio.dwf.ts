@@ -1023,10 +1023,23 @@ for (const card of tasks) {
     seat_failed: seatFailed,
     required_seat_missing: requiredSeatMissing,
   };
-  const gate = await agent(`Gatekeeper ${card.id}`, { system: gatekeeperPersona, budget: { webSearch: 0 } }).ask<GateVerdict>(
+  // The studio does not take over the boot VT or restart the host. Use git as well as
+  // the classifier: the main checkout may predate the display-manager evidence class.
+  const bootPaths = ["executables/lumen-dm", "deploy/lumen-dm", "deploy/systemd/lumen-dm.service.in"];
+  const trackedBootDiff = await world.run("git", ["-C", wt, "diff", "--quiet", effBase, "--", ...bootPaths]);
+  const untrackedBootDiff = await world.run("git", ["-C", wt, "ls-files", "--others", "--exclude-standard", "--", ...bootPaths]);
+  const bootEvidenceMissing = required.classes.includes("display-manager") || trackedBootDiff.exitCode !== 0 ||
+    untrackedBootDiff.exitCode !== 0 || untrackedBootDiff.stdout.trim() !== "";
+  if (bootEvidenceMissing) {
+    notCovered.push(`task ${card.id}: display-manager boot and PAM/VT handoff require an owner-approved native seat test (ADR 015)`);
+  }
+  const modelGate = await agent(`Gatekeeper ${card.id}`, { system: gatekeeperPersona, budget: { webSearch: 0 } }).ask<GateVerdict>(
     `Gate this finished Lumen task. Verify the packet against the worktree at ${wt} yourself ` +
       `(read the diff, the tests, the suite definition) before deciding.\n\n${JSON.stringify(packet, null, 2)}`,
   );
+  const gate: GateVerdict = bootEvidenceMissing && modelGate.verdict === "READY"
+    ? { ...modelGate, verdict: "BLOCKED", reasons: [...modelGate.reasons, "Missing native display-manager boot and handoff evidence (ADR 015)"] }
+    : modelGate;
   for (const r of gate.reasons) {
     allFindings.push({
       where: `task ${card.id} gate`,

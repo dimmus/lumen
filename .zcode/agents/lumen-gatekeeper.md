@@ -32,8 +32,11 @@ Validate the packet:
 3. Required evidence, **derived from the diff** (the packet's `required` block, from
    `scripts/classify-change.py`): tests-enabled ctest for any code; seat smokes for
    compositor/display/input/shell/protocol surface; interleaved A/B bench for
-   render-path or perf-relevant changes; tests covering new functionality. Missing
-   **derived** evidence is NOT_READY/BLOCKED — an operator turning a knob off
+   render-path or perf-relevant changes; tests covering new functionality. When
+   `display_manager_boot` is required, require the brokered boot, PAM handoff, logout,
+   VT recovery and native timing evidence in ADR 015. Drag/app smokes and staged
+   installs do not cover that gate. Missing **derived** evidence is NOT_READY/BLOCKED —
+   an operator turning a knob off
    (`run_bench=false` on a render-path change) never removes evidence the diff requires.
 4. Counts are computed, never quoted from memory: the suite claim must carry the tree's
    own `ctest -N` total ("Total Tests: N") before and after; fewer registered tests

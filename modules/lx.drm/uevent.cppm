@@ -71,9 +71,9 @@ public:
     uevent_monitor(uevent_monitor&& other) noexcept;
     uevent_monitor& operator=(uevent_monitor&& other) noexcept;
 
-    /// Opens the monitor for the card whose dev_t is `card`. `not_implemented` without
-    /// libudev in the build; `drm_err::monitor_failed` when udev refuses (no udevd, no
-    /// netlink in a container).
+    /// Opens the monitor for the card whose dev_t is `card`. Pass zero to observe all
+    /// DRM minor events for discovery: only `hotplug_batch::events` is meaningful then.
+    /// `not_implemented` without libudev; `drm_err::monitor_failed` when udev refuses.
     [[nodiscard]] static lx::result<uevent_monitor> open(unsigned long long card);
     /// The netlink socket (nonblocking), -1 when closed.
     [[nodiscard]] int fd() const;
@@ -193,8 +193,6 @@ lx::result<lx::drm::uevent_monitor> lx::drm::uevent_monitor::open(unsigned long 
     const auto fail = [](const char* why) {
         return lx::make_error(lx::drm_err::monitor_failed, why);
     };
-    if (card == 0)
-        return lx::invalid_argument("uevent monitor: no card");
     uevent_monitor m{};
     m.card_ = card;
     m.udev_ = udev_new();

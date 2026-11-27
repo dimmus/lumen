@@ -2292,13 +2292,20 @@ shell's connection, so a dead shell can neither hold keys nor lock the user in.
 
 ## 10. Session deployment (systemd)
 
-A login runs **`lumen-session`** — from the shell of a console login, or from a display
-manager through `share/wayland-sessions/lumen.desktop`. With a systemd user manager it
-imports the login's environment into the manager (recording what it changes), runs
-`systemctl --user --wait start lumen-compositor.service`, and when that returns starts
-`lumen-shutdown.target` and puts the manager's environment back exactly as it was
-(ADR 011, design-session-and-wm Part S). Nothing is enabled: the compositor's unit pulls in
-the rest.
+A login runs **`lumen-session`** — from the shell of a console login, from an external
+manager through `share/wayland-sessions/lumen.desktop`, or from the optional
+`lumen-dm.service`. The latter is a system unit enabled as `display-manager.service`.
+It runs greetd on VT1. The unprivileged `lumen-dm` greeter acquires its own local
+logind greeter session and draws directly to atomic DRM/KMS using Lumen's UI engine.
+It runs no Wayland server. After PAM accepts a login, the greeter releases the seat
+before greetd starts the Lumen session as the authenticated user. The greeter returns
+when that session ends ([ADR 015](adr/015-display-manager.md)).
+
+With a systemd user manager, `lumen-session` imports the login's environment into the
+manager (recording what it changes), runs `systemctl --user --wait start
+lumen-compositor.service`, and when that returns starts `lumen-shutdown.target` and puts
+the manager's environment back exactly as it was (ADR 011, design-session-and-wm Part S).
+No user unit is enabled: the compositor's unit pulls in the rest.
 
 ```mermaid
 flowchart LR
@@ -2315,8 +2322,9 @@ flowchart LR
 ```
 
 Unit files: `deploy/systemd/*.in`, configured at install time with the prefix's paths
-(`cmake --install build --prefix DIR` gives DIR's own tree; units go to systemd's
-`systemduserunitdir` for `/usr`, else `<prefix>/lib/systemd/user`).
+(`cmake --install build --prefix DIR` gives DIR's own tree; user units go to systemd's
+`systemduserunitdir` for `/usr`, else `<prefix>/lib/systemd/user`). The optional DM unit
+goes to systemd's system unit directory (`<prefix>/lib/systemd/system` for other prefixes).
 
 | Unit | Role |
 |------|------|

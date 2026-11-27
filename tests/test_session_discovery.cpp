@@ -71,6 +71,15 @@ lx::session::session_discovery discovery(fake_logind& f, unsigned uid, const cha
 
 std::string_view id_of(const lx::session::session_choice& c) { return c.id; }
 
+constexpr lx::session::detail::greeter_session_facts local_greeter{
+    .process_session_id = "c1",
+    .seat = "seat0",
+    .session_class = "greeter",
+    .uid = 975,
+    .vt = 1,
+    .local = true,
+};
+
 } // namespace
 
 LUMEN_TEST(xdg_session_id_wins_when_it_is_a_seat_session_of_this_user) {
@@ -148,6 +157,52 @@ LUMEN_TEST(greeter_sessions_and_unknown_ids_are_never_taken) {
     const auto c = lx::session::discover_session(discovery(f, 1000, "missing"));
     LUMEN_CHECK(!c.found());
     LUMEN_CHECK(std::string_view{lx::session::session_found_by_name(c.found_by)} == "none");
+}
+
+LUMEN_TEST(greeter_open_policy_selects_only_the_process_session) {
+    using lx::session::detail::discover_greeter_session;
+    const auto c = discover_greeter_session(975, 975, local_greeter);
+    LUMEN_CHECK(c.found_by == lx::session::session_found_by::process);
+    LUMEN_CHECK(id_of(c) == "c1");
+
+    auto f = local_greeter;
+    f.process_session_id = "";
+    LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
+    const std::string overlong_id(64, 'c');
+    f.process_session_id = overlong_id;
+    LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
+}
+
+LUMEN_TEST(greeter_open_policy_requires_matching_nonroot_uids) {
+    using lx::session::detail::discover_greeter_session;
+    LUMEN_CHECK(!discover_greeter_session(975, 976, local_greeter).found());
+    LUMEN_CHECK(!discover_greeter_session(976, 976, local_greeter).found());
+
+    auto f = local_greeter;
+    f.uid = 0;
+    LUMEN_CHECK(!discover_greeter_session(0, 0, f).found());
+}
+
+LUMEN_TEST(greeter_open_policy_requires_exact_class_and_local_seat0_vt) {
+    using lx::session::detail::discover_greeter_session;
+    auto f = local_greeter;
+    for (auto cls : {"", "user", "greeter-extra"}) {
+        f.session_class = cls;
+        LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
+    }
+    f = local_greeter;
+    for (auto seat : {"", "seat1", "seat00"}) {
+        f.seat = seat;
+        LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
+    }
+    f = local_greeter;
+    for (unsigned vt : {0u, 64u}) {
+        f.vt = vt;
+        LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
+    }
+    f = local_greeter;
+    f.local = false;
+    LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
 }
 
 int main(int argc, char** argv) {

@@ -16,9 +16,9 @@ files). --host auto-detects from the DRM drivers (vmwgfx → vm, anything else
 → notebook — the two hosts share the name iritur). Output is JSON on stdout:
 
     classes      what the change touches (docs-only, logic, seat-surface,
-                 render-path, ui-engine, protocol, build, harness-scripts)
+                 render-path, ui-engine, protocol, build, harness-scripts, display-manager)
     required     the evidence class the gate must see: ctest, smokes,
-                 bench_ab, goldens
+                 bench_ab, goldens, display_manager_boot
     render_path  the change rides the decisive present path
     decisive_backend_blocked_on_host
                  render-path change on a host with no hardware Vulkan (the
@@ -49,11 +49,12 @@ PRESENT_PIPELINE = (
     "modules/lx.compositor/output_policy",
     "modules/lx.compositor/content_update",
 )
+DISPLAY_MANAGER = ("executables/lumen-dm/", "deploy/lumen-dm/", "deploy/systemd/lumen-dm.service.in")
 SEAT_SURFACE = (
     "modules/lx.compositor/", "modules/lx.input/", "modules/lx.drm/",
     "modules/lx.session/", "modules/lx.shell/", "modules/lx.wayland.server/",
     "executables/lumen-compositor/", "executables/lumen-shell/",
-)
+) + DISPLAY_MANAGER
 UI_ENGINE = ("modules/lx.ui/", "modules/lx.ui.host/", "modules/lx.app/")
 DOC_PATTERNS = (re.compile(r"^docs/"), re.compile(r"^\.zcode/"), re.compile(r"\.md$"),
                 re.compile(r"^AGENTS\.md$"), re.compile(r"^README"))
@@ -94,7 +95,7 @@ def changed_files(repo, base, head):
 
 def classify(files, host):
     classes = set()
-    required = {"ctest": False, "smokes": False, "bench_ab": False, "goldens": False}
+    required = dict.fromkeys(("ctest", "smokes", "bench_ab", "goldens", "display_manager_boot"), False)
     render_path = False
 
     def is_doc(p):
@@ -106,6 +107,8 @@ def classify(files, host):
             render_path = True
         if p.startswith(SEAT_SURFACE) or p.startswith("protocols/"):
             classes.add("seat-surface")
+        if p.startswith(DISPLAY_MANAGER):
+            classes.add("display-manager")
         if p.startswith(UI_ENGINE):
             classes.add("ui-engine")
         if p.startswith(("modules/", "executables/", "tests/")):
@@ -118,8 +121,7 @@ def classify(files, host):
             classes.discard("docs-only-marker")
     if files and all(is_doc(p) for p in files):
         return {
-            "classes": ["docs-only"], "required": {"ctest": False, "smokes": False,
-                                                   "bench_ab": False, "goldens": False},
+            "classes": ["docs-only"], "required": required,
             "render_path": False, "decisive_backend_blocked_on_host": False,
             "changed_files_count": len(files),
         }
@@ -129,6 +131,8 @@ def classify(files, host):
         required["ctest"] = True
     if "seat-surface" in classes:
         required["smokes"] = True
+    if "display-manager" in classes:
+        required["display_manager_boot"] = True
     if "render-path" in classes:
         required["bench_ab"] = True
     if "ui-engine" in classes:

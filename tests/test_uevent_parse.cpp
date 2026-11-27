@@ -8,6 +8,7 @@
 
 import std;
 import lx.drm;
+import lx.foundation;
 
 using lx::drm::hotplug_batch;
 using lx::drm::merge_hotplug;
@@ -89,10 +90,18 @@ LUMEN_TEST(uevent_more_hints_than_fit) {
     LUMEN_CHECK(b.all_connectors && b.connector_count == 0);
 }
 
-LUMEN_TEST(uevent_monitor_open_without_card) {
-    // No card dev_t: refused with a typed error (or not_implemented without libudev).
-    auto m = lx::drm::uevent_monitor::open(0);
-    LUMEN_CHECK(!m);
+LUMEN_TEST(uevent_monitor_discovery) {
+    auto monitor = lx::drm::uevent_monitor::open(0);
+    if (!monitor) {
+        const auto err = monitor.get_error();
+        LUMEN_CHECK(err.domain == lx::error_domain::not_implemented ||
+                    (err.domain == lx::error_domain::drm &&
+                     err.code == static_cast<int>(lx::drm_err::monitor_failed)));
+        return;
+    }
+    LUMEN_CHECK(monitor->fd() >= 0);
+    LUMEN_CHECK(monitor->card() == 0);
+    LUMEN_CHECK(monitor->drain().empty());
 }
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }
