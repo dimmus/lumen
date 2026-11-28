@@ -2667,6 +2667,10 @@ int usage() {
                  "       lumen-probe sni [--id ID] [--title T] [--icon-name NAME | --pixmap] "
                  "[--status S] [--tooltip T] [--no-menu] [--item-is-menu] [--register-path] "
                  "[--change-after MS] [--exit-after S]\n");
+    // A call of its own: the statement above is not laid out the way .clang-format wants,
+    // and a line of it added here would be one more of its violations.
+    std::fprintf(stderr, "       lumen-probe wlr-toplevels [--version V] [--watch S] [--for S] "
+                         "[@MS:REQUEST:TITLE ...]\n");
     return 2;
 }
 
@@ -2679,6 +2683,7 @@ int pointer_main(int argc, char** argv);
 int capture_main(int argc, char** argv);
 int input_main(int argc, char** argv);
 int workspace_main(int argc, char** argv);
+int wlr_toplevel_main(int argc, char** argv);
 int sni_main(int argc, char** argv);
 
 int main(int argc, char** argv) {
@@ -2716,6 +2721,10 @@ int main(int argc, char** argv) {
     // lumen-probe-workspace.cpp.
     if (argc >= 2 && (std::strcmp(argv[1], "workspaces") == 0 || std::strcmp(argv[1], "window") == 0))
         return workspace_main(argc, argv);
+    // zwlr_foreign_toplevel_management_v1 as a bar sees it, with timed window requests:
+    // lumen-probe-wlr-toplevel.cpp.
+    if (argc >= 2 && std::strcmp(argv[1], "wlr-toplevels") == 0)
+        return wlr_toplevel_main(argc, argv);
     // A StatusNotifierItem with a dbusmenu menu on the user bus (no Wayland connection):
     // lumen-probe-sni.cpp.
     if (argc >= 2 && std::strcmp(argv[1], "sni") == 0)

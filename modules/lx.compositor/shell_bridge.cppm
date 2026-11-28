@@ -43,6 +43,10 @@ struct toplevel_observer {
     void (*changed)(void* user, const toplevel_record& rec) = nullptr;
     /// The keyboard focus moved to `rec` (null: no window). Optional.
     void (*focused)(void* user, const toplevel_record* rec) = nullptr;
+    /// `rec` moved or was resized, its parent relation may differ, or the shell was told its
+    /// workspace: what follows from these — the output it is on, its parent — may have
+    /// changed. Optional; the list observer is the one that asks.
+    void (*updated)(void* user, const toplevel_record& rec) = nullptr;
     void* user = nullptr;
 };
 
@@ -104,6 +108,10 @@ public:
     void set_observer(toplevel_observer observer) { observer_ = observer; }
     /// A second observer: the control socket's event stream (lumen-ctl monitor).
     void set_control_observer(toplevel_observer observer) { control_observer_ = observer; }
+    /// A third, with a slot of its own (a second `set_observer` would drop the first):
+    /// zwlr_foreign_toplevel_management_v1 (wire_wlr_foreign_toplevel.cpp), which also
+    /// follows focus, moves, parents and workspaces through `focused` and `updated`.
+    void set_list_observer(toplevel_observer observer) { list_observer_ = observer; }
 
     /// Called at the end of every `on_bridge_bound`, with the shell's `wl_client*`.
     void set_bound_handler(void (*bound)(void* user, void* client_native), void* user) {
@@ -134,6 +142,7 @@ private:
     const toplevel_icon_table* icons_ = nullptr;
     toplevel_observer observer_{};
     toplevel_observer control_observer_{};
+    toplevel_observer list_observer_{};
     const char* shell_binary_path_ = "lumen-shell";
     void* bridge_ = nullptr;
     unsigned binds_ = 0;
@@ -387,6 +396,8 @@ void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
         observer_.mapped(observer_.user, rec);
     if (control_observer_.mapped)
         control_observer_.mapped(control_observer_.user, rec);
+    if (list_observer_.mapped)
+        list_observer_.mapped(list_observer_.user, rec);
 #ifdef LUMEN_HAS_PROTOCOL_GLUE
     if (!bridge_ || rec.shell_handle)
         return;
@@ -426,6 +437,8 @@ void lx::compositor::shell_bridge::emit_toplevel_destroyed(toplevel_record& rec)
         observer_.unmapped(observer_.user, rec);
     if (control_observer_.unmapped)
         control_observer_.unmapped(control_observer_.user, rec);
+    if (list_observer_.unmapped)
+        list_observer_.unmapped(list_observer_.user, rec);
 #ifdef LUMEN_HAS_PROTOCOL_GLUE
     if (!rec.shell_handle)
         return;
@@ -446,6 +459,8 @@ void lx::compositor::shell_bridge::emit_toplevel_state(const toplevel_record& re
         observer_.changed(observer_.user, rec);
     if (control_observer_.changed)
         control_observer_.changed(control_observer_.user, rec);
+    if (list_observer_.changed)
+        list_observer_.changed(list_observer_.user, rec);
 #ifdef LUMEN_HAS_PROTOCOL_GLUE
     if (!bridge_ || !rec.shell_handle)
         return;
@@ -458,6 +473,8 @@ void lx::compositor::shell_bridge::emit_toplevel_state(const toplevel_record& re
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_geometry(const toplevel_record& rec) {
+    if (list_observer_.updated)
+        list_observer_.updated(list_observer_.user, rec);
 #ifdef LUMEN_HAS_PROTOCOL_GLUE
     if (!bridge_ || !rec.shell_handle)
         return;
@@ -473,6 +490,8 @@ void lx::compositor::shell_bridge::emit_toplevel_geometry(const toplevel_record&
 void lx::compositor::shell_bridge::emit_focus_changed(const toplevel_record* focused) {
     if (control_observer_.focused)
         control_observer_.focused(control_observer_.user, focused);
+    if (list_observer_.focused)
+        list_observer_.focused(list_observer_.user, focused);
 #ifdef LUMEN_HAS_PROTOCOL_GLUE
     if (!bridge_)
         return;
@@ -545,6 +564,8 @@ void lx::compositor::shell_bridge::emit_toplevel_icon(const toplevel_record& rec
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_parent(const toplevel_record& rec) {
+    if (list_observer_.updated)
+        list_observer_.updated(list_observer_.user, rec);
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && \
     defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
     auto* bridge = static_cast<wl_resource*>(bridge_);
@@ -573,6 +594,8 @@ void lx::compositor::shell_bridge::emit_bell(const toplevel_record* rec) {
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_workspace(const toplevel_record& rec) {
+    if (list_observer_.updated)
+        list_observer_.updated(list_observer_.user, rec);
 #if defined(LUMEN_HAS_PROTOCOL_GLUE) && \
     defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_WORKSPACE_SINCE_VERSION)
     auto* bridge = static_cast<wl_resource*>(bridge_);

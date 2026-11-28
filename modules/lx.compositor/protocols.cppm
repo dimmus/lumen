@@ -909,10 +909,13 @@ void output_mgmt_finish(protocol_context& ctx, unsigned long long token, mgmt_re
 
 /// `output_manager::generation` moved: every bound wl_output and zxdg_output_v1 is sent
 /// the new state (then `done`), and every surface's output membership is recomputed from
-/// its node rect. UI affinity; rare (a mode change, an output added or removed).
+/// its node rect. The zwlr_foreign_toplevel_handle_v1 objects follow the windows first
+/// (wire_wlr_foreign_toplevel.cpp). UI affinity; rare (a mode change, an output added or
+/// removed).
 void notify_outputs_changed(protocol_context& ctx);
 /// The window manager's workspaces or memberships changed (its observer): every
-/// ext_workspace_manager_v1 is brought in line, one `done` each. UI affinity.
+/// ext_workspace_manager_v1 is brought in line, one `done` each, and every
+/// zwlr_foreign_toplevel_handle_v1 with them. UI affinity.
 void workspaces_changed(protocol_context& ctx);
 
 } // namespace lx::compositor

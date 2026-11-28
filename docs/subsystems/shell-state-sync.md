@@ -233,6 +233,40 @@ ext-workspace's bind and the snapshot.
 `workspace` argument of `snapshot_toplevel` / `toplevel_created` stays null. Because zlm now
 names `ext_workspace_handle_v1`, the zlm glue links ext-workspace-v1's interface tables.
 
+### Bars that are not the shell: wlr-foreign-toplevel-management-unstable-v1
+
+`zlm_shell_v1` is the shell's channel. A bar or a switcher that is not lumen-shell —
+waybar-class clients — gets the windows from the public
+**`zwlr_foreign_toplevel_manager_v1`** (wlr-foreign-toplevel-management-unstable-v1, served
+at version 3; ADR 009 Part 4's amendment), from the same compositor state and the same
+window manager; nothing of zlm changes for it.
+
+- **List.** At the bind one `toplevel` per mapped window, bottom to top; each handle's opening
+  batch is `title`, `app_id`, `state`, one `output_enter` per `wl_output` the client bound for
+  the window's output, `parent` (null without a mapped one) and `done`. A window that maps
+  gets the same batch.
+- **Changes.** A handle is sent only what differs from what it was last told — a title, an
+  app id, a state (`maximized`, `minimized`, `activated`, `fullscreen`), the output, the
+  parent — closed by one `done`. `activated` is the window manager's focus decision, the one
+  `focus_changed` gives the shell, so a bar and lumen-shell's panel agree. The output is the
+  one whose active workspace lists the window (a sticky or fullscreen one: the one it is on);
+  minimizing sends no `output_leave`, so a bar keeps the button that restores the window. A
+  `wl_output` bound later gets the `output_enter` it missed.
+- **Requests.** `activate`, `close`, `set_minimized` / `unset_minimized`, `set_maximized` /
+  `unset_maximized`, `set_fullscreen` / `unset_fullscreen` do what the policy bridge's
+  requests do (`window_manager::activate` unminimizes, switches to the window's workspace,
+  raises it and gives it the keyboard). Nothing changes while the session is locked.
+  `set_rectangle` keeps its rectangle as a hint; a negative width or height, or exactly one
+  of them zero, is `invalid_rectangle`. After `closed` the handle is inert; `stop` is
+  answered with `finished` and the manager object goes, its handles staying the client's.
+
+The unit (`wire_wlr_foreign_toplevel.cpp`) follows the windows through the shell bridge's
+third observer slot (`set_list_observer`, beside the capture list's and the control stream's):
+map, unmap, state and focus, and an `updated` callback for moves, parents and workspace
+changes — event-driven, with the workspace and outputs entry points as the two places every
+handle is compared again. Session-wide, so hidden from sandboxed clients like ext-workspace.
+With no manager bound it costs nothing: every entry returns before iterating.
+
 ### Version 7: held actions (the window switcher)
 
 A binding of a **held** action (`switcher.next`, `switcher.previous`, `-app`; ADR 011 K2) is
@@ -440,6 +474,9 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   `stacking_index`), so a restarted shell shows the order it had. While a snapshot is in progress the
   model reports `in_snapshot()` and the panel keeps what it last drew, so half a snapshot is
   never shown. On `toplevel_destroyed` the shell removes the entry and destroys its proxy.
+  A bar that is not lumen-shell (waybar, another panel) lists the same windows through
+  `zwlr_foreign_toplevel_manager_v1` ("Bars that are not the shell", above), `activated`
+  following the same focus decision.
 - **Panel** (`lx.shell:panel`), **one per output** (waybar's default; ADR 008 M13). A layer
   surface on `top` of its `wl_output`, anchored top/left/right, 32 px, exclusive zone 32,
   keyboard interactivity `none`, namespace `lumen-panel`. Each lists the windows on its
