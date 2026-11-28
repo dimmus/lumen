@@ -98,6 +98,7 @@ static_assert(!can_retain_frame(dm::phase::started, 2, 2, false));
     case dm::phase::fatal:
         return nullptr;
     case dm::phase::connecting:
+    case dm::phase::reporting:
         return "Connecting to the sign-in service…";
     case dm::phase::authenticating:
         return "Checking credentials…";
@@ -123,7 +124,7 @@ thread_local greeter* active = nullptr;
 class greeter final : public lx::runtime::event_source {
 public:
     greeter(lx::runtime::event_loop& loop, lx::session::logind_session& session, std::string socket,
-            std::string command)
+            std::string command, bool split_vt = false)
         : loop_(loop),
           session_(session),
           kms_(loop, session,
@@ -138,13 +139,16 @@ public:
                 .user = this,
                 .background_xrgb = background_xrgb(),
                 .presented =
-                    [](void* user, std::uint64_t revision) {
+                    [](void* user, std::uint64_t revision, bool kernel_event) {
                         auto& self = *static_cast<greeter*>(user);
                         self.presented_revision_ = revision;
+                        self.kernel_presented_ = kernel_event;
                         if (self.painted_revision_ == revision)
                             self.presented_field_ = self.painted_field_;
                     }}),
-          conversation_(loop, std::move(socket), std::move(command), [this] { changed(); }) {
+          conversation_(
+              loop, std::move(socket), std::move(command), [this] { changed(); }, split_vt),
+          split_vt_(split_vt) {
         repeat_.set_enabled(false);
         handoff_timeout_.set_enabled(false);
     }
@@ -278,9 +282,14 @@ private:
         return engaged_ && !stopping_ && !vt_switch_pending_ && handoff_revision_ == 0;
     }
 
-    [[nodiscard]] bool accepts_input() const {
+    [[nodiscard]] bool form_presented() const {
         return seat_active() && !cancel_pointer_owed_ && kms_.content_visible() &&
                presented_revision_ >= form_revision_;
+    }
+
+    [[nodiscard]] bool accepts_input() const {
+        return form_presented() && (!split_vt_ || presentation_reported_) &&
+               conversation_.view().state != dm::phase::reporting;
     }
 
     void update_form() {
@@ -304,10 +313,23 @@ private:
             return;
         }
         display_present_ = true;
-        if (!interactive_logged_ && keyboard_ready_ && accepts_input() &&
+        if (keyboard_ready_ && form_presented() &&
             conversation_.view().state == dm::phase::username) {
-            interactive_logged_ = true;
-            log_dm.info("greeter_interactive timestamp_ns={}", loop_.now());
+            if (split_vt_ && !presentation_reported_) {
+                if (!kernel_presented_) {
+                    // A blocking modeset can be the only initial frame. Request a
+                    // kernel flip before reporting the greeter ready to the broker.
+                    kms_.request_frame(frame_revision_);
+                    return;
+                }
+                presentation_reported_ = true;
+                conversation_.report_presented();
+                return;
+            }
+            if (!interactive_logged_) {
+                interactive_logged_ = true;
+                log_dm.info("greeter_interactive timestamp_ns={}", loop_.now());
+            }
         }
         if (root_.wants_frame())
             kms_.request_frame(frame_revision_);
@@ -923,6 +945,7 @@ private:
     lx::runtime::timer_source repeat_{k_repeat_step_ns, [this] { repeat_key(); }};
     lx::runtime::timer_source handoff_timeout_{0, [this] { stop(); }, false};
     dm::conversation conversation_;
+    const bool split_vt_;
     lx::rect2i form_{};
     dm::field_hit_map painted_field_{};
     dm::field_hit_map presented_field_{};
@@ -950,6 +973,8 @@ private:
     bool vt_switch_pending_ = false;
     bool display_present_ = false;
     bool keyboard_ready_ = false;
+    bool kernel_presented_ = false;
+    bool presentation_reported_ = false;
     bool interactive_logged_ = false;
     bool pointer_initialized_ = false;
     dm::phase last_phase_ = dm::phase::offline;
@@ -1080,10 +1105,11 @@ int main() {
 int main(int argc, char** argv) {
     if (::getuid() == 0 || ::geteuid() == 0 || ::getuid() != ::geteuid())
         return fail(lx::make_error(lx::io_err::permission_denied, "greeter must run unprivileged"));
-    auto command = argc == 2 ? dm::session_word(argv[1]) : std::nullopt;
-    if (!command || !trusted_session(argv[1]))
-        return fail(
-            lx::invalid_argument("expected one absolute path to the installed lumen-session"));
+    const bool split_vt = argc == 3 && std::string_view{argv[2]} == "--split-vt";
+    auto command = argc == 2 || split_vt ? dm::session_word(argv[1]) : std::nullopt;
+    if (!command || !trusted_session(argv[1]) ||
+        (split_vt && std::string_view{argv[1]} != "/usr/bin/lumen-session"))
+        return fail(lx::invalid_argument("expected an installed lumen-session path [--split-vt]"));
     // Do not change inherited rlimits: the target session is a separate greetd child.
     // Make this process non-dumpable before any credentials can enter it.
     if (::prctl(PR_SET_DUMPABLE, 0L, 0L, 0L, 0L) < 0)
@@ -1110,7 +1136,7 @@ int main(int argc, char** argv) {
     auto session = lx::session::logind_session::open_greeter();
     if (!session)
         return fail(session.get_error());
-    greeter view{loop, *session, socket, std::move(*command)};
+    greeter view{loop, *session, socket, std::move(*command), split_vt};
     lx::runtime::fd_source stop{signal_fd.get(), [&] {
                                     signalfd_siginfo signal{};
                                     if (::read(signal_fd.get(), &signal, sizeof(signal)) ==

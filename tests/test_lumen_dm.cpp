@@ -77,11 +77,14 @@ std::string framed(std::string_view message) {
 struct fixture {
     lx::runtime::event_loop loop{};
     unsigned changes = 0;
-    conversation login{loop, "/dev/null/lumen-dm-test", "'/usr/bin/lumen-session'",
-                       [this] { ++changes; }};
+    conversation login;
     lx::unique_fd server{};
 
-    explicit fixture(bool verify_peer = false) { connect(verify_peer); }
+    explicit fixture(bool verify_peer = false, bool split_vt = false)
+        : login{loop, "/dev/null/lumen-dm-test", "'/usr/bin/lumen-session'", [this] { ++changes; },
+                split_vt} {
+        connect(verify_peer);
+    }
 
     void connect(bool verify_peer = false) {
         int fd[2]{};
@@ -139,6 +142,31 @@ struct fixture {
         request(create);
     }
 };
+
+void split_start() {
+    fixture f{false, true};
+    f.login.report_presented();
+    f.request(R"({"type":"greeter_presented","version":1})");
+    expect(f.login.view().state == phase::reporting && !f.login.editable(),
+           "credential editing is disabled while reporting the first greeter frame");
+    f.login.append("sally");
+    f.login.submit();
+    f.waiting();
+    f.reply(R"({"type":"error","error_type":"error","description":"no pending return"})");
+    expect(f.login.view().state == phase::offline && conversation_test::socket(f.login) < 0,
+           "initial boot report closes its one-shot stream before auth reconnects");
+    f.connect();
+    f.begin();
+    f.write(framed(success));
+    f.run();
+    f.request(R"({"type":"start_session_split_vt","version":1})");
+    expect(f.login.view().state == phase::starting && !f.login.view().exit_code(),
+           "split greeter waits for the broker to finish the handoff");
+    f.write(framed(success));
+    f.run();
+    expect(f.login.view().state == phase::started && f.login.view().exit_code() == 0,
+           "split greeter exits only after the broker acknowledges the handoff");
+}
 
 void visible_caret() {
     fixture f;
@@ -410,6 +438,7 @@ void trust_boundaries() {
 
 int main() {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    split_start();
     visible_caret();
     multi_prompt();
     cancel_and_retry();

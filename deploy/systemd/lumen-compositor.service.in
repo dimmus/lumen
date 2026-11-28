@@ -23,6 +23,8 @@ Before=xdg-desktop-autostart.target
 Type=@LUMEN_UNIT_SERVICE_TYPE@
 @LUMEN_UNIT_EXEC_RELOAD@
 NotifyAccess=main
+# Created only by lumen-session during a supervised display-manager launch.
+EnvironmentFile=-%t/lumen/dm-handoff.env
 # $LUMEN_DISPLAY: the Wayland socket name (lumen-session imports it when set; unset, the
 # compositor serves lumen-0).
 ExecStart=@LUMEN_BINDIR@/lumen-compositor --session $LUMEN_DISPLAY

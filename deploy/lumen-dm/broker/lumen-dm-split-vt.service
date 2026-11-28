@@ -1,0 +1,20 @@
+# Opt-in split VT broker. Enable only after verifying that VT2 is a working console.
+[Unit]
+Description=Lumen Display Manager (split VT)
+Documentation=man:greetd(1)
+After=systemd-user-sessions.service plymouth-quit-wait.service getty@tty1.service getty@tty7.service
+Conflicts=getty@tty1.service getty@tty7.service lumen-dm.service greetd.service
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+UMask=0077
+RuntimeDirectory=lumen-dm-handoff
+RuntimeDirectoryMode=0711
+ExecStart=/usr/libexec/lumen-greetd-split-vt --config /etc/lumen-dm/greetd-split-vt.toml
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+Alias=display-manager.service

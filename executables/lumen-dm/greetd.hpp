@@ -9,6 +9,7 @@ namespace lumen::dm {
 enum class phase {
     offline,
     connecting,
+    reporting,
     username,
     authenticating,
     visible,
@@ -56,12 +57,13 @@ struct screen {
 class conversation final : public lx::runtime::event_source {
 public:
     conversation(lx::runtime::event_loop& loop, std::string socket, std::string session_command,
-                 lx::runtime::callback changed);
+                 lx::runtime::callback changed, bool split_vt = false);
     ~conversation() override;
     conversation(const conversation&) = delete;
     conversation& operator=(const conversation&) = delete;
 
     void reconnect();
+    void report_presented();
     void submit();
     void cancel();
     void clear_input();
@@ -75,7 +77,7 @@ public:
 
 private:
     friend struct conversation_test;
-    enum class request { create, answer, acknowledge, cancel, start };
+    enum class request { create, answer, acknowledge, cancel, start, presented };
 
     bool prepare(lx::runtime::clock_time& timeout) override;
     bool check() override;
@@ -112,6 +114,7 @@ private:
     const std::string socket_;
     const std::string session_command_;
     lx::runtime::callback changed_;
+    const bool split_vt_;
     lx::unique_fd fd_{};
     lx::runtime::clock_time deadline_ = 0;
     phase phase_ = phase::offline;

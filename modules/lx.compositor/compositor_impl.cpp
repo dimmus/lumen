@@ -3,6 +3,8 @@ module;
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #ifdef __GLIBC__
@@ -68,6 +70,84 @@ constexpr lx::trace::category log_config{"config"};
 [[nodiscard]] bool seat_less_start(const lx::compositor::config& cfg) {
     return cfg.virtual_outputs && *cfg.virtual_outputs && !cfg.session_mode;
 }
+
+[[nodiscard]] lx::result<lx::unique_fd> connect_dm_handoff(std::string_view path) {
+    sockaddr_un addr{};
+    if (path.empty() || path.front() != '/' || path.size() >= sizeof(addr.sun_path))
+        return lx::invalid_argument("LUMEN_DM_HANDOFF must be an absolute Unix socket path");
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.data(), path.size());
+    lx::unique_fd fd{::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)};
+    if (fd.get() < 0 ||
+        ::connect(fd.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) < 0)
+        return lx::make_error(lx::io_err::broken_pipe, "DM handoff connection failed");
+    ucred peer{};
+    socklen_t len = sizeof(peer);
+    if (::getsockopt(fd.get(), SOL_SOCKET, SO_PEERCRED, &peer, &len) != 0 || len != sizeof(peer) ||
+        peer.pid <= 0 || peer.uid != 0)
+        return lx::make_error(lx::io_err::permission_denied, "DM handoff peer is not root");
+    return fd;
+}
+
+[[nodiscard]] bool send_dm_handoff(int fd, std::string_view line) {
+    // A short write or a full/closed socket fails the exchange;
+    // neither the compositor startup nor its event loop waits on the broker.
+    return ::send(fd, line.data(), line.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(line.size());
+}
+
+constexpr std::string_view k_dm_active_prefix = "ACTIVE ";
+constexpr std::string_view k_dm_presented_prefix = "PRESENTED ";
+constexpr std::size_t k_dm_nonce_size = 32;
+constexpr std::size_t k_dm_active_size = k_dm_active_prefix.size() + k_dm_nonce_size + 1;
+constexpr std::size_t k_dm_presented_size = k_dm_presented_prefix.size() + k_dm_nonce_size + 1;
+
+[[nodiscard]] constexpr bool valid_dm_challenge_prefix(std::string_view bytes) {
+    if (bytes.size() > k_dm_active_size ||
+        !k_dm_active_prefix.starts_with(bytes.substr(0, k_dm_active_prefix.size())))
+        return false;
+    for (std::size_t i = k_dm_active_prefix.size(); i < bytes.size(); ++i) {
+        const char c = bytes[i];
+        if (i == k_dm_active_size - 1)
+            return c == '\n';
+        if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f'))
+            return false;
+    }
+    return true;
+}
+
+static_assert(k_dm_active_size == 40 && k_dm_presented_size == 43);
+static_assert([] {
+    constexpr std::string_view line = "ACTIVE 0123456789abcdef0123456789abcdef\n";
+    for (std::size_t n = 0; n <= line.size(); ++n)
+        if (!valid_dm_challenge_prefix(line.substr(0, n)))
+            return false;
+    return true;
+}());
+static_assert(!valid_dm_challenge_prefix("ACTZ"));
+static_assert(!valid_dm_challenge_prefix("ACTIVE 0123456789abcdef0123456789abcdEf\n"));
+static_assert(!valid_dm_challenge_prefix("ACTIVE 0123456789abcdef0123456789abcde\n"));
+static_assert(!valid_dm_challenge_prefix("ACTIVE 0123456789abcdef0123456789abcdef\n\n"));
+
+constexpr std::string_view k_dm_return = "RETURN\n";
+constexpr std::string_view k_dm_returned = "RETURNED\n";
+
+[[nodiscard]] constexpr bool valid_dm_returned_fragment(std::size_t received,
+                                                        std::string_view fragment) {
+    return received <= k_dm_returned.size() && k_dm_returned.substr(received).starts_with(fragment);
+}
+
+static_assert(k_dm_return.size() == 7 && k_dm_returned.size() == 9);
+static_assert([] {
+    for (std::size_t n = 0; n <= k_dm_returned.size(); ++n)
+        if (!valid_dm_returned_fragment(0, k_dm_returned.substr(0, n)) ||
+            !valid_dm_returned_fragment(n, k_dm_returned.substr(n)))
+            return false;
+    return true;
+}());
+static_assert(!valid_dm_returned_fragment(0, "RETURN\n"));
+static_assert(!valid_dm_returned_fragment(6, "ed\n"));
+static_assert(!valid_dm_returned_fragment(8, "\r\n"));
+static_assert(!valid_dm_returned_fragment(9, "\n"));
 
 } // namespace
 
@@ -413,6 +493,27 @@ struct compositor_impl {
     // ── Session pause/resume (VT switching) — docs/architecture.md "Session pause/resume" ──
     /// UI affinity. The state machine; `apply_session_actions` executes what it returns.
     session_state session_{};
+    /// UI only. After PRESENTED the broker socket stays open, with no timer until logout.
+    enum class dm_handoff_phase : unsigned char { startup, presented, returning };
+    dm_handoff_phase dm_handoff_phase_ = dm_handoff_phase::startup;
+    static constexpr lx::runtime::clock_time k_dm_return_timeout_ns = 3'500'000'000;
+    lx::unique_fd dm_handoff_{};
+    std::unique_ptr<runtime::fd_source> dm_handoff_source_{};
+    char dm_challenge_[k_dm_active_size]{}; // fixed wire record; contains the nonce
+    std::size_t dm_challenge_size_ = 0;
+    unsigned dm_challenge_frame_ = 0;
+    lx::runtime::clock_time dm_return_deadline_ns_ = 0;
+    std::size_t dm_returned_size_ = 0;
+    bool dm_session_ = false;
+    void read_dm_handoff();
+    [[nodiscard]] bool begin_dm_return();
+    void finish_dm_return(const char* reason);
+    void read_dm_challenge();
+    void close_dm_handoff();
+    void fail_dm_handoff(lx::error err);
+    [[nodiscard]] bool dm_input_working();
+    void start_dm_input();
+
     /// UI affinity. VT and logout bindings, the shell's key grabs, tap observation.
     keybindings keys_{};
     /// UI affinity. xdg-toplevel-icon-v1's icon memfds and xdg-foreign's handles
@@ -1242,6 +1343,8 @@ struct compositor_impl {
     /// between the two.
     void begin_input();
     void finish_input();
+    [[nodiscard]] lx::input::device_provider input_provider();
+    void install_input(lx::input::input_manager&& opened);
     std::thread input_open_thread_{};
     std::optional<lx::result<lx::input::input_manager>> input_opened_{};
     /// Where opening the seat spent its time, logged once by `finish_input`: the keymap
@@ -1327,6 +1430,8 @@ struct compositor_impl {
     }
 
     ~compositor_impl() {
+        if (active == this)
+            active = nullptr;
         // Clients first, while everything their objects' destructors reach (the scene, the
         // window manager, the tree) is still alive: members are destroyed in reverse order,
         // and the server is declared first.
@@ -2462,17 +2567,10 @@ void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
                           : "headless");
 }
 
-void compositor_impl::begin_input() {
-    // A seat-less start (`start` decided it through the same seat_less_start predicate:
-    // virtual outputs, not the session's display server) opens no seat at all — no logind
-    // round trips, no udev walk, no /dev/input node touched, the same state as a host with
-    // no session for the user. The keymap below is still compiled: clients are told the
-    // layout at bind time, and a compositor that never found a keyboard still has to
-    // answer it.
-    const bool seat_less = seat_less_start(cfg);
+lx::input::device_provider compositor_impl::input_provider() {
     // Device nodes are opened through logind when there is a session; without one libinput
     // falls back to opening them directly, which works for root or a member of the input
-    // group and fails cleanly otherwise.
+    // group and fails cleanly otherwise. DM handoff requires a live logind fd.
     lx::input::device_provider provider{};
     provider.user = this;
     provider.open_device = [](const char* path, int flags, void* user) -> int {
@@ -2481,15 +2579,22 @@ void compositor_impl::begin_input() {
         int fd = -1;
         bool via_logind = false;
         if (self) {
-            if (auto taken = self->logind_.take_device_path(path); taken) {
-                fd = std::move(taken).value().release();
-                via_logind = true;
+            bool inactive = false;
+            if (auto taken = self->logind_.take_device_path(path, &inactive); taken) {
+                if (self->dm_session_ && inactive)
+                    self->logind_.release_device_fd(taken.value().get());
+                else {
+                    fd = std::move(taken).value().release();
+                    via_logind = true;
+                }
             }
         }
-        if (fd < 0) {
+        if (fd < 0 && !(self && self->dm_session_)) {
             fd = ::open(path, flags | O_CLOEXEC);
             if (fd < 0)
                 fd = -errno;
+        } else if (fd < 0) {
+            fd = -EACCES;
         }
         if (self) {
             const double ms =
@@ -2505,7 +2610,9 @@ void compositor_impl::begin_input() {
             // A device that stalls the seat (start-up waits for it) is named every time.
             if (ms > k_slow_device_open_ms)
                 log_input.warn("opening {} took {:.0f} ms ({})", path ? path : "?", ms,
-                               via_logind ? "logind TakeDevice" : "direct open after TakeDevice failed");
+                               via_logind          ? "logind TakeDevice"
+                               : self->dm_session_ ? "logind TakeDevice denied"
+                                                   : "direct open after TakeDevice failed");
         }
         return fd;
     };
@@ -2516,6 +2623,15 @@ void compositor_impl::begin_input() {
             self->logind_.release_device_fd(fd);
         ::close(fd);
     };
+    return provider;
+}
+
+void compositor_impl::begin_input() {
+    // A seat-less start opens no devices. An inactive DM session defers them until its
+    // VT comes up: paused evdev fds from logind cannot be used by libinput. Both still
+    // compile the keymap so clients can bind the seat before any input is opened.
+    const bool seat_less = dm_session_ || seat_less_start(cfg);
+    const auto provider = input_provider();
 
     // The configured layout (config.toml [input.keyboard]); the snapshot does not change
     // before the loop runs, so the thread may read it.
@@ -2584,7 +2700,165 @@ void compositor_impl::finish_input() {
         log_input.error(opened.get_error());
         return;
     }
-    input_devices_ = std::move(opened).value();
+    install_input(std::move(opened).value());
+}
+
+void compositor_impl::start_dm_input() {
+    // After startup the logind bus and Wayland seat belong to the UI thread. Reuse the
+    // compiled keymap and pointer position while adopting the live libinput manager.
+    auto& seat = input_devices_.default_seat();
+    const double x = seat.pointer_x();
+    const double y = seat.pointer_y();
+    auto opened = lx::input::input_manager::open(
+        input_provider(), "seat0", keymap_config_of(config_.current().keyboard),
+        !seat.keymap().valid() && config_.current().keyboard.numlock, &seat.keymap());
+    if (!opened) {
+        log_input.error(opened.get_error());
+        return;
+    }
+    opened.value().default_seat().set_pointer_position(x, y);
+    install_input(std::move(opened).value());
+}
+
+void compositor_impl::read_dm_challenge() {
+    // A dispatch consumes at most one fixed-size record plus one byte to detect extra
+    // data. Keep watching EOF and protocol errors even after a valid challenge.
+    while (dm_handoff_.get() >= 0) {
+        const bool complete = dm_challenge_size_ == k_dm_active_size;
+        char extra;
+        const auto n =
+            ::recv(dm_handoff_.get(), complete ? &extra : dm_challenge_ + dm_challenge_size_,
+                   complete ? 1 : k_dm_active_size - dm_challenge_size_, MSG_DONTWAIT);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        if (n <= 0) {
+            fail_dm_handoff(lx::make_error(lx::io_err::broken_pipe,
+                                           "DM handoff broker went away or could not be read"));
+            return;
+        }
+        if (complete) {
+            fail_dm_handoff(lx::invalid_argument("unexpected data after DM activation challenge"));
+            return;
+        }
+        dm_challenge_size_ += static_cast<std::size_t>(n);
+        if (!valid_dm_challenge_prefix({dm_challenge_, dm_challenge_size_})) {
+            fail_dm_handoff(lx::invalid_argument("malformed DM activation challenge"));
+            return;
+        }
+        if (dm_challenge_size_ == k_dm_active_size) {
+            // An older frame may be queued or may already have flipped. Require the
+            // kernel event for a frame built after the challenge, even on an idle desktop.
+            dm_challenge_frame_ = frame_index.load(std::memory_order_relaxed);
+            scene.note_full_damage();
+            request_frame();
+        }
+    }
+}
+
+void compositor_impl::read_dm_handoff() {
+    if (dm_handoff_.get() < 0)
+        return;
+    if (dm_handoff_phase_ == dm_handoff_phase::startup) {
+        read_dm_challenge();
+        return;
+    }
+    if (dm_handoff_phase_ == dm_handoff_phase::presented) {
+        // An idle broker never writes. EOF or unsolicited bytes only disable RETURN.
+        char byte;
+        const auto n = ::recv(dm_handoff_.get(), &byte, sizeof(byte), MSG_DONTWAIT);
+        if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            close_dm_handoff();
+        return;
+    }
+
+    if (now_ns() >= dm_return_deadline_ns_) {
+        finish_dm_return("timed out");
+        return;
+    }
+
+    // Consume up to RETURNED plus one byte, enough to reject already buffered junk.
+    while (true) {
+        char bytes[k_dm_returned.size() + 1];
+        const auto n =
+            ::recv(dm_handoff_.get(), bytes, sizeof(bytes) - dm_returned_size_, MSG_DONTWAIT);
+        const bool complete = dm_returned_size_ == k_dm_returned.size();
+        if (n > 0) {
+            const auto size = static_cast<std::size_t>(n);
+            if (!valid_dm_returned_fragment(dm_returned_size_, {bytes, size})) {
+                finish_dm_return("malformed RETURNED");
+                return;
+            }
+            dm_returned_size_ += size;
+            continue;
+        }
+        const bool would_block = n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        if (complete && (n == 0 || would_block))
+            finish_dm_return("RETURNED");
+        else if (!would_block)
+            finish_dm_return("connection lost");
+        return;
+    }
+}
+
+bool compositor_impl::begin_dm_return() {
+    if (dm_handoff_.get() < 0 || dm_handoff_phase_ != dm_handoff_phase::presented ||
+        !session_timer_ || session_.phase() != session_phase::active ||
+        display_gate_.load(std::memory_order_relaxed) != 0 || !logind_.has_control() ||
+        !logind_.is_active() || !drm_via_logind_ || !logind_.holds_device(drm_major_, drm_minor_) ||
+        !kms.is_master())
+        return false;
+
+    // Detect anything queued while the socket was idle before treating it as a reply.
+    read_dm_handoff();
+    if (dm_handoff_.get() < 0)
+        return false;
+    if (!send_dm_handoff(dm_handoff_.get(), k_dm_return)) {
+        close_dm_handoff();
+        return false;
+    }
+    dm_handoff_phase_ = dm_handoff_phase::returning;
+    dm_return_deadline_ns_ = now_ns() + k_dm_return_timeout_ns;
+    rearm_session_timer();
+    return true;
+}
+
+void compositor_impl::finish_dm_return(const char* reason) {
+    log_session.debug("DM logout return: {}", reason);
+    close_dm_handoff();
+    dm_return_deadline_ns_ = 0;
+    logout_active_ = false;
+    loop.quit(0);
+}
+
+void compositor_impl::close_dm_handoff() {
+    if (dm_handoff_.get() < 0)
+        return;
+    if (dm_handoff_source_)
+        loop.remove_source(dm_handoff_source_.get());
+    dm_handoff_.reset();
+}
+
+void compositor_impl::fail_dm_handoff(lx::error err) {
+    log_session.error(err);
+    close_dm_handoff();
+    loop.quit(1);
+}
+
+bool compositor_impl::dm_input_working() {
+    if (!input_ready_ || input_devices_.suspended())
+        return false;
+    bool usable = false;
+    input_devices_.enumerate_devices(
+        [](void* user, const char*, lx::input::device_class kind, bool keyboard) {
+            if (keyboard || kind != lx::input::device_class::other)
+                *static_cast<bool*>(user) = true;
+        },
+        &usable);
+    return usable;
+}
+
+void compositor_impl::install_input(lx::input::input_manager&& opened) {
+    input_devices_ = std::move(opened);
 
     lx::input::event_sink sink{};
     sink.user = this;
@@ -2609,10 +2883,16 @@ void compositor_impl::finish_input() {
     // Each device once, as it appears (start, hotplug, VT resume): what it can do decides
     // which protocols it can drive — gestures need a touchpad, relative pointers a mouse.
     sink.device_added = [](const char* name, bool keyboard, bool pointer, bool touch, bool gesture,
-                           void*) {
+                           void* user) {
         log_input.debug("input device \"{}\":{}{}{}{}", name ? name : "?",
                         keyboard ? " keyboard" : "", pointer ? " pointer" : "",
                         touch ? " touch" : "", gesture ? " gesture" : "");
+        auto* self = static_cast<compositor_impl*>(user);
+        // A real KMS flip may have landed before input appeared. The fd callback requests
+        // a frame; damage it so there will be a content flip even if nothing else changed.
+        if ((keyboard || pointer) && self->dm_handoff_.get() >= 0 &&
+            self->dm_handoff_phase_ == dm_handoff_phase::startup)
+            self->scene.note_full_damage();
     };
     // Touch is not routed to clients yet; it is still the user, and wakes the display.
     sink.touch = [](const lx::input::touch_event&, void* u) {
@@ -2641,6 +2921,11 @@ void compositor_impl::finish_input() {
     // Share the keymap the device layer compiled, so the state the compositor tracks and
     // the state clients are told about are the same one.
     if (const int fd = input_devices_.fd(); fd >= 0) {
+        if (dm_session_ && loop.source_count() >= loop.source_capacity()) {
+            log_input.error(
+                lx::make_error(lx::io_err::broken_pipe, "no event source slot for input"));
+            return;
+        }
         input_fd_source = std::make_unique<runtime::fd_source>(
             fd, &compositor_impl::input_ready_callback);
         loop.add_source(input_fd_source.get());
@@ -3088,6 +3373,10 @@ void compositor_impl::after_dispatch_callback() {
         active->handle_reload_request();
         const auto now = now_ns();
         active->maybe_ping_watchdog(now);
+        // A client's disconnect can finish DM logout even with no ticking output. The
+        // session timer covers the case where a client never closes.
+        if (active->dm_session_ && active->logout_active_)
+            active->advance_logout(now);
         if (active->placement_hold_until_ != 0 && active->shell_bridge_.has_bridge()) {
             bool reserved = active->outputs.live_mask() != 0;
             for (unsigned slot = 0; slot < output_manager::k_max && reserved; ++slot) {
@@ -3575,6 +3864,8 @@ void compositor_impl::begin_logout(const char* source) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     logout_deadline_ns_ = now + k_logout_grace_ns;
+    if (dm_session_)
+        rearm_session_timer();
     // systemd shows the unit deactivating from here on; the shell's exit is an ending, not a
     // crash, so its zones are not held.
     session::service_notifier::stopping("Logging out");
@@ -3595,12 +3886,14 @@ void compositor_impl::begin_logout(const char* source) {
 }
 
 void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
-    if (!logout_active_)
+    if (!logout_active_ || dm_return_deadline_ns_ != 0)
         return;
     const unsigned left = toplevels.count();
     if (left > 0 && now_ns < logout_deadline_ns_)
         return;
     log_session.info("logout: stopping ({} window{} still open)", left, left == 1 ? "" : "s");
+    if (begin_dm_return())
+        return;
     logout_active_ = false;
     loop.quit(0);
 }
@@ -5090,7 +5383,11 @@ void compositor_impl::rearm_session_timer() {
     if (!session_timer_)
         return;
     lx::runtime::clock_time next = 0;
-    for (const auto t : {zone_hold_until_, placement_hold_until_})
+    // DM logout uses this timer even when no output clock runs (for example, once the
+    // broker switches away to the greeter's VT). No periodic wake or extra timer source.
+    const auto grace =
+        (dm_session_ && logout_active_ && dm_return_deadline_ns_ == 0) ? logout_deadline_ns_ : 0;
+    for (const auto t : {zone_hold_until_, placement_hold_until_, grace, dm_return_deadline_ns_})
         if (t != 0 && (next == 0 || t < next))
             next = t;
     if (next == 0)
@@ -5109,6 +5406,13 @@ void compositor_impl::session_timer_callback() {
     }
     if (active->placement_hold_until_ != 0 && now >= active->placement_hold_until_)
         active->end_placement_hold("750 ms passed");
+    if (active->dm_return_deadline_ns_ != 0) {
+        if (now >= active->dm_return_deadline_ns_)
+            active->finish_dm_return("timed out");
+    } else if (active->dm_session_ && active->logout_active_ &&
+               now >= active->logout_deadline_ns_) {
+        active->advance_logout(now);
+    }
     active->rearm_session_timer();
 }
 
@@ -6042,6 +6346,35 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
     // (seq 0, as the spec asks): no hw_clock. A blocking modeset's completion is timed
     // here, in software: vsync only. Only feedback this output paces is presented (M8).
     if (fb.content && fb.tag != 0) {
+        // hw_clock here means a kernel page-flip event, even without a hardware vblank
+        // timestamp. DRM drops old-generation events before calling us. Neither a
+        // blocking modeset's synthetic event nor a cursor-only flip proves handoff.
+        if (dm_handoff_.get() >= 0 && dm_handoff_phase_ == dm_handoff_phase::startup &&
+            dm_challenge_size_ == k_dm_active_size && p.kms &&
+            static_cast<int>(fb.tag - dm_challenge_frame_) > 0 && logind_.is_active() &&
+            kms.is_master()) {
+            if (!fb.hw_clock) {
+                // The blocking modeset can be the only damage on a quiet desktop. Ask
+                // for a new frame so a normal page flip can prove presentation.
+                scene.note_full_damage_output(slot);
+                request_frame(1u << slot);
+            } else if (dm_input_working()) {
+                // The flip source may run before the broker source in this loop pass.
+                // Reject buffered junk or EOF before acknowledging the challenge.
+                read_dm_challenge();
+                if (dm_handoff_.get() >= 0) {
+                    char reply[k_dm_presented_size]{};
+                    std::format_to_n(reply, sizeof(reply), "{}{}\n", k_dm_presented_prefix,
+                                     std::string_view{dm_challenge_ + k_dm_active_prefix.size(),
+                                                      k_dm_nonce_size});
+                    if (!send_dm_handoff(dm_handoff_.get(), {reply, sizeof(reply)}))
+                        fail_dm_handoff(lx::make_error(lx::io_err::broken_pipe,
+                                                       "DM handoff PRESENTED send failed"));
+                    else
+                        dm_handoff_phase_ = dm_handoff_phase::presented;
+                }
+            }
+        }
         // Health: presented, and missed when it landed half a period or more past its aim
         // (a whole vblank late). Only the frame the aim was noted for is judged.
         ++o.presented;
@@ -6252,7 +6585,9 @@ void compositor_impl::on_session_events() {
             log_session.debug("ResumeDevice {}:{}", ev.major, ev.minor);
             // evdev: we released every input device at the pause, so this is a leftover of
             // a race; the fd is sd-bus's and libinput re-takes its devices itself.
-            if (session_.is_drm(ev.major, ev.minor))
+            // A DM resume may probe as soon as master arrives; finish_display_resume
+            // also requires Active before opening evdev or ungating KMS.
+            if (session_.is_drm(ev.major, ev.minor) && (!dm_session_ || kms.is_master()))
                 apply_session_actions(session_.on_device_resumed(ev.major, ev.minor));
             break;
         case session_event::kind::active:
@@ -6392,6 +6727,9 @@ void compositor_impl::suspend_input_for_pause() {
 }
 
 void compositor_impl::resume_input_after_pause() {
+    if (dm_session_ && !input_ready_ && logind_.is_active())
+        start_dm_input();
+
     auto& seat = input_devices_.default_seat();
     if (input_devices_.suspended()) {
         // Re-enumerates the seat and re-takes every device through logind; a device that
@@ -6429,6 +6767,15 @@ void compositor_impl::begin_display_resume(unsigned gen) {
 }
 
 void compositor_impl::finish_display_resume(unsigned gen) {
+    if (dm_session_) {
+        if (session_.phase() != session_phase::resuming || session_.resume_generation() != gen)
+            return;
+        if (!logind_.is_active() || !kms.is_master()) {
+            apply_session_actions(
+                session_.on_resume_result(gen, session_resume_outcome::device_unavailable));
+            return;
+        }
+    }
     if (hotplug_timer_)
         hotplug_timer_->set_enabled(false);
     // A flip completed before the pause is consumed under the old generation first, which
@@ -9595,6 +9942,24 @@ lx::result<void> compositor::start() {
     // does not wait 15–40 ms on the UI thread for fontconfig to start.
     lx::text::face_cache::shared().persist_matches();
 
+    const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
+    lx::unique_fd dm_handoff;
+    if (const char* endpoint = std::getenv("LUMEN_DM_HANDOFF")) {
+        if (want_virtual)
+            return lx::invalid_argument("DM handoff requires real KMS outputs");
+        auto broker = connect_dm_handoff(endpoint);
+        if (!broker)
+            return broker.get_error();
+        dm_handoff = std::move(broker).value();
+        auto login = session::logind_session::open_dm_handoff(std::getenv("XDG_SESSION_ID"),
+                                                              std::getenv("XDG_VTNR"));
+        if (!login)
+            return login.get_error();
+        impl_->logind_ = std::move(login).value();
+        impl_->dm_session_ = true;
+        impl_->display_gate_.store(detail::compositor_impl::gate_vt, std::memory_order_release);
+    }
+
     // The hardware-Vulkan probe runs beside the logind and KMS opening below: they mostly
     // wait on D-Bus and the kernel, the probe is CPU work in the Vulkan loader. Only the UI
     // thread exists yet, so the scope's environment edit has no concurrent writer. It lists
@@ -9615,12 +9980,13 @@ lx::result<void> compositor::start() {
     // always takes the full seat path, virtual outputs or not. Computed here — before the
     // session open, which it decides; `begin_input` decides the seat through the same
     // seat_less_start predicate.
-    const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
     const bool seat_less = seat_less_start(impl_->cfg);
-    if (seat_less)
-        log_session.info("virtual outputs: seat-less start (no logind session, no input seat)");
-    else if (auto session = session::logind_session::open(); session)
-        impl_->logind_ = std::move(session).value();
+    if (!impl_->dm_session_) {
+        if (seat_less)
+            log_session.info("virtual outputs: seat-less start (no logind session, no input seat)");
+        else if (auto session = session::logind_session::open(); session)
+            impl_->logind_ = std::move(session).value();
+    }
 
     // The card: LUMEN_DRM_DEVICE when set, else the display devices sysfs lists, best first
     // (`drm::find_cards`: a connected display, boot VGA, lowest index — card0 is often
@@ -9658,6 +10024,8 @@ lx::result<void> compositor::start() {
                 if (::fstat(taken.value().get(), &st) == 0)
                     taken_dev = st.st_rdev;
                 opened = drm::kms_device::open_fd(std::move(taken).value());
+            } else if (impl_->dm_session_) {
+                opened = taken.get_error();
             } else {
                 opened = drm::kms_device::open(c.path);
             }
@@ -9682,7 +10050,7 @@ lx::result<void> compositor::start() {
                                  drm::no_atomic_hint(c.driver));
             }
         }
-        if (!opened) {
+        if (!opened && !impl_->dm_session_) {
             // Each card's reason is logged above; this is the outcome.
             log_drm.error(cards.count == 0
                               ? opened.get_error()
@@ -9730,6 +10098,12 @@ lx::result<void> compositor::start() {
         probe.join();
     probe_scope.reset();
     lx::trace::timeline_instant("startup", "graphics probed");
+    if (impl_->dm_session_ &&
+        (!impl_->drm_present_ || !impl_->drm_via_logind_ || !impl_->drm_start_inactive_ ||
+         !impl_->drm_node_.present || impl_->kms.is_master() ||
+         !impl_->logind_.holds_device(impl_->drm_major_, impl_->drm_minor_)))
+        return lx::make_error(lx::drm_err::open_failed,
+                              "DM handoff requires a paused logind KMS device");
     // Hardware Vulkan means the device that would composite is hardware: the one behind the
     // card, the same choice `ensure_graphics_device` makes (software drivers were not
     // loaded for the probe, so none is listed).
@@ -9852,6 +10226,8 @@ lx::result<void> compositor::start() {
         }
 
         if (!present) {
+            if (impl_->dm_session_)
+                return present.get_error();
             log_gfx.error(present.get_error());
             impl_->headless_present_ = true;
             impl_->cpu_present_ = false;
@@ -9953,6 +10329,8 @@ lx::result<void> compositor::start() {
         }
     }
     if (auto made = impl_->create_pipelines(); !made) {
+        if (impl_->dm_session_)
+            return made.get_error();
         log_drm.error(made.get_error());
         if (impl_->drm_present_) {
             // No output can be driven: composite nowhere rather than fail every frame.
@@ -9961,6 +10339,10 @@ lx::result<void> compositor::start() {
                     p->kms.reset();
         }
     }
+    if (impl_->dm_session_ &&
+        std::ranges::none_of(impl_->pipes_, [](const auto& pipe) { return pipe && pipe->kms; }))
+        return lx::make_error(lx::drm_err::no_crtc, "DM handoff has no usable KMS output");
+
     // The GL context has to move to the render thread, which claims it in render_loop; it
     // cannot be current on two threads at once.
     if (impl_->gl_present_) {
@@ -10190,6 +10572,9 @@ lx::result<void> compositor::start() {
     // The card reports readable only while a DRM event (a flip) is queued, and
     // drmHandleEvent consumes it — so the flip handler runs the moment the flip lands.
     if (impl_->drm_present_ && impl_->kms.card_fd() >= 0) {
+        if (impl_->dm_session_ && impl_->loop.source_count() >= impl_->loop.source_capacity())
+            return lx::make_error(lx::io_err::broken_pipe, "no event source slot for DRM");
+
         impl_->drm_fd_source = std::make_unique<runtime::fd_source>(
             impl_->kms.card_fd(), &detail::compositor_impl::drm_fd_callback);
         impl_->loop.add_source(impl_->drm_fd_source.get());
@@ -10230,6 +10615,9 @@ lx::result<void> compositor::start() {
         impl_->loop.add_source(impl_->hotplug_timer_.get());
     }
     if (impl_->logind_.bus_fd() >= 0) {
+        if (impl_->dm_session_ && impl_->loop.source_count() >= impl_->loop.source_capacity())
+            return lx::make_error(lx::io_err::broken_pipe, "no event source slot for logind");
+
         // Signals are recorded by these callbacks and acted on after each dispatch. A VT
         // switch brings one PauseDevice/ResumeDevice per taken device plus Active.
         impl_->session_events_.reserve(64);
@@ -10286,8 +10674,11 @@ lx::result<void> compositor::start() {
             ev.active = start;
             static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
         };
-        if (auto listening = impl_->logind_.set_listener(listener); !listening)
+        if (auto listening = impl_->logind_.set_listener(listener); !listening) {
+            if (impl_->dm_session_)
+                return listening.get_error();
             log_session.error(listening.get_error());
+        }
         // Before-sleep locking: sleep waits (at most 2 s of ours) for the lock a shell starts
         // on lock_requested(sleep). Only the session's display server holds it.
         if (impl_->logind_.has_control())
@@ -10329,6 +10720,30 @@ lx::result<void> compositor::start() {
 
     // After the socket is served: the control socket, the session environment, READY.
     impl_->apply_initial_config();
+    if (impl_->dm_session_) {
+        // Handle changes queued by startup's synchronous bus calls. An unexpected switch
+        // before the broker's activation is a startup failure, not a handoff.
+        impl_->logind_.dispatch();
+        impl_->on_session_events();
+        if (!impl_->logind_source || !impl_->drm_fd_source || impl_->logind_.is_active() ||
+            impl_->session_.phase() != session_phase::paused ||
+            impl_->session_.resume_generation() != 0 || impl_->kms.is_master())
+            return lx::make_error(lx::io_err::permission_denied,
+                                  "DM handoff session did not remain inactive during startup");
+        // The broker, the session control socket and timer, and deferred input must fit.
+        if (impl_->loop.source_capacity() - impl_->loop.source_count() < 4)
+            return lx::make_error(lx::io_err::broken_pipe,
+                                  "not enough event source slots for DM session startup");
+        if (!send_dm_handoff(dm_handoff.get(), "PREPARED\n"))
+            return lx::make_error(lx::io_err::broken_pipe, "DM handoff PREPARED send failed");
+        impl_->dm_handoff_ = std::move(dm_handoff);
+        impl_->dm_handoff_source_ =
+            std::make_unique<runtime::fd_source>(impl_->dm_handoff_.get(), [] {
+                if (auto* self = detail::compositor_impl::active)
+                    self->read_dm_handoff();
+            });
+        impl_->loop.add_source(impl_->dm_handoff_source_.get());
+    }
     impl_->start_session();
     return {};
 }
@@ -10338,6 +10753,7 @@ int compositor::run() {
 
     runtime::set_current_affinity(runtime::affinity::ui);
     const int code = impl_->loop.run();
+    impl_->close_dm_handoff();
     // The session environment goes first (applications started from now on must not find
     // a display that is going), then the control socket.
     impl_->end_session();
@@ -10526,7 +10942,8 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // window's ghost had its chance to keep them): queued now.
     if (impl->wire_.defer_retire)
         flush_deferred_retires(impl->wire_);
-    impl->advance_logout(tick.timestamp_ns);
+    if (!impl->dm_session_)
+        impl->advance_logout(tick.timestamp_ns);
     // Output heads changed since the last loop iteration (tests drive ticks without the loop).
     impl->flush_output_heads();
     // Staging: free retired CPU-path storage the render thread has let go of, unmap GL
@@ -10830,7 +11247,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // anywhere: a frame callback or buffer waiting on a later frame, deferred WM work.
     const bool global_busy = impl->buffer_lifecycle_.has_unreleased_frames() ||
                              !impl->shm_direct_.idle() || impl->wm_.needs_tick() ||
-                             impl->logout_active_; // logout ends on a tick
+                             (impl->logout_active_ && !impl->dm_session_);
     // A frame callback keeps the output that paces it ticking (its flip or its idle rule
     // answers it), not every output.
     const std::uint32_t waiting = frame_callbacks_pending(impl->wire_)

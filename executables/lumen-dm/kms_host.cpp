@@ -302,7 +302,7 @@ struct kms_host::state {
                 }
                 const auto revision = buffers[front].contents.form_revision;
                 if (revision && callbacks.presented)
-                    callbacks.presented(callbacks.user, revision);
+                    callbacks.presented(callbacks.user, revision, event.hw);
             }
         }
         if (resume_due || probe_due || paint_due || cursor.dirty() ||

@@ -1,0 +1,43 @@
+# Optional split-VT broker for Lumen. Does not replace the distribution's greetd.
+pkgname=lumen-greetd-split-vt
+pkgver=0.10.3
+pkgrel=1
+pkgdesc='greetd with the experimental Lumen split-VT handoff'
+arch=('x86_64' 'aarch64')
+url='https://github.com/kennylevinsen/greetd'
+license=('GPL-3.0-only')
+depends=('greetd' 'systemd' 'systemd-libs' 'pam' 'glibc' 'gcc-libs')
+makedepends=('cargo')
+_commit=08efe60feceea8c81f9571c666880ff1e1c2e3ff
+source=("greetd-${_commit}.tar.gz::https://codeload.github.com/kennylevinsen/greetd/tar.gz/${_commit}"
+        'split-vt.patch' 'lumen-dm-split-vt.service' 'greetd-split-vt.toml')
+sha256sums=('c36b48756789648c449e2078047d27875d68971485a836fa0a0be51119bdcc2c'
+            'b3b610de85df1ffacbabd3e4258c7d608f1d0c11626b4251fe5bdd9fbe7e61b0'
+            'eef40a280bf35a9cd36247c00560d907f21fa09585cb4ad4261463f787d5b517'
+            'bf36b61911b1cc984ff4b61989d88fbad613b61a7b2da699861906bf49a9ed9b')
+backup=('etc/lumen-dm/greetd-split-vt.toml')
+
+prepare() {
+    cd "greetd-${_commit}"
+    patch -Np1 < "$srcdir/split-vt.patch"
+    cargo fetch --locked
+}
+
+build() {
+    cd "greetd-${_commit}"
+    cargo build --release --frozen -p greetd
+}
+
+check() {
+    cd "greetd-${_commit}"
+    cargo test --frozen --workspace
+}
+
+package() {
+    cd "greetd-${_commit}"
+    install -Dm755 target/release/greetd "$pkgdir/usr/libexec/lumen-greetd-split-vt"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$srcdir/split-vt.patch" "$pkgdir/usr/share/doc/$pkgname/split-vt.patch"
+    install -Dm644 "$srcdir/lumen-dm-split-vt.service" "$pkgdir/usr/lib/systemd/system/lumen-dm-split-vt.service"
+    install -Dm644 "$srcdir/greetd-split-vt.toml" "$pkgdir/etc/lumen-dm/greetd-split-vt.toml"
+}

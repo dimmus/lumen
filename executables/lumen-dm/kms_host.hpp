@@ -17,7 +17,7 @@ struct kms_host_callbacks {
     std::uint32_t background_xrgb = 0x00282c34;
     // Called on the loop after a current primary commit presents. Record only; do
     // not reenter the host from a KMS callback. Zero revisions are not reported.
-    void (*presented)(void*, std::uint64_t form_revision) = nullptr;
+    void (*presented)(void*, std::uint64_t form_revision, bool kernel_event) = nullptr;
 };
 
 // One output on the greeter's UI loop. The loop, session and callbacks outlive the host.

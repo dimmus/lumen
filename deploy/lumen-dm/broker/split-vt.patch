@@ -1,0 +1,3012 @@
+diff --git a/fakegreet/src/main.rs b/fakegreet/src/main.rs
+index 6ce4708..cf5e410 100644
+--- a/fakegreet/src/main.rs
++++ b/fakegreet/src/main.rs
+@@ -138,6 +138,12 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
+                 }
+             }
+             Request::StartSession { cmd, env: _ } => wrap_result(ctx.start(cmd).await),
++            Request::StartSessionSplitVt { .. } | Request::GreeterPresented { .. } => {
++                Response::Error {
++                    error_type: ErrorType::Error,
++                    description: "split VT is not supported".into(),
++                }
++            }
+             Request::CancelSession => wrap_result(ctx.cancel().await),
+         };
+ 
+diff --git a/greetd/src/config/mod.rs b/greetd/src/config/mod.rs
+index 2d1d645..2a0bd2c 100644
+--- a/greetd/src/config/mod.rs
++++ b/greetd/src/config/mod.rs
+@@ -50,6 +50,7 @@ pub struct ConfigInternal {
+ pub struct ConfigTerminal {
+     pub vt: VtSelection,
+     pub switch: bool,
++    pub user_vt: Option<usize>,
+ }
+ 
+ #[derive(Debug, Eq, PartialEq)]
+@@ -186,10 +187,27 @@ fn parse_config(config_str: &str) -> Result<ConfigFile, Error> {
+                 .unwrap_or(&"true")
+                 .parse()
+                 .map_err(|e| format!("could not parse switch: {}", e))?,
++            user_vt: section
++                .get("user_vt")
++                .map(|value| {
++                    // VT_GETSTATE exposes only VT 1 through 15 in its open mask.
++                    let vt = value
++                        .parse()
++                        .map_err(|_| "terminal.user_vt must be an integer")?;
++                    if !(1..=15).contains(&vt) || vt == 2 {
++                        return Err("terminal.user_vt must be between 1 and 15, excluding VT2");
++                    }
++                    Ok(vt)
++                })
++                .transpose()?,
+         }),
+         None => Err("no terminal specified"),
+     }?;
+ 
++    if terminal.user_vt.is_some() && initial_session.is_some() {
++        return Err("terminal.user_vt requires an authenticated login (no initial_session)".into());
++    }
++
+     Ok(ConfigFile {
+         initial_session,
+         default_session,
+@@ -293,6 +311,7 @@ command = \"agreety\"
+                 terminal: ConfigTerminal {
+                     vt: VtSelection::Specific(1),
+                     switch: true,
++                    user_vt: None,
+                 },
+                 default_session: ConfigSession {
+                     command: "agreety".to_string(),
+@@ -322,6 +341,7 @@ user = \"john\"
+                 terminal: ConfigTerminal {
+                     vt: VtSelection::Specific(1),
+                     switch: true,
++                    user_vt: None,
+                 },
+                 default_session: ConfigSession {
+                     command: "agreety".to_string(),
+@@ -355,6 +375,7 @@ runfile = \"/path/to/greetd.state\"
+                 terminal: ConfigTerminal {
+                     vt: VtSelection::Specific(1),
+                     switch: true,
++                    user_vt: None,
+                 },
+                 default_session: ConfigSession {
+                     command: "agreety".to_string(),
+@@ -399,6 +420,7 @@ vt = 1
+                 terminal: ConfigTerminal {
+                     vt: VtSelection::Specific(1),
+                     switch: true,
++                    user_vt: None,
+                 },
+                 default_session: ConfigSession {
+                     command: "agreety".to_string(),
+@@ -423,6 +445,7 @@ vt = next
+                 terminal: ConfigTerminal {
+                     vt: VtSelection::Next,
+                     switch: true,
++                    user_vt: None,
+                 },
+                 default_session: ConfigSession {
+                     command: "agreety".to_string(),
+@@ -447,6 +470,7 @@ vt = current
+                 terminal: ConfigTerminal {
+                     vt: VtSelection::Current,
+                     switch: true,
++                    user_vt: None,
+                 },
+                 default_session: ConfigSession {
+                     command: "agreety".to_string(),
+diff --git a/greetd/src/context.rs b/greetd/src/context.rs
+index 6bd4d82..2a86788 100644
+--- a/greetd/src/context.rs
++++ b/greetd/src/context.rs
+@@ -1,6 +1,7 @@
+ use std::{
+     fs::File,
+     path::Path,
++    sync::Arc,
+     time::{Duration, Instant},
+ };
+ 
+@@ -8,7 +9,11 @@ use nix::{
+     sys::wait::{waitpid, WaitPidFlag, WaitStatus},
+     unistd::alarm,
+ };
+-use tokio::{sync::RwLock, time::sleep};
++use tokio::{
++    net::UnixStream,
++    sync::{oneshot, watch, Mutex, RwLock},
++    time::{sleep, timeout},
++};
+ 
+ use crate::{
+     error::Error,
+@@ -17,6 +22,8 @@ use crate::{
+         interface::{Session, SessionChild, SessionState},
+         worker::{AuthMessageType as SessAuthMessageType, SessionClass, TerminalMode},
+     },
++    split_vt::{self, Handoff, Peer, PidFd, ReturnRequest, Switch, Vts, COMMAND, HANDOFF_TIMEOUT},
++    split_vt_logind as logind,
+ };
+ use greetd_ipc::AuthMessageType;
+ 
+@@ -24,6 +31,69 @@ struct SessionChildSet {
+     child: SessionChild,
+     time: Instant,
+     is_greeter: bool,
++    split_greeter: Option<SplitGreeter>,
++}
++
++#[derive(Clone)]
++struct SplitGreeter {
++    pid: nix::unistd::Pid,
++    command_pid: nix::unistd::Pid,
++    worker: Arc<PidFd>,
++    command: Arc<PidFd>,
++}
++
++impl SplitGreeter {
++    fn track(child: &SessionChild, worker: Arc<PidFd>) -> Result<Self, Error> {
++        let pid = child.task;
++        let command = Arc::new(PidFd::open_child(child.sub_task.as_raw(), pid.as_raw())?);
++        let tracked = Self {
++            pid,
++            command_pid: child.sub_task,
++            worker,
++            command,
++        };
++        tracked.check()?;
++        Ok(tracked)
++    }
++
++    fn check(&self) -> Result<(), Error> {
++        self.worker.alive()?;
++        self.command.alive()
++    }
++
++    fn pam(&self, vts: &Vts) -> Result<Option<logind::Session>, Error> {
++        self.check()?;
++        let pam =
++            logind::Session::try_from_worker(self.pid.as_raw(), vts.greeter_uid, vts.greeter)?;
++        self.check()?;
++        Ok(pam)
++    }
++
++    fn require_presented_session(&self, vts: &Vts, pam: &logind::Session) -> Result<(), Error> {
++        if self.pam(vts)?.as_ref() != Some(pam)
++            || logind::Session::from_worker(
++                self.command_pid.as_raw(),
++                vts.greeter_uid,
++                vts.greeter,
++            )? != *pam
++            || !split_vt::graphics(vts.greeter)?
++        {
++            return Err("split VT: presented greeter PAM session or graphics mode changed".into());
++        }
++        split_vt::require_foreground(vts.greeter, pam)?;
++        self.check()
++    }
++}
++
++// Dispose of a worker if its launch was cancelled before publication.
++struct StartingGreeter(Option<Arc<PidFd>>);
++
++impl Drop for StartingGreeter {
++    fn drop(&mut self) {
++        if let Some(worker) = self.0.take() {
++            worker.signal(libc::SIGKILL);
++        }
++    }
+ }
+ 
+ struct SessionSet {
+@@ -31,10 +101,66 @@ struct SessionSet {
+     time: Instant,
+ }
+ 
++struct PendingSplit {
++    pid: nix::unistd::Pid,
++    abort: watch::Sender<bool>,
++    worker: Arc<PidFd>,
++}
++
++struct ActiveSplit {
++    child: SessionChild,
++    command: PidFd,
++    binding: Arc<Desktop>,
++    return_alive: watch::Sender<()>,
++    return_recovery: oneshot::Receiver<bool>,
++    return_presentation: Option<GreeterPresentation>,
++}
++
++struct GreeterPresentation {
++    greeter: SplitGreeter,
++    pam: logind::Session,
++    request: ReturnRequest,
++    received: oneshot::Sender<()>,
++}
++
++struct Desktop {
++    pid: nix::unistd::Pid,
++    worker: Arc<PidFd>,
++    peer: Peer,
++    pam: logind::Session,
++    prior_greeter: Arc<PidFd>,
++    return_switch: Arc<Switch>,
++}
++
++impl Desktop {
++    fn check(&self, vts: &Vts) -> Result<(), Error> {
++        self.worker.alive()?;
++        self.peer.check()?;
++        let current = logind::Session::from_worker(self.pid.as_raw(), self.peer.uid, vts.user)?;
++        self.worker.alive()?;
++        if current != self.pam {
++            return Err("split VT: desktop PAM session changed".into());
++        }
++        Ok(())
++    }
++
++    fn require_active(&self, vts: &Vts) -> Result<(), Error> {
++        let vt = split_vt::foreground()?;
++        if vt != vts.user && vt != vts.greeter {
++            self.return_switch.inhibit_restore();
++            return Err("split VT: operator changed foreground VT".into());
++        }
++        split_vt::require_active(vts, &self.pam)
++    }
++}
++
+ struct ContextInner {
+     current: Option<SessionChildSet>,
+     scheduled: Option<SessionSet>,
+     configuring: Option<SessionSet>,
++    pending_split: Option<PendingSplit>,
++    active_split: Option<ActiveSplit>,
++    recovering_split: bool,
+ }
+ 
+ /// Context keeps track of running sessions and start new ones.
+@@ -48,6 +174,9 @@ pub struct Context {
+     source_profile: bool,
+     runfile: String,
+     listener_path: String,
++    split_vts: Option<Vts>,
++    split_failure: watch::Sender<Option<Error>>,
++    split_greeter_start: Mutex<()>,
+ }
+ 
+ impl Context {
+@@ -60,12 +189,16 @@ impl Context {
+         source_profile: bool,
+         runfile: String,
+         listener_path: String,
++        split_vts: Option<Vts>,
+     ) -> Context {
+         Context {
+             inner: RwLock::new(ContextInner {
+                 current: None,
+                 scheduled: None,
+                 configuring: None,
++                pending_split: None,
++                active_split: None,
++                recovering_split: false,
+             }),
+             greeter_bin,
+             greeter_user,
+@@ -75,6 +208,9 @@ impl Context {
+             source_profile,
+             runfile,
+             listener_path,
++            split_vts,
++            split_failure: watch::channel(None).0,
++            split_greeter_start: Mutex::new(()),
+         }
+     }
+ 
+@@ -88,14 +224,45 @@ impl Context {
+         service: &str,
+         cmd: Vec<String>,
+     ) -> Result<SessionChild, Error> {
+-        let mut scheduled_session = Session::new_external()?;
++        self.start_session_on(class, user, service, cmd, &self.term_mode)
++            .await
++    }
++
++    async fn start_session_on(
++        &self,
++        class: SessionClass,
++        user: &str,
++        service: &str,
++        cmd: Vec<String>,
++        term_mode: &TerminalMode,
++    ) -> Result<SessionChild, Error> {
++        self.start_unauthenticated_worker(
++            &mut Session::new_external()?,
++            class,
++            user,
++            service,
++            cmd,
++            term_mode,
++        )
++        .await
++    }
++
++    async fn start_unauthenticated_worker(
++        &self,
++        scheduled_session: &mut Session,
++        class: SessionClass,
++        user: &str,
++        service: &str,
++        cmd: Vec<String>,
++        term_mode: &TerminalMode,
++    ) -> Result<SessionChild, Error> {
+         scheduled_session
+             .initiate(
+                 service,
+                 class,
+                 user,
+                 false,
+-                &self.term_mode,
++                term_mode,
+                 self.source_profile,
+                 &self.listener_path,
+             )
+@@ -135,10 +302,20 @@ impl Context {
+         }
+ 
+         let mut inner = self.inner.write().await;
++        let child = self.start_greeter().await?;
++        let split_greeter = if self.split_vts.is_some() {
++            Some(SplitGreeter::track(
++                &child,
++                Arc::new(PidFd::open(child.task.as_raw())?),
++            )?)
++        } else {
++            None
++        };
+         inner.current = Some(SessionChildSet {
+-            child: self.start_greeter().await?,
++            child,
+             time: Instant::now(),
+             is_greeter: true,
++            split_greeter,
+         });
+         Ok(())
+     }
+@@ -171,12 +348,46 @@ impl Context {
+                 .await?,
+             time: Instant::now(),
+             is_greeter: false,
++            split_greeter: None,
+         });
+         Ok(())
+     }
+ 
+     /// Create a new session for configuration.
+     pub async fn create_session(&self, username: String) -> Result<(), Error> {
++        if let Some(vts) = &self.split_vts {
++            let mut inner = self.inner.write().await;
++            if inner.current.is_none()
++                || inner.configuring.is_some()
++                || inner.pending_split.is_some()
++                || inner.active_split.is_some()
++                || inner.recovering_split
++            {
++                return Err("split VT: greeter is not ready to authenticate".into());
++            }
++            vts.require_greeter()?;
++            let mode = TerminalMode::SplitUser {
++                path: format!("/dev/tty{}", vts.user),
++                vt: vts.user,
++            };
++            let mut session = Session::new_external()?;
++            session
++                .initiate(
++                    &self.pam_service,
++                    SessionClass::User,
++                    &username,
++                    true,
++                    &mode,
++                    false,
++                    &self.listener_path,
++                )
++                .await?;
++            inner.configuring = Some(SessionSet {
++                session,
++                time: Instant::now(),
++            });
++            return Ok(());
++        }
+         {
+             let inner = self.inner.read().await;
+             if inner.current.is_none() {
+@@ -223,6 +434,9 @@ impl Context {
+     /// Cancel the session being configured.
+     pub async fn cancel(&self) -> Result<(), Error> {
+         let mut inner = self.inner.write().await;
++        if let Some(pending) = &inner.pending_split {
++            pending.abort.send_replace(true);
++        }
+         if let Some(mut s) = inner.configuring.take() {
+             s.session.cancel().await?;
+         }
+@@ -268,6 +482,9 @@ impl Context {
+ 
+     /// Schedule the session under configuration with the provided arguments.
+     pub async fn start(&self, cmd: Vec<String>, env: Vec<String>) -> Result<(), Error> {
++        if self.split_vts.is_some() {
++            return Err("split VT requires the versioned start_session_split_vt request".into());
++        }
+         let mut session = self.inner.write().await.configuring.take();
+ 
+         match &mut session {
+@@ -298,8 +515,198 @@ impl Context {
+         }
+     }
+ 
++    /// Complete the handoff without holding the context lock across the wait.
++    pub async fn start_split(
++        self: &std::rc::Rc<Self>,
++        version: u32,
++        cmd: &[String],
++        env: &[String],
++        greeter_socket: &mut tokio::net::UnixStream,
++    ) -> Result<(), Error> {
++        use tokio::io::AsyncReadExt;
++        split_vt::check_request(version, cmd, env)?;
++        let vts = self.split_vts.as_ref().ok_or("split VT is not enabled")?;
++        let (mut session, worker, greeter, mut abort) = {
++            let mut inner = self.inner.write().await;
++            if inner.pending_split.is_some()
++                || inner.active_split.is_some()
++                || inner.recovering_split
++            {
++                return Err("split VT handoff already in progress".into());
++            }
++            vts.require_greeter()?;
++            let greeter = inner
++                .current
++                .as_ref()
++                .ok_or("split VT greeter has exited")?
++                .split_greeter
++                .as_ref()
++                .ok_or("split VT greeter is not tracked")?
++                .clone();
++            greeter.check()?;
++            let pid = inner
++                .configuring
++                .as_ref()
++                .ok_or("no authenticated user session")?
++                .session
++                .pid();
++            let worker = Arc::new(PidFd::open(pid.as_raw())?);
++            let session = inner.configuring.take().unwrap().session;
++            let (abort, recv) = watch::channel(false);
++            inner.pending_split = Some(PendingSplit {
++                pid,
++                abort,
++                worker: worker.clone(),
++            });
++            (session, worker, greeter, recv)
++        };
++
++        let mut child = None;
++        let mut command = None;
++        let mut pam = None;
++        let mut peer = None;
++        let mut desktop_stream = None;
++        let switch = Arc::new(split_vt::Switch::default());
++        let outcome = timeout(HANDOFF_TIMEOUT, async {
++            tokio::select! {
++                biased;
++                _ = abort.changed() => Err("split VT greeter or pending user exited or was cancelled".into()),
++                _ = worker.exited() => Err("split VT pending worker exited".into()),
++                _ = greeter_socket.read_u8() => Err("split VT greeter disconnected or sent an unexpected request".into()),
++                res = async {
++                    let (uid, _) = session.split_account().await?;
++                    split_vt::require_free_vt(vts.user)?;
++                    let handoff = Handoff::new(uid)?;
++                    session.send_session_args(vec![COMMAND.into()], vec![], Some(handoff.path().into())).await?;
++                    let worker_pid = session.pid().as_raw();
++                    let started = session.start_split(|| {
++                        worker.alive()?;
++                        pam = Some(logind::Session::from_worker(worker_pid, uid, vts.user)?);
++                        Ok(())
++                    }).await?;
++                    command = Some(PidFd::open_child(started.sub_task.as_raw(), worker_pid)?);
++                    child = Some(started);
++                    let user_pam = pam.as_ref().ok_or("missing split PAM acknowledgement")?.clone();
++                    let mut stream = tokio::select! {
++                        biased;
++                        err = split_vt::wait_foreground_change(vts.greeter, None) => return Err(err),
++                        res = handoff.prepare(&user_pam, &mut peer) => res?,
++                    };
++                    let verified = peer.as_ref().ok_or("split VT: missing verified peer")?;
++                    verified.check()?;
++                    tokio::select! {
++                        biased;
++                        err = split_vt::wait_foreground_change(vts.greeter, Some(vts.user)) => {
++                            switch.inhibit_restore();
++                            Err(err)
++                        },
++                        res = async {
++                            split_vt::presented(&mut stream, vts, &user_pam, switch.clone()).await?;
++                            verified.recheck(&user_pam).await?;
++                            split_vt::require_active(vts, &user_pam)
++                        } => res,
++                    }?;
++                    desktop_stream = Some(stream);
++                    Ok(())
++                } => res,
++            }
++        }).await.unwrap_or_else(|_| Err("split VT handoff timed out".into()));
++
++        {
++            let mut inner = self.inner.write().await;
++            let live = inner.current.as_ref().map(|slot| slot.child.task) == Some(greeter.pid)
++                && !*abort.borrow()
++                && worker.alive().is_ok()
++                && peer.as_ref().map_or(false, |p| p.check().is_ok());
++            if outcome.is_ok() && live {
++                let child = child.take().expect("presented handoff has a worker");
++                let binding = Arc::new(Desktop {
++                    pid: child.task,
++                    worker,
++                    peer: peer.take().expect("presented handoff has a peer"),
++                    pam: pam.take().expect("presented handoff has a PAM session"),
++                    prior_greeter: greeter.command.clone(),
++                    return_switch: Arc::new(Switch::default()),
++                });
++                let stream = desktop_stream
++                    .take()
++                    .expect("presented handoff has a stream");
++                let (return_alive, ended) = watch::channel(());
++                let (reconciled, return_recovery) = oneshot::channel();
++                inner.pending_split = None;
++                inner.active_split = Some(ActiveSplit {
++                    child,
++                    command: command.take().expect("presented handoff has a command"),
++                    binding: binding.clone(),
++                    return_alive,
++                    return_recovery,
++                    return_presentation: None,
++                });
++                let ctx = self.clone();
++                tokio::task::spawn_local(async move {
++                    ctx.serve_return(stream, binding, ended, reconciled).await
++                });
++                return Ok(());
++            }
++        }
++
++        // The bus call may have submitted a switch that the kernel has not completed.
++        let switched = if switch.cancel().await {
++            match split_vt::observe_rollback(vts).await {
++                Ok(owns_foreground) => owns_foreground,
++                Err(e) => {
++                    eprintln!("split VT: could not observe rollback: {}", e);
++                    false
++                }
++            }
++        } else {
++            false
++        };
++        if switched {
++            if let Err(e) = vts
++                .restore(greeter.pid.as_raw(), greeter.worker.clone(), pam.clone())
++                .await
++            {
++                eprintln!("split VT: could not restore the greeter: {}", e);
++            }
++        }
++        if let Some(peer) = peer {
++            peer.fd.signal(libc::SIGTERM);
++        }
++        if let Some(command) = command {
++            command.signal(libc::SIGTERM);
++        } else {
++            // Before FinalChildPid, the worker either handles Cancel before fork or
++            // remains the verified logind session leader for the scoped fallback.
++            let _ = timeout(Duration::from_millis(50), session.cancel()).await;
++        }
++        let _ = timeout(Duration::from_millis(250), worker.exited()).await;
++        let restore = if switched { pam.clone() } else { None };
++        if worker.alive().is_ok() {
++            if let Some(pam) = pam {
++                let _ = tokio::task::spawn_blocking(move || pam.terminate()).await;
++            }
++        }
++        if worker.alive().is_ok() {
++            worker.signal(libc::SIGKILL);
++        }
++        let mut inner = self.inner.write().await;
++        inner.pending_split = None;
++        let no_greeter = inner.current.is_none();
++        drop(inner);
++        if no_greeter {
++            self.recover_split(restore).await;
++        }
++        outcome.and(Err(
++            "split VT user or greeter exited before acknowledgement".into(),
++        ))
++    }
++
+     /// Notify the Context of an alarm.
+     pub async fn alarm(&self) -> Result<(), Error> {
++        if self.split_vts.is_some() {
++            return Ok(());
++        }
+         // Keep trying to terminate the greeter until it gives up.
+         let mut inner = self.inner.write().await;
+ 
+@@ -327,15 +734,420 @@ impl Context {
+                 child: s,
+                 time: Instant::now(),
+                 is_greeter: false,
++                split_greeter: None,
+             });
+         }
+ 
+         Ok(())
+     }
+ 
++    pub async fn wait_split_failure(&self) -> Error {
++        let mut failures = self.split_failure.subscribe();
++        let result = failures.wait_for(Option::is_some).await;
++        result
++            .ok()
++            .and_then(|failure| failure.clone())
++            .unwrap_or_else(|| "split VT: recovery channel closed".into())
++    }
++
++    async fn ensure_split_greeter(
++        &self,
++        vts: &Vts,
++        previous: Option<&Arc<PidFd>>,
++    ) -> Result<SplitGreeter, Error> {
++        let _starting = self.split_greeter_start.lock().await;
++        loop {
++            let current = self
++                .inner
++                .read()
++                .await
++                .current
++                .as_ref()
++                .and_then(|slot| slot.split_greeter.clone());
++            match current {
++                Some(greeter)
++                    if previous.map_or(true, |command| !Arc::ptr_eq(command, &greeter.command))
++                        && greeter.check().is_ok() =>
++                {
++                    return Ok(greeter);
++                }
++                // The login greeter exits after a completed handoff. Wait for its reaping.
++                Some(_) => sleep(Duration::from_millis(25)).await, // SIGCHLD will clear it.
++                None => break,
++            }
++        }
++        if logind::vt_is_occupied(vts.greeter)? {
++            return Err("split VT: greeter VT is occupied by another session".into());
++        }
++        let mode = TerminalMode::SplitGreeter {
++            path: format!("/dev/tty{}", vts.greeter),
++            vt: vts.greeter,
++        };
++        let mut replacement = Session::new_external()?;
++        let worker = Arc::new(PidFd::open(replacement.pid().as_raw())?);
++        let mut guard = StartingGreeter(Some(worker.clone()));
++        let child = self
++            .start_unauthenticated_worker(
++                &mut replacement,
++                SessionClass::Greeter,
++                &self.greeter_user,
++                &self.greeter_service,
++                vec![self.greeter_bin.clone()],
++                &mode,
++            )
++            .await?;
++        let greeter = SplitGreeter::track(&child, worker)?;
++        let mut inner = self.inner.write().await;
++        greeter.check()?;
++        inner.current = Some(SessionChildSet {
++            child,
++            time: Instant::now(),
++            is_greeter: true,
++            split_greeter: Some(greeter.clone()),
++        });
++        guard.0.take();
++        Ok(greeter)
++    }
++
++    pub async fn greeter_presented(&self, version: u32, stream: &UnixStream) -> Result<(), Error> {
++        if version != 1 {
++            return Err("unsupported split VT greeter presentation version".into());
++        }
++        let vts = self.split_vts.as_ref().ok_or("split VT is not enabled")?;
++        let (greeter, pam, request, attempt, peer) = {
++            let inner = self.inner.read().await;
++            let active = inner
++                .active_split
++                .as_ref()
++                .ok_or("split VT: no pending RETURN")?;
++            let pending = active
++                .return_presentation
++                .as_ref()
++                .ok_or("split VT: no pending greeter presentation")?;
++            let attempt = &active.binding.return_switch;
++            if !attempt.requested() {
++                return Err("split VT: return activation has not been requested".into());
++            }
++            pending.request.check()?;
++            vts.require_greeter()?;
++            let greeter = &pending.greeter;
++            let peer = greeter.command.match_peer(
++                stream,
++                greeter.command_pid.as_raw(),
++                vts.greeter_uid,
++            )?;
++            (
++                greeter.clone(),
++                pending.pam.clone(),
++                pending.request.clone(),
++                attempt.clone(),
++                peer,
++            )
++        };
++        // Logind can publish Active=yes after the KMS completion.
++        loop {
++            request.check()?;
++            vts.require_greeter()?;
++            greeter.check()?;
++            peer.alive()?;
++            if pam.active()? {
++                break;
++            }
++            sleep(Duration::from_millis(25)).await;
++        }
++        let mut inner = self.inner.write().await;
++        let current = inner
++            .current
++            .as_ref()
++            .and_then(|slot| slot.split_greeter.as_ref())
++            .ok_or("split VT: presentation greeter is no longer tracked")?;
++        if !Arc::ptr_eq(&current.command, &greeter.command) {
++            return Err("split VT: tracked greeter changed before presentation".into());
++        }
++        let active = inner
++            .active_split
++            .as_mut()
++            .ok_or("split VT: no pending RETURN")?;
++        if !Arc::ptr_eq(&active.binding.return_switch, &attempt) {
++            return Err("split VT: return attempt changed before presentation".into());
++        }
++        greeter.require_presented_session(vts, &pam)?;
++        peer.alive()?;
++        request.check()?;
++        active
++            .return_presentation
++            .take()
++            .ok_or("split VT: no pending greeter presentation")?
++            .received
++            .send(())
++            .map_err(|_| "split VT: return no longer awaits presentation".into())
++    }
++
++    async fn serve_return(
++        &self,
++        stream: UnixStream,
++        desktop: Arc<Desktop>,
++        mut ended: watch::Receiver<()>,
++        reconciled: oneshot::Sender<bool>,
++    ) {
++        let result = tokio::select! {
++            biased;
++            _ = ended.changed() => Ok(false),
++            result = split_vt::return_exchange(stream, |request| self.return_to_greeter(&desktop, request)) => result,
++        };
++        if let Some(active) = self.inner.write().await.active_split.as_mut() {
++            if Arc::ptr_eq(&active.binding, &desktop) {
++                active.return_presentation = None;
++            }
++        }
++        let acknowledged = matches!(&result, Ok(true));
++        if let Err(e) = result {
++            eprintln!("split VT: orderly RETURN failed: {}", e);
++        }
++        let Some(vts) = &self.split_vts else { return };
++        let allowed = !acknowledged
++            && match desktop
++                .return_switch
++                .clone()
++                .allow_return_recovery(vts)
++                .await
++            {
++                Ok(allowed) => allowed,
++                Err(e) => {
++                    eprintln!("split VT: could not reconcile return activation: {}", e);
++                    false
++                }
++            };
++        let allowed = if allowed {
++            // Preserve a late switch, or an operator VT, until the worker exits.
++            tokio::select! {
++                biased;
++                _ = split_vt::wait_foreground_change(vts.user, None) => false,
++                _ = ended.changed() => true,
++            }
++        } else {
++            false
++        };
++        let _ = reconciled.send(allowed);
++    }
++
++    async fn return_to_greeter(
++        &self,
++        desktop: &Arc<Desktop>,
++        request: ReturnRequest,
++    ) -> Result<(), Error> {
++        let vts = self.split_vts.as_ref().ok_or("split VT is not enabled")?;
++        tokio::select! {
++            biased;
++            err = split_vt::wait_foreground_change(vts.user, Some(vts.greeter)) => {
++                desktop.return_switch.inhibit_restore();
++                Err(err)
++            },
++            result = async {
++                desktop.check(vts)?;
++                desktop.require_active(vts)?;
++                desktop.peer.recheck(&desktop.pam).await?;
++                let greeter = self.ensure_split_greeter(vts, Some(&desktop.prior_greeter)).await?;
++                let greeter_pam = loop {
++                    request.check()?;
++                    desktop.require_active(vts)?;
++                    if let Some(pam) = greeter.pam(vts)? {
++                        if split_vt::graphics(vts.greeter)? {
++                            break pam;
++                        }
++                    }
++                    sleep(Duration::from_millis(25)).await;
++                };
++                let (received, presented) = oneshot::channel();
++                {
++                    let mut inner = self.inner.write().await;
++                    let active = inner.active_split.as_mut().filter(|a| Arc::ptr_eq(&a.binding, desktop))
++                        .ok_or("split VT: desktop exited during RETURN")?;
++                    request.check()?;
++                    active.return_presentation = Some(GreeterPresentation {
++                        greeter: greeter.clone(),
++                        pam: greeter_pam.clone(),
++                        request: request.clone(),
++                        received,
++                    });
++                }
++                let tracked = greeter.clone();
++                let switch_desktop = desktop.clone();
++                let switch_vts = vts.clone();
++                let switch_request = request.clone();
++                let activation = desktop.return_switch.clone().activate(greeter_pam.clone(), move |target| {
++                    switch_request.check()?;
++                    switch_desktop.peer.verify(&switch_desktop.pam)?;
++                    switch_desktop.check(&switch_vts)?;
++                    if tracked.pam(&switch_vts)?.as_ref() != Some(target) {
++                        return Err("split VT: prepared greeter PAM session changed".into());
++                    }
++                    logind::require_exclusive_vt(switch_vts.greeter, target)?;
++                    if !split_vt::graphics(switch_vts.greeter)? || target.active()? {
++                        return Err("split VT: greeter is not an inactive graphics session".into());
++                    }
++                    switch_desktop.require_active(&switch_vts)?;
++                    switch_request.check()
++                }).await;
++                if !desktop.return_switch.requested() {
++                    activation?;
++                }
++                // A delivered activation can succeed without a bus reply. Only
++                // the authenticated presentation can complete the exchange.
++                presented.await.map_err(|_| "split VT: greeter presentation channel closed")?;
++                request.check()?;
++                desktop.check(vts)?;
++                greeter.require_presented_session(vts, &greeter_pam)
++            } => result,
++        }
++    }
++
++    async fn recover_split(&self, owner: Option<logind::Session>) {
++        let Some(vts) = &self.split_vts else {
++            return;
++        };
++        {
++            let mut inner = self.inner.write().await;
++            if inner.recovering_split
++                || inner.active_split.is_some()
++                || inner.pending_split.is_some()
++            {
++                return;
++            }
++            inner.recovering_split = true;
++        }
++        self.finish_split_recovery(vts, owner).await;
++    }
++
++    async fn finish_split_recovery(&self, vts: &Vts, mut owner: Option<logind::Session>) {
++        let launch = timeout(Duration::from_secs(2), self.ensure_split_greeter(vts, None));
++        tokio::pin!(launch);
++        let started = tokio::select! {
++            biased;
++            _ = split_vt::wait_foreground_change(vts.user, None), if owner.is_some() => {
++                owner = None;
++                launch.await
++            }
++            started = &mut launch => started,
++        };
++        match started {
++            Ok(Ok(greeter)) => {
++                if let Some(owner) = owner {
++                    if let Err(e) = self.restore_split_greeter(vts, &greeter, owner).await {
++                        eprintln!("split VT: greeter foreground recovery failed: {}", e);
++                    }
++                }
++                self.inner.write().await.recovering_split = false;
++            }
++            Ok(Err(e)) => {
++                self.split_failure.send_replace(Some(
++                    format!("split VT: greeter recovery failed: {}", e).into(),
++                ));
++            }
++            Err(_) => {
++                self.split_failure
++                    .send_replace(Some("split VT: replacement greeter start timed out".into()));
++            }
++        }
++    }
++
++    async fn restore_split_greeter(
++        &self,
++        vts: &Vts,
++        greeter: &SplitGreeter,
++        owner: logind::Session,
++    ) -> Result<(), Error> {
++        let prepared = timeout(Duration::from_secs(2), async {
++            while split_vt::foreground()? == vts.user {
++                if greeter.pam(vts)?.is_some() && split_vt::graphics(vts.greeter)? {
++                    return Ok::<_, Error>(true);
++                }
++                sleep(Duration::from_millis(25)).await;
++            }
++            Ok(false)
++        })
++        .await;
++        if prepared.map_err(|_| "split VT: recovery greeter did not enter graphics mode")?? {
++            vts.restore(greeter.pid.as_raw(), greeter.worker.clone(), Some(owner))
++                .await?;
++        }
++        Ok(())
++    }
++
++    async fn check_split_child(self: &std::rc::Rc<Self>, pid: nix::unistd::Pid) {
++        let recovery = {
++            let mut inner = self.inner.write().await;
++            if inner
++                .current
++                .as_ref()
++                .map_or(false, |s| s.child.owns_pid(pid))
++            {
++                let early = inner.current.take().unwrap().time.elapsed() < Duration::from_secs(1);
++                if let Some(mut setting) = inner.configuring.take() {
++                    let _ = setting.session.cancel().await;
++                }
++                if let Some(pending) = &inner.pending_split {
++                    pending.abort.send_replace(true);
++                    return;
++                }
++                if inner.active_split.is_some() {
++                    return;
++                }
++                if early || inner.recovering_split {
++                    inner.recovering_split = true;
++                    self.split_failure
++                        .send_replace(Some("split VT: greeter exited during startup".into()));
++                    return;
++                }
++                Some(None)
++            } else if inner.pending_split.as_ref().map_or(false, |s| s.pid == pid) {
++                inner
++                    .pending_split
++                    .as_ref()
++                    .unwrap()
++                    .abort
++                    .send_replace(true);
++                return;
++            } else if inner
++                .active_split
++                .as_ref()
++                .map_or(false, |s| s.child.owns_pid(pid))
++            {
++                let active = inner.active_split.take().unwrap();
++                active.binding.peer.fd.signal(libc::SIGTERM);
++                drop(active.return_alive);
++                if inner.recovering_split {
++                    return;
++                }
++                inner.recovering_split = true;
++                Some(Some((active.binding, active.return_recovery)))
++            } else {
++                // Authentication failures are reported over the internal socket to
++                // the auth handler; do not discard its buffered error here.
++                None
++            }
++        };
++        if let Some(recovery) = recovery {
++            let ctx = self.clone();
++            tokio::task::spawn_local(async move {
++                if let Some((desktop, reconciled)) = recovery {
++                    let owner = reconciled
++                        .await
++                        .unwrap_or(false)
++                        .then(|| desktop.pam.clone());
++                    if let Some(vts) = &ctx.split_vts {
++                        ctx.finish_split_recovery(vts, owner).await;
++                    }
++                } else {
++                    ctx.recover_split(None).await;
++                }
++            });
++        }
++    }
++
+     /// Notify the Context that it needs to check its children for termination.
+     /// This should be called on SIGCHLD.
+-    pub async fn check_children(&self) -> Result<(), Error> {
++    pub async fn check_children(self: &std::rc::Rc<Self>) -> Result<(), Error> {
+         loop {
+             match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+                 // No scheduled exits.
+@@ -343,6 +1155,10 @@ impl Context {
+ 
+                 // We got an exit, see if it's something we need to clean up.
+                 Ok(WaitStatus::Exited(pid, ..)) | Ok(WaitStatus::Signaled(pid, ..)) => {
++                    if self.split_vts.is_some() {
++                        self.check_split_child(pid).await;
++                        continue;
++                    }
+                     let mut inner = self.inner.write().await;
+                     let (was_greeter, sesion_length) = match &inner.current {
+                         Some(s) if s.child.owns_pid(pid) => {
+@@ -367,6 +1183,7 @@ impl Context {
+                                 child: s,
+                                 time: Instant::now(),
+                                 is_greeter: false,
++                                split_greeter: None,
+                             });
+                         }
+                         None => {
+@@ -380,6 +1197,7 @@ impl Context {
+                                 child: self.start_greeter().await?,
+                                 time: Instant::now(),
+                                 is_greeter: true,
++                                split_greeter: None,
+                             });
+                         }
+                     }
+@@ -404,6 +1222,27 @@ impl Context {
+     /// SIGTERM.
+     pub async fn terminate(&self) -> Result<(), Error> {
+         let mut inner = self.inner.write().await;
++        if self.split_vts.is_some() {
++            inner.recovering_split = true;
++            if let Some(pending) = &inner.pending_split {
++                pending.abort.send_replace(true);
++            }
++            drop(inner);
++            let _ = timeout(Duration::from_secs(2), async {
++                while self.inner.read().await.pending_split.is_some() {
++                    sleep(Duration::from_millis(25)).await;
++                }
++            })
++            .await;
++            inner = self.inner.write().await;
++            if let Some(pending) = inner.pending_split.take() {
++                pending.worker.signal(libc::SIGKILL);
++            }
++            if let Some(active) = inner.active_split.take() {
++                active.binding.peer.fd.signal(libc::SIGTERM);
++                active.command.signal(libc::SIGTERM);
++            }
++        }
+         if let Some(mut sess) = inner.configuring.take() {
+             let _ = sess.session.cancel().await;
+         }
+@@ -411,7 +1250,10 @@ impl Context {
+             let _ = sess.session.cancel().await;
+         }
+         if let Some(sess) = inner.current.take() {
+-            sess.child.term();
++            match sess.split_greeter {
++                Some(greeter) => greeter.command.signal(libc::SIGTERM),
++                None => sess.child.term(),
++            }
+         }
+         Ok(())
+     }
+diff --git a/greetd/src/main.rs b/greetd/src/main.rs
+index 92a53d4..c0c9ed1 100644
+--- a/greetd/src/main.rs
++++ b/greetd/src/main.rs
+@@ -1,3 +1,13 @@
++macro_rules! cstr {
++    ($value:literal) => {{
++        const VALUE: &std::ffi::CStr =
++            match std::ffi::CStr::from_bytes_with_nul(concat!($value, "\0").as_bytes()) {
++                Ok(value) => value,
++                Err(_) => panic!("invalid C string literal"),
++            };
++        VALUE
++    }};
++}
+ mod config;
+ mod context;
+ mod error;
+@@ -5,6 +15,8 @@ mod pam;
+ mod scrambler;
+ mod server;
+ mod session;
++mod split_vt;
++mod split_vt_logind;
+ mod terminal;
+ 
+ use std::os::unix::{
+@@ -42,6 +54,8 @@ async fn main() {
+         eprintln!("config: {:?}", config);
+     }
+     mlockall(MlockAllFlags::all()).expect("unable to lock pages");
++    let split_server =
++        config.internal.session_worker == 0 && config.file.terminal.user_vt.is_some();
+     let res = task::LocalSet::new()
+         .run_until(async move {
+             if config.internal.session_worker > 0 {
+@@ -53,5 +67,8 @@ async fn main() {
+         .await;
+     if let Err(e) = res {
+         eprintln!("error: {}", e);
++        if split_server {
++            std::process::exit(1);
++        }
+     }
+ }
+diff --git a/greetd/src/server.rs b/greetd/src/server.rs
+index b215c4a..f418b42 100644
+--- a/greetd/src/server.rs
++++ b/greetd/src/server.rs
+@@ -12,6 +12,7 @@ use crate::{
+     context::Context,
+     error::Error,
+     session::worker::TerminalMode,
++    split_vt::Vts,
+     terminal::{self, Terminal},
+ };
+ use greetd_ipc::{
+@@ -27,6 +28,7 @@ fn reset_vt(term_mode: &TerminalMode) -> Result<(), Error> {
+             term.vt_setactivate(*vt)?;
+         }
+         TerminalMode::Stdin => (),
++        _ => return Err("internal split VT mode cannot be used as a greeter configuration".into()),
+     }
+     Ok(())
+ }
+@@ -38,6 +40,7 @@ fn wait_vt(term_mode: &TerminalMode) -> Result<(), Error> {
+             term.vt_waitactive(*vt)?;
+         }
+         TerminalMode::Stdin => (),
++        _ => return Err("internal split VT mode cannot be used as a greeter configuration".into()),
+     }
+     Ok(())
+ }
+@@ -66,7 +69,8 @@ async fn client_get_question(ctx: &Context) -> Response {
+     }
+ }
+ 
+-async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
++async fn client_handler(ctx: &Rc<Context>, mut s: UnixStream) -> Result<(), Error> {
++    let mut first = true;
+     loop {
+         let req = match Request::read_from(&mut s).await {
+             Ok(req) => req,
+@@ -86,9 +90,23 @@ async fn client_handler(ctx: &Context, mut s: UnixStream) -> Result<(), Error> {
+                 }
+             }
+             Request::StartSession { cmd, env } => wrap_result(ctx.start(cmd, env).await),
++            Request::StartSessionSplitVt { version, cmd, env } => {
++                wrap_result(ctx.start_split(version, &cmd, &env, &mut s).await)
++            }
++            Request::GreeterPresented { version } => {
++                let result = if first {
++                    ctx.greeter_presented(version, &s).await
++                } else {
++                    Err("split VT: greeter presentation requires a new connection".into())
++                };
++                // This one-shot connection does not own the authentication flow.
++                let _ = wrap_result(result).write_to(&mut s).await;
++                return Ok(());
++            }
+             Request::CancelSession => wrap_result(ctx.cancel().await),
+         };
+ 
++        first = false;
+         resp.write_to(&mut s).await?;
+     }
+ }
+@@ -232,6 +250,14 @@ pub async fn main(config: Config) -> Result<(), Error> {
+     let (listener_path, listener) = Listener::create(u.uid, u.gid)?;
+ 
+     let term_mode = get_tty(&config)?;
++    let split_vts = match (config.file.terminal.user_vt, &term_mode) {
++        (Some(user), TerminalMode::Terminal { vt, .. }) => {
++            Some(Vts::new(*vt, user, u.uid.as_raw())?)
++        }
++        (Some(_), _) => return Err("split VT requires a real greeter VT".into()),
++        (None, _) => None,
++    };
++    let split_enabled = split_vts.is_some();
+ 
+     if !config.file.terminal.switch {
+         wait_vt(&term_mode).map_err(|e| format!("unable to wait VT: {}", e))?;
+@@ -246,7 +272,9 @@ pub async fn main(config: Config) -> Result<(), Error> {
+         config.file.general.source_profile,
+         config.file.general.runfile,
+         listener_path,
++        split_vts,
+     ));
++    let mut child = signal(SignalKind::child()).expect("unable to listen for SIGCHLD");
+ 
+     if let (Some(s), true) = (config.file.initial_session, ctx.is_first_run()) {
+         if let Err(e) = ctx.start_user_session(&s.user, vec![s.command]).await {
+@@ -257,7 +285,9 @@ pub async fn main(config: Config) -> Result<(), Error> {
+         }
+     } else if let Err(e) = ctx.greet().await {
+         eprintln!("unable to start greeter: {}", e);
+-        reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {}", e))?;
++        if !split_enabled {
++            reset_vt(&term_mode).map_err(|e| format!("unable to reset VT: {}", e))?;
++        }
+ 
+         std::process::exit(1);
+     }
+@@ -265,7 +295,6 @@ pub async fn main(config: Config) -> Result<(), Error> {
+     ctx.create_runfile();
+ 
+     let mut alarm = signal(SignalKind::alarm()).expect("unable to listen for SIGALRM");
+-    let mut child = signal(SignalKind::child()).expect("unable to listen for SIGCHLD");
+     let mut term = signal(SignalKind::terminate()).expect("unable to listen for SIGTERM");
+     let mut int = signal(SignalKind::interrupt()).expect("unable to listen for SIGINT");
+ 
+@@ -273,6 +302,10 @@ pub async fn main(config: Config) -> Result<(), Error> {
+         tokio::select! {
+             _ = child.recv() => ctx.check_children().await.map_err(|e| format!("check_children: {}", e))?,
+             _ = alarm.recv() => ctx.alarm().await.map_err(|e| format!("alarm: {}", e))?,
++            failure = ctx.wait_split_failure(), if split_enabled => {
++                ctx.terminate().await?;
++                return Err(failure);
++            }
+             _ = term.recv() => {
+                 ctx.terminate().await.map_err(|e| format!("terminate: {}", e))?;
+                 break;
+diff --git a/greetd/src/session/interface.rs b/greetd/src/session/interface.rs
+index 7e6c502..045addf 100644
+--- a/greetd/src/session/interface.rs
++++ b/greetd/src/session/interface.rs
+@@ -93,6 +93,10 @@ pub struct Session {
+ }
+ 
+ impl Session {
++    pub fn pid(&self) -> Pid {
++        self.task
++    }
++
+     /// Create a session started as an external process.
+     pub fn new_external() -> Result<Session, Error> {
+         // Pipe used to communicate the true PID of the final child.
+@@ -169,6 +173,7 @@ impl Session {
+                 Ok(SessionState::Question(style, msg))
+             }
+             SessionChildToParent::Success => Ok(SessionState::Ready),
++            SessionChildToParent::AuthenticatedUser { .. } => Ok(SessionState::Ready),
+             SessionChildToParent::Error(e) => Err(e),
+             msg => panic!(
+                 "expected PamMessage, Success or Error from session worker, got: {:?}",
+@@ -203,7 +208,28 @@ impl Session {
+     /// Send the arguments that will be used to start the session.
+     ///
+     pub async fn send_args(&mut self, cmd: Vec<String>, env: Vec<String>) -> Result<(), Error> {
+-        let msg = ParentToSessionChild::Args { env, cmd };
++        self.send_session_args(cmd, env, None).await
++    }
++
++    pub async fn split_account(&mut self) -> Result<(u32, u32), Error> {
++        self.get_state().await?;
++        match self.last_msg {
++            Some(SessionChildToParent::AuthenticatedUser { uid, gid }) => Ok((uid, gid)),
++            _ => Err("split VT user is not authenticated".into()),
++        }
++    }
++
++    pub async fn send_session_args(
++        &mut self,
++        cmd: Vec<String>,
++        env: Vec<String>,
++        split_handoff: Option<String>,
++    ) -> Result<(), Error> {
++        let msg = ParentToSessionChild::Args {
++            env,
++            cmd,
++            split_handoff,
++        };
+         msg.send(&mut self.sock).await?;
+ 
+         let msg = SessionChildToParent::recv(&mut self.sock).await?;
+@@ -224,13 +250,35 @@ impl Session {
+     /// Start the session.
+     ///
+     pub async fn start(&mut self) -> Result<SessionChild, Error> {
++        self.start_internal(None::<fn() -> Result<(), Error>>).await
++    }
++
++    pub async fn start_split(
++        &mut self,
++        on_pam_open: impl FnOnce() -> Result<(), Error>,
++    ) -> Result<SessionChild, Error> {
++        self.start_internal(Some(on_pam_open)).await
++    }
++
++    async fn start_internal(
++        &mut self,
++        mut on_pam_open: Option<impl FnOnce() -> Result<(), Error>>,
++    ) -> Result<SessionChild, Error> {
+         let msg = ParentToSessionChild::Start;
+         msg.send(&mut self.sock).await?;
+ 
+         let sub_task = loop {
+             match SessionChildToParent::recv(&mut self.sock).await? {
+                 SessionChildToParent::Error(e) => return Err(e),
+-                SessionChildToParent::FinalChildPid(raw_pid) => {
++                SessionChildToParent::SplitPamOpened => {
++                    on_pam_open
++                        .take()
++                        .ok_or("unexpected split PAM acknowledgement")?()?;
++                    ParentToSessionChild::ContinueSplit
++                        .send(&mut self.sock)
++                        .await?;
++                }
++                SessionChildToParent::FinalChildPid(raw_pid) if on_pam_open.is_none() => {
+                     break Pid::from_raw(raw_pid as i32)
+                 }
+                 SessionChildToParent::PamMessage { .. } => {
+diff --git a/greetd/src/session/worker.rs b/greetd/src/session/worker.rs
+index 71c9d10..87b2e16 100644
+--- a/greetd/src/session/worker.rs
++++ b/greetd/src/session/worker.rs
+@@ -28,6 +28,14 @@ pub enum TerminalMode {
+         vt: usize,
+         switch: bool,
+     },
++    SplitUser {
++        path: String,
++        vt: usize,
++    },
++    SplitGreeter {
++        path: String,
++        vt: usize,
++    },
+     Stdin,
+ }
+ 
+@@ -63,8 +71,11 @@ pub enum ParentToSessionChild<'a> {
+     Args {
+         env: Vec<String>,
+         cmd: Vec<String>,
++        #[serde(default)]
++        split_handoff: Option<String>,
+     },
+     Start,
++    ContinueSplit,
+     Cancel,
+ }
+ 
+@@ -83,7 +94,9 @@ impl<'a> ParentToSessionChild<'a> {
+ pub enum SessionChildToParent {
+     Success,
+     Error(Error),
++    AuthenticatedUser { uid: u32, gid: u32 },
+     PamMessage { style: AuthMessageType, msg: String },
++    SplitPamOpened,
+     FinalChildPid(u64),
+ }
+ 
+@@ -134,8 +147,27 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
+     // Not the credentials you think.
+     pam.setcred(PamFlag::ESTABLISH_CRED)?;
+ 
++    let broker_managed = matches!(
++        tty,
++        TerminalMode::SplitUser { .. } | TerminalMode::SplitGreeter { .. }
++    );
++
+     // Mark authentication as a success.
+-    SessionChildToParent::Success.send(sock)?;
++    let split_account = if matches!(tty, TerminalMode::SplitUser { .. }) {
++        if !authenticate || !matches!(class, SessionClass::User) {
++            return Err("split VT requires an authenticated user".into());
++        }
++        let user = nix::unistd::User::from_name(&pam.get_user()?)?.ok_or("unknown PAM user")?;
++        SessionChildToParent::AuthenticatedUser {
++            uid: user.uid.as_raw(),
++            gid: user.gid.as_raw(),
++        }
++        .send(sock)?;
++        Some((user.uid, user.gid))
++    } else {
++        SessionChildToParent::Success.send(sock)?;
++        None
++    };
+ 
+     // Add GREETD_SOCK if this is a greeter session - we do this early as we are about to reuse the
+     // buffer, invalidating our borrow.
+@@ -144,12 +176,21 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
+     }
+ 
+     // Fetch our arguments from the parent.
+-    let (env, cmd) = match ParentToSessionChild::recv(sock, &mut data)? {
+-        ParentToSessionChild::Args { env, cmd } => (env, cmd),
++    let (env, cmd, split_handoff) = match ParentToSessionChild::recv(sock, &mut data)? {
++        ParentToSessionChild::Args {
++            env,
++            cmd,
++            split_handoff,
++        } => (env, cmd, split_handoff),
+         ParentToSessionChild::Cancel => return Err("cancelled".into()),
+         msg => return Err(format!("expected Args or Cancel, got: {:?}", msg).into()),
+     };
+ 
++    if split_account.is_some() != split_handoff.is_some()
++        || (split_handoff.is_some() && !env.is_empty())
++    {
++        return Err("invalid split VT session arguments".into());
++    }
+     SessionChildToParent::Success.send(sock)?;
+ 
+     // Await start request from our parent.
+@@ -163,11 +204,34 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
+ 
+     let user = nix::unistd::User::from_name(&pam_username)?.ok_or("unable to get user info")?;
+ 
++    if split_account.is_some() && split_account != Some((user.uid, user.gid)) {
++        return Err("PAM user changed during split VT authentication".into());
++    }
+     // Make this process a session leader.
+     setsid().map_err(|e| format!("unable to become session leader: {}", e))?;
+ 
+     match tty {
+         TerminalMode::Stdin => (),
++        TerminalMode::SplitGreeter { path, vt } => {
++            pam.set_item(PamItemType::TTY, &format!("tty{}", vt))?;
++            pam.putenv(&format!("XDG_VTNR={}", vt))?;
++            let target_term = terminal::Terminal::open(&path)?;
++            target_term.term_take_controlling(false)?;
++            target_term.term_connect_pipes()?;
++        }
++        TerminalMode::SplitUser { path, vt } => {
++            pam.set_item(PamItemType::TTY, &format!("tty{}", vt))?;
++            pam.putenv(&format!("XDG_VTNR={}", vt))?;
++            crate::split_vt::require_free_vt(vt)?;
++            let target_term = terminal::Terminal::open(&path)?;
++            if target_term.vt_get_current()? == vt {
++                return Err("split VT: target became active before launch".into());
++            }
++            // Do not steal a controlling TTY if someone raced the occupancy check.
++            target_term.term_take_controlling(false)?;
++            target_term.term_connect_pipes()?;
++            // The compositor and logind own graphics mode and VT_PROCESS.
++        }
+         TerminalMode::Terminal { path, vt, switch } => {
+             // Tell PAM what TTY we're targetting, which is used by logind.
+             pam.set_item(PamItemType::TTY, &format!("tty{}", vt))?;
+@@ -221,84 +285,123 @@ fn worker(sock: &UnixDatagram) -> Result<(), Error> {
+     // Session time!
+     pam.open_session(PamFlag::NONE)?;
+ 
+-    // We are done with PAM, clear variables that the child will not need.
+-    _ = pam.putenv(&"XDG_SESSION_CLASS");
++    let launch = (|| -> Result<(), Error> {
++        if split_account.is_some() {
++            // The broker must record exact scope ownership before we can launch a command.
++            // Bound the open PAM session if the broker dies or never acknowledges it.
++            sock.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
++            SessionChildToParent::SplitPamOpened.send(sock)?;
++            let decision = ParentToSessionChild::recv(sock, &mut data)?;
++            sock.set_read_timeout(None)?;
++            match decision {
++                ParentToSessionChild::ContinueSplit => (),
++                ParentToSessionChild::Cancel => return Ok(()),
++                _ => return Err("expected ContinueSplit or Cancel after PAM open".into()),
++            }
++        }
+ 
+-    // Prepare some strings in C format that we'll need.
+-    let cusername = CString::new(user.name)?;
+-    let command = if source_profile {
+-        format!(
++        // We are done with PAM, clear variables that the child will not need.
++        _ = pam.putenv(&"XDG_SESSION_CLASS");
++
++        // Prepare some strings in C format that we'll need.
++        let cusername = CString::new(user.name)?;
++        let command = if source_profile {
++            format!(
+             "[ -f /etc/profile ] && . /etc/profile; [ -f $HOME/.profile ] && . $HOME/.profile; exec {}",
+             cmd.join(" ")
+         )
+-    } else {
+-        format!("exec {}", cmd.join(" "))
+-    };
++        } else {
++            format!("exec {}", cmd.join(" "))
++        };
+ 
+-    // Extract PAM environment for use with execve below.
+-    let pamenvlist = pam.getenvlist()?;
+-    let envvec = pamenvlist.to_vec();
+-
+-    // PAM is weird and gets upset if you exec from the process that opened
+-    // the session, registering it automatically as a log-out. Thus, we must
+-    // exec in a new child.
+-    let child = match unsafe { fork() }.map_err(|e| format!("unable to fork: {}", e))? {
+-        ForkResult::Parent { child, .. } => child,
+-        ForkResult::Child => {
+-            // It is important that we do *not* return from here by
+-            // accidentally using '?'. The process *must* exit from within
+-            // this match arm.
+-
+-            // Drop privileges to target user
+-            initgroups(&cusername, user.gid).expect("unable to init groups");
+-            setgid(user.gid).expect("unable to set GID");
+-            setuid(user.uid).expect("unable to set UID");
+-
+-            // Set our parent death signal. setuid/setgid above resets the
+-            // death signal, which is why we do this here.
+-            prctl(PrctlOption::SET_PDEATHSIG(libc::SIGTERM)).expect("unable to set death signal");
+-
+-            // Change working directory
+-            if let Err(e) = env::set_current_dir(user.dir) {
+-                eprintln!("unable to set working directory: {}", e);
+-            }
++        // Extract PAM environment for use with execve below.
++        let pamenvlist = pam.getenvlist()?;
++        let mut envvec = pamenvlist.to_vec();
++        let handoff_env = split_handoff
++            .map(|path| CString::new(format!("LUMEN_DM_HANDOFF={}", path)))
++            .transpose()?;
++        if let Some(handoff) = handoff_env.as_ref() {
++            // The private value is never shared with PAM or taken from greeter IPC.
++            envvec.retain(|entry| !entry.to_bytes().starts_with(b"LUMEN_DM_HANDOFF="));
++            envvec.push(handoff.as_c_str());
++        }
+ 
+-            // Run
+-            let cpath = CString::new("/bin/sh").unwrap();
+-            execve(
+-                &cpath,
+-                &[
++        // PAM is weird and gets upset if you exec from the process that opened
++        // the session, registering it automatically as a log-out. Thus, we must
++        // exec in a new child.
++        let worker_pid = nix::unistd::getpid();
++        let child = match unsafe { fork() }.map_err(|e| format!("unable to fork: {}", e))? {
++            ForkResult::Parent { child, .. } => child,
++            ForkResult::Child => {
++                // It is important that we do *not* return from here by
++                // accidentally using '?'. The process *must* exit from within
++                // this match arm.
++
++                // Drop privileges to target user
++                initgroups(&cusername, user.gid).expect("unable to init groups");
++                setgid(user.gid).expect("unable to set GID");
++                setuid(user.uid).expect("unable to set UID");
++
++                // Set our parent death signal. setuid/setgid above resets the
++                // death signal, which is why we do this here.
++                prctl(PrctlOption::SET_PDEATHSIG(libc::SIGTERM))
++                    .expect("unable to set death signal");
++                if broker_managed && nix::unistd::getppid() != worker_pid {
++                    std::process::exit(1);
++                }
++
++                // Change working directory
++                if let Err(e) = env::set_current_dir(user.dir) {
++                    eprintln!("unable to set working directory: {}", e);
++                }
++
++                // Run
++                let cpath = CString::new("/bin/sh").unwrap();
++                execve(
+                     &cpath,
+-                    &CString::new("-c").unwrap(),
+-                    &CString::new(command).unwrap(),
+-                ],
+-                &envvec,
+-            )
+-            .expect("unable to exec");
+-
+-            unreachable!("after exec");
+-        }
+-    };
++                    &[
++                        &cpath,
++                        &CString::new("-c").unwrap(),
++                        &CString::new(command).unwrap(),
++                    ],
++                    &envvec,
++                )
++                .expect("unable to exec");
++
++                unreachable!("after exec");
++            }
++        };
+ 
+-    // Signal the inner PID to the parent process.
+-    SessionChildToParent::FinalChildPid(child.as_raw() as u64).send(sock)?;
+-    sock.shutdown(std::net::Shutdown::Both)?;
+-
+-    // Set our parent death signal. setsid above resets the signal, hence our
+-    // late assignment, which is why we do this here.
+-    prctl(PrctlOption::SET_PDEATHSIG(libc::SIGTERM))?;
+-
+-    // Wait for process to terminate, handling EINTR as necessary.
+-    loop {
+-        match waitpid(child, None) {
+-            Err(nix::errno::Errno::EINTR) => continue,
+-            Err(e) => {
+-                eprintln!("session: waitpid on inner child failed: {}", e);
+-                break;
++        // Signal the inner PID to the parent process.
++        SessionChildToParent::FinalChildPid(child.as_raw() as u64).send(sock)?;
++        sock.shutdown(std::net::Shutdown::Both)?;
++
++        // Set our parent death signal. setsid above resets the signal, hence our
++        // late assignment, which is why we do this here.
++        prctl(PrctlOption::SET_PDEATHSIG(libc::SIGTERM))?;
++
++        // Wait for process to terminate, handling EINTR as necessary.
++        loop {
++            match waitpid(child, None) {
++                Err(nix::errno::Errno::EINTR) => continue,
++                Err(e) => {
++                    eprintln!("session: waitpid on inner child failed: {}", e);
++                    break;
++                }
++                Ok(_) => break,
+             }
+-            Ok(_) => break,
+         }
++
++        Ok(())
++    })();
++    if split_account.is_some() {
++        // Keep cleanup in the process that opened PAM, including errors before fork.
++        let close = pam.close_session(PamFlag::NONE).map_err(Error::from);
++        let delete = pam.setcred(PamFlag::DELETE_CRED).map_err(Error::from);
++        let end = pam.end().map_err(Error::from);
++        return launch.and(close).and(delete).and(end);
+     }
++    launch?;
+ 
+     // Close the session. This step requires root privileges to run, as it
+     // will result in various forms of login teardown (including unmounting
+diff --git a/greetd/src/split_vt.rs b/greetd/src/split_vt.rs
+new file mode 100644
+index 0000000..2733e7c
+--- /dev/null
++++ b/greetd/src/split_vt.rs
+@@ -0,0 +1,883 @@
++use std::{
++    ffi::CString,
++    fs::{self, DirBuilder},
++    future::Future,
++    io,
++    os::{
++        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
++        unix::fs::{DirBuilderExt, MetadataExt},
++    },
++    path::Path,
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Arc, Mutex,
++    },
++    time::{Duration, Instant},
++};
++
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{UnixListener, UnixStream},
++    time::{sleep, timeout_at},
++};
++
++use crate::{error::Error, split_vt_logind as logind, terminal::Terminal};
++
++pub const COMMAND: &str = "/usr/bin/lumen-session";
++const COMPOSITOR: &str = "/usr/bin/lumen-compositor";
++const DIRECTORY: &str = "/run/lumen-dm-handoff";
++const SO_PEERPIDFD: libc::c_int = 77;
++pub const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
++const CHECK_INTERVAL: Duration = Duration::from_millis(25);
++const RETURN_TIMEOUT: Duration = Duration::from_secs(2);
++
++pub fn check_request(version: u32, cmd: &[String], env: &[String]) -> Result<(), Error> {
++    if version != 1 {
++        return Err("unsupported split VT protocol version".into());
++    }
++    if !(cmd.is_empty() || (cmd.len() == 1 && cmd[0] == COMMAND)) || !env.is_empty() {
++        return Err(
++            "split VT requires the installed lumen-session command and no IPC environment".into(),
++        );
++    }
++    Ok(())
++}
++
++fn trusted_file(path: &str) -> Result<fs::Metadata, Error> {
++    let meta = fs::metadata(path)?;
++    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 || meta.mode() & 0o111 == 0 {
++        return Err(format!("split VT: untrusted executable {}", path).into());
++    }
++    Ok(meta)
++}
++
++pub fn require_free_vt(vt: usize) -> Result<(), Error> {
++    if Terminal::open("/dev/tty0")?.vt_is_open(vt)? || logind::vt_is_occupied(vt)? {
++        return Err(format!("split VT: VT{} is active or occupied", vt).into());
++    }
++    Ok(())
++}
++
++pub fn foreground() -> Result<usize, Error> {
++    Terminal::open("/dev/tty0")?.vt_get_current()
++}
++
++#[derive(Clone)]
++pub struct Vts {
++    pub greeter: usize,
++    pub user: usize,
++    pub greeter_uid: u32,
++}
++
++impl Vts {
++    pub fn new(greeter: usize, user: usize, greeter_uid: u32) -> Result<Self, Error> {
++        if user == greeter || greeter == 0 || user == 2 || !(1..=15).contains(&user) {
++            return Err("split VT requires a separate dedicated user VT (not VT2)".into());
++        }
++        require_free_vt(user)?;
++        trusted_file(COMMAND)?;
++        trusted_file(COMPOSITOR)?;
++        Ok(Self {
++            greeter,
++            user,
++            greeter_uid,
++        })
++    }
++
++    pub fn require_greeter(&self) -> Result<(), Error> {
++        if foreground()? != self.greeter {
++            return Err("split VT: greeter is no longer in the foreground".into());
++        }
++        Ok(())
++    }
++
++    pub async fn restore(
++        &self,
++        greeter_pid: libc::pid_t,
++        worker: Arc<PidFd>,
++        owner: Option<logind::Session>,
++    ) -> Result<(), Error> {
++        let (user_vt, greeter_vt, uid) = (self.user, self.greeter, self.greeter_uid);
++        tokio::task::spawn_blocking(move || {
++            if foreground()? != user_vt || logind::vt_has_other_session(user_vt, owner.as_ref())? {
++                return Ok(());
++            }
++            worker.alive()?;
++            let session = logind::Session::from_worker(greeter_pid, uid, greeter_vt)?;
++            session.activate_if(|| {
++                worker.alive()?;
++                logind::require_exclusive_vt(greeter_vt, &session)?;
++                if !graphics(greeter_vt)? {
++                    return Err("split VT: recovery greeter is not in KD_GRAPHICS".into());
++                }
++                if logind::vt_has_other_session(user_vt, owner.as_ref())?
++                    || foreground()? != user_vt
++                {
++                    return Err("split VT: foreground ownership changed during rollback".into());
++                }
++                Ok(())
++            })
++        })
++        .await
++        .map_err(|e| e.to_string())?
++    }
++}
++
++struct SocketPath(String);
++
++impl Drop for SocketPath {
++    fn drop(&mut self) {
++        let _ = fs::remove_file(&self.0);
++    }
++}
++
++pub struct Handoff {
++    listener: UnixListener,
++    path: SocketPath,
++    uid: u32,
++}
++
++fn random_nonce() -> Result<String, Error> {
++    use std::io::Read;
++    let mut random = [0u8; 16];
++    fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
++    Ok(random.iter().map(|n| format!("{:02x}", n)).collect())
++}
++
++impl Handoff {
++    pub fn new(uid: u32) -> Result<Self, Error> {
++        if uid == 0 {
++            return Err("split VT does not accept root desktop sessions".into());
++        }
++        match DirBuilder::new().mode(0o711).create(DIRECTORY) {
++            Ok(()) => {}
++            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
++            Err(e) => return Err(e.into()),
++        }
++        let meta = fs::symlink_metadata(DIRECTORY)?;
++        if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o777 != 0o711 {
++            return Err("split VT: handoff directory must be root-owned with mode 0711".into());
++        }
++        let name = random_nonce()?;
++        let path = format!("{}/{}.sock", DIRECTORY, name);
++        // No await between binding with 0700 and restoring greetd's normal umask.
++        let mask = unsafe { libc::umask(0o077) };
++        let listener = UnixListener::bind(&path);
++        unsafe { libc::umask(mask) };
++        let listener = listener?;
++        let path = SocketPath(path);
++        // Linux POSIX ACL xattr: root rw, this UID w, and no access for others.
++        // Keep owner root so the authenticated account cannot widen access.
++        let mut acl = vec![2, 0, 0, 0];
++        for (tag, perm, id) in [
++            (1u16, 6u16, u32::MAX),
++            (2, 2, uid),
++            (4, 0, u32::MAX),
++            (16, 2, u32::MAX),
++            (32, 0, u32::MAX),
++        ] {
++            acl.extend(tag.to_le_bytes());
++            acl.extend(perm.to_le_bytes());
++            acl.extend(id.to_le_bytes());
++        }
++        let socket_path = CString::new(path.0.as_str())?;
++        if unsafe {
++            libc::setxattr(
++                socket_path.as_ptr(),
++                cstr!("system.posix_acl_access").as_ptr(),
++                acl.as_ptr().cast(),
++                acl.len(),
++                0,
++            )
++        } != 0
++        {
++            return Err(format!(
++                "split VT: cannot restrict handoff socket: {}",
++                io::Error::last_os_error()
++            )
++            .into());
++        }
++        Ok(Self {
++            listener,
++            path,
++            uid,
++        })
++    }
++
++    pub fn path(&self) -> &str {
++        &self.path.0
++    }
++
++    pub async fn prepare(
++        &self,
++        pam: &logind::Session,
++        verified: &mut Option<Peer>,
++    ) -> Result<UnixStream, Error> {
++        let (mut stream, _) = self.listener.accept().await?;
++        let cred = stream.peer_cred()?;
++        let pid = cred
++            .pid()
++            .filter(|pid| *pid > 0)
++            .ok_or("missing compositor peer PID")?;
++        if cred.uid() != self.uid {
++            return Err("split VT: compositor peer UID did not authenticate".into());
++        }
++        let peer = Peer {
++            pid,
++            uid: self.uid,
++            path: self.path.0.clone(),
++            fd: PidFd::from_peer(&stream)?,
++        };
++        peer.recheck(pam).await?;
++        *verified = Some(peer);
++        read_message(&mut stream, b"PREPARED\n").await?;
++        Ok(stream)
++    }
++}
++
++fn verify_peer(pid: libc::pid_t, uid: u32, path: &str, pam: &logind::Session) -> Result<(), Error> {
++    logind::verify_service(pid, uid)?;
++    let proc_exe = format!("/proc/{}/exe", pid);
++    let exe = fs::metadata(&proc_exe)?;
++    let trusted = trusted_file(COMPOSITOR)?;
++    if fs::read_link(proc_exe)? != Path::new(COMPOSITOR)
++        || (exe.dev(), exe.ino()) != (trusted.dev(), trusted.ino())
++    {
++        return Err(
++            "split VT: compositor executable identity differs from the installed binary".into(),
++        );
++    }
++    let environment = fs::read(format!("/proc/{}/environ", pid))?;
++    let has = |name: &[u8], value: &[u8]| {
++        let mut matches = environment
++            .split(|b| *b == 0)
++            .filter_map(|entry| entry.strip_prefix(name));
++        matches.next() == Some(value) && matches.next().is_none()
++    };
++    if !has(b"XDG_SESSION_ID=", pam.id()) || !has(b"LUMEN_DM_HANDOFF=", path.as_bytes()) {
++        return Err(
++            "split VT: compositor unit is not bound to this PAM session and attempt".into(),
++        );
++    }
++    Ok(())
++}
++
++pub struct PidFd(OwnedFd);
++
++impl PidFd {
++    pub fn open(pid: libc::pid_t) -> Result<Self, Error> {
++        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
++        if fd < 0 {
++            return Err(io::Error::last_os_error().into());
++        }
++        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd as RawFd) }))
++    }
++
++    pub fn open_child(pid: libc::pid_t, parent: libc::pid_t) -> Result<Self, Error> {
++        let handle = Self::open(pid)?;
++        let status = fs::read_to_string(format!("/proc/{}/status", pid))?;
++        let actual = status
++            .lines()
++            .find_map(|line| line.strip_prefix("PPid:"))
++            .and_then(|value| value.trim().parse().ok());
++        handle.alive()?;
++        if actual != Some(parent) {
++            return Err("split VT: command is no longer a child of the PAM worker".into());
++        }
++        Ok(handle)
++    }
++
++    fn from_peer(stream: &UnixStream) -> Result<Self, Error> {
++        let mut fd: RawFd = -1;
++        let mut len = std::mem::size_of_val(&fd) as libc::socklen_t;
++        if unsafe {
++            libc::getsockopt(
++                stream.as_raw_fd(),
++                libc::SOL_SOCKET,
++                SO_PEERPIDFD,
++                (&mut fd as *mut RawFd).cast(),
++                &mut len,
++            )
++        } < 0
++        {
++            return Err(format!(
++                "split VT requires SO_PEERPIDFD: {}",
++                io::Error::last_os_error()
++            )
++            .into());
++        }
++        if fd < 0 {
++            return Err("split VT: invalid peer pidfd".into());
++        }
++        let peer = Self(unsafe { OwnedFd::from_raw_fd(fd) });
++        if len as usize != std::mem::size_of::<RawFd>() {
++            return Err("split VT: invalid SO_PEERPIDFD result length".into());
++        }
++        Ok(peer)
++    }
++
++    pub fn match_peer(
++        &self,
++        stream: &UnixStream,
++        pid: libc::pid_t,
++        uid: libc::uid_t,
++    ) -> Result<Self, Error> {
++        self.alive()?;
++        let cred = stream.peer_cred()?;
++        if pid <= 0 || cred.pid() != Some(pid) || cred.uid() != uid {
++            return Err("split VT: presentation peer is not the tracked greeter command".into());
++        }
++        let peer = Self::from_peer(stream)?;
++        // Both kernel handles must still be live for the same numeric PID in
++        // this namespace. Bracket the peer check so PID reuse cannot match.
++        peer.alive()?;
++        self.alive()?;
++        Ok(peer)
++    }
++
++    pub fn alive(&self) -> Result<(), Error> {
++        let mut fd = libc::pollfd {
++            fd: self.0.as_raw_fd(),
++            events: libc::POLLIN,
++            revents: 0,
++        };
++        match unsafe { libc::poll(&mut fd, 1, 0) } {
++            0 => Ok(()),
++            -1 => Err(io::Error::last_os_error().into()),
++            _ => Err("split VT: tracked process has exited".into()),
++        }
++    }
++
++    pub async fn exited(&self) {
++        while self.alive().is_ok() {
++            sleep(CHECK_INTERVAL).await;
++        }
++    }
++
++    pub fn signal(&self, signal: libc::c_int) {
++        unsafe {
++            libc::syscall(
++                libc::SYS_pidfd_send_signal,
++                self.0.as_raw_fd(),
++                signal,
++                std::ptr::null::<libc::siginfo_t>(),
++                0u32,
++            )
++        };
++    }
++}
++
++pub struct Peer {
++    pid: libc::pid_t,
++    pub uid: u32,
++    path: String,
++    pub fd: PidFd,
++}
++
++impl Peer {
++    pub fn verify(&self, pam: &logind::Session) -> Result<(), Error> {
++        self.check()?;
++        verify_peer(self.pid, self.uid, &self.path, pam)?;
++        self.check()
++    }
++
++    pub async fn recheck(&self, pam: &logind::Session) -> Result<(), Error> {
++        self.check()?;
++        let (pid, uid) = (self.pid, self.uid);
++        let (path, pam) = (self.path.clone(), pam.clone());
++        tokio::task::spawn_blocking(move || verify_peer(pid, uid, &path, &pam))
++            .await
++            .map_err(|e| e.to_string())??;
++        self.check()
++    }
++
++    pub fn check(&self) -> Result<(), Error> {
++        self.fd
++            .alive()
++            .map_err(|e| format!("compositor {}: {}", self.pid, e).into())
++    }
++}
++
++async fn read_message(stream: &mut UnixStream, expected: &[u8]) -> Result<(), Error> {
++    let mut buf = [0; 43];
++    stream.read_exact(&mut buf[..expected.len()]).await?;
++    if &buf[..expected.len()] != expected {
++        return Err("split VT: unexpected handoff message".into());
++    }
++    Ok(())
++}
++
++#[derive(Clone)]
++pub struct ReturnRequest(Arc<ReturnState>);
++
++struct ReturnState {
++    fd: OwnedFd,
++    deadline: Instant,
++    cancelled: AtomicBool,
++}
++
++impl ReturnRequest {
++    pub fn check(&self) -> Result<(), Error> {
++        if self.0.cancelled.load(Ordering::Acquire) || Instant::now() >= self.0.deadline {
++            return Err("split VT RETURN expired or cancelled".into());
++        }
++        // Check the actual socket from inside the blocking activation guard, where
++        // the Tokio read half may not yet have observed a hangup or extra bytes.
++        let mut byte = 0u8;
++        let received = unsafe {
++            libc::recv(
++                self.0.fd.as_raw_fd(),
++                (&mut byte as *mut u8).cast(),
++                1,
++                libc::MSG_DONTWAIT | libc::MSG_PEEK,
++            )
++        };
++        if received < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
++            return Ok(());
++        }
++        Err("split VT RETURN peer disconnected or sent extra data".into())
++    }
++}
++
++struct ReturnScope(ReturnRequest);
++
++impl Drop for ReturnScope {
++    fn drop(&mut self) {
++        self.0 .0.cancelled.store(true, Ordering::Release);
++        // The guard held by a blocking logind call may still own the duplicate.
++        unsafe { libc::shutdown(self.0 .0.fd.as_raw_fd(), libc::SHUT_RDWR) };
++    }
++}
++
++pub async fn return_exchange<F>(
++    mut stream: UnixStream,
++    activate: impl FnOnce(ReturnRequest) -> F,
++) -> Result<bool, Error>
++where
++    F: Future<Output = Result<(), Error>>,
++{
++    let mut first = [0u8; 1];
++    if stream.read(&mut first).await? == 0 {
++        return Ok(false);
++    }
++    if first[0] != b'R' {
++        return Err("split VT: expected RETURN".into());
++    }
++    let deadline = Instant::now() + RETURN_TIMEOUT;
++    timeout_at(deadline.into(), read_message(&mut stream, b"ETURN\n"))
++        .await
++        .map_err(|_| Error::from("split VT RETURN record timed out"))??;
++    let fd = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
++    if fd < 0 {
++        return Err(io::Error::last_os_error().into());
++    }
++    let scope = ReturnScope(ReturnRequest(Arc::new(ReturnState {
++        fd: unsafe { OwnedFd::from_raw_fd(fd) },
++        deadline,
++        cancelled: AtomicBool::new(false),
++    })));
++    let (mut read, mut write) = stream.split();
++    timeout_at(deadline.into(), async {
++        tokio::select! {
++            biased;
++            _ = read.read_u8() => Err("split VT RETURN peer disconnected or sent extra data".into()),
++            result = async {
++                scope.0.check()?;
++                activate(scope.0.clone()).await?;
++                scope.0.check()?;
++                write.write_all(b"RETURNED\n").await?;
++                Ok(true)
++            } => result,
++        }
++    }).await.map_err(|_| Error::from("split VT RETURN timed out"))?
++}
++
++pub fn require_foreground(vt: usize, pam: &logind::Session) -> Result<(), Error> {
++    logind::require_exclusive_vt(vt, pam)?;
++    if !pam.active()? || foreground()? != vt {
++        return Err("split VT: expected PAM session is no longer in the foreground".into());
++    }
++    Ok(())
++}
++
++pub fn graphics(vt: usize) -> Result<bool, Error> {
++    Terminal::open(&format!("/dev/tty{}", vt))?.kd_is_graphics()
++}
++
++pub async fn wait_active(vt: usize, pam: &logind::Session) -> Result<(), Error> {
++    loop {
++        if foreground()? == vt && pam.active()? {
++            return require_foreground(vt, pam);
++        }
++        sleep(CHECK_INTERVAL).await;
++    }
++}
++
++async fn challenge(stream: &mut UnixStream, nonce: &str) -> Result<(), Error> {
++    stream
++        .write_all(format!("ACTIVE {}\n", nonce).as_bytes())
++        .await?;
++    read_message(stream, format!("PRESENTED {}\n", nonce).as_bytes()).await
++}
++
++pub async fn wait_foreground_change(greeter: usize, user: Option<usize>) -> Error {
++    loop {
++        match foreground() {
++            Ok(vt) if vt == greeter || user == Some(vt) => {}
++            Ok(_) => return "split VT: operator changed foreground VT".into(),
++            Err(e) => return e,
++        }
++        sleep(CHECK_INTERVAL).await;
++    }
++}
++
++const ROLLBACK_OBSERVE: Duration = Duration::from_millis(500);
++
++#[derive(Debug, PartialEq, Eq)]
++enum ForegroundAfterSwitch {
++    Source,
++    Target,
++    Other,
++}
++
++async fn observe_late_switch(
++    mut foreground: impl FnMut() -> Result<usize, Error>,
++    source: usize,
++    target: usize,
++    limit: Duration,
++) -> Result<ForegroundAfterSwitch, Error> {
++    let deadline = tokio::time::Instant::now() + limit;
++    loop {
++        let vt = foreground()?;
++        if vt != source {
++            return Ok(if vt == target {
++                ForegroundAfterSwitch::Target
++            } else {
++                ForegroundAfterSwitch::Other
++            });
++        }
++        let now = tokio::time::Instant::now();
++        if now >= deadline {
++            return Ok(ForegroundAfterSwitch::Source);
++        }
++        sleep(CHECK_INTERVAL.min(deadline - now)).await;
++    }
++}
++
++pub async fn observe_rollback(vts: &Vts) -> Result<bool, Error> {
++    Ok(
++        observe_late_switch(foreground, vts.greeter, vts.user, ROLLBACK_OBSERVE).await?
++            == ForegroundAfterSwitch::Target,
++    )
++}
++
++#[derive(Default)]
++pub struct Switch {
++    cancelled: Mutex<bool>,
++    requested: AtomicBool,
++    foreground_lost: AtomicBool,
++}
++
++impl Switch {
++    pub fn inhibit_restore(&self) {
++        self.foreground_lost.store(true, Ordering::Release);
++    }
++
++    pub async fn cancel(self: Arc<Self>) -> bool {
++        tokio::task::spawn_blocking(move || {
++            *self.cancelled.lock().unwrap() = true;
++            self.requested() && !self.foreground_lost.load(Ordering::Acquire)
++        })
++        .await
++        .unwrap_or(false)
++    }
++
++    pub fn requested(&self) -> bool {
++        self.requested.load(Ordering::Acquire)
++    }
++
++    pub async fn activate(
++        self: Arc<Self>,
++        session: logind::Session,
++        guard: impl FnOnce(&logind::Session) -> Result<(), Error> + Send + 'static,
++    ) -> Result<(), Error> {
++        tokio::task::spawn_blocking(move || {
++            let cancelled = self.cancelled.lock().unwrap();
++            // Keep cancellation serialized with the checked blocking call.
++            session.activate_if(|| {
++                if *cancelled || self.foreground_lost.load(Ordering::Acquire) {
++                    return Err("split VT: switch cancelled before activation".into());
++                }
++                guard(&session)?;
++                if self.foreground_lost.load(Ordering::Acquire) {
++                    return Err("split VT: foreground changed before activation".into());
++                }
++                // A bus timeout is not evidence that the request was not delivered.
++                self.requested.store(true, Ordering::Release);
++                Ok(())
++            })
++        })
++        .await
++        .map_err(|e| e.to_string())?
++    }
++
++    pub async fn allow_return_recovery(self: Arc<Self>, vts: &Vts) -> Result<bool, Error> {
++        let observe =
++            self.clone()
++                .reconcile_return(foreground, vts.user, vts.greeter, ROLLBACK_OBSERVE);
++        tokio::select! {
++            biased;
++            _ = wait_foreground_change(vts.user, Some(vts.greeter)) => {
++                self.inhibit_restore();
++                self.cancel().await;
++                Ok(false)
++            }
++            result = observe => result,
++        }
++    }
++
++    async fn reconcile_return(
++        self: Arc<Self>,
++        mut foreground: impl FnMut() -> Result<usize, Error>,
++        source: usize,
++        target: usize,
++        limit: Duration,
++    ) -> Result<bool, Error> {
++        let requested = self.clone().cancel().await;
++        if self.foreground_lost.load(Ordering::Acquire) {
++            return Ok(false);
++        }
++        if !requested {
++            return Ok(foreground()? == source);
++        }
++        // Never repeat an already-requested switch that reached its destination.
++        Ok(
++            observe_late_switch(foreground, source, target, limit).await?
++                == ForegroundAfterSwitch::Source,
++        )
++    }
++}
++
++pub fn require_active(vts: &Vts, pam: &logind::Session) -> Result<(), Error> {
++    require_foreground(vts.user, pam)
++}
++
++pub async fn presented(
++    stream: &mut UnixStream,
++    vts: &Vts,
++    pam: &logind::Session,
++    switch: Arc<Switch>,
++) -> Result<(), Error> {
++    let greeter_vt = vts.greeter;
++    let user_vt = vts.user;
++    switch
++        .activate(pam.clone(), move |session| {
++            logind::require_exclusive_vt(user_vt, session)?;
++            if !Terminal::open(&format!("/dev/tty{}", user_vt))?.kd_is_graphics()? {
++                return Err("split VT: target is not in KD_GRAPHICS".into());
++            }
++            if session.active()? || foreground()? != greeter_vt {
++                return Err("split VT: cannot activate after the foreground changed".into());
++            }
++            Ok(())
++        })
++        .await?;
++
++    // The bus reply can arrive before the kernel completes the VT switch.
++    wait_active(user_vt, pam).await?;
++    challenge(stream, &random_nonce()?).await?;
++    require_active(vts, pam)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn split_request_is_versioned_and_pinned() {
++        assert!(check_request(1, &[], &[]).is_ok());
++        assert!(check_request(1, &[COMMAND.into()], &[]).is_ok());
++        assert!(check_request(0, &[], &[]).is_err());
++        assert!(check_request(1, &["lumen-session".into()], &[]).is_err());
++        assert!(check_request(1, &[COMMAND.into(), "; true".into()], &[]).is_err());
++        assert!(check_request(1, &[], &["LUMEN_DM_HANDOFF=/tmp/no".into()]).is_err());
++    }
++
++    #[tokio::test]
++    async fn rollback_observes_late_activation_and_latches_third_vt() {
++        for (vts, expected) in [
++            (vec![1, 1, 7], ForegroundAfterSwitch::Target),
++            (vec![1, 3, 7], ForegroundAfterSwitch::Other),
++            (vec![1], ForegroundAfterSwitch::Source),
++        ] {
++            let last = *vts.last().unwrap();
++            let mut vts = vts.into_iter();
++            assert_eq!(
++                observe_late_switch(
++                    || Ok(vts.next().unwrap_or(last)),
++                    1,
++                    7,
++                    Duration::from_millis(150)
++                )
++                .await
++                .unwrap(),
++                expected
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn cancelled_return_reconciles_a_delivered_request_without_stealing_vt() {
++        for (vts, allowed) in [(vec![7, 1], false), (vec![7, 3, 7], false), (vec![7], true)] {
++            let switch = Arc::new(Switch::default());
++            switch.requested.store(true, Ordering::Release);
++            let last = *vts.last().unwrap();
++            let mut vts = vts.into_iter();
++            assert_eq!(
++                switch
++                    .reconcile_return(
++                        || Ok(vts.next().unwrap_or(last)),
++                        7,
++                        1,
++                        Duration::from_millis(60)
++                    )
++                    .await
++                    .unwrap(),
++                allowed
++            );
++        }
++        let switch = Arc::new(Switch::default());
++        switch.inhibit_restore();
++        assert!(!switch
++            .reconcile_return(|| Ok(7), 7, 1, Duration::ZERO)
++            .await
++            .unwrap());
++    }
++
++    #[tokio::test]
++    async fn greeter_presentation_checks_kernel_peer_credentials_and_live_pidfd() {
++        let (_peer, broker) = UnixStream::pair().unwrap();
++        let (pid, uid) = unsafe { (libc::getpid(), libc::geteuid()) };
++        let command = PidFd::open(pid).unwrap();
++        assert!(command.match_peer(&broker, pid, uid).is_ok());
++        assert!(command.match_peer(&broker, pid, uid ^ 1).is_err());
++        let mut other = std::process::Command::new("/bin/sleep")
++            .arg("60")
++            .spawn()
++            .unwrap();
++        let other_pid = other.id() as libc::pid_t;
++        let other_command = PidFd::open(other_pid).unwrap();
++        let different_peer = other_command.match_peer(&broker, other_pid, uid);
++        other.kill().unwrap();
++        other.wait().unwrap();
++        assert!(different_peer.is_err());
++        assert!(other_command.alive().is_err());
++        assert!(other_command.match_peer(&broker, other_pid, uid).is_err());
++    }
++
++    #[tokio::test]
++    async fn stale_presentation_cannot_answer_fresh_activation() {
++        let (mut client, mut daemon) = UnixStream::pair().unwrap();
++        let stale = "00112233445566778899aabbccddeeff";
++        let fresh = "ffeeddccbbaa99887766554433221100";
++        client
++            .write_all(format!("PRESENTED {}\n", stale).as_bytes())
++            .await
++            .unwrap();
++        assert!(challenge(&mut daemon, fresh).await.is_err());
++        read_message(&mut client, format!("ACTIVE {}\n", fresh).as_bytes())
++            .await
++            .unwrap();
++
++        let (mut client, mut daemon) = UnixStream::pair().unwrap();
++        let (accepted, ()) = tokio::join!(challenge(&mut daemon, fresh), async {
++            read_message(&mut client, format!("ACTIVE {}\n", fresh).as_bytes())
++                .await
++                .unwrap();
++            client
++                .write_all(format!("PRESENTED {}\n", fresh).as_bytes())
++                .await
++                .unwrap();
++        });
++        assert!(accepted.is_ok());
++    }
++
++    #[tokio::test]
++    async fn return_ack_waits_for_presentation_even_after_activation() {
++        let (mut client, broker) = UnixStream::pair().unwrap();
++        let (activated_tx, activated_rx) = tokio::sync::oneshot::channel();
++        let (presented_tx, presented_rx) = tokio::sync::oneshot::channel();
++        let exchange = return_exchange(broker, |request| async move {
++            request.check()?;
++            activated_tx.send(()).unwrap();
++            presented_rx.await.unwrap();
++            request.check()
++        });
++        let client_side = async {
++            client.write_all(b"RET").await.unwrap();
++            client.write_all(b"URN\n").await.unwrap();
++            activated_rx.await.unwrap();
++            assert_eq!(
++                client.try_read(&mut [0]).unwrap_err().kind(),
++                io::ErrorKind::WouldBlock
++            );
++            presented_tx.send(()).unwrap();
++            read_message(&mut client, b"RETURNED\n").await.unwrap();
++            assert_eq!(client.read(&mut [0]).await.unwrap(), 0);
++        };
++        let (result, ()) = tokio::join!(exchange, client_side);
++        assert!(result.unwrap());
++    }
++
++    #[tokio::test]
++    async fn return_rejects_duplicate_and_malformed_requests() {
++        for invalid in [b"RETURN\nRETURN\n".as_slice(), b"RETURNx".as_slice()] {
++            let (mut client, broker) = UnixStream::pair().unwrap();
++            client.write_all(invalid).await.unwrap();
++            assert!(return_exchange(broker, |_| async {
++                panic!("invalid RETURN reached activation")
++            })
++            .await
++            .is_err());
++            match client.read(&mut [0]).await {
++                Ok(0) => {}
++                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
++                result => panic!("invalid RETURN did not close the stream: {:?}", result),
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn return_hangup_cancels_inflight_guard() {
++        let (mut client, broker) = UnixStream::pair().unwrap();
++        let (guard_tx, guard_rx) = tokio::sync::oneshot::channel();
++        let exchange = return_exchange(broker, |request| async move {
++            request.check()?;
++            assert!(guard_tx.send(request).is_ok());
++            std::future::pending::<Result<(), Error>>().await
++        });
++        let client_side = async {
++            client.write_all(b"RETURN\n").await.unwrap();
++            let request = guard_rx.await.unwrap();
++            drop(client);
++            request
++        };
++        let (result, request) = tokio::join!(exchange, client_side);
++        assert!(result.is_err());
++        assert!(request.check().is_err());
++    }
++
++    #[tokio::test]
++    async fn handoff_records_are_exact_and_ordered() {
++        use tokio::io::AsyncWriteExt;
++        let (mut client, mut daemon) = UnixStream::pair().unwrap();
++        client.write_all(b"PREPARED\nPRESENTED\n").await.unwrap();
++        read_message(&mut daemon, b"PREPARED\n").await.unwrap();
++        read_message(&mut daemon, b"PRESENTED\n").await.unwrap();
++        let (mut client, mut daemon) = UnixStream::pair().unwrap();
++        client.write_all(b"PRESENTED\n").await.unwrap();
++        assert!(read_message(&mut daemon, b"PREPARED\n").await.is_err());
++        drop(client);
++        assert!(read_message(&mut daemon, b"PRESENTED\n").await.is_err());
++    }
++}
+diff --git a/greetd/src/split_vt_logind.rs b/greetd/src/split_vt_logind.rs
+new file mode 100644
+index 0000000..0975d0a
+--- /dev/null
++++ b/greetd/src/split_vt_logind.rs
+@@ -0,0 +1,327 @@
++//! Narrow systemd interfaces for the split VT path. No user-supplied D-Bus targets.
++use std::{
++    ffi::{CStr, CString},
++    io,
++    os::raw::{c_char, c_int, c_void},
++    ptr,
++};
++
++use crate::error::Error;
++
++type BusPtr = *mut c_void;
++
++#[link(name = "systemd")]
++extern "C" {
++    fn sd_bus_open_system(ret: *mut BusPtr) -> c_int;
++    fn sd_bus_new(ret: *mut BusPtr) -> c_int;
++    fn sd_bus_set_address(bus: BusPtr, address: *const c_char) -> c_int;
++    fn sd_bus_start(bus: BusPtr) -> c_int;
++    fn sd_bus_get_fd(bus: BusPtr) -> c_int;
++    fn sd_bus_set_method_call_timeout(bus: BusPtr, usec: u64) -> c_int;
++    fn sd_bus_unref(bus: BusPtr) -> BusPtr;
++    fn sd_bus_get_property_trivial(
++        bus: BusPtr,
++        dest: *const c_char,
++        path: *const c_char,
++        interface: *const c_char,
++        member: *const c_char,
++        error: BusPtr,
++        ty: c_char,
++        ret: *mut c_void,
++    ) -> c_int;
++    fn sd_bus_call_method(
++        bus: BusPtr,
++        dest: *const c_char,
++        path: *const c_char,
++        interface: *const c_char,
++        member: *const c_char,
++        error: BusPtr,
++        reply: *mut BusPtr,
++        types: *const c_char,
++        ...
++    ) -> c_int;
++    fn sd_pid_get_session(pid: libc::pid_t, ret: *mut *mut c_char) -> c_int;
++    fn sd_pid_get_owner_uid(pid: libc::pid_t, ret: *mut libc::uid_t) -> c_int;
++    fn sd_pid_get_user_unit(pid: libc::pid_t, ret: *mut *mut c_char) -> c_int;
++    fn sd_session_get_uid(id: *const c_char, ret: *mut libc::uid_t) -> c_int;
++    fn sd_session_get_vt(id: *const c_char, ret: *mut libc::c_uint) -> c_int;
++    fn sd_session_get_seat(id: *const c_char, ret: *mut *mut c_char) -> c_int;
++    fn sd_session_is_active(id: *const c_char) -> c_int;
++    fn sd_seat_get_sessions(
++        seat: *const c_char,
++        ids: *mut *mut *mut c_char,
++        uids: *mut *mut libc::uid_t,
++        n_uids: *mut libc::c_uint,
++    ) -> c_int;
++}
++
++fn check(status: c_int) -> Result<c_int, Error> {
++    if status < 0 {
++        return Err(io::Error::from_raw_os_error(-status).into());
++    }
++    Ok(status)
++}
++
++fn allocated(f: impl FnOnce(*mut *mut c_char) -> c_int) -> Result<CString, Error> {
++    let mut data = ptr::null_mut();
++    check(f(&mut data))?;
++    let value = unsafe { CStr::from_ptr(data).to_owned() };
++    unsafe { libc::free(data.cast()) };
++    Ok(value)
++}
++
++struct Bus(BusPtr);
++
++impl Drop for Bus {
++    fn drop(&mut self) {
++        unsafe { sd_bus_unref(self.0) };
++    }
++}
++
++impl Bus {
++    fn system() -> Result<Self, Error> {
++        let mut bus = Self(ptr::null_mut());
++        check(unsafe { sd_bus_open_system(&mut bus.0) })?;
++        check(unsafe { sd_bus_set_method_call_timeout(bus.0, 500_000) })?;
++        Ok(bus)
++    }
++
++    fn user_manager(uid: libc::uid_t, manager_pid: u32) -> Result<Self, Error> {
++        let mut bus = Self(ptr::null_mut());
++        let address = CString::new(format!("unix:path=/run/user/{}/systemd/private", uid))?;
++        check(unsafe { sd_bus_new(&mut bus.0) })?;
++        check(unsafe { sd_bus_set_address(bus.0, address.as_ptr()) })?;
++        check(unsafe { sd_bus_set_method_call_timeout(bus.0, 500_000) })?;
++        check(unsafe { sd_bus_start(bus.0) })?;
++        let fd = check(unsafe { sd_bus_get_fd(bus.0) })?;
++        let mut cred = libc::ucred {
++            pid: 0,
++            uid: 0,
++            gid: 0,
++        };
++        let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
++        if unsafe {
++            libc::getsockopt(
++                fd,
++                libc::SOL_SOCKET,
++                libc::SO_PEERCRED,
++                (&mut cred as *mut libc::ucred).cast(),
++                &mut len,
++            )
++        } != 0
++        {
++            return Err(io::Error::last_os_error().into());
++        }
++        if cred.uid != uid || cred.pid as u32 != manager_pid || manager_pid == 0 {
++            return Err("split VT: unexpected systemd user manager peer".into());
++        }
++        Ok(bus)
++    }
++
++    fn main_pid(&self, unit_path: &CStr, private: bool) -> Result<u32, Error> {
++        let dest = if private {
++            ptr::null()
++        } else {
++            cstr!("org.freedesktop.systemd1").as_ptr()
++        };
++        let mut pid: u32 = 0;
++        check(unsafe {
++            sd_bus_get_property_trivial(
++                self.0,
++                dest,
++                unit_path.as_ptr(),
++                cstr!("org.freedesktop.systemd1.Service").as_ptr(),
++                cstr!("MainPID").as_ptr(),
++                ptr::null_mut(),
++                b'u' as c_char,
++                (&mut pid as *mut u32).cast(),
++            )
++        })?;
++        Ok(pid)
++    }
++}
++
++pub fn verify_service(pid: libc::pid_t, uid: libc::uid_t) -> Result<(), Error> {
++    let mut owner = 0;
++    check(unsafe { sd_pid_get_owner_uid(pid, &mut owner) })?;
++    let unit = allocated(|ret| unsafe { sd_pid_get_user_unit(pid, ret) })?;
++    if owner != uid || unit.as_c_str() != cstr!("lumen-compositor.service") {
++        return Err("split VT: compositor peer is outside the user unit".into());
++    }
++    let system_unit = CString::new(format!(
++        "/org/freedesktop/systemd1/unit/user_40{}_2eservice",
++        uid
++    ))?;
++    let manager = Bus::system()?.main_pid(&system_unit, false)?;
++    let user_bus = Bus::user_manager(uid, manager)?;
++    let main = user_bus.main_pid(
++        cstr!("/org/freedesktop/systemd1/unit/lumen_2dcompositor_2eservice"),
++        true,
++    )?;
++    if pid as u32 != main {
++        return Err("split VT: compositor peer is not the service MainPID".into());
++    }
++    Ok(())
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Session(CString);
++
++impl Session {
++    pub fn from_worker(pid: libc::pid_t, uid: libc::uid_t, vt: usize) -> Result<Self, Error> {
++        Self::try_from_worker(pid, uid, vt)?
++            .ok_or_else(|| "split VT: worker has no PAM session".into())
++    }
++
++    pub fn try_from_worker(
++        pid: libc::pid_t,
++        uid: libc::uid_t,
++        vt: usize,
++    ) -> Result<Option<Self>, Error> {
++        let mut missing = false;
++        let id = allocated(|ret| {
++            let status = unsafe { sd_pid_get_session(pid, ret) };
++            missing = status == -libc::ENODATA || status == -libc::ENXIO;
++            status
++        });
++        if missing {
++            return Ok(None);
++        }
++        let id = id?;
++        let seat = allocated(|ret| unsafe { sd_session_get_seat(id.as_ptr(), ret) })?;
++        let mut actual_uid = 0;
++        let mut actual_vt = 0;
++        check(unsafe { sd_session_get_uid(id.as_ptr(), &mut actual_uid) })?;
++        check(unsafe { sd_session_get_vt(id.as_ptr(), &mut actual_vt) })?;
++        if actual_uid != uid || seat.as_c_str() != cstr!("seat0") || actual_vt as usize != vt {
++            return Err(
++                "split VT: PAM session does not match the expected UID, seat and VT".into(),
++            );
++        }
++        Ok(Some(Self(id)))
++    }
++
++    pub fn id(&self) -> &[u8] {
++        self.0.as_bytes()
++    }
++
++    pub fn active(&self) -> Result<bool, Error> {
++        Ok(check(unsafe { sd_session_is_active(self.0.as_ptr()) })? > 0)
++    }
++
++    pub fn activate_if(&self, guard: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
++        let bus = Bus::system()?;
++        guard()?;
++        self.call(&bus, cstr!("ActivateSession"))
++    }
++
++    pub fn terminate(&self) -> Result<(), Error> {
++        self.call(&Bus::system()?, cstr!("TerminateSession"))
++    }
++
++    fn call(&self, bus: &Bus, method: &CStr) -> Result<(), Error> {
++        check(unsafe {
++            sd_bus_call_method(
++                bus.0,
++                cstr!("org.freedesktop.login1").as_ptr(),
++                cstr!("/org/freedesktop/login1").as_ptr(),
++                cstr!("org.freedesktop.login1.Manager").as_ptr(),
++                method.as_ptr(),
++                ptr::null_mut(),
++                ptr::null_mut(),
++                cstr!("s").as_ptr(),
++                self.0.as_ptr(),
++            )
++        })?;
++        Ok(())
++    }
++}
++
++pub fn vt_is_occupied(vt: usize) -> Result<bool, Error> {
++    vt_has_other_session(vt, None)
++}
++
++pub fn vt_has_other_session(vt: usize, allowed: Option<&Session>) -> Result<bool, Error> {
++    Ok(vt_sessions(vt, allowed)?.other)
++}
++
++pub fn require_exclusive_vt(vt: usize, owner: &Session) -> Result<(), Error> {
++    let claims = vt_sessions(vt, Some(owner))?;
++    match claims {
++        VtClaims {
++            owner: true,
++            other: false,
++        } => Ok(()),
++        _ => Err("split VT: target does not belong exclusively to the pending PAM session".into()),
++    }
++}
++
++#[derive(Default)]
++struct VtClaims {
++    owner: bool,
++    other: bool,
++}
++
++fn session_vt(status: c_int, number: libc::c_uint) -> Result<Option<usize>, Error> {
++    match -status {
++        // sd-login uses ENXIO for a session that disappeared after enumeration and
++        // ENODATA for a session with no VT. An explicit zero also denotes no VT.
++        libc::ENXIO | libc::ENODATA => Ok(None),
++        _ => Ok((check(status)? >= 0 && number != 0).then_some(number as usize)),
++    }
++}
++
++fn vt_sessions(vt: usize, allowed: Option<&Session>) -> Result<VtClaims, Error> {
++    let mut ids = ptr::null_mut();
++    let count = check(unsafe {
++        sd_seat_get_sessions(
++            cstr!("seat0").as_ptr(),
++            &mut ids,
++            ptr::null_mut(),
++            ptr::null_mut(),
++        )
++    })? as usize;
++    let mut claims = VtClaims::default();
++    let mut error = None;
++    for i in 0..count {
++        unsafe {
++            let id = *ids.add(i);
++            let mut number = 0;
++            let status = sd_session_get_vt(id, &mut number);
++            match session_vt(status, number) {
++                Ok(Some(number)) if number == vt => {
++                    if allowed.is_some_and(|s| s.id() == CStr::from_ptr(id).to_bytes()) {
++                        claims.owner = true;
++                    } else {
++                        claims.other = true;
++                    }
++                }
++                Err(e) => {
++                    error.get_or_insert(e);
++                }
++                _ => {}
++            }
++            libc::free(id.cast());
++        }
++    }
++    unsafe { libc::free(ids.cast()) };
++    match error {
++        Some(e) => Err(e),
++        None => Ok(claims),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn vt_lookup_only_ignores_missing_sessions_and_unassigned_vts() {
++        assert_eq!(session_vt(-libc::ENODATA, 0).unwrap(), None);
++        assert_eq!(session_vt(-libc::ENXIO, 0).unwrap(), None);
++        assert_eq!(session_vt(0, 0).unwrap(), None);
++        assert_eq!(session_vt(0, 7).unwrap(), Some(7));
++        assert!(session_vt(-libc::EIO, 0).is_err());
++        assert!(session_vt(-libc::EACCES, 0).is_err());
++    }
++}
+diff --git a/greetd/src/terminal/ioctl.rs b/greetd/src/terminal/ioctl.rs
+index 4c072b4..065f058 100644
+--- a/greetd/src/terminal/ioctl.rs
++++ b/greetd/src/terminal/ioctl.rs
+@@ -1,6 +1,7 @@
+ use nix::{ioctl_read_bad, ioctl_write_int_bad, ioctl_write_ptr_bad};
+ 
+ pub const KDSETMODE: u16 = 0x4B3A;
++pub const KDGETMODE: u16 = 0x4B3B;
+ pub const KDTEXT: i32 = 0x00;
+ pub const KDGRAPHICS: i32 = 0x01;
+ pub const VT_OPENQRY: u16 = 0x5600;
+diff --git a/greetd/src/terminal/mod.rs b/greetd/src/terminal/mod.rs
+index 987f6cc..53cf353 100644
+--- a/greetd/src/terminal/mod.rs
++++ b/greetd/src/terminal/mod.rs
+@@ -185,6 +185,27 @@ impl Terminal {
+         }
+     }
+ 
++    pub fn kd_is_graphics(&self) -> Result<bool, Error> {
++        let mut mode = 0i32;
++        if unsafe { libc::ioctl(self.fd, ioctl::KDGETMODE as _, &mut mode) } < 0 {
++            return Err(std::io::Error::last_os_error().into());
++        }
++        Ok(mode == ioctl::KDGRAPHICS)
++    }
++
++    pub fn vt_is_open(&self, vt: usize) -> Result<bool, Error> {
++        let mut state = ioctl::vt_state {
++            v_active: 0,
++            v_signal: 0,
++            v_state: 0,
++        };
++        unsafe { ioctl::vt_getstate(self.fd, &mut state) }?;
++        let bit = 1u16
++            .checked_shl(vt as u32)
++            .ok_or("VT is outside the kernel open mask")?;
++        Ok((state.v_state & bit) != 0 || state.v_active as usize == vt)
++    }
++
+     /// Find the next unallocated VT, allocate it and return the number. Note
+     /// that allocation does not mean exclusivity, and another process may take
+     /// and use the VT before you get to it.
+@@ -228,7 +249,11 @@ impl Terminal {
+ 
+     // Forcibly take control of the terminal referred to by this fd.
+     pub fn term_take_ctty(&self) -> Result<(), Error> {
+-        let res = unsafe { ioctl::term_tiocsctty(self.fd, 1) };
++        self.term_take_controlling(true)
++    }
++
++    pub fn term_take_controlling(&self, force: bool) -> Result<(), Error> {
++        let res = unsafe { ioctl::term_tiocsctty(self.fd, i32::from(force)) };
+ 
+         match res {
+             Err(e) => Err(format!("terminal: unable to take controlling terminal: {}", e).into()),
+diff --git a/greetd_ipc/src/lib.rs b/greetd_ipc/src/lib.rs
+index 8155267..60c17b6 100644
+--- a/greetd_ipc/src/lib.rs
++++ b/greetd_ipc/src/lib.rs
+@@ -82,6 +82,18 @@ pub enum Request {
+         env: Vec<String>,
+     },
+ 
++    /// Private Lumen handoff; stock brokers reject this distinct request.
++    StartSessionSplitVt {
++        version: u32,
++        #[serde(default)]
++        cmd: Vec<String>,
++        #[serde(default)]
++        env: Vec<String>,
++    },
++
++    /// Private Lumen return notification, sent as the only request on a new connection.
++    GreeterPresented { version: u32 },
++
+     /// Cancel a session. This can only be done if the session has not been
+     /// started. Cancel does not have to be called if an error has been
+     /// encountered in its setup or login flow.

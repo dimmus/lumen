@@ -15,6 +15,7 @@ namespace {
 
 constexpr std::string_view k_session_executable = "lumen-session";
 constexpr lx::runtime::clock_time k_transport_timeout = 5'000'000'000;
+constexpr lx::runtime::clock_time k_split_start_timeout = 12'000'000'000;
 constexpr lx::runtime::clock_time k_auth_timeout = 120'000'000'000;
 
 // A single valid scalar; allow combining marks, layout-dependent symbols and
@@ -110,11 +111,13 @@ std::optional<std::string> session_word(std::string_view path) {
 }
 
 conversation::conversation(lx::runtime::event_loop& loop, std::string socket,
-                           std::string session_command, lx::runtime::callback changed)
+                           std::string session_command, lx::runtime::callback changed,
+                           bool split_vt)
     : loop_(loop),
       socket_(std::move(socket)),
       session_command_(std::move(session_command)),
-      changed_(std::move(changed)) {}
+      changed_(std::move(changed)),
+      split_vt_(split_vt) {}
 
 conversation::~conversation() {
     close();
@@ -166,6 +169,13 @@ void conversation::connected() {
         return;
     }
     ready();
+}
+
+void conversation::report_presented() {
+    if (!split_vt_ || phase_ != phase::username || may_own_session_)
+        return;
+    phase_ = phase::reporting;
+    queue(request::presented);
 }
 
 void conversation::ready() {
@@ -255,7 +265,7 @@ void conversation::receive() {
             return;
         }
         if (tx_size_ || (phase_ != phase::authenticating && phase_ != phase::cancelling &&
-                         phase_ != phase::starting)) {
+                         phase_ != phase::starting && phase_ != phase::reporting)) {
             fatal(notice::protocol);
             return;
         }
@@ -318,6 +328,14 @@ void conversation::response(std::string_view json) {
         return;
     }
     const auto type = member(object.get(), "type");
+    if (phase_ == phase::reporting) {
+        // This report uses a single-request connection. An error on initial boot
+        // simply means there is no desktop waiting for the greeter.
+        close();
+        phase_ = phase::offline;
+        reconnect();
+        return;
+    }
     if (type == "error") {
         const auto kind = member(object.get(), "error_type");
         if ((kind != "auth_error" && kind != "error") || !member(object.get(), "description")) {
@@ -413,10 +431,18 @@ void conversation::queue(request kind) {
     case request::cancel:
         payload.add(R"({"type":"cancel_session"})");
         break;
+    case request::presented:
+        payload.add(R"({"type":"greeter_presented","version":1})");
+        break;
     case request::start:
-        payload.add(R"({"type":"start_session","cmd":[)");
-        payload.string(session_command_);
-        payload.add(R"(],"env":["XDG_SESSION_TYPE=wayland"]})");
+        if (split_vt_) {
+            // A distinct request cannot be mistaken for a same-VT start by stock greetd.
+            payload.add(R"({"type":"start_session_split_vt","version":1})");
+        } else {
+            payload.add(R"({"type":"start_session","cmd":[)");
+            payload.string(session_command_);
+            payload.add(R"(],"env":["XDG_SESSION_TYPE=wayland"]})");
+        }
         break;
     }
     wipe_input();
@@ -428,7 +454,8 @@ void conversation::queue(request kind) {
     const auto size = static_cast<std::uint32_t>(payload.size);
     std::memcpy(tx_.data(), &size, k_header_bytes);
     tx_size_ = k_header_bytes + payload.size;
-    deadline_ = loop_.now() + k_transport_timeout;
+    deadline_ = loop_.now() +
+                (kind == request::start && split_vt_ ? k_split_start_timeout : k_transport_timeout);
     send();
     if (fd_.get() >= 0)
         changed();

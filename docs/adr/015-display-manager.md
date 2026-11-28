@@ -40,6 +40,29 @@ session or a new privileged client.
   or device descriptors cross the handoff. The existing launcher still owns the
   user's login-shell setup and user-manager environment.
 
+### Experimental split-VT handoff
+
+The separately packaged `lumen-dm-split-vt.service` uses an opt-in greetd build.
+The prototype reserves VT1 for the greeter, VT7 for the authenticated desktop,
+and leaves VT2 available for recovery. The broker keeps the greeter visible while
+PAM opens the user session and Lumen prepares its inactive KMS path. It asks
+logind to activate the desktop after verifying `KD_GRAPHICS` and readiness on a
+private Unix socket. The greeter exits after the broker receives a fresh response
+from a physical content flip with working input.
+
+On orderly logout the compositor keeps its display until the broker confirms
+that the replacement greeter owns the foreground graphics VT. Startup and return
+have bounded failure paths. The broker checks the foreground before each switch
+and abandons recovery after observing a third VT. Logind offers no atomic
+foreground check and switch, so concurrent manual VT changes remain a race to
+test. The authenticated desktop and the greeter retain separate UIDs and logind
+controllers, and no DRM or input descriptors cross that boundary.
+
+Keep the installed boot workaround until real-seat login and logout tests pass
+with `fbcon=vc:2-63` omitted. Display a recovery login on VT2 and check the
+physical screen alongside KMS and VT traces. The normal `lumen-dm.service`
+remains available for rollback.
+
 ## Consequences
 
 The desktop stays Vulkan-first. The login screen is a single local UI with no
