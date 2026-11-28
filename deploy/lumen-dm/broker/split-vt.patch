@@ -104,7 +104,7 @@ index 2d1d645..2a0bd2c 100644
                  default_session: ConfigSession {
                      command: "agreety".to_string(),
 diff --git a/greetd/src/context.rs b/greetd/src/context.rs
-index 6bd4d82..2a86788 100644
+index 6bd4d82..56d19f9 100644
 --- a/greetd/src/context.rs
 +++ b/greetd/src/context.rs
 @@ -1,6 +1,7 @@
@@ -359,29 +359,29 @@ index 6bd4d82..2a86788 100644
                  self.source_profile,
                  &self.listener_path,
              )
-@@ -135,10 +302,20 @@ impl Context {
+@@ -134,11 +301,20 @@ impl Context {
+             }
          }
  
++        if let Some(vts) = &self.split_vts {
++            // A fresh broker has no proof it owns the foreground. Start the greeter
++            // without switching VTs, even if the stock terminal mode allows it.
++            self.ensure_split_greeter(vts, None).await?;
++            return Ok(());
++        }
++
          let mut inner = self.inner.write().await;
 +        let child = self.start_greeter().await?;
-+        let split_greeter = if self.split_vts.is_some() {
-+            Some(SplitGreeter::track(
-+                &child,
-+                Arc::new(PidFd::open(child.task.as_raw())?),
-+            )?)
-+        } else {
-+            None
-+        };
          inner.current = Some(SessionChildSet {
 -            child: self.start_greeter().await?,
 +            child,
              time: Instant::now(),
              is_greeter: true,
-+            split_greeter,
++            split_greeter: None,
          });
          Ok(())
      }
-@@ -171,12 +348,46 @@ impl Context {
+@@ -171,12 +347,46 @@ impl Context {
                  .await?,
              time: Instant::now(),
              is_greeter: false,
@@ -428,7 +428,7 @@ index 6bd4d82..2a86788 100644
          {
              let inner = self.inner.read().await;
              if inner.current.is_none() {
-@@ -223,6 +434,9 @@ impl Context {
+@@ -223,6 +433,9 @@ impl Context {
      /// Cancel the session being configured.
      pub async fn cancel(&self) -> Result<(), Error> {
          let mut inner = self.inner.write().await;
@@ -438,7 +438,7 @@ index 6bd4d82..2a86788 100644
          if let Some(mut s) = inner.configuring.take() {
              s.session.cancel().await?;
          }
-@@ -268,6 +482,9 @@ impl Context {
+@@ -268,6 +481,9 @@ impl Context {
  
      /// Schedule the session under configuration with the provided arguments.
      pub async fn start(&self, cmd: Vec<String>, env: Vec<String>) -> Result<(), Error> {
@@ -448,7 +448,7 @@ index 6bd4d82..2a86788 100644
          let mut session = self.inner.write().await.configuring.take();
  
          match &mut session {
-@@ -298,8 +515,198 @@ impl Context {
+@@ -298,8 +514,198 @@ impl Context {
          }
      }
  
@@ -647,7 +647,7 @@ index 6bd4d82..2a86788 100644
          // Keep trying to terminate the greeter until it gives up.
          let mut inner = self.inner.write().await;
  
-@@ -327,15 +734,420 @@ impl Context {
+@@ -327,15 +733,420 @@ impl Context {
                  child: s,
                  time: Instant::now(),
                  is_greeter: false,
@@ -1069,7 +1069,7 @@ index 6bd4d82..2a86788 100644
          loop {
              match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
                  // No scheduled exits.
-@@ -343,6 +1155,10 @@ impl Context {
+@@ -343,6 +1154,10 @@ impl Context {
  
                  // We got an exit, see if it's something we need to clean up.
                  Ok(WaitStatus::Exited(pid, ..)) | Ok(WaitStatus::Signaled(pid, ..)) => {
@@ -1080,7 +1080,7 @@ index 6bd4d82..2a86788 100644
                      let mut inner = self.inner.write().await;
                      let (was_greeter, sesion_length) = match &inner.current {
                          Some(s) if s.child.owns_pid(pid) => {
-@@ -367,6 +1183,7 @@ impl Context {
+@@ -367,6 +1182,7 @@ impl Context {
                                  child: s,
                                  time: Instant::now(),
                                  is_greeter: false,
@@ -1088,7 +1088,7 @@ index 6bd4d82..2a86788 100644
                              });
                          }
                          None => {
-@@ -380,6 +1197,7 @@ impl Context {
+@@ -380,6 +1196,7 @@ impl Context {
                                  child: self.start_greeter().await?,
                                  time: Instant::now(),
                                  is_greeter: true,
@@ -1096,7 +1096,7 @@ index 6bd4d82..2a86788 100644
                              });
                          }
                      }
-@@ -404,6 +1222,27 @@ impl Context {
+@@ -404,6 +1221,27 @@ impl Context {
      /// SIGTERM.
      pub async fn terminate(&self) -> Result<(), Error> {
          let mut inner = self.inner.write().await;
@@ -1124,7 +1124,7 @@ index 6bd4d82..2a86788 100644
          if let Some(mut sess) = inner.configuring.take() {
              let _ = sess.session.cancel().await;
          }
-@@ -411,7 +1250,10 @@ impl Context {
+@@ -411,7 +1249,10 @@ impl Context {
              let _ = sess.session.cancel().await;
          }
          if let Some(sess) = inner.current.take() {

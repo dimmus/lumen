@@ -12,7 +12,7 @@ _commit=08efe60feceea8c81f9571c666880ff1e1c2e3ff
 source=("greetd-${_commit}.tar.gz::https://codeload.github.com/kennylevinsen/greetd/tar.gz/${_commit}"
         'split-vt.patch' 'lumen-dm-split-vt.service' 'greetd-split-vt.toml')
 sha256sums=('c36b48756789648c449e2078047d27875d68971485a836fa0a0be51119bdcc2c'
-            'b3b610de85df1ffacbabd3e4258c7d608f1d0c11626b4251fe5bdd9fbe7e61b0'
+            '4dd978e07ade17b17f990fd19ff6466fbe2cfdefecf65233d42ebb5d5794e277'
             'eef40a280bf35a9cd36247c00560d907f21fa09585cb4ad4261463f787d5b517'
             'bf36b61911b1cc984ff4b61989d88fbad613b61a7b2da699861906bf49a9ed9b')
 backup=('etc/lumen-dm/greetd-split-vt.toml')

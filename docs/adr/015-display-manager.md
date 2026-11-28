@@ -58,6 +58,11 @@ foreground check and switch, so concurrent manual VT changes remain a race to
 test. The authenticated desktop and the greeter retain separate UIDs and logind
 controllers, and no DRM or input descriptors cross that boundary.
 
+At startup or after broker death, the broker starts the greeter without activating
+VT1. If VT1 is already foreground at boot, no switch is needed. Otherwise the
+operator returns to VT1 manually once the greeter has started. If a previous
+session still occupies a reserved VT, startup can fail rather than taking it over.
+
 Keep the installed boot workaround until real-seat login and logout tests pass
 with `fbcon=vc:2-63` omitted. Display a recovery login on VT2 and check the
 physical screen alongside KMS and VT traces. The normal `lumen-dm.service`
