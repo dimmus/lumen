@@ -220,8 +220,26 @@ current when an item closes.
   clang-format run on a bare /tmp copy of the file produces, ~35x the real debt),
   zero on the change's 19 added lines (violation-line set ∩
   added-line set = ∅; the changed test file is clean) — diff-hygiene exits 1 with no
-  added line at fault. (The script's own
+  added line at fault. Fifth instance 2026-11-25 with wlr-foreign-toplevel-management:
+  eight modified files whole-file dirty at base == tree alike (protocols.cppm,
+  shell_bridge.cppm, wire.cppm, wire_install.cpp, wire_output.cpp, wire_workspace.cpp,
+  tests/clients/lumen-probe.cpp, tests/test_window_protocols.cpp; per-line counts base vs
+  head 24/24, 33/33, 26/26, 10/10, 18/18, 9/9, 282/282, 83/83), 0 of the 91 added lines
+  at fault, all three new C++ files whole-file clean — diff-hygiene exits 1 with no added
+  line at fault. (The script's own
   `local`-at-top-level bug is the row above.)
+- [ ] **The build-run skill's app-smoke notebook baseline is stale** (found 2026-11-25
+  with wlr-foreign-toplevel-management; pre-existing; low): `.zcode/skills/lumen-build-run/
+  SKILL.md:37-39` documents app-smoke = 177 PASS / 0 WARN / 0 FAIL; a brokered clean-main
+  e80fc1a run on the notebook (2026-11-25) measures 173 PASS / 4 WARN / 0 FAIL, and the
+  wlr-foreign task branch 174/4/0 (its new Q8 row the +1) — four WARN rows (B6 GTK
+  open+Escape, B6 GTK open+outside click, B6 GTK flip at the bottom, G11 GTK → foot) that
+  are not in the skill's environmental list and reproduce on main the same day
+  (`evidence/2026-11-25-wlr-foreign-toplevel/app-smoke-main-baseline-1.log` in the task
+  worktree). Unjudged: either the four GTK rows are environmental and join the list, or
+  they are a real regression to bisect (the 2026-11-26 libinput upgrade is a candidate
+  trigger). Fix: re-measure a fresh clean-main baseline, update the skill's number and
+  list — a skill edit owes an eval rerun.
 - [x] **smoke_harness hermetic fixture lost seat-lock.sh** (found 2026-11-19, notebook,
   pre-existing since the seat-broker merge ba80f18): the perfetto sub-suite copies
   `ui-bench.sh` + `bench-warmup.sh` into the fixture dir but not `seat-lock.sh`, and
@@ -267,6 +285,12 @@ current when an item closes.
   harness change touches no product/test code). Next occurrence: capture the failing
   sub-rows with timestamps and check for libinput/seat-event delay correlation before
   considering a stabilization fix (retry-once in the test or a wider timeout).
+  Third sighting 2026-11-26 (wlr-foreign-toplevel post-task suite re-run): 6 session-lock
+  cases failed deterministically (3/3 re-runs) AND reproduced identically on main's own
+  Nov-26 binary — environmental, attributed by clean reproduction; the Nov 26 21:11
+  system upgrade incl. libinput is the suspected trigger, mechanism not pinpointed;
+  ui_bench_e2e_dry_run failed its seat preflight vs the user's live compositor the same
+  day. This row's "capture with timestamps" step is still owed.
 - [x] **Agent-level parallelism landed** (2026-11-19, this change): gated-change
   confirmations now dispatch under `Promise.all` (studio already did), and
   `lumen-studio` §Lead duties mandates parallel dispatch of independent role agents.

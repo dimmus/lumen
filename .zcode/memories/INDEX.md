@@ -2,7 +2,7 @@
      archive (and for lumen-decisions/lumen-build-run lookups): grep the
      module slice instead of the whole archive. Do not hand-edit. -->
 
-# Memory index by module (59 records, generated 2026-11-25)
+# Memory index by module (61 records, generated 2026-11-28)
 
 ## (general)
 
@@ -54,6 +54,8 @@
 
 ## lx.compositor
 
+- **wlr foreign toplevel management closeout** (2026-11-25) — wlr-foreign-toplevel close-out: full semantics + artifact paths (evidence/2026-11-25-wlr-foreign-toplevel/), heaptrack-wrapper fuckup, 2026-11-26 suite drift  [topics: protocol, observer, taskbar, waybar]
+- **wlr foreign toplevel management** (2026-11-25) — zwlr_foreign_toplevel_management_v1 v3 from lx.compositor, 28db6b6..cde2e50 READY 2026-11-25; ctest 148→149 (77 cases), smokes PASS, idle A/B flat; landing owes fetch-protocols.sh on main  [topics: protocol, observer, taskbar, waybar]
 - **event loop slot leak** (2026-11-24) — Slot leak fixed (fe97caf): ~event_loop() reclaims own source-table slots via owners[]; pre-fix red 4/5 artifact-backed; ctest 142/142; closes the 3rd-start() bug; noise 3/3/0/3  [topics: event-loop, leak, destructor, source-table, compositor-restart]
 - **invariant gap tests** (2026-11-24) — 4 invariants-GAP tests (f936cda..976b3a1): GPU-pool row closed on hasvk; 3 rows narrowed; 2 overflow departures found; ctest 142→146; start() takes the seat, 3rd start()/process fails  [topics: invariants, overflow, memory-pressure, present-mode]
 - **seatless virtual start closeout** (2026-11-24) — Closeout: gate numbers (142/142, smokes PASS, vulkan A/B rounds), dead-assert forensics + getpeername proof, review findings detail, honest gaps  [topics: seat-less, bench, seat-broker, gate]
@@ -164,10 +166,14 @@
 
 ## protocols
 
+- **wlr foreign toplevel management closeout** (2026-11-25) — wlr-foreign-toplevel close-out: full semantics + artifact paths (evidence/2026-11-25-wlr-foreign-toplevel/), heaptrack-wrapper fuckup, 2026-11-26 suite drift  [topics: protocol, observer, taskbar, waybar]
+- **wlr foreign toplevel management** (2026-11-25) — zwlr_foreign_toplevel_management_v1 v3 from lx.compositor, 28db6b6..cde2e50 READY 2026-11-25; ctest 148→149 (77 cases), smokes PASS, idle A/B flat; landing owes fetch-protocols.sh on main  [topics: protocol, observer, taskbar, waybar]
 - **toplevel drag protocol registration** (2026-11-12) — xdg-toplevel-drag-v1 manifest block (glue only); suite 133-era known-red tolerated; smoke trap LUMEN_BUILD_DIR; review dedup 578e08c≡d4e96d5  [topics: protocol, manifest]
 
 ## scripts
 
+- **wlr foreign toplevel management closeout** (2026-11-25) — wlr-foreign-toplevel close-out: full semantics + artifact paths (evidence/2026-11-25-wlr-foreign-toplevel/), heaptrack-wrapper fuckup, 2026-11-26 suite drift  [topics: protocol, observer, taskbar, waybar]
+- **wlr foreign toplevel management** (2026-11-25) — zwlr_foreign_toplevel_management_v1 v3 from lx.compositor, 28db6b6..cde2e50 READY 2026-11-25; ctest 148→149 (77 cases), smokes PASS, idle A/B flat; landing owes fetch-protocols.sh on main  [topics: protocol, observer, taskbar, waybar]
 - **super tap mid chord repro** (2026-11-24) — Super tap mid-chord NOT_REPRODUCED (notebook 2026-11-24): 45 chords, 0 fires, control 6/6 at 161-182 us; 2026-11-17 sighting = lone-meta tap + saved chord binding; no product change; noise 2/2/0/0.  [topics: keybindings, tap, injection, seat, repro]
 - **tray menu uaf** (2026-11-24) — Tray-menu UAF fixed (a89cbad..63941df): close_from() freed ui_context inside its own key delivery; ASan seat repro 1/1, post-fix 30/30; injection dead-window 10:01-10:52; noise 5/5/0/1  [topics: asan, use-after-free, menu, tray, popup, seat]
 - **smoke harness broker fixture** (2026-11-23) — smoke_harness perfetto fixture carries the seat broker hermetically (wrapper→real broker --no-preflight, private lock dir); 49/13→82/0; mutations flip it; review noise 6/6/0, 2 preexisting  [topics: smoke, seat-broker, hermeticity]
