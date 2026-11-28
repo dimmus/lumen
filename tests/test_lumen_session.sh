@@ -18,8 +18,10 @@ pass() { echo "  PASS  $1"; }
 fail() { echo "  FAIL  $1${2:+ — $2}"; fails=$((fails + 1)); }
 
 cp "$SRC/deploy/lumen/config.toml" "$WORK/default-config.toml"
+# Keep the fixture's broker socket under WORK, not /run.
 sed -e "s|@LUMEN_BINDIR@|$WORK/bin|" \
     -e "s|@LUMEN_DEFAULT_CONFIG@|$WORK/default-config.toml|" \
+    -e 's|/run/lumen-dm-handoff/|"${FAKE_STATE%/*}"/handoff/|' \
     "$SRC/scripts/lumen-session.in" >"$WORK/bin/lumen-session"
 chmod +x "$WORK/bin/lumen-session"
 
@@ -32,7 +34,8 @@ echo "systemctl $*" >>"$S/log"
 [[ "$1" == --user ]] && shift
 [[ -e "$S/no-manager" ]] && exit 1
 quiet=0; [[ "$1" == -q ]] && { quiet=1; shift; }
-wait_flag=0; [[ "$1" == --wait ]] && { wait_flag=1; shift; }
+transaction=0; [[ "$1" == --show-transaction ]] && { transaction=1; shift; }
+[[ "$1" == --wait ]] && shift
 setvar() { grep -v "^${1%%=*}=" "$S/env" >"$S/env.tmp"; echo "$1" >>"$S/env.tmp"; sort -o "$S/env" "$S/env.tmp"; }
 unsetvar() { grep -v "^$1=" "$S/env" >"$S/env.tmp"; mv "$S/env.tmp" "$S/env"; }
 case "$1" in
@@ -41,9 +44,32 @@ case "$1" in
   unset-environment) shift; for n in "$@"; do unsetvar "$n"; done ;;
   import-environment) shift; for n in "$@"; do setvar "$n=${!n}"; done ;;
   is-active) grep -qx "$2" "$S/active"; exit $? ;;
-  reset-failed|stop) ;;
+  reset-failed) ;;
+  stop)
+    if [[ -p "$S/session-end" && "${*: -1}" == lumen-compositor.service ]]; then
+      if [[ ! -e "$S/job-queued" ]]; then
+        touch "$S/stopped-before-queue"
+        exit 1
+      fi
+      case "${FAKE_STOP_FAILURE:-}" in
+        always) exit 1 ;;
+        once) if [[ ! -e "$S/stop-failed" ]]; then touch "$S/stop-failed"; exit 1; fi ;;
+      esac
+      printf 'stop\n' 1<>"$S/session-end"
+    fi ;;
   start)
     if [[ "$2" == lumen-compositor.service ]]; then
+      if (( transaction )); then
+        if [[ -p "$S/allow-ack" ]]; then
+          read -r -t 8 0<>"$S/allow-ack" || exit 8
+        fi
+        touch "$S/job-queued"
+        printf 'Enqueued anchor job 23 lumen-compositor.service/start.\n' >&2
+        if [[ -p "$S/session-end" ]]; then
+          read -r -t 8 0<>"$S/session-end" || exit 8
+          exit 0
+        fi
+      fi
       cmp -s "${XDG_CONFIG_HOME:-$HOME/.config}/lumen/config.toml" "$FAKE_STATE/../default-config.toml" &&
         touch "$S/config-ready"
       # The compositor exports its variables; a clean exit unsets them, a crash does not.
@@ -65,6 +91,16 @@ EOF
 cat >"$WORK/bin/loginctl" <<'EOF'
 #!/usr/bin/env bash
 echo "${FAKE_ACTIVE:-yes}"
+EOF
+cat >"$WORK/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+# The fixture cannot create a root-owned broker socket as an ordinary user.
+if [[ "$#" == 4 && "$1" == -c && "$2" == %u && "$3" == -- &&
+      "$4" == "${FAKE_STATE%/*}/handoff/"*.sock ]]; then
+  printf '0\n'
+else
+  exec /usr/bin/stat "$@"
+fi
 EOF
 # Fallback binaries: the compositor serves until its socket file is removed.
 cat >"$WORK/bin/lumen-compositor" <<'EOF'
@@ -344,6 +380,62 @@ else
   fail "concurrent config publication" "rc=$rc"
 fi
 rm -f "$WORK/bin/ln"
+
+# 12. Split-VT cancellation before acknowledgement and in the idle read window.
+mkdir -p "$WORK/handoff"
+handoff_name=00000000000000000000000000000000.sock
+python3 -I -c 'import os, socket, sys
+os.chdir(sys.argv[1])  # Bind by basename so long build paths work as well.
+with socket.socket(socket.AF_UNIX) as sock:
+    sock.bind(sys.argv[2])' "$WORK/handoff" "$handoff_name"
+cat >"$WORK/signal-at-read" <<'EOF'
+# Inject TERM immediately before the launcher's transaction-pipe read, rather
+# than racing a sleep against when Bash happens to enter the blocking read.
+unset BASH_ENV
+read() {
+  if [[ "${2:-}" == -u && ! -e "$FAKE_STATE/signalled" ]]; then
+    if [[ "$FAKE_SIGNAL_PHASE" == before ]]; then
+      : >"$FAKE_STATE/signalled"
+      kill -TERM "$BASHPID"
+      printf 'queue\n' 1<>"$FAKE_STATE/allow-ack"
+    elif [[ "${acknowledged:-0}" == 1 ]]; then
+      : >"$FAKE_STATE/signalled"
+      kill -TERM "$BASHPID"
+    fi
+  fi
+  builtin read "$@"
+}
+EOF
+
+for scenario in delayed idle retry failed; do
+  reset_state
+  cp "$STATE/env" "$STATE/env-before"
+  mkfifo "$STATE/session-end"
+  phase=after stop_failure= expected_stops=1
+  case "$scenario" in
+    delayed)
+      phase=before
+      mkfifo "$STATE/allow-ack"
+      exec {ack_pipe}<>"$STATE/allow-ack" # Retain the byte until the manager opens its end.
+      ;;
+    retry) stop_failure=once; expected_stops=2 ;;
+    failed) stop_failure=always; expected_stops=2 ;;
+  esac
+  run_session XDG_VTNR=7 FAKE_ACTIVE=no LUMEN_DM_HANDOFF="$WORK/handoff/$handoff_name" \
+    FAKE_SIGNAL_PHASE="$phase" FAKE_STOP_FAILURE="$stop_failure" BASH_ENV="$WORK/signal-at-read" \
+    timeout -k 1s 4s "$WORK/bin/lumen-session" -l >"$STATE/out" 2>&1
+  rc=$?
+  if [[ "$scenario" == delayed ]]; then exec {ack_pipe}>&-; fi
+  if (( rc == 1 )) && [[ -e "$STATE/signalled" && -e "$STATE/job-queued" &&
+                         ! -e "$STATE/stopped-before-queue" && ! -e "$WORK/runtime/lumen/dm-handoff.env" ]] &&
+     [[ $(grep -c '^systemctl --user stop .*lumen-compositor.service$' "$STATE/log") == "$expected_stops" ]] &&
+     diff -q "$STATE/env" "$STATE/env-before" >/dev/null &&
+     { [[ "$scenario" != failed ]] || grep -q 'failed to stop the display manager session' "$STATE/out"; }; then
+    pass "split-VT cancellation: $scenario"
+  else
+    fail "split-VT cancellation: $scenario" "rc=$rc; $(tr '\n' '|' <"$STATE/out")"
+  fi
+done
 
 echo "$fails failed"
 (( fails == 0 ))

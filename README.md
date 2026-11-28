@@ -99,6 +99,18 @@ and run `sudo systemctl disable --now lumen-dm.service`. Re-enable your previous
 manager or return to `multi-user.target` for console logins. The installed files and
 all parent directories must be trusted, root-owned, and not writable by ordinary users.
 
+### Split-VT login preview (Arch Linux)
+
+The experimental broker starts the authenticated Lumen session on VT7 while the
+greeter is still visible on VT1. Orderly logout prepares VT1 again before the
+desktop exits. The package in `deploy/lumen-dm/broker/` builds from pinned greetd
+source using `makepkg` and installs a separate `lumen-dm-split-vt.service`.
+It requires a matching Lumen build installed under `/usr`, Linux 6.5 or later,
+logind, and POSIX ACL support under `/run`. Keep VT7 free and confirm the VT2
+recovery console works before selecting the experimental service. The two
+services share the `display-manager.service` alias, so disable the current
+manager before enabling the preview. See ADR 015 for the rollout checks.
+
 ## Documentation
 
 - [User guide](docs/user-guide.md) — building and testing, key bindings, the shell, monitors,

@@ -80,6 +80,17 @@ constexpr lx::session::detail::greeter_session_facts local_greeter{
     .local = true,
 };
 
+struct dm_logind {
+    lx::session::detail::dm_session_facts facts{1000, 8, true, "seat0", "user"};
+    unsigned lookups = 0;
+
+    static lx::session::detail::dm_session_facts lookup(void* user, const char* id) {
+        auto& self = *static_cast<dm_logind*>(user);
+        ++self.lookups;
+        return std::string_view{id} == "c28" ? self.facts : lx::session::detail::dm_session_facts{};
+    }
+};
+
 } // namespace
 
 LUMEN_TEST(xdg_session_id_wins_when_it_is_a_seat_session_of_this_user) {
@@ -203,6 +214,53 @@ LUMEN_TEST(greeter_open_policy_requires_exact_class_and_local_seat0_vt) {
     f = local_greeter;
     f.local = false;
     LUMEN_CHECK(!discover_greeter_session(975, 975, f).found());
+}
+
+LUMEN_TEST(dm_handoff_resolves_exactly_the_expected_session_and_vt) {
+    using lx::session::detail::discover_dm_session;
+    dm_logind d;
+    const auto c = discover_dm_session(1000, 1000, "c28", "8", dm_logind::lookup, &d);
+    LUMEN_CHECK(c.found_by == lx::session::session_found_by::environment && id_of(c) == "c28");
+    LUMEN_CHECK(d.lookups == 1);
+    LUMEN_CHECK(!discover_dm_session(1000, 1000, "c29", "8", dm_logind::lookup, &d).found());
+    LUMEN_CHECK(!discover_dm_session(1000, 1000, "c28", "7", dm_logind::lookup, &d).found());
+    LUMEN_CHECK(d.lookups == 3);
+}
+
+LUMEN_TEST(dm_handoff_rejects_missing_or_malformed_launcher_identity) {
+    using lx::session::detail::discover_dm_session;
+    dm_logind d;
+    const std::string overlong_id(64, 'c');
+    for (const auto* id : {static_cast<const char*>(nullptr), "", "../c28", overlong_id.c_str()})
+        LUMEN_CHECK(!discover_dm_session(1000, 1000, id, "8", dm_logind::lookup, &d).found());
+    for (auto vt : {"", "0", "-8", "+8", " 8", "8 ", "8x", "64", "9999999999999999"})
+        LUMEN_CHECK(!discover_dm_session(1000, 1000, "c28", vt, dm_logind::lookup, &d).found());
+    LUMEN_CHECK(d.lookups == 0);
+}
+
+LUMEN_TEST(dm_handoff_requires_same_nonroot_uid_and_exact_local_user_class_and_seat) {
+    using lx::session::detail::discover_dm_session;
+    dm_logind d;
+    const auto accepted = [&](unsigned uid = 1000, unsigned euid = 1000) {
+        return discover_dm_session(uid, euid, "c28", "8", dm_logind::lookup, &d).found();
+    };
+    LUMEN_CHECK(!accepted(1000, 1001));
+    LUMEN_CHECK(!accepted(1001, 1001));
+    d.facts.uid = 0;
+    LUMEN_CHECK(!accepted(0, 0));
+    d.facts.uid = 1000;
+    for (auto seat : {"", "seat1", "seat00"}) {
+        d.facts.seat = seat;
+        LUMEN_CHECK(!accepted());
+    }
+    d.facts.seat = "seat0";
+    for (auto cls : {"", "greeter", "manager", "user-early", "user-extra"}) {
+        d.facts.session_class = cls;
+        LUMEN_CHECK(!accepted());
+    }
+    d.facts.session_class = "user";
+    d.facts.local = false;
+    LUMEN_CHECK(!accepted());
 }
 
 int main(int argc, char** argv) {

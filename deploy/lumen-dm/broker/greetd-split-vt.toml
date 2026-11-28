@@ -1,0 +1,11 @@
+[terminal]
+vt = 1
+switch = true
+user_vt = 7
+
+[general]
+source_profile = false
+
+[default_session]
+command = "/usr/libexec/lumen-dm /usr/bin/lumen-session --split-vt"
+user = "lumen-dm"

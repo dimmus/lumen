@@ -23,8 +23,17 @@ import lx.text;
 import lx.trace;
 import lx.ui;
 
+#include "field.hpp"
 #include "greetd.hpp"
 #include "kms_host.hpp"
+
+#ifdef LUMEN_DM_TEST_FORM
+namespace lumen::dm {
+struct conversation_test {
+    static void set_phase(conversation& value, phase state) { value.phase_ = state; }
+};
+} // namespace lumen::dm
+#endif
 
 namespace {
 
@@ -32,6 +41,18 @@ namespace dm = lumen::dm;
 constexpr lx::trace::category log_dm{"lumen.dm"};
 constexpr lx::runtime::clock_time k_repeat_delay_ns = 400'000'000;
 constexpr lx::runtime::clock_time k_repeat_step_ns = 25'000'000;
+constexpr lx::runtime::clock_time k_handoff_wait_ns = 50'000'000;
+
+[[nodiscard]] constexpr bool can_retain_frame(dm::phase phase, std::uint64_t requested,
+                                              std::uint64_t presented, bool visible) {
+    return phase == dm::phase::started && requested != 0 && presented == requested && visible;
+}
+
+static_assert(can_retain_frame(dm::phase::started, 2, 2, true));
+static_assert(!can_retain_frame(dm::phase::fatal, 2, 2, true));
+static_assert(!can_retain_frame(dm::phase::starting, 2, 2, true));
+static_assert(!can_retain_frame(dm::phase::started, 2, 1, true));
+static_assert(!can_retain_frame(dm::phase::started, 2, 2, false));
 
 [[nodiscard]] lx::color background() {
     return lx::ui::active_theme().color(lx::ui::tok::surface_background);
@@ -77,6 +98,7 @@ constexpr lx::runtime::clock_time k_repeat_step_ns = 25'000'000;
     case dm::phase::fatal:
         return nullptr;
     case dm::phase::connecting:
+    case dm::phase::reporting:
         return "Connecting to the sign-in service…";
     case dm::phase::authenticating:
         return "Checking credentials…";
@@ -102,7 +124,7 @@ thread_local greeter* active = nullptr;
 class greeter final : public lx::runtime::event_source {
 public:
     greeter(lx::runtime::event_loop& loop, lx::session::logind_session& session, std::string socket,
-            std::string command)
+            std::string command, bool split_vt = false)
         : loop_(loop),
           session_(session),
           kms_(loop, session,
@@ -117,17 +139,25 @@ public:
                 .user = this,
                 .background_xrgb = background_xrgb(),
                 .presented =
-                    [](void* user, std::uint64_t revision) {
-                        static_cast<greeter*>(user)->presented_revision_ = revision;
+                    [](void* user, std::uint64_t revision, bool kernel_event) {
+                        auto& self = *static_cast<greeter*>(user);
+                        self.presented_revision_ = revision;
+                        self.kernel_presented_ = kernel_event;
+                        if (self.painted_revision_ == revision)
+                            self.presented_field_ = self.painted_field_;
                     }}),
-          conversation_(loop, std::move(socket), std::move(command), [this] { changed(); }) {
+          conversation_(
+              loop, std::move(socket), std::move(command), [this] { changed(); }, split_vt),
+          split_vt_(split_vt) {
         repeat_.set_enabled(false);
+        handoff_timeout_.set_enabled(false);
     }
 
     ~greeter() override {
         stopping_ = true;
         loop_.set_after_dispatch({});
         loop_.remove_source(&repeat_);
+        loop_.remove_source(&handoff_timeout_);
         loop_.remove_source(this);
         if (input_source_) {
             loop_.remove_source(&*input_source_);
@@ -136,7 +166,7 @@ public:
         }
         reset_compose();
         conversation_.clear_input();
-        kms_.close();
+        kms_.close(retain_revision_);
         lx::ui::set_ui_resources({});
         active = nullptr;
     }
@@ -180,7 +210,8 @@ public:
         // At simultaneous readiness, handle a pending session loss before input or KMS.
         loop_.add_source(this);
         loop_.add_source(&repeat_);
-        kms_.request_frame(form_revision_);
+        loop_.add_source(&handoff_timeout_);
+        kms_.request_frame(frame_revision_);
         if (auto result = kms_.open(); !result)
             return result;
         if (session_.is_active()) {
@@ -198,17 +229,24 @@ public:
     }
 
     void stop() {
+        retain_revision_ = 0;
         stopping_ = true;
         loop_.quit(conversation_.view().exit_code().value_or(1));
     }
 
 private:
+#ifdef LUMEN_DM_TEST_FORM
+    friend bool test_form_pixels();
+#endif
+
     [[nodiscard]] lx::result<void> configure(lx::rect2i rect) {
         const int scale = kms_.scale();
         if (scale <= 0 || rect.width < scale || rect.height < scale)
             return lx::invalid_argument("invalid greeter form extent");
         // A release following an output change must not click at the old target.
         presented_revision_ = 0;
+        painted_revision_ = 0;
+        presented_field_.bounds = {};
         cancel_pointer();
         form_ = rect;
         root_.set_scale(static_cast<float>(scale));
@@ -217,7 +255,13 @@ private:
     }
 
     [[nodiscard]] lx::result<void> paint(const lx::gfx::pixel_surface& target) {
-        (void)root_.tick(draws_);
+        if (root_.tick(draws_)) {
+            draws_.batch_for_render();
+            if (painted_revision_ != frame_revision_) {
+                painted_field_ = dm::snapshot_field(root_.tree());
+                painted_revision_ = frame_revision_;
+            }
+        }
         const lx::gfx::ui_stream stream{
             .refs = draws_.refs(),
             .batches = draws_.batches(),
@@ -234,16 +278,30 @@ private:
         return {};
     }
 
-    [[nodiscard]] bool seat_active() const { return engaged_ && !stopping_ && !vt_switch_pending_; }
+    [[nodiscard]] bool seat_active() const {
+        return engaged_ && !stopping_ && !vt_switch_pending_ && handoff_revision_ == 0;
+    }
+
+    [[nodiscard]] bool form_presented() const {
+        return seat_active() && !cancel_pointer_owed_ && kms_.content_visible() &&
+               presented_revision_ >= form_revision_;
+    }
 
     [[nodiscard]] bool accepts_input() const {
-        return seat_active() && !cancel_pointer_owed_ && kms_.content_visible() &&
-               presented_revision_ == form_revision_;
+        return form_presented() && (!split_vt_ || presentation_reported_) &&
+               conversation_.view().state != dm::phase::reporting;
     }
 
     void update_form() {
         if (stopping_ || !engaged_)
             return;
+        if (can_retain_frame(conversation_.view().state, handoff_revision_, presented_revision_,
+                             kms_.content_visible())) {
+            retain_revision_ = handoff_revision_;
+            stopping_ = true;
+            loop_.quit(0);
+            return;
+        }
         if (std::exchange(cancel_pointer_owed_, false))
             cancel_pointer();
         const auto display = kms_.display_rect();
@@ -255,13 +313,26 @@ private:
             return;
         }
         display_present_ = true;
-        if (!interactive_logged_ && keyboard_ready_ && accepts_input() &&
+        if (keyboard_ready_ && form_presented() &&
             conversation_.view().state == dm::phase::username) {
-            interactive_logged_ = true;
-            log_dm.info("greeter_interactive timestamp_ns={}", loop_.now());
+            if (split_vt_ && !presentation_reported_) {
+                if (!kernel_presented_) {
+                    // A blocking modeset can be the only initial frame. Request a
+                    // kernel flip before reporting the greeter ready to the broker.
+                    kms_.request_frame(frame_revision_);
+                    return;
+                }
+                presentation_reported_ = true;
+                conversation_.report_presented();
+                return;
+            }
+            if (!interactive_logged_) {
+                interactive_logged_ = true;
+                log_dm.info("greeter_interactive timestamp_ns={}", loop_.now());
+            }
         }
         if (root_.wants_frame())
-            kms_.request_frame(form_revision_);
+            kms_.request_frame(frame_revision_);
     }
 
     [[nodiscard]] static int open_input(const char* path, int flags, void* user) {
@@ -459,14 +530,28 @@ private:
                 display.y + static_cast<int>(std::clamp(y, 0.0, double(display.height - 1)))};
     }
 
+    [[nodiscard]] lx::point2i logical_point(lx::point2i point) const {
+        const int scale = kms_.scale();
+        return {(point.x - form_.x) / scale, (point.y - form_.y) / scale};
+    }
+
+    void press_field(lx::point2i point) {
+        if (!conversation_.editable())
+            return;
+        if (const auto caret = presented_field_.caret_at(logical_point(point))) {
+            reset_compose();
+            stop_repeat();
+            conversation_.place_caret(*caret);
+        }
+    }
+
     bool route_position(lx::point2i point) {
         const lx::point2i local{point.x - form_.x, point.y - form_.y};
         if (local.x < 0 || local.y < 0 || local.x >= form_.width || local.y >= form_.height) {
             root_.pointer_leave();
             return false;
         }
-        const int scale = kms_.scale();
-        root_.pointer_move({local.x / scale, local.y / scale});
+        root_.pointer_move(logical_point(point));
         return true;
     }
 
@@ -496,10 +581,15 @@ private:
             return;
         if (event.device_removed) {
             cancel_pointer();
-        } else if (pointer_initialized_ && route_position(position(pointer_x_, pointer_y_))) {
-            root_.pointer_button(lx::ui::mouse_button::left, event.pressed);
-        } else if (!event.pressed) {
-            root_.pointer_cancel();
+        } else if (pointer_initialized_) {
+            const auto point = position(pointer_x_, pointer_y_);
+            if (route_position(point)) {
+                if (event.pressed)
+                    press_field(point);
+                root_.pointer_button(lx::ui::mouse_button::left, event.pressed);
+            } else if (!event.pressed) {
+                root_.pointer_cancel();
+            }
         }
     }
 
@@ -526,9 +616,11 @@ private:
             return;
         }
         const auto display = kms_.display_rect();
-        if (!route_position(position(event.x * display.width, event.y * display.height))) {
+        const auto point = position(event.x * display.width, event.y * display.height);
+        if (!route_position(point)) {
             root_.pointer_cancel();
         } else if (event.kind == phase::down) {
+            press_field(point);
             root_.pointer_button(lx::ui::mouse_button::left, true);
         }
     }
@@ -578,17 +670,57 @@ private:
         }
     }
 
+    // Rebase both maps: either their frame is on screen now or it can be next.
+    void edit_input(auto edit) {
+        const auto length = [](const dm::screen& value) -> std::size_t {
+            if (value.state == dm::phase::secret)
+                return value.mask_length;
+            return std::ranges::count_if(value.visible_value, dm::field_detail::scalar_start);
+        };
+        const auto before = conversation_.view();
+        const auto old_length = length(before);
+        edit();
+        const auto after = conversation_.view();
+        const auto new_length = length(after);
+        if (old_length == new_length)
+            return;
+        const auto first = std::min(before.caret_index, after.caret_index);
+        const auto removed = old_length > new_length ? old_length - new_length : 0;
+        const auto inserted = new_length > old_length ? new_length - old_length : 0;
+        painted_field_.rebase(first, removed, inserted);
+        presented_field_.rebase(first, removed, inserted);
+    }
+
     bool handle_key(unsigned code, bool repeated) {
         auto& keymap = input_.default_seat().keymap();
         const unsigned sym = keymap.keysym(code);
-        if (sym == XKB_KEY_BackSpace) {
-            reset_compose();
-            conversation_.erase();
-            return conversation_.editable();
+        if (conversation_.editable()) {
+            switch (sym) {
+            case XKB_KEY_BackSpace:
+                reset_compose();
+                edit_input([this] { conversation_.erase(); });
+                return true;
+            case XKB_KEY_Delete:
+                reset_compose();
+                edit_input([this] { conversation_.erase_forward(); });
+                return true;
+            case XKB_KEY_Left:
+            case XKB_KEY_Right:
+                reset_compose();
+                conversation_.move_caret((sym == XKB_KEY_Left) != presented_field_.rtl ? -1 : 1);
+                return true;
+            case XKB_KEY_Home:
+            case XKB_KEY_End:
+                reset_compose();
+                conversation_.place_caret(sym == XKB_KEY_Home ? 0 : std::string_view::npos);
+                return false;
+            default:
+                break;
+            }
         }
         if (!repeated && sym == XKB_KEY_Escape) {
             reset_compose();
-            conversation_.cancel();
+            edit_input([this] { conversation_.cancel(); });
         } else if (!repeated && (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter)) {
             reset_compose();
             conversation_.submit();
@@ -647,7 +779,7 @@ private:
                 reset_compose();
                 const bool got_text = n > 0 && static_cast<std::size_t>(n) < sizeof(utf8);
                 if (got_text)
-                    conversation_.append({utf8, static_cast<std::size_t>(n)});
+                    edit_input([&] { conversation_.append({utf8, static_cast<std::size_t>(n)}); });
                 ::explicit_bzero(utf8, sizeof(utf8));
                 return got_text;
             }
@@ -661,7 +793,7 @@ private:
         char utf8[8]{};
         const auto n = input_.default_seat().keymap().utf8(code, utf8, sizeof(utf8));
         if (n > 0 && n < sizeof(utf8))
-            conversation_.append({utf8, n});
+            edit_input([&] { conversation_.append({utf8, n}); });
         ::explicit_bzero(utf8, sizeof(utf8));
         return n > 0 && n < sizeof(utf8);
     }
@@ -669,8 +801,14 @@ private:
     // Advance for prompt and action changes, not for ordinary typing or hover. The host
     // may paint later in this same dispatch pass, so set the revision before it can do so.
     void invalidate_form_revision() {
-        ++form_revision_;
-        kms_.request_frame(form_revision_);
+        form_revision_ = ++frame_revision_;
+        kms_.request_frame(frame_revision_);
+    }
+
+    void begin_handoff() {
+        handoff_revision_ = frame_revision_;
+        root_.set_describer(&describe);
+        handoff_timeout_.schedule_at(loop_.now() + k_handoff_wait_ns);
     }
 
     void changed() {
@@ -707,10 +845,13 @@ private:
             }
             last_notice_ = screen.status;
         }
-        if (const auto exit = screen.exit_code()) {
+        if (screen.state == dm::phase::started && !stopping_ && engaged_ && session_.is_active()) {
+            begin_handoff();
+        } else if (const auto exit = screen.exit_code()) {
             stopping_ = true;
             loop_.quit(*exit);
         } else if (!stopping_) {
+            kms_.request_frame(++frame_revision_);
             root_.set_describer(&describe);
         }
     }
@@ -744,6 +885,18 @@ private:
         std::size_t n = 0;
         parts[n++] = label("LUMEN").color(tok::text_accent).size_px(13).bold();
         parts[n++] = label("Sign in").size_px(27).bold();
+        if (screen.state == dm::phase::started) {
+            parts[n++] = label("Starting your session…");
+            return div(style{}
+                           .size_full()
+                           .p(px(24))
+                           .bg(tok::surface_background)
+                           .flex_col()
+                           .items_center()
+                           .justify_center()
+                           .gap(px(12)),
+                       {parts.data(), n});
+        }
         if (const char* status = notice_label(screen.status))
             parts[n++] = label(status).color(tok::text_muted);
         if (!screen.prompt.empty())
@@ -752,28 +905,9 @@ private:
         else if (const char* hint = phase_label(screen.state))
             parts[n++] = label(hint);
 
-        if (editable) {
-            // No credential text reaches lx.ui for a secret prompt, even temporarily.
-            // Cap mask width so a long passphrase never pushes the form off-screen.
-            char bullets[97]{};
-            const std::size_t count = std::min<std::size_t>(32, screen.mask_length);
-            for (std::size_t i = 0; i < count; ++i)
-                std::memcpy(bullets + 3 * i, "\xe2\x80\xa2", 3);
-            const char* value = screen.state == dm::phase::secret ? copy({bullets, 3 * count})
-                                                                  : copy(screen.visible_value);
-            const child field = label(value).size_px(17).truncate();
-            parts[n++] = div(style{}
-                                 .w_full()
-                                 .h(px(42))
-                                 .px(px(12))
-                                 .flex_col()
-                                 .justify_center()
-                                 .bg(tok::background)
-                                 .border_1(tok::border_variant)
-                                 .rounded(radius::md)
-                                 .overflow_hidden(),
-                             {&field, 1});
-        }
+        if (editable)
+            parts[n++] = dm::greeter_field(screen.visible_value, screen.state == dm::phase::secret,
+                                           screen.mask_length, screen.caret_index);
         std::array<child, 2> actions{};
         std::size_t a = 0;
         if (screen.state != dm::phase::username &&
@@ -809,10 +943,18 @@ private:
     lx::input::input_manager input_{};
     std::optional<lx::runtime::fd_source> input_source_{};
     lx::runtime::timer_source repeat_{k_repeat_step_ns, [this] { repeat_key(); }};
+    lx::runtime::timer_source handoff_timeout_{0, [this] { stop(); }, false};
     dm::conversation conversation_;
+    const bool split_vt_;
     lx::rect2i form_{};
+    dm::field_hit_map painted_field_{};
+    dm::field_hit_map presented_field_{};
+    std::uint64_t painted_revision_ = 0;
+    std::uint64_t frame_revision_ = 1;
     std::uint64_t form_revision_ = 1;
     std::uint64_t presented_revision_ = 0;
+    std::uint64_t handoff_revision_ = 0;
+    std::uint64_t retain_revision_ = 0;
     double pointer_x_ = 0.0;
     double pointer_y_ = 0.0;
     std::optional<unsigned> repeat_key_{};
@@ -831,6 +973,8 @@ private:
     bool vt_switch_pending_ = false;
     bool display_present_ = false;
     bool keyboard_ready_ = false;
+    bool kernel_presented_ = false;
+    bool presentation_reported_ = false;
     bool interactive_logged_ = false;
     bool pointer_initialized_ = false;
     dm::phase last_phase_ = dm::phase::offline;
@@ -844,15 +988,128 @@ int fail(lx::error error) {
     return 1;
 }
 
+#ifdef LUMEN_DM_TEST_FORM
+// Exercise the real greeter form and rasterizer without opening logind or a DRM device.
+bool test_form_pixels() {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    lx::ui::set_active_builtin_theme(lx::ui::appearance::dark);
+    lx::runtime::event_loop loop{};
+    lx::session::logind_session session{};
+    greeter view{loop, session, {}, {}};
+    lx::ui::ui_resources resources{};
+    resources.text = {{}, &view.glyphs_, nullptr};
+    lx::ui::set_ui_resources(resources);
+    active = &view;
+    view.root_.set_describer(&greeter::describe);
+    constexpr lx::rect2i bounds{0, 0, 468, 360};
+    if (!view.configure(bounds))
+        return false;
+    std::vector<std::uint32_t> pixels(bounds.width * bounds.height);
+    const lx::gfx::pixel_surface target{
+        .pixels = reinterpret_cast<unsigned char*>(pixels.data()),
+        .width = bounds.width,
+        .height = bounds.height,
+        .stride = bounds.width * sizeof(std::uint32_t),
+        .format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888),
+    };
+    if (!view.paint(target))
+        return false;
+    // Reject a frame that only cleared the form canvas, without painting the form.
+    const auto painted = [&](auto first, auto last) {
+        return std::count_if(first, last, [](std::uint32_t pixel) {
+            return (pixel & 0x00ff'ffffu) != background_xrgb();
+        });
+    };
+    const auto middle = pixels.begin() + pixels.size() / 2;
+    if (painted(pixels.begin(), middle) <= 100 || painted(middle, pixels.end()) <= 100)
+        return false;
+
+    const auto draw_field = [&](lx::ui::describe_fn describe_field) {
+        view.root_.set_describer(describe_field);
+        ++view.frame_revision_;
+        return view.paint(target).has_value();
+    };
+    const auto caret_color = lx::ui::active_theme().color(lx::ui::tok::player0_cursor);
+    const auto channel = [](float value) {
+        return static_cast<std::uint32_t>(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+    };
+    const auto caret_pixel =
+        (channel(caret_color.r) << 16) | (channel(caret_color.g) << 8) | channel(caret_color.b);
+    const auto caret_column = [&]() -> int {
+        const auto b = view.painted_field_.bounds;
+        const int y = b.y + b.height / 2;
+        for (int x = b.x; x < b.x + b.width; ++x) {
+            if ((pixels[y * bounds.width + x] & 0x00ff'ffffu) == caret_pixel)
+                return x;
+        }
+        return -1;
+    };
+    if (!draw_field(+[](lx::ui::build_context&) { return dm::greeter_field({}, false, 0, 0); }))
+        return false;
+    const int empty = caret_column();
+    if (empty < 0 ||
+        !draw_field(+[](lx::ui::build_context&) { return dm::greeter_field("abc", false, 0, 1); }))
+        return false;
+    const int middle_caret = caret_column();
+    const auto b = view.painted_field_.bounds;
+    const lx::point2i hit{middle_caret, b.y + b.height / 2};
+    if (middle_caret <= empty || view.painted_field_.caret_at(hit) != 1)
+        return false;
+    // An insertion before this still-visible stop must not shift a click to the wrong gap.
+    auto shown = view.painted_field_;
+    shown.rebase(0, 0, 1);
+    if (shown.caret_at(hit) != 2)
+        return false;
+    shown.rebase(0, 1, 0);
+    if (shown.caret_at(hit) != 1)
+        return false;
+    if (!draw_field(
+            +[](lx::ui::build_context&) { return dm::greeter_field("abc", false, 0, 3); }) ||
+        caret_column() <= middle_caret)
+        return false;
+    if (!draw_field(+[](lx::ui::build_context&) { return dm::greeter_field({}, true, 100, 95); }))
+        return false;
+    const auto* mask = dm::find_field(*view.root_.tree());
+    const auto* label =
+        mask ? static_cast<const lx::ui::text_block_node*>(mask->child_at(0)) : nullptr;
+    if (!label || label->layout().text().size() != 32 * 3)
+        return false;
+    const auto masked_bounds = view.painted_field_.bounds;
+    if (caret_column() < 0 ||
+        view.painted_field_.caret_at(
+            {caret_column(), masked_bounds.y + masked_bounds.height / 2}) != 95)
+        return false;
+
+    // A confirmed user session must still launch if the neutral frame never flips.
+    dm::conversation_test::set_phase(view.conversation_, dm::phase::started);
+    loop.add_source(&view.handoff_timeout_);
+    lx::runtime::timer_source guard{0, [&] { loop.quit(1); }, false};
+    guard.schedule_at(loop.now() + 1'000'000'000);
+    loop.add_source(&guard);
+    view.begin_handoff();
+    const int status = loop.run();
+    loop.remove_source(&guard);
+    return status == 0 && view.stopping_ && view.retain_revision_ == 0;
+}
+#endif
+
 } // namespace
 
+#ifdef LUMEN_DM_TEST_FORM
+int main() {
+    if (test_form_pixels())
+        return 0;
+    return fail(lx::invalid_argument("greeter form pixels are missing"));
+}
+#else
 int main(int argc, char** argv) {
     if (::getuid() == 0 || ::geteuid() == 0 || ::getuid() != ::geteuid())
         return fail(lx::make_error(lx::io_err::permission_denied, "greeter must run unprivileged"));
-    auto command = argc == 2 ? dm::session_word(argv[1]) : std::nullopt;
-    if (!command || !trusted_session(argv[1]))
-        return fail(
-            lx::invalid_argument("expected one absolute path to the installed lumen-session"));
+    const bool split_vt = argc == 3 && std::string_view{argv[2]} == "--split-vt";
+    auto command = argc == 2 || split_vt ? dm::session_word(argv[1]) : std::nullopt;
+    if (!command || !trusted_session(argv[1]) ||
+        (split_vt && std::string_view{argv[1]} != "/usr/bin/lumen-session"))
+        return fail(lx::invalid_argument("expected an installed lumen-session path [--split-vt]"));
     // Do not change inherited rlimits: the target session is a separate greetd child.
     // Make this process non-dumpable before any credentials can enter it.
     if (::prctl(PR_SET_DUMPABLE, 0L, 0L, 0L, 0L) < 0)
@@ -879,7 +1136,7 @@ int main(int argc, char** argv) {
     auto session = lx::session::logind_session::open_greeter();
     if (!session)
         return fail(session.get_error());
-    greeter view{loop, *session, socket, std::move(*command)};
+    greeter view{loop, *session, socket, std::move(*command), split_vt};
     lx::runtime::fd_source stop{signal_fd.get(), [&] {
                                     signalfd_siginfo signal{};
                                     if (::read(signal_fd.get(), &signal, sizeof(signal)) ==
@@ -892,3 +1149,4 @@ int main(int argc, char** argv) {
     loop.remove_source(&stop);
     return status;
 }
+#endif

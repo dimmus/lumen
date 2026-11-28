@@ -52,7 +52,7 @@ seed_config() (
 
 # Never imported into the user manager: per-process, per-terminal or per-login-tool
 # variables, and the display variables the compositor owns.
-DENY_RE='^(PWD|OLDPWD|SHLVL|_|TERM|COLORTERM|TERM_PROGRAM.*|MOTD_SHOWN|SSH_.*|INVOCATION_ID|JOURNAL_STREAM|NOTIFY_SOCKET|SYSTEMD_EXEC_PID|MANAGERPID|LISTEN_.*|WATCHDOG_.*|MAIL|LS_COLORS|WAYLAND_DISPLAY|DISPLAY|HOSTTYPE|OSTYPE|MACHTYPE|LUMEN_SOCKET|BASH_.*|COLUMNS|LINES|SHELLOPTS|BASHOPTS|PS[0-9]|HISTFILE|HISTSIZE|HISTFILESIZE|HISTCONTROL|LESSOPEN|LESSCLOSE)$'
+DENY_RE='^(LUMEN_DM_HANDOFF|PWD|OLDPWD|SHLVL|_|TERM|COLORTERM|TERM_PROGRAM.*|MOTD_SHOWN|SSH_.*|INVOCATION_ID|JOURNAL_STREAM|NOTIFY_SOCKET|SYSTEMD_EXEC_PID|MANAGERPID|LISTEN_.*|WATCHDOG_.*|MAIL|LS_COLORS|WAYLAND_DISPLAY|DISPLAY|HOSTTYPE|OSTYPE|MACHTYPE|LUMEN_SOCKET|BASH_.*|COLUMNS|LINES|SHELLOPTS|BASHOPTS|PS[0-9]|HISTFILE|HISTSIZE|HISTFILESIZE|HISTCONTROL|LESSOPEN|LESSCLOSE)$'
 # Owned by the compositor (it exports and unsets them): recorded, so a crash that skips the
 # compositor's own unset is still undone here.
 OWNED=(WAYLAND_DISPLAY LUMEN_SOCKET DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP
@@ -61,6 +61,19 @@ OWNED=(WAYLAND_DISPLAY LUMEN_SOCKET DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP
 RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 STATE_DIR="$RUNTIME/lumen"
 RECORD="$STATE_DIR/session-env"
+DM_HANDOFF_FILE="$STATE_DIR/dm-handoff.env"
+
+# Only the compositor unit consumes this file. Validate every value before writing
+# systemd EnvironmentFile syntax; the compositor verifies the broker and logind again.
+write_dm_handoff() (
+  umask 077
+  mkdir -p -- "$STATE_DIR" || exit 1
+  tmp=$(mktemp "$STATE_DIR/.dm-handoff.XXXXXX") || exit 1
+  trap 'rm -f -- "$tmp"' EXIT
+  printf 'LUMEN_DM_HANDOFF=%s\nXDG_SESSION_ID=%s\nXDG_VTNR=%s\n' \
+    "$dm_handoff" "$XDG_SESSION_ID" "$XDG_VTNR" > "$tmp" || exit 1
+  mv -fT -- "$tmp" "$DM_HANDOFF_FILE"
+)
 
 # ── The manager's environment: record, import, restore ───────────────────────
 
@@ -278,9 +291,19 @@ if [[ -n "${WAYLAND_DISPLAY:-}" && -S "$RUNTIME/${WAYLAND_DISPLAY#"$RUNTIME/"}" 
 fi
 unset WAYLAND_DISPLAY DISPLAY
 
-# On a console the session must be the one in front: logind gives the display and the
-# input devices only to the active session.
-if [[ -n "${XDG_SESSION_ID:-}" ]] && command -v loginctl >/dev/null; then
+# Normal logins must be in front. Only a supervised handoff may prepare on an inactive VT.
+dm_handoff=${LUMEN_DM_HANDOFF:-}
+unset LUMEN_DM_HANDOFF
+if [[ -n "$dm_handoff" ]]; then
+  if [[ ! "$dm_handoff" =~ ^/run/lumen-dm-handoff/[0-9a-f]{32}\.sock$ ||
+        ! -S "$dm_handoff" || -L "$dm_handoff" ||
+        "$(stat -c '%u' -- "$dm_handoff" 2>/dev/null)" != 0 ||
+        ! "${XDG_SESSION_ID:-}" =~ ^[a-zA-Z0-9]+$ ||
+        ! "${XDG_VTNR:-}" =~ ^([3-9]|[1-5][0-9]|6[0-3])$ ]]; then
+    say 'invalid display manager handoff'
+    exit 2
+  fi
+elif [[ -n "${XDG_SESSION_ID:-}" ]] && command -v loginctl >/dev/null; then
   if [[ "$(loginctl show-session "$XDG_SESSION_ID" -p Active --value 2>/dev/null)" == no ]]; then
     say "session $XDG_SESSION_ID is not the active one on its seat; switch to its VT first"
     exit 2
@@ -294,16 +317,32 @@ export XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE=wayland
 seed_config || say "warning: could not create user config.toml; continuing with available configuration"
 
 if ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
+  if [[ -n "$dm_handoff" ]]; then
+    say 'display manager handoff requires a systemd user manager'
+    exit 2
+  fi
   run_fallback
   exit $?
 fi
 
-if systemctl --user -q is-active graphical-session.target; then
-  say "a graphical session is already running for $(id -un) (graphical-session.target is active)"
+# Serialize launchers for this user before touching their shared manager state.
+(umask 077; touch -- "$RUNTIME/lumen-session.lock") || exit 2
+exec {session_lock}<"$RUNTIME/lumen-session.lock" || exit 2
+if ! flock -n "$session_lock"; then
+  say 'another Lumen session launcher is running'
+  exit 2
+fi
+
+if systemctl --user -q is-active graphical-session.target ||
+   [[ "$(systemctl --user show -p ActiveState --value lumen-compositor.service)" =~ ^(active|activating|deactivating|reloading)$ ]]; then
+  say "a graphical session is already running or starting for $(id -un)"
   exit 2
 fi
 
 # A session left behind by a crash of this script is undone first.
+interrupted=0
+trap 'interrupted=1' INT TERM HUP
+rm -f -- "$DM_HANDOFF_FILE"
 restore_env
 
 systemctl --user reset-failed lumen-compositor.service lumen-shell.service 2>/dev/null
@@ -339,18 +378,103 @@ fi
 
 # The session runs until the compositor's unit stops: a logout, the compositor exiting,
 # or a hang-up (the terminal closed) or termination of this script, which stops it.
-systemctl --user --wait start lumen-compositor.service &
-waiter=$!
-trap 'systemctl --user stop --no-block lumen-compositor.service' INT TERM HUP
-while :; do
-  wait "$waiter"
-  rc=$?
-  kill -0 "$waiter" 2>/dev/null || break
-done
+if [[ -n "$dm_handoff" ]] && ! write_dm_handoff; then
+  say 'cannot publish display manager handoff'
+  restore_env
+  exit 2
+fi
 
-trap - INT TERM HUP
-systemctl --user start --job-mode=replace-irreversibly lumen-shutdown.target
+# Once StartUnit is acknowledged, the signal trap itself requests the stop. A
+# flag checked before a blocking read would leave a window for a lost wake-up.
+stop_dm_session() {
+  (( ! stop_started )) || return 0
+  stop_started=1
+  # Wait for StopUnit, not the original --wait client, during cancellation.
+  # Allow for the compositor unit's 10s TimeoutStopSec and retry once.
+  if ! timeout -k 1s 12s systemctl --user stop lumen-compositor.service &&
+     ! timeout -k 1s 12s systemctl --user stop lumen-compositor.service; then
+    say 'failed to stop the display manager session'
+  fi
+  kill -KILL "$waiter" 2>/dev/null || :
+}
+
+wait_for_dm_session() {
+  local output waiter line partial='' read_status rc remaining
+  local acknowledged=0 stop_started=0 ack_deadline=$((SECONDS + 10))
+  local -a read_timeout=()
+  (( ! interrupted )) || return 2
+  exec {output}< <(
+    trap '' INT TERM HUP
+    export LC_ALL=C SYSTEMD_LOG_LEVEL=info SYSTEMD_LOG_COLOR=0 SYSTEMD_LOG_TARGET=console
+    exec systemctl --user --show-transaction --wait start lumen-compositor.service 2>&1
+  ) || return 1
+  waiter=$!
+  trap 'interrupted=1; if (( acknowledged )); then stop_dm_session; fi' INT TERM HUP
+  while (( ! stop_started )); do
+    if (( ! acknowledged )); then
+      remaining=$((ack_deadline - SECONDS))
+      if (( remaining <= 0 )); then
+        say 'timed out waiting for the display manager start job'
+        # The transaction may have reached the manager without a usable reply.
+        kill -KILL "$waiter" 2>/dev/null || :
+        stop_dm_session
+        break
+      fi
+      read_timeout=(-t "$remaining")
+    fi
+    line=''
+    if IFS= read -r -u "$output" "${read_timeout[@]}" line; then
+      line=$partial$line
+      partial=''
+      if [[ "$line" =~ ^Enqueued\ anchor\ job\ [0-9]+\ lumen-compositor\.service/start\.$ ]]; then
+        acknowledged=1
+        read_timeout=()
+        if (( interrupted )); then stop_dm_session; fi
+      else
+        printf '%s\n' "$line" >&2
+      fi
+    else
+      read_status=$?
+      (( read_status > 128 )) || break
+      partial+=$line
+    fi
+  done
+  if (( interrupted && ! stop_started )); then stop_dm_session; fi
+  exec {output}<&-
+  while :; do
+    wait "$waiter"
+    rc=$?
+    kill -0 "$waiter" 2>/dev/null || break
+  done
+  trap 'interrupted=1' INT TERM HUP
+  (( ! interrupted && ! stop_started )) || return 2
+  return "$rc"
+}
+
+if [[ -n "$dm_handoff" ]]; then
+  wait_for_dm_session
+  rc=$?
+else
+  systemctl --user --wait start lumen-compositor.service &
+  waiter=$!
+  trap 'systemctl --user stop --no-block lumen-compositor.service' INT TERM HUP
+  while :; do
+    wait "$waiter"
+    rc=$?
+    kill -0 "$waiter" 2>/dev/null || break
+  done
+  trap 'interrupted=1' INT TERM HUP
+fi
+
+rm -f -- "$DM_HANDOFF_FILE"
+if [[ -n "$dm_handoff" ]] && (( rc != 0 )); then
+  # A failed stop must not turn into another unbounded wait for a manager job.
+  timeout -k 1s 12s systemctl --user start --job-mode=replace-irreversibly lumen-shutdown.target
+else
+  systemctl --user start --job-mode=replace-irreversibly lumen-shutdown.target
+fi
 restore_env
+trap - INT TERM HUP
 
 if (( rc != 0 )); then
   result=$(systemctl --user show -p Result --value lumen-compositor.service 2>/dev/null)

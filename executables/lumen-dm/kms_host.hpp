@@ -17,7 +17,7 @@ struct kms_host_callbacks {
     std::uint32_t background_xrgb = 0x00282c34;
     // Called on the loop after a current primary commit presents. Record only; do
     // not reenter the host from a KMS callback. Zero revisions are not reported.
-    void (*presented)(void*, std::uint64_t form_revision) = nullptr;
+    void (*presented)(void*, std::uint64_t form_revision, bool kernel_event) = nullptr;
 };
 
 // One output on the greeter's UI loop. The loop, session and callbacks outlive the host.
@@ -33,8 +33,9 @@ public:
     // memory named by its outstanding flip events alive. ResumeDevice returns that file.
     void suspend();
     [[nodiscard]] lx::result<void> resume();
-    // Passing handoff=true lets the last XRGB frame remain until the next DRM master.
-    void close(bool handoff = false);
+    // Retain the visible primary only if it presented the caller's neutral revision.
+    // Zero requests ordinary console restore.
+    void close(std::uint64_t handoff_revision = 0);
 
     [[nodiscard]] bool owns_device(unsigned major, unsigned minor) const;
     void device_gone(unsigned major, unsigned minor);

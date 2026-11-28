@@ -15,6 +15,7 @@ namespace {
 
 constexpr std::string_view k_session_executable = "lumen-session";
 constexpr lx::runtime::clock_time k_transport_timeout = 5'000'000'000;
+constexpr lx::runtime::clock_time k_split_start_timeout = 12'000'000'000;
 constexpr lx::runtime::clock_time k_auth_timeout = 120'000'000'000;
 
 // A single valid scalar; allow combining marks, layout-dependent symbols and
@@ -39,6 +40,10 @@ unsigned scalar_bytes(std::string_view text) {
                    cp != 0x2029
                ? n
                : 0;
+}
+
+[[nodiscard]] bool continuation_byte(char byte) {
+    return (static_cast<unsigned char>(byte) & 0xc0u) == 0x80u;
 }
 
 // Serialize directly into writable, zeroizable storage. The only inputs to
@@ -106,11 +111,13 @@ std::optional<std::string> session_word(std::string_view path) {
 }
 
 conversation::conversation(lx::runtime::event_loop& loop, std::string socket,
-                           std::string session_command, lx::runtime::callback changed)
+                           std::string session_command, lx::runtime::callback changed,
+                           bool split_vt)
     : loop_(loop),
       socket_(std::move(socket)),
       session_command_(std::move(session_command)),
-      changed_(std::move(changed)) {}
+      changed_(std::move(changed)),
+      split_vt_(split_vt) {}
 
 conversation::~conversation() {
     close();
@@ -162,6 +169,13 @@ void conversation::connected() {
         return;
     }
     ready();
+}
+
+void conversation::report_presented() {
+    if (!split_vt_ || phase_ != phase::username || may_own_session_)
+        return;
+    phase_ = phase::reporting;
+    queue(request::presented);
 }
 
 void conversation::ready() {
@@ -251,7 +265,7 @@ void conversation::receive() {
             return;
         }
         if (tx_size_ || (phase_ != phase::authenticating && phase_ != phase::cancelling &&
-                         phase_ != phase::starting)) {
+                         phase_ != phase::starting && phase_ != phase::reporting)) {
             fatal(notice::protocol);
             return;
         }
@@ -314,6 +328,14 @@ void conversation::response(std::string_view json) {
         return;
     }
     const auto type = member(object.get(), "type");
+    if (phase_ == phase::reporting) {
+        // This report uses a single-request connection. An error on initial boot
+        // simply means there is no desktop waiting for the greeter.
+        close();
+        phase_ = phase::offline;
+        reconnect();
+        return;
+    }
     if (type == "error") {
         const auto kind = member(object.get(), "error_type");
         if ((kind != "auth_error" && kind != "error") || !member(object.get(), "description")) {
@@ -409,10 +431,18 @@ void conversation::queue(request kind) {
     case request::cancel:
         payload.add(R"({"type":"cancel_session"})");
         break;
+    case request::presented:
+        payload.add(R"({"type":"greeter_presented","version":1})");
+        break;
     case request::start:
-        payload.add(R"({"type":"start_session","cmd":[)");
-        payload.string(session_command_);
-        payload.add(R"(],"env":["XDG_SESSION_TYPE=wayland"]})");
+        if (split_vt_) {
+            // A distinct request cannot be mistaken for a same-VT start by stock greetd.
+            payload.add(R"({"type":"start_session_split_vt","version":1})");
+        } else {
+            payload.add(R"({"type":"start_session","cmd":[)");
+            payload.string(session_command_);
+            payload.add(R"(],"env":["XDG_SESSION_TYPE=wayland"]})");
+        }
         break;
     }
     wipe_input();
@@ -424,7 +454,8 @@ void conversation::queue(request kind) {
     const auto size = static_cast<std::uint32_t>(payload.size);
     std::memcpy(tx_.data(), &size, k_header_bytes);
     tx_size_ = k_header_bytes + payload.size;
-    deadline_ = loop_.now() + k_transport_timeout;
+    deadline_ = loop_.now() +
+                (kind == request::start && split_vt_ ? k_split_start_timeout : k_transport_timeout);
     send();
     if (fd_.get() >= 0)
         changed();
@@ -495,7 +526,7 @@ void conversation::cancel() {
 
 void conversation::wipe_input() {
     ::explicit_bzero(input_.data(), input_.size());
-    input_size_ = input_chars_ = 0;
+    input_size_ = input_chars_ = caret_byte_ = caret_index_ = 0;
 }
 
 void conversation::wipe_tx() {
@@ -514,6 +545,46 @@ bool conversation::editable() const {
     return phase_ == phase::username || phase_ == phase::visible || phase_ == phase::secret;
 }
 
+std::size_t conversation::previous_scalar(std::size_t offset) const {
+    // Input is already validated; an interior byte can only be a continuation.
+    while (continuation_byte(input_[--offset])) {
+    }
+    return offset;
+}
+
+std::size_t conversation::next_scalar(std::size_t offset) const {
+    while (++offset < input_size_ && continuation_byte(input_[offset])) {
+    }
+    return offset;
+}
+
+void conversation::place_caret(std::size_t index) {
+    if (!editable())
+        return;
+    index = std::min(index, input_chars_);
+    if (index == caret_index_)
+        return;
+    if (index == 0) {
+        caret_byte_ = 0;
+    } else if (index == input_chars_) {
+        caret_byte_ = input_size_;
+    } else {
+        for (auto current = caret_index_; current > index; --current)
+            caret_byte_ = previous_scalar(caret_byte_);
+        for (auto current = caret_index_; current < index; ++current)
+            caret_byte_ = next_scalar(caret_byte_);
+    }
+    caret_index_ = index;
+    changed();
+}
+
+void conversation::move_caret(int delta) {
+    // All indices are bounded by the byte capacity; clamp before adding delta.
+    const auto index = static_cast<int>(caret_index_);
+    const auto remaining = static_cast<int>(input_chars_ - caret_index_);
+    place_caret(static_cast<std::size_t>(index + std::clamp(delta, -index, remaining)));
+}
+
 void conversation::append(std::string_view utf8) {
     if (!editable() || utf8.empty() || utf8.size() > input_.size() - input_size_)
         return;
@@ -524,20 +595,49 @@ void conversation::append(std::string_view utf8) {
             return;
         chars.remove_prefix(n);
     }
-    std::ranges::copy(utf8, input_.data() + input_size_);
+
+    auto* const first = input_.data();
+    auto* const at = first + caret_byte_;
+    auto* const end = first + input_size_;
+    const std::less<const char*> less;
+    if (at != end && !less(utf8.data(), first) && less(utf8.data(), end)) {
+        // A caller may be inserting part of its own visible_value. Copy it before shifting.
+        std::memcpy(end, utf8.data(), utf8.size());
+        std::rotate(at, end, end + utf8.size());
+    } else {
+        if (at != end)
+            std::memmove(at + utf8.size(), at, input_size_ - caret_byte_);
+        std::memcpy(at, utf8.data(), utf8.size());
+    }
     input_size_ += utf8.size();
     input_chars_ += added;
+    caret_byte_ += utf8.size();
+    caret_index_ += added;
     changed();
 }
 
 void conversation::erase() {
-    if (!editable() || !input_size_)
+    if (!editable() || !caret_index_)
         return;
-    std::size_t start = input_size_ - 1;
-    while (start && (static_cast<unsigned char>(input_[start]) & 0xc0u) == 0x80u)
-        --start;
-    ::explicit_bzero(input_.data() + start, input_size_ - start);
-    input_size_ = start;
+    const auto last = caret_byte_;
+    caret_byte_ = previous_scalar(last);
+    --caret_index_;
+    remove_scalar(caret_byte_, last);
+}
+
+void conversation::erase_forward() {
+    if (!editable() || caret_index_ == input_chars_)
+        return;
+    remove_scalar(caret_byte_, next_scalar(caret_byte_));
+}
+
+void conversation::remove_scalar(std::size_t first, std::size_t last) {
+    auto* const data = input_.data();
+    if (last != input_size_)
+        std::memmove(data + first, data + last, input_size_ - last);
+    const auto removed = last - first;
+    input_size_ -= removed;
+    ::explicit_bzero(data + input_size_, removed);
     --input_chars_;
     changed();
 }
@@ -550,7 +650,8 @@ screen conversation::view() const {
             notice_,
             {prompt_.data(), prompt_size_},
             visible,
-            phase_ == phase::secret ? input_chars_ : 0};
+            phase_ == phase::secret ? input_chars_ : 0,
+            editable() ? caret_index_ : 0};
 }
 
 void conversation::changed() {

@@ -708,6 +708,15 @@ set_tests_properties(layer_graph PROPERTIES
 
 if(LUMEN_BUILD_TESTS)
     if(LUMEN_BUILD_DM)
+        add_executable(test_lumen_dm_form executables/lumen-dm/main.cpp
+            executables/lumen-dm/greetd.cpp executables/lumen-dm/kms_host.cpp)
+        target_compile_definitions(test_lumen_dm_form PRIVATE LUMEN_DM_TEST_FORM)
+        target_link_libraries(test_lumen_dm_form PRIVATE lx.ui lx.scene lx.layout lx.text lx.gfx
+            lx.runtime lx.foundation lx.trace lx.drm lx.input lx.session PkgConfig::LUMEN_DM_JSON
+            ${XKBCOMMON_LINK_LIBRARIES})
+        target_include_directories(test_lumen_dm_form PRIVATE ${XKBCOMMON_INCLUDE_DIRS})
+        lumen_apply_module_properties(test_lumen_dm_form)
+        add_test(NAME test_lumen_dm_form COMMAND test_lumen_dm_form)
         add_executable(test_lumen_dm tests/test_lumen_dm.cpp executables/lumen-dm/greetd.cpp)
         target_link_libraries(test_lumen_dm PRIVATE lx.runtime lx.foundation PkgConfig::LUMEN_DM_JSON)
         target_include_directories(test_lumen_dm PRIVATE tests executables/lumen-dm)
